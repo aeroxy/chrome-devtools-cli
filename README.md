@@ -2,6 +2,30 @@
 
 Rust CLI that connects to an existing Chrome browser via the DevTools Protocol. Auto-connects by default — no manual WebSocket URL needed.
 
+## Installation
+
+### Homebrew (macOS, recommended)
+
+```bash
+brew tap aeroxy/chrome-devtools-cli
+brew install chrome-devtools
+```
+
+### Cargo
+
+```bash
+cargo install chrome-devtools-cli
+```
+
+The installed binary is named `chrome-devtools`.
+
+### Build from source
+
+```bash
+cargo build --release
+# Binary: ./target/release/chrome-devtools
+```
+
 ## Why this exists
 
 Inspired by [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp) — the official MCP server for Chrome DevTools. It works well, but MCP-based browser tools consume a lot of token context: every interaction sends and receives large protocol payloads through the MCP layer.
@@ -34,13 +58,6 @@ Chrome must have remote debugging enabled:
 1. Open Chrome
 2. Go to `chrome://inspect/#remote-debugging`
 3. Enable the remote debugging server
-
-## Build
-
-```bash
-cargo build --release
-# Binary: ./target/release/chrome-devtools
-```
 
 ## Auto-connect
 
