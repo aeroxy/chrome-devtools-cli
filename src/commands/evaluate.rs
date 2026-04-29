@@ -47,31 +47,43 @@ pub async fn evaluate(
                 let desc = exception["exception"]["description"]
                     .as_str()
                     .unwrap_or(text);
-                anyhow::bail!("{desc}");
+                anyhow::bail!(
+                    "{desc}\n\n[HINT: To explore the page DOM, use the `snapshot` command instead of `evaluate`. To interact with elements, use `click` or `fill`.]"
+                );
             }
 
             let value = &result["result"];
             let val_type = value["type"].as_str().unwrap_or("undefined");
 
-            if as_json {
+            let mut output = if as_json {
                 if let Some(v) = value.get("value") {
-                    return Ok(serde_json::to_string_pretty(v)?);
+                    serde_json::to_string_pretty(v)?
                 } else {
-                    return Ok(serde_json::to_string_pretty(value)?);
+                    serde_json::to_string_pretty(value)?
                 }
             } else {
                 match val_type {
-                    "undefined" => return Ok("undefined".to_string()),
-                    "string" => return Ok(value["value"].as_str().unwrap_or("").to_string()),
+                    "undefined" => "undefined".to_string(),
+                    "string" => value["value"].as_str().unwrap_or("").to_string(),
                     _ => {
                         if let Some(v) = value.get("value") {
-                            return Ok(serde_json::to_string_pretty(v)?);
+                            serde_json::to_string_pretty(v)?
                         } else {
-                            return Ok(value["description"].as_str().unwrap_or("").to_string());
+                            value["description"].as_str().unwrap_or("").to_string()
                         }
                     }
                 }
+            };
+
+            if expression.contains("querySelector")
+                || expression.contains("document.body")
+                || expression.contains("getElementById")
+                || expression.contains("getElementsBy")
+            {
+                output.push_str("\n\n[HINT: Avoid using `evaluate` for DOM traversal. Use the `snapshot` command to get a clean accessibility tree of the page, then use `click` or `fill`.]");
             }
+
+            return Ok(output);
         }
 
         // Handle dialog events if they occur
@@ -93,6 +105,18 @@ pub async fn evaluate(
                 client
                     .send_to_target(session_id, "Page.handleJavaScriptDialog", params)
                     .await?;
+            } else {
+                let dialog_type = resp
+                    .get("params")
+                    .and_then(|p| p.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("unknown");
+                let msg = resp
+                    .get("params")
+                    .and_then(|p| p.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("");
+                anyhow::bail!("A javascript dialog is open ({dialog_type}: {msg}). Use `evaluate` with --dialog-action to dismiss it.");
             }
         }
     }

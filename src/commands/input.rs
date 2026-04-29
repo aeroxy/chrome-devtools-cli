@@ -96,10 +96,44 @@ pub async fn fill(
     value: &str,
 ) -> Result<String> {
     let escaped_sel = selector.replace('\\', "\\\\").replace('\'', "\\'");
+    // Escape value for safely injecting into JS
+    let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
+
     let expr = format!(
         r#"(() => {{
             const el = document.querySelector('{escaped_sel}');
             if (!el) return 'not_found';
+            
+            const tagName = el.tagName.toLowerCase();
+            const type = el.type ? el.type.toLowerCase() : '';
+            
+            if (tagName === 'select') {{
+                let optionFound = false;
+                for (const option of el.options) {{
+                    if (option.value === '{escaped_val}' || option.text === '{escaped_val}') {{
+                        el.value = option.value;
+                        optionFound = true;
+                        break;
+                    }}
+                }}
+                if (!optionFound) {{
+                    return 'option_not_found';
+                }}
+                el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                return 'select_ok';
+            }}
+            
+            if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
+                const isTrue = '{escaped_val}'.toLowerCase() === 'true';
+                if (el.checked !== isTrue) {{
+                    el.checked = isTrue;
+                    el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                }}
+                return 'checkbox_ok';
+            }}
+            
             el.focus();
             el.value = '';
             el.dispatchEvent(new Event('input', {{bubbles: true}}));
@@ -115,8 +149,15 @@ pub async fn fill(
         )
         .await?;
 
-    if result["result"]["value"].as_str() == Some("not_found") {
+    let res_val = result["result"]["value"].as_str().unwrap_or("error");
+
+    if res_val == "not_found" {
         bail!("Element not found: {selector}");
+    } else if res_val == "option_not_found" {
+        bail!("Could not find option with text or value '{value}' in select element: {selector}");
+    } else if res_val == "select_ok" || res_val == "checkbox_ok" {
+        // For select/checkbox, the work is done entirely in JS
+        return Ok(format!("Filled '{selector}' with: {value}"));
     }
 
     client

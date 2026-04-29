@@ -88,6 +88,26 @@ impl CdpClient {
             let resp_text = self.read_text().await?;
             let resp: Value = serde_json::from_str(&resp_text)?;
 
+            // Proactively fail if a dialog is opened during execution (unless it's handleJavaScriptDialog)
+            if resp.get("method").and_then(|v| v.as_str()) == Some("Page.javascriptDialogOpening")
+                && method != "Page.handleJavaScriptDialog"
+            {
+                if let Some(msg) = resp
+                    .get("params")
+                    .and_then(|p| p.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    let dialog_type = resp
+                        .get("params")
+                        .and_then(|p| p.get("type"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("unknown");
+                    bail!("A javascript dialog is open ({dialog_type}: {msg}). Use `evaluate` with --dialog-action to dismiss it.");
+                } else {
+                    bail!("A javascript dialog is open. Use `evaluate` with --dialog-action to dismiss it.");
+                }
+            }
+
             if resp.get("id").and_then(|v| v.as_u64()) == Some(id) {
                 if let Some(error) = resp.get("error") {
                     bail!(
