@@ -237,9 +237,7 @@ async fn run() -> Result<()> {
             let clean_err = err_str.replace("For more information, try '--help'.", "");
             eprintln!("{}", clean_err.trim_end());
             if e.kind() != ErrorKind::DisplayHelp && e.kind() != ErrorKind::DisplayVersion {
-                println!("\n=========================================");
-                println!("Help Menu & Available Commands");
-                println!("=========================================\n");
+                println!();
                 let mut cmd = Cli::command();
                 let _ = cmd.print_help();
             }
