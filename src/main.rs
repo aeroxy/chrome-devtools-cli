@@ -233,7 +233,9 @@ async fn run() -> Result<()> {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
-            let _ = e.print();
+            let err_str = e.render().to_string();
+            let clean_err = err_str.replace("For more information, try '--help'.", "");
+            eprintln!("{}", clean_err.trim_end());
             if e.kind() != ErrorKind::DisplayHelp && e.kind() != ErrorKind::DisplayVersion {
                 println!("\n=========================================");
                 println!("Help Menu & Available Commands");
