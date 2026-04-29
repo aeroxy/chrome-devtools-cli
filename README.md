@@ -128,7 +128,7 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 |---------|-------------|
 | `click <selector>` | Click element by CSS selector |
 | `click-at <x> <y>` | Click at specific coordinates |
-| `fill <selector> <value>` | Fill input field |
+| `fill <selector> <value>` | Fill input field, dropdown (`<select>`), or toggle checkbox/radio (`"true"`/`"false"`) |
 | `type-text <text> [--submit-key <key>]` | Type into focused element (optionally press key after) |
 | `press-key <key>` | Press key (e.g. `Enter`, `Control+A`) |
 | `hover <selector>` | Hover over element |
