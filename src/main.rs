@@ -14,7 +14,7 @@ use serde_json::json;
 use protocol::DaemonRequest;
 
 #[derive(Parser)]
-#[command(name = "chrome-devtools", about = "Chrome DevTools Protocol CLI")]
+#[command(name = "chrome-devtools", version, about = "Chrome DevTools Protocol CLI")]
 struct Cli {
     /// Explicit WebSocket endpoint (skips auto-connect)
     #[arg(long, global = true)]

@@ -1,6 +1,6 @@
 [package]
 name = "chrome-devtools-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Chrome DevTools Protocol CLI — auto-connects to existing Chrome"
 authors = ["Aero <aero.windwalker@gmail.com>"]

@@ -5,8 +5,8 @@ class ChromeDevtools < Formula
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/aeroxy/chrome-devtools-cli/releases/download/0.1.1/chrome-devtools-macos-arm64.zip"
-      sha256 "7988e57c4bdb0b178a8a195d687d295a872c27343363cf66c893dd89b7125c46"
+      url "https://github.com/aeroxy/chrome-devtools-cli/releases/download/0.1.2/chrome-devtools-macos-arm64.zip"
+      sha256 "24010da8997666942342e64a9b753e787fb599ee74c797ea6d7fedaad07148fd"
     end
   end
 
@@ -15,6 +15,6 @@ class ChromeDevtools < Formula
   end
 
   test do
-    assert_match "chrome-devtools", shell_output("#{bin}/chrome-devtools --help")
+    assert_match "chrome-devtools #{version}", shell_output("#{bin}/chrome-devtools --version")
   end
 end
