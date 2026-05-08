@@ -14,6 +14,9 @@ pub struct CdpClient {
     write: SplitSink<WsStream, Message>,
     read: SplitStream<WsStream>,
     next_id: u64,
+    /// Dialog action to automatically handle JavaScript dialogs during command execution.
+    /// Valid values: "accept", "dismiss", or custom prompt text.
+    pub dialog_action: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +38,7 @@ impl CdpClient {
             write,
             read,
             next_id: 1,
+            dialog_action: None,
         })
     }
 
@@ -88,23 +92,43 @@ impl CdpClient {
             let resp_text = self.read_text().await?;
             let resp: Value = serde_json::from_str(&resp_text)?;
 
-            // Proactively fail if a dialog is opened during execution (unless it's handleJavaScriptDialog)
+            // Proactively handle or fail if a dialog is opened during execution
             if resp.get("method").and_then(|v| v.as_str()) == Some("Page.javascriptDialogOpening")
                 && method != "Page.handleJavaScriptDialog"
             {
-                if let Some(msg) = resp
+                let dialog_type = resp
+                    .get("params")
+                    .and_then(|p| p.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("unknown");
+                let msg = resp
                     .get("params")
                     .and_then(|p| p.get("message"))
                     .and_then(|m| m.as_str())
-                {
-                    let dialog_type = resp
-                        .get("params")
-                        .and_then(|p| p.get("type"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("unknown");
-                    bail!("A javascript dialog is open ({dialog_type}: {msg}). Use `evaluate` with --dialog-action to dismiss it.");
+                    .unwrap_or("");
+
+                if let Some(action) = &self.dialog_action {
+                    let mut handler_params = json!({});
+                    match action.as_str() {
+                        "accept" => {
+                            handler_params["accept"] = json!(true);
+                        }
+                        "dismiss" => {
+                            handler_params["accept"] = json!(false);
+                        }
+                        text => {
+                            handler_params["accept"] = json!(true);
+                            handler_params["promptText"] = json!(text);
+                        }
+                    }
+                    // Send the handle command but don't wait for its response here
+                    // (we are still waiting for the original 'id')
+                    self.send_raw_no_wait(session_id, "Page.handleJavaScriptDialog", handler_params)
+                        .await
+                        .map_err(|e| anyhow!("Failed to send dialog handle command: {e}"))?;
+                    continue;
                 } else {
-                    bail!("A javascript dialog is open. Use `evaluate` with --dialog-action to dismiss it.");
+                    bail!("A javascript dialog is open ({dialog_type}: {msg}). Use `evaluate` with --dialog-action to dismiss it.");
                 }
             }
 

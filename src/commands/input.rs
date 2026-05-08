@@ -70,9 +70,59 @@ async fn dispatch_mouse(
 }
 
 pub async fn click(client: &mut CdpClient, session_id: &str, selector: &str) -> Result<String> {
-    let (x, y) = get_element_center(client, session_id, selector).await?;
-    click_at(client, session_id, x, y).await?;
-    Ok(format!("Clicked: {selector}"))
+    // Special handling for native <option> elements which don't always respond to mouse clicks
+    let escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
+    let check_expr = format!(
+        r#"(() => {{
+            const el = document.querySelector('{escaped}');
+            if (!el) return 'not_found';
+            if (el.tagName.toLowerCase() === 'option') {{
+                if (el.disabled) return 'option_disabled';
+                const select = el.closest('select');
+                if (!select) return 'option_no_select';
+                if (select.disabled) return 'select_disabled';
+                if (select.multiple) return 'select_multiple';
+
+                select.value = el.value;
+                select.dispatchEvent(new Event('input', {{bubbles: true}}));
+                select.dispatchEvent(new Event('change', {{bubbles: true}}));
+                return 'selected';
+            }}
+            return 'not_option';
+        }})()"#
+    );
+
+    let result = client
+        .send_to_target(
+            session_id,
+            "Runtime.evaluate",
+            json!({"expression": check_expr, "returnByValue": true}),
+        )
+        .await?;
+
+    if let Some(exception) = result.get("exceptionDetails") {
+        let text = exception["text"].as_str().unwrap_or("Unknown error");
+        let desc = exception["exception"]["description"]
+            .as_str()
+            .unwrap_or(text);
+        bail!("JavaScript error during click handling: {desc}");
+    }
+
+    let res_val = result["result"]["value"].as_str().unwrap_or("error");
+    match res_val {
+        "not_found" => bail!("Element not found: {selector}"),
+        "selected" => Ok(format!("Selected option: {selector}")),
+        "option_disabled" => bail!("Cannot click disabled option: {selector}"),
+        "option_no_select" => bail!("Option element is not inside a select: {selector}"),
+        "select_disabled" => bail!("Cannot click option in disabled select: {selector}"),
+        "select_multiple" => bail!("Manual clicking on <option> is not supported for <select multiple>. Use `evaluate` to update selection instead: {selector}"),
+        "not_option" => {
+            let (x, y) = get_element_center(client, session_id, selector).await?;
+            click_at(client, session_id, x, y).await?;
+            Ok(format!("Clicked: {selector}"))
+        }
+        _ => bail!("Unexpected response from page during click handling: {res_val}"),
+    }
 }
 
 pub async fn click_at(client: &mut CdpClient, session_id: &str, x: f64, y: f64) -> Result<String> {

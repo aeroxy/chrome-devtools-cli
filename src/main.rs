@@ -17,15 +17,15 @@ use protocol::DaemonRequest;
 #[command(name = "chrome-devtools", version, about = "Chrome DevTools Protocol CLI")]
 struct Cli {
     /// Explicit WebSocket endpoint (skips auto-connect)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "CHROME_WS_ENDPOINT")]
     ws_endpoint: Option<String>,
 
     /// Chrome user data directory (for auto-connect)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "CHROME_USER_DATA_DIR")]
     user_data_dir: Option<String>,
 
     /// Chrome channel: stable, beta, canary, dev
-    #[arg(long, global = true, default_value = "stable")]
+    #[arg(long, global = true, default_value = "stable", env = "CHROME_CHANNEL")]
     channel: String,
 
     /// Page index for page-level commands (0-based, from list-pages)
@@ -136,6 +136,17 @@ enum Commands {
         #[arg(long, default_value_t = 30000)]
         timeout: u64,
     },
+
+    /// List third-party developer tools exposed by the page
+    List3pTools,
+
+    /// Execute a third-party developer tool exposed by the page
+    Execute3pTool {
+        /// Name of the tool to execute
+        name: String,
+        /// JSON-stringified parameters for the tool
+        params: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -202,6 +213,10 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         Commands::Resize { width, height } => ("resize", json!({"width": width, "height": height})),
         Commands::WaitFor { text, timeout } => {
             ("wait-for", json!({"text": text, "timeout": timeout}))
+        }
+        Commands::List3pTools => ("list-3p-tools", json!({})),
+        Commands::Execute3pTool { name, params } => {
+            ("execute-3p-tool", json!({"name": name, "params": params}))
         }
     };
 
@@ -312,6 +327,15 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<String> {
     let target_id = target.target_id.clone();
     let session_id = client.attach_to_target(&target_id).await?;
 
+    // Enable Page domain to receive dialog events for proactive rejection
+    let _ = client
+        .send_to_target(&session_id, "Page.enable", json!({}))
+        .await;
+
+    if let Commands::Evaluate { dialog_action, .. } = &cli.command {
+        client.dialog_action = dialog_action.clone();
+    }
+
     let result = match &cli.command {
         Commands::Navigate {
             url,
@@ -345,14 +369,13 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<String> {
         }
         Commands::Evaluate {
             expression,
-            dialog_action,
+            ..
         } => {
             commands::evaluate::evaluate(
                 &mut client,
                 &session_id,
                 expression,
                 cli.json,
-                dialog_action.as_deref(),
             )
             .await
         }
@@ -382,6 +405,19 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<String> {
         }
         Commands::WaitFor { text, timeout } => {
             commands::pages::wait_for(&mut client, &session_id, text, *timeout).await
+        }
+        Commands::List3pTools => {
+            commands::third_party::list_3p_tools(&mut client, &session_id, cli.json).await
+        }
+        Commands::Execute3pTool { name, params } => {
+            commands::third_party::execute_3p_tool(
+                &mut client,
+                &session_id,
+                name,
+                params.as_deref(),
+                cli.json,
+            )
+            .await
         }
         _ => unreachable!(),
     };

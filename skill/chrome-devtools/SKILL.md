@@ -69,6 +69,12 @@ chrome-devtools --target <name> press-key Control+A
 chrome-devtools --target <name> hover ".menu-item"
 ```
 
+### Third-party developer tools
+```bash
+chrome-devtools list-3p-tools                          # List tools from window.__dtmcp
+chrome-devtools execute-3p-tool <name> '<json-params>' # Execute a custom tool
+```
+
 ### Utilities
 ```bash
 chrome-devtools --target <name> wait-for "Success" --timeout 10000
@@ -82,9 +88,9 @@ chrome-devtools --target <name> resize 1280 720
 | `--target <name>` | Target page by friendly name or raw Chrome target ID |
 | `--page <index>` | Target page by index (for quick one-offs) |
 | `--json` | Machine-readable JSON output |
-| `--ws-endpoint <url>` | Explicit WebSocket endpoint (overrides auto-connect) |
-| `--user-data-dir <path>` | Custom Chrome profile directory |
-| `--channel <ch>` | Chrome channel: stable / beta / canary / dev |
+| `--ws-endpoint <url>` | Explicit WebSocket endpoint (overrides auto-connect) — env: `CHROME_WS_ENDPOINT` |
+| `--user-data-dir <path>` | Custom Chrome profile directory — env: `CHROME_USER_DATA_DIR` |
+| `--channel <ch>` | Chrome channel: stable / beta / canary / dev — env: `CHROME_CHANNEL` |
 
 ## Typical task pattern
 

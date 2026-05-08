@@ -6,6 +6,7 @@ use crate::cdp::CdpClient;
 use crate::commands;
 use crate::friendly;
 use crate::protocol::*;
+use serde_json::json;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
@@ -154,6 +155,13 @@ async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Result<
     let target_id = target.target_id.clone();
     let session_id = client.attach_to_target(&target_id).await?;
 
+    // Enable Page domain to receive dialog events for proactive rejection
+    let _ = client
+        .send_to_target(&session_id, "Page.enable", json!({}))
+        .await;
+
+    client.dialog_action = args["dialog_action"].as_str().map(|s| s.to_string());
+
     let result = match cmd {
         "navigate" => {
             commands::navigate::navigate(
@@ -185,7 +193,6 @@ async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Result<
                 &session_id,
                 expr,
                 req.json_output,
-                args["dialog_action"].as_str(),
             )
             .await
         }
@@ -232,10 +239,25 @@ async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Result<
             let timeout = args["timeout"].as_u64().unwrap_or(30000);
             commands::pages::wait_for(client, &session_id, text, timeout).await
         }
+        "list-3p-tools" => {
+            commands::third_party::list_3p_tools(client, &session_id, req.json_output).await
+        }
+        "execute-3p-tool" => {
+            let name = args["name"].as_str().ok_or(anyhow!("name required"))?;
+            commands::third_party::execute_3p_tool(
+                client,
+                &session_id,
+                name,
+                args["params"].as_str(),
+                req.json_output,
+            )
+            .await
+        }
         _ => Err(anyhow!("Unknown command: {cmd}")),
     };
 
     let _ = client.detach_from_target(&session_id).await;
+    client.dialog_action = None;
 
     // Append target ID so the caller can pin subsequent commands to this page
     let name = friendly::to_friendly(&target_id);

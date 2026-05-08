@@ -72,7 +72,13 @@ By default, the CLI reads `DevToolsActivePort` from Chrome's user data directory
 | Linux | `~/.config/google-chrome/` |
 | Windows | `%LOCALAPPDATA%\Google\Chrome\User Data\` |
 
-Override with `--user-data-dir`, `--channel` (beta/canary/dev), or `--ws-endpoint`.
+Override with `--user-data-dir`, `--channel` (beta/canary/dev), or `--ws-endpoint`. All three also read from environment variables:
+
+| Environment Variable | Corresponding Flag |
+|----------------------|--------------------|
+| `CHROME_WS_ENDPOINT` | `--ws-endpoint` |
+| `CHROME_USER_DATA_DIR` | `--user-data-dir` |
+| `CHROME_CHANNEL` | `--channel` |
 
 ## Page targeting
 
@@ -136,6 +142,15 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 | `press-key <key>` | Press key (e.g. `Enter`, `Control+A`) |
 | `hover <selector>` | Hover over element |
 
+### Third-party developer tools
+
+| Command | Description |
+|---------|-------------|
+| `list-3p-tools` | List custom developer tools exposed via `window.__dtmcp` |
+| `execute-3p-tool <name> <params>` | Execute a custom tool by name with a JSON params string |
+
+These commands interact with tools injected into the page via `window.__dtmcp.toolGroup` / `window.__dtmcp.executeTool`.
+
 ### Other
 
 | Command | Description |
@@ -180,7 +195,8 @@ src/
     ├── screenshot.rs
     ├── evaluate.rs
     ├── input.rs    # click/fill/type/press/hover
-    └── snapshot.rs
+    ├── snapshot.rs
+    └── third_party.rs  # list-3p-tools/execute-3p-tool
 ```
 
 ## Typical workflow
