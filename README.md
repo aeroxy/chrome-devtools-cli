@@ -2,6 +2,7 @@
 
 Rust CLI that connects to an existing Chrome browser via the DevTools Protocol. Auto-connects by default — no manual WebSocket URL needed.
 
+[![crates.io](https://img.shields.io/crates/v/chrome-devtools-cli.svg)](https://crates.io/crates/chrome-devtools-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/aeroxy/chrome-devtools-cli)
 
@@ -10,8 +11,7 @@ Rust CLI that connects to an existing Chrome browser via the DevTools Protocol. 
 ### Homebrew (macOS, recommended)
 
 ```bash
-brew tap aeroxy/chrome-devtools-cli
-brew install chrome-devtools
+brew install aeroxy/tap/chrome-devtools
 ```
 
 ### Cargo
