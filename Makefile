@@ -1,4 +1,4 @@
-.PHONY: build check run test clean bump-patch bump-minor bump-major update-formula release-macos
+.PHONY: build check run test clean bump-patch bump-minor bump-major update-formula release
 
 ## Build the project (debug)
 build:
@@ -59,12 +59,6 @@ bump-major:
 	sed -i '' "s/version \"$$old\"/version \"$$new\"/" Formula/chrome-devtools.rb; \
 	sed -i '' "s|/$$old/|/$$new/|g" Formula/chrome-devtools.rb; \
 	echo "$$old → $$new"
-
-## Build a release zip for macOS arm64 (run after bump-*, before upload)
-##   make release-macos
-release-macos:
-	cargo build --release
-	zip -j target/release/chrome-devtools-macos-arm64.zip target/release/chrome-devtools
 
 ## Update Formula/chrome-devtools.rb SHA256 from local release zip (run after release-macos, before upload)
 ##   make update-formula
