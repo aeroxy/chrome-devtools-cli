@@ -14,7 +14,11 @@ use serde_json::json;
 use protocol::DaemonRequest;
 
 #[derive(Parser)]
-#[command(name = "chrome-devtools", version, about = "Chrome DevTools Protocol CLI")]
+#[command(
+    name = "chrome-devtools",
+    version,
+    about = "Chrome DevTools Protocol CLI"
+)]
 struct Cli {
     /// Explicit WebSocket endpoint (skips auto-connect)
     #[arg(long, global = true, env = "CHROME_WS_ENDPOINT")]
@@ -248,14 +252,16 @@ async fn run() -> Result<()> {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                e.exit();
+            }
+
             let err_str = e.render().to_string();
             let clean_err = err_str.replace("For more information, try '--help'.", "");
             eprintln!("{}", clean_err.trim_end());
-            if e.kind() != ErrorKind::DisplayHelp && e.kind() != ErrorKind::DisplayVersion {
-                println!();
-                let mut cmd = Cli::command();
-                let _ = cmd.print_help();
-            }
+            println!();
+            let mut cmd = Cli::command();
+            let _ = cmd.print_help();
             std::process::exit(1);
         }
     };
@@ -276,7 +282,9 @@ async fn run() -> Result<()> {
 
     // Daemon not running — spawn it
     client::spawn_daemon(&ws_url)?;
-    client::wait_for_daemon().await?;
+    if let Err(e) = client::wait_for_daemon().await {
+        return run_direct_fallback(&cli, &ws_url, &e).await;
+    }
 
     // Retry via daemon
     match client::send_to_daemon(&request).await {
@@ -286,17 +294,22 @@ async fn run() -> Result<()> {
         }
         Err(e) => {
             // Daemon failed — fall back to direct execution
-            eprintln!("Warning: daemon unavailable ({e}), running directly");
-            let output = run_direct(&cli, &ws_url).await?;
-            if !output.is_empty() {
-                print!("{}", output);
-                if !output.ends_with('\n') {
-                    println!();
-                }
-            }
-            Ok(())
+            run_direct_fallback(&cli, &ws_url, &e).await
         }
     }
+}
+
+/// Fall back to direct execution when the daemon is unavailable.
+async fn run_direct_fallback(cli: &Cli, ws_url: &str, error: &anyhow::Error) -> Result<()> {
+    eprintln!("Warning: daemon unavailable ({error}), running directly");
+    let output = run_direct(cli, ws_url).await?;
+    if !output.is_empty() {
+        print!("{output}");
+        if !output.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
 }
 
 /// Direct execution without daemon (fallback).
@@ -332,9 +345,13 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<String> {
         .send_to_target(&session_id, "Page.enable", json!({}))
         .await;
 
-    if let Commands::Evaluate { dialog_action, .. } = &cli.command {
-        client.dialog_action = dialog_action.clone();
-    }
+    // Extract dialog_action if set (only available on Evaluate command, but
+    // apply it for all commands in direct mode to match daemon behavior)
+    let dialog_action = match &cli.command {
+        Commands::Evaluate { dialog_action, .. } => dialog_action.clone(),
+        _ => None,
+    };
+    client.dialog_action = dialog_action;
 
     let result = match &cli.command {
         Commands::Navigate {
@@ -367,17 +384,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<String> {
             )
             .await
         }
-        Commands::Evaluate {
-            expression,
-            ..
-        } => {
-            commands::evaluate::evaluate(
-                &mut client,
-                &session_id,
-                expression,
-                cli.json,
-            )
-            .await
+        Commands::Evaluate { expression, .. } => {
+            commands::evaluate::evaluate(&mut client, &session_id, expression, cli.json).await
         }
         Commands::Click { selector } => {
             commands::input::click(&mut client, &session_id, selector).await

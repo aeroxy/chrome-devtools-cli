@@ -21,8 +21,14 @@ pub struct DaemonResponse {
     pub error: String,
 }
 
+#[cfg(unix)]
 pub fn socket_path() -> PathBuf {
     std::env::temp_dir().join("chrome-devtools-daemon.sock")
+}
+
+#[cfg(windows)]
+pub fn addr_path() -> PathBuf {
+    std::env::temp_dir().join("chrome-devtools-daemon.addr")
 }
 
 pub fn pid_path() -> PathBuf {

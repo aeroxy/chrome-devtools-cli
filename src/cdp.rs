@@ -123,9 +123,13 @@ impl CdpClient {
                     }
                     // Send the handle command but don't wait for its response here
                     // (we are still waiting for the original 'id')
-                    self.send_raw_no_wait(session_id, "Page.handleJavaScriptDialog", handler_params)
-                        .await
-                        .map_err(|e| anyhow!("Failed to send dialog handle command: {e}"))?;
+                    self.send_raw_no_wait(
+                        session_id,
+                        "Page.handleJavaScriptDialog",
+                        handler_params,
+                    )
+                    .await
+                    .map_err(|e| anyhow!("Failed to send dialog handle command: {e}"))?;
                     continue;
                 } else {
                     bail!("A javascript dialog is open ({dialog_type}: {msg}). Use `evaluate` with --dialog-action to dismiss it.");
