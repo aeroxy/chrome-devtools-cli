@@ -283,15 +283,7 @@ async fn run() -> Result<()> {
     // Daemon not running — spawn it
     client::spawn_daemon(&ws_url)?;
     if let Err(e) = client::wait_for_daemon().await {
-        eprintln!("Warning: daemon unavailable ({e}), running directly");
-        let output = run_direct(&cli, &ws_url).await?;
-        if !output.is_empty() {
-            print!("{}", output);
-            if !output.ends_with('\n') {
-                println!();
-            }
-        }
-        return Ok(());
+        return run_direct_fallback(&cli, &ws_url, &e).await;
     }
 
     // Retry via daemon
@@ -302,17 +294,22 @@ async fn run() -> Result<()> {
         }
         Err(e) => {
             // Daemon failed — fall back to direct execution
-            eprintln!("Warning: daemon unavailable ({e}), running directly");
-            let output = run_direct(&cli, &ws_url).await?;
-            if !output.is_empty() {
-                print!("{}", output);
-                if !output.ends_with('\n') {
-                    println!();
-                }
-            }
-            Ok(())
+            run_direct_fallback(&cli, &ws_url, &e).await
         }
     }
+}
+
+/// Fall back to direct execution when the daemon is unavailable.
+async fn run_direct_fallback(cli: &Cli, ws_url: &str, error: &anyhow::Error) -> Result<()> {
+    eprintln!("Warning: daemon unavailable ({error}), running directly");
+    let output = run_direct(cli, ws_url).await?;
+    if !output.is_empty() {
+        print!("{output}");
+        if !output.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
 }
 
 /// Direct execution without daemon (fallback).
@@ -348,9 +345,13 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<String> {
         .send_to_target(&session_id, "Page.enable", json!({}))
         .await;
 
-    if let Commands::Evaluate { dialog_action, .. } = &cli.command {
-        client.dialog_action = dialog_action.clone();
-    }
+    // Extract dialog_action if set (only available on Evaluate command, but
+    // apply it for all commands in direct mode to match daemon behavior)
+    let dialog_action = match &cli.command {
+        Commands::Evaluate { dialog_action, .. } => dialog_action.clone(),
+        _ => None,
+    };
+    client.dialog_action = dialog_action;
 
     let result = match &cli.command {
         Commands::Navigate {

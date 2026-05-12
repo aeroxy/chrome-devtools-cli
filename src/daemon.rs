@@ -14,6 +14,36 @@ use serde_json::json;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
+/// Result of handling a single daemon connection.
+enum ConnectionOutcome {
+    /// Continue accepting new connections.
+    Continue,
+    /// Fatal error occurred; daemon should exit.
+    Fatal,
+}
+
+macro_rules! run_accept_loop_body {
+    ($accept:expr, $client:expr, $ws_url:expr) => {
+        loop {
+            let accept = tokio::time::timeout(IDLE_TIMEOUT, $accept).await;
+
+            match accept {
+                Ok(Ok((stream, _))) => match handle_connection(stream, $client, $ws_url).await {
+                    ConnectionOutcome::Continue => {}
+                    ConnectionOutcome::Fatal => break,
+                },
+                Ok(Err(e)) => {
+                    eprintln!("daemon: accept error: {e}");
+                }
+                Err(_) => {
+                    // Idle timeout — exit
+                    break;
+                }
+            }
+        }
+    };
+}
+
 pub async fn run_daemon(ws_url: &str) -> Result<()> {
     // Write PID
     std::fs::write(pid_path(), std::process::id().to_string())?;
@@ -49,7 +79,7 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
     let mut client: Option<CdpClient> = None;
 
     // Signal readiness by socket/address existence (it's already bound)
-    run_accept_loop(listener, &mut client, ws_url).await;
+    run_accept_loop_body!(listener.accept(), &mut client, ws_url);
 
     #[cfg(unix)]
     let _ = std::fs::remove_file(socket_path());
@@ -61,51 +91,7 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-async fn run_accept_loop(listener: UnixListener, client: &mut Option<CdpClient>, ws_url: &str) {
-    loop {
-        let accept = tokio::time::timeout(IDLE_TIMEOUT, listener.accept()).await;
-
-        match accept {
-            Ok(Ok((stream, _))) => {
-                if !handle_connection(stream, client, ws_url).await {
-                    break;
-                }
-            }
-            Ok(Err(e)) => {
-                eprintln!("daemon: accept error: {e}");
-            }
-            Err(_) => {
-                // Idle timeout — exit
-                break;
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-async fn run_accept_loop(listener: TcpListener, client: &mut Option<CdpClient>, ws_url: &str) {
-    loop {
-        let accept = tokio::time::timeout(IDLE_TIMEOUT, listener.accept()).await;
-
-        match accept {
-            Ok(Ok((stream, _))) => {
-                if !handle_connection(stream, client, ws_url).await {
-                    break;
-                }
-            }
-            Ok(Err(e)) => {
-                eprintln!("daemon: accept error: {e}");
-            }
-            Err(_) => {
-                // Idle timeout — exit
-                break;
-            }
-        }
-    }
-}
-
-async fn handle_connection<S>(mut stream: S, client: &mut Option<CdpClient>, ws_url: &str) -> bool
+async fn handle_connection<S>(mut stream: S, client: &mut Option<CdpClient>, ws_url: &str) -> ConnectionOutcome
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -113,7 +99,7 @@ where
         Ok(b) => b,
         Err(e) => {
             eprintln!("daemon: read error: {e}");
-            return true;
+            return ConnectionOutcome::Continue;
         }
     };
 
@@ -126,7 +112,7 @@ where
                 error: format!("Invalid request: {e}"),
             };
             let _ = write_msg(&mut stream, &serde_json::to_vec(&resp).unwrap()).await;
-            return true;
+            return ConnectionOutcome::Continue;
         }
     };
 
@@ -142,12 +128,19 @@ where
                 };
                 let _ = write_msg(&mut stream, &serde_json::to_vec(&resp).unwrap()).await;
                 // Exit daemon if we can't connect, so the next CLI call will spawn a fresh daemon
-                return false;
+                return ConnectionOutcome::Fatal;
             }
         }
     }
 
-    let response = handle_request(client.as_mut().unwrap(), &request).await;
+    let response = match client.as_mut() {
+        Some(client) => handle_request(client, &request).await,
+        None => DaemonResponse {
+            success: false,
+            output: String::new(),
+            error: String::from("Failed to connect to Chrome: client initialization failed"),
+        },
+    };
 
     // Check if the error indicates a disconnected WebSocket.
     // If so, we should exit the daemon so it can be respawned cleanly next time.
@@ -160,7 +153,11 @@ where
         let _ = write_msg(&mut stream, &resp_bytes).await;
     }
 
-    !is_fatal
+    if is_fatal {
+        ConnectionOutcome::Fatal
+    } else {
+        ConnectionOutcome::Continue
+    }
 }
 
 async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> DaemonResponse {
