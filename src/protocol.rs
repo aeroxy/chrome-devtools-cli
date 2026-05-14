@@ -19,6 +19,7 @@ pub struct DaemonResponse {
     pub success: bool,
     pub output: String,
     pub error: String,
+    pub navigated_to: Option<String>,
 }
 
 #[cfg(unix)]

@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use serde_json::json;
 
 use crate::cdp::CdpClient;
+use crate::result::CommandResult;
 
 async fn get_element_center(
     client: &mut CdpClient,
@@ -69,7 +70,12 @@ async fn dispatch_mouse(
     Ok(())
 }
 
-pub async fn click(client: &mut CdpClient, session_id: &str, selector: &str) -> Result<String> {
+pub async fn click(
+    client: &mut CdpClient,
+    session_id: &str,
+    selector: &str,
+) -> Result<CommandResult> {
+    let initial_url = client.current_url(session_id).await?;
     // Special handling for native <option> elements which don't always respond to mouse clicks
     let escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
     let check_expr = format!(
@@ -111,32 +117,50 @@ pub async fn click(client: &mut CdpClient, session_id: &str, selector: &str) -> 
     let res_val = result["result"]["value"].as_str().unwrap_or("error");
     match res_val {
         "not_found" => bail!("Element not found: {selector}"),
-        "selected" => Ok(format!("Selected option: {selector}")),
+        "selected" => {
+            let new_url = client.current_url(session_id).await?;
+            Ok(CommandResult::output(format!("Selected option: {selector}"))
+                .with_navigated_to_if_changed(new_url, initial_url))
+        }
         "option_disabled" => bail!("Cannot click disabled option: {selector}"),
         "option_no_select" => bail!("Option element is not inside a select: {selector}"),
         "select_disabled" => bail!("Cannot click option in disabled select: {selector}"),
         "select_multiple" => bail!("Manual clicking on <option> is not supported for <select multiple>. Use `evaluate` to update selection instead: {selector}"),
         "not_option" => {
             let (x, y) = get_element_center(client, session_id, selector).await?;
-            click_at(client, session_id, x, y).await?;
-            Ok(format!("Clicked: {selector}"))
+            click_at(client, session_id, x, y).await
         }
         _ => bail!("Unexpected response from page during click handling: {res_val}"),
     }
 }
 
-pub async fn click_at(client: &mut CdpClient, session_id: &str, x: f64, y: f64) -> Result<String> {
+pub async fn click_at(
+    client: &mut CdpClient,
+    session_id: &str,
+    x: f64,
+    y: f64,
+) -> Result<CommandResult> {
+    let initial_url = client.current_url(session_id).await?;
     dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0).await?;
     dispatch_mouse(client, session_id, "mousePressed", x, y, "left", 1).await?;
     dispatch_mouse(client, session_id, "mouseReleased", x, y, "left", 1).await?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    Ok(format!("Clicked at ({x}, {y})"))
+    let new_url = client.current_url(session_id).await?;
+    Ok(CommandResult::output(format!("Clicked at ({x}, {y})"))
+        .with_navigated_to_if_changed(new_url, initial_url))
 }
 
-pub async fn hover(client: &mut CdpClient, session_id: &str, selector: &str) -> Result<String> {
+pub async fn hover(
+    client: &mut CdpClient,
+    session_id: &str,
+    selector: &str,
+) -> Result<CommandResult> {
+    let initial_url = client.current_url(session_id).await?;
     let (x, y) = get_element_center(client, session_id, selector).await?;
     dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0).await?;
-    Ok(format!("Hovered: {selector}"))
+    let new_url = client.current_url(session_id).await?;
+    Ok(CommandResult::output(format!("Hovered: {selector}"))
+        .with_navigated_to_if_changed(new_url, initial_url))
 }
 
 pub async fn fill(
@@ -144,7 +168,8 @@ pub async fn fill(
     session_id: &str,
     selector: &str,
     value: &str,
-) -> Result<String> {
+) -> Result<CommandResult> {
+    let initial_url = client.current_url(session_id).await?;
     let escaped_sel = selector.replace('\\', "\\\\").replace('\'', "\\'");
     // Escape value for safely injecting into JS
     let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
@@ -153,10 +178,10 @@ pub async fn fill(
         r#"(() => {{
             const el = document.querySelector('{escaped_sel}');
             if (!el) return 'not_found';
-            
+
             const tagName = el.tagName.toLowerCase();
             const type = el.type ? el.type.toLowerCase() : '';
-            
+
             if (tagName === 'select') {{
                 let optionFound = false;
                 for (const option of el.options) {{
@@ -173,7 +198,7 @@ pub async fn fill(
                 el.dispatchEvent(new Event('change', {{bubbles: true}}));
                 return 'select_ok';
             }}
-            
+
             if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
                 const isTrue = '{escaped_val}'.toLowerCase() === 'true';
                 if (el.checked !== isTrue) {{
@@ -183,7 +208,7 @@ pub async fn fill(
                 }}
                 return 'checkbox_ok';
             }}
-            
+
             el.focus();
             el.value = '';
             el.dispatchEvent(new Event('input', {{bubbles: true}}));
@@ -207,7 +232,9 @@ pub async fn fill(
         bail!("Could not find option with text or value '{value}' in select element: {selector}");
     } else if res_val == "select_ok" || res_val == "checkbox_ok" {
         // For select/checkbox, the work is done entirely in JS
-        return Ok(format!("Filled '{selector}' with: {value}"));
+        let new_url = client.current_url(session_id).await?;
+        return Ok(CommandResult::output(format!("Filled '{selector}' with: {value}"))
+            .with_navigated_to_if_changed(new_url, initial_url));
     }
 
     client
@@ -231,7 +258,9 @@ pub async fn fill(
         )
         .await?;
 
-    Ok(format!("Filled '{selector}' with: {value}"))
+    let new_url = client.current_url(session_id).await?;
+    Ok(CommandResult::output(format!("Filled '{selector}' with: {value}"))
+        .with_navigated_to_if_changed(new_url, initial_url))
 }
 
 pub async fn type_text(
@@ -239,7 +268,8 @@ pub async fn type_text(
     session_id: &str,
     text: &str,
     submit_key: Option<&str>,
-) -> Result<String> {
+) -> Result<CommandResult> {
+    let initial_url = client.current_url(session_id).await?;
     client
         .send_to_target(session_id, "Input.insertText", json!({"text": text}))
         .await?;
@@ -248,13 +278,16 @@ pub async fn type_text(
         press_key(client, session_id, key).await?;
     }
 
-    Ok(format!(
+    let new_url = client.current_url(session_id).await?;
+    Ok(CommandResult::output(format!(
         "Typed: {text}{}",
         submit_key.map(|k| format!(" + {k}")).unwrap_or_default()
     ))
+    .with_navigated_to_if_changed(new_url, initial_url))
 }
 
-pub async fn press_key(client: &mut CdpClient, session_id: &str, key: &str) -> Result<String> {
+pub async fn press_key(client: &mut CdpClient, session_id: &str, key: &str) -> Result<CommandResult> {
+    let initial_url = client.current_url(session_id).await?;
     let parts: Vec<&str> = key.split('+').collect();
     let main_key = parts.last().ok_or_else(|| anyhow::anyhow!("Empty key"))?;
 
@@ -299,7 +332,9 @@ pub async fn press_key(client: &mut CdpClient, session_id: &str, key: &str) -> R
         )
         .await?;
 
-    Ok(format!("Pressed: {key}"))
+    let new_url = client.current_url(session_id).await?;
+    Ok(CommandResult::output(format!("Pressed: {key}"))
+        .with_navigated_to_if_changed(new_url, initial_url))
 }
 
 fn map_key(key: &str) -> (&str, &str, i32) {

@@ -4,8 +4,9 @@ use std::fmt::Write;
 
 use crate::cdp::CdpClient;
 use crate::friendly;
+use crate::result::CommandResult;
 
-pub async fn list_pages(client: &mut CdpClient, as_json: bool) -> Result<String> {
+pub async fn list_pages(client: &mut CdpClient, as_json: bool) -> Result<CommandResult> {
     let pages = client.get_page_targets().await?;
 
     if as_json {
@@ -21,44 +22,44 @@ pub async fn list_pages(client: &mut CdpClient, as_json: bool) -> Result<String>
                 })
             })
             .collect();
-        Ok(serde_json::to_string_pretty(&items)?)
+        Ok(CommandResult::output(serde_json::to_string_pretty(&items)?))
     } else {
         if pages.is_empty() {
-            return Ok("No pages open.".to_string());
+            return Ok(CommandResult::output("No pages open.".to_string()));
         }
         let mut out = String::new();
         for (i, page) in pages.iter().enumerate() {
             let name = friendly::to_friendly(&page.target_id);
             writeln!(out, "[{i}] ({name}) {} — {}", page.title, page.url).unwrap();
         }
-        Ok(out)
+        Ok(CommandResult::output(out))
     }
 }
 
-pub async fn new_page(client: &mut CdpClient, url: &str) -> Result<String> {
+pub async fn new_page(client: &mut CdpClient, url: &str) -> Result<CommandResult> {
     let target_id = client.create_target(url).await?;
-    Ok(format!("Opened new page: {url} (target: {target_id})"))
+    Ok(CommandResult::output(format!("Opened new page: {url} (target: {target_id})")))
 }
 
-pub async fn close_page(client: &mut CdpClient, index: usize) -> Result<String> {
+pub async fn close_page(client: &mut CdpClient, index: usize) -> Result<CommandResult> {
     let pages = client.get_page_targets().await?;
     let page = pages
         .get(index)
         .ok_or_else(|| anyhow!("No page at index {index} (have {} pages)", pages.len()))?;
     client.close_target(&page.target_id).await?;
-    Ok(format!("Closed page [{index}]: {}", page.url))
+    Ok(CommandResult::output(format!("Closed page [{index}]: {}", page.url)))
 }
 
-pub async fn select_page(client: &mut CdpClient, index: usize) -> Result<String> {
+pub async fn select_page(client: &mut CdpClient, index: usize) -> Result<CommandResult> {
     let pages = client.get_page_targets().await?;
     let page = pages
         .get(index)
         .ok_or_else(|| anyhow!("No page at index {index} (have {} pages)", pages.len()))?;
-    client.activate_target(&page.target_id).await?;
-    Ok(format!(
+client.activate_target(&page.target_id).await?;
+    Ok(CommandResult::output(format!(
         "Activated page [{index}]: {} — {}",
         page.title, page.url
-    ))
+    )))
 }
 
 pub async fn resize(
@@ -66,7 +67,7 @@ pub async fn resize(
     session_id: &str,
     width: u32,
     height: u32,
-) -> Result<String> {
+) -> Result<CommandResult> {
     client
         .send_to_target(
             session_id,
@@ -79,7 +80,7 @@ pub async fn resize(
             }),
         )
         .await?;
-    Ok(format!("Resized viewport to {width}x{height}"))
+    Ok(CommandResult::output(format!("Resized viewport to {width}x{height}")))
 }
 
 pub async fn wait_for(
@@ -87,7 +88,7 @@ pub async fn wait_for(
     session_id: &str,
     text: &str,
     timeout_ms: u64,
-) -> Result<String> {
+) -> Result<CommandResult> {
     let escaped = text.replace('\\', "\\\\").replace('\'', "\\'");
     let check_expr = format!("document.body && document.body.innerText.includes('{escaped}')");
 
@@ -111,7 +112,7 @@ pub async fn wait_for(
 
         if let Ok(val) = result {
             if val["result"]["value"].as_bool() == Some(true) {
-                return Ok(format!("Found text: {text}"));
+                return Ok(CommandResult::output(format!("Found text: {text}")));
             }
         }
 

@@ -18,6 +18,15 @@ async fn connect_daemon() -> Result<TcpStream> {
     Ok(TcpStream::connect(addr.trim()).await?)
 }
 
+/// Read the daemon wait timeout from `DAEMON_WAIT_TIMEOUT_SECS`, defaulting to 5.
+fn daemon_wait_timeout() -> Duration {
+    std::env::var("DAEMON_WAIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(5))
+}
+
 /// Try to send a request to the daemon. Returns error if daemon is not running.
 pub async fn send_to_daemon(request: &DaemonRequest) -> Result<DaemonResponse> {
     let mut stream = connect_daemon().await?;
@@ -48,11 +57,11 @@ pub fn spawn_daemon(ws_url: &str) -> Result<()> {
 
 /// Wait for the daemon socket to become available, with exponential backoff.
 pub async fn wait_for_daemon() -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+     let deadline = tokio::time::Instant::now() + daemon_wait_timeout();
     let mut delay = Duration::from_millis(50);
     loop {
         if tokio::time::Instant::now() > deadline {
-            bail!("Daemon failed to start within 5 seconds");
+            bail!("Daemon failed to start within {} seconds", daemon_wait_timeout().as_secs());
         }
         if connect_daemon().await.is_ok() {
             return Ok(());

@@ -2,12 +2,13 @@ use anyhow::{bail, Result};
 use serde_json::json;
 
 use crate::cdp::CdpClient;
+use crate::result::CommandResult;
 
 pub async fn list_3p_tools(
     client: &mut CdpClient,
     session_id: &str,
     json_output: bool,
-) -> Result<String> {
+) -> Result<CommandResult> {
     let expr = r#"(() => {
         const dtmcp = window.__dtmcp;
         if (!dtmcp || !dtmcp.toolGroup) {
@@ -37,7 +38,7 @@ pub async fn list_3p_tools(
         .ok_or_else(|| anyhow::anyhow!("Failed to list third-party tools"))?;
 
     if json_output {
-        Ok(val_str.to_string())
+        Ok(CommandResult::output(val_str.to_string()))
     } else {
         let val: serde_json::Value = serde_json::from_str(val_str)?;
         let tools = val["tools"]
@@ -45,7 +46,7 @@ pub async fn list_3p_tools(
             .ok_or_else(|| anyhow::anyhow!("Invalid response from page"))?;
 
         if tools.is_empty() {
-            return Ok("No third-party developer tools found on this page.".to_string());
+            return Ok(CommandResult::output("No third-party developer tools found on this page.".to_string()));
         }
 
         let mut output = String::new();
@@ -63,7 +64,7 @@ pub async fn list_3p_tools(
             output.push_str(&format!("- {}: {}\n", name, desc));
         }
 
-        Ok(output)
+        Ok(CommandResult::output(output))
     }
 }
 
@@ -73,7 +74,7 @@ pub async fn execute_3p_tool(
     name: &str,
     params: Option<&str>,
     json_output: bool,
-) -> Result<String> {
+) -> Result<CommandResult> {
     let params_json = params.unwrap_or("{}");
     // Basic validation of params
     let parsed_params: serde_json::Value = serde_json::from_str(params_json)
@@ -117,12 +118,12 @@ pub async fn execute_3p_tool(
     }
 
     if json_output {
-        Ok(val["result"].to_string())
+        Ok(CommandResult::output(val["result"].to_string()))
     } else {
-        Ok(format!(
+        Ok(CommandResult::output(format!(
             "Successfully executed tool '{}'. Result:\n{}",
             name,
             serde_json::to_string_pretty(&val["result"])?
-        ))
+        )))
     }
 }

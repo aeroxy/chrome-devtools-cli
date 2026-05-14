@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use serde_json::json;
 
 use crate::cdp::CdpClient;
+use crate::result::CommandResult;
 
 pub async fn navigate(
     client: &mut CdpClient,
@@ -10,15 +11,16 @@ pub async fn navigate(
     back: bool,
     forward: bool,
     reload: bool,
-) -> Result<String> {
+    output: Option<&str>,
+) -> Result<CommandResult> {
     if back {
-        return go_back(client, session_id).await;
+        return go_back(client, session_id, output).await;
     }
     if forward {
-        return go_forward(client, session_id).await;
+        return go_forward(client, session_id, output).await;
     }
     if reload {
-        return do_reload(client, session_id).await;
+        return do_reload(client, session_id, output).await;
     }
 
     let url =
@@ -33,10 +35,18 @@ pub async fn navigate(
     }
 
     wait_for_load(client, session_id, 30_000).await?;
-    Ok(format!("Navigated to {url}"))
+    let result = CommandResult::output(format!("Navigated to {url}"))
+        .with_navigated_to(url.to_string());
+
+    if let Some(path) = output {
+        std::fs::write(path, result.output.as_bytes())?;
+        Ok(CommandResult::output(format!("Output saved to {path}")).with_navigated_to(url.to_string()))
+    } else {
+        Ok(result)
+    }
 }
 
-async fn go_back(client: &mut CdpClient, session_id: &str) -> Result<String> {
+async fn go_back(client: &mut CdpClient, session_id: &str, output: Option<&str>) -> Result<CommandResult> {
     let history = client
         .send_to_target(session_id, "Page.getNavigationHistory", json!({}))
         .await?;
@@ -63,10 +73,17 @@ async fn go_back(client: &mut CdpClient, session_id: &str) -> Result<String> {
 
     wait_for_load(client, session_id, 30_000).await?;
     let url = prev_entry["url"].as_str().unwrap_or("unknown");
-    Ok(format!("Navigated back to {url}"))
+    let result = CommandResult::output(format!("Navigated back to {url}"))
+        .with_navigated_to(url.to_string());
+    if let Some(path) = output {
+        std::fs::write(path, result.output.as_bytes())?;
+        Ok(CommandResult::output(format!("Output saved to {path}")).with_navigated_to(url.to_string()))
+    } else {
+        Ok(result)
+    }
 }
 
-async fn go_forward(client: &mut CdpClient, session_id: &str) -> Result<String> {
+async fn go_forward(client: &mut CdpClient, session_id: &str, output: Option<&str>) -> Result<CommandResult> {
     let history = client
         .send_to_target(session_id, "Page.getNavigationHistory", json!({}))
         .await?;
@@ -93,15 +110,30 @@ async fn go_forward(client: &mut CdpClient, session_id: &str) -> Result<String> 
 
     wait_for_load(client, session_id, 30_000).await?;
     let url = next_entry["url"].as_str().unwrap_or("unknown");
-    Ok(format!("Navigated forward to {url}"))
+    let result = CommandResult::output(format!("Navigated forward to {url}"))
+        .with_navigated_to(url.to_string());
+    if let Some(path) = output {
+        std::fs::write(path, result.output.as_bytes())?;
+        Ok(CommandResult::output(format!("Output saved to {path}")).with_navigated_to(url.to_string()))
+    } else {
+        Ok(result)
+    }
 }
 
-async fn do_reload(client: &mut CdpClient, session_id: &str) -> Result<String> {
+async fn do_reload(client: &mut CdpClient, session_id: &str, output: Option<&str>) -> Result<CommandResult> {
     client
         .send_to_target(session_id, "Page.reload", json!({}))
         .await?;
     wait_for_load(client, session_id, 30_000).await?;
-    Ok("Reloaded page".to_string())
+    let url = client.current_url(session_id).await?;
+    let result = CommandResult::output("Reloaded page".to_string())
+        .with_navigated_to(url.clone());
+    if let Some(path) = output {
+        std::fs::write(path, result.output.as_bytes())?;
+        Ok(CommandResult::output(format!("Output saved to {path}")).with_navigated_to(url))
+    } else {
+        Ok(result)
+    }
 }
 
 async fn wait_for_load(client: &mut CdpClient, session_id: &str, timeout_ms: u64) -> Result<()> {

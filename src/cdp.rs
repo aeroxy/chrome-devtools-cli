@@ -5,11 +5,49 @@ use futures_util::{
     SinkExt, StreamExt,
 };
 use serde_json::{json, Value};
+use std::fmt::Debug;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Trait abstracting Chrome DevTools Protocol operations.
+///
+/// Enables dependency injection for testing command logic without
+/// requiring a live Chrome/WebSocket connection.
+///
+/// NOTE: Full trait implementation requires the `async-trait` crate.
+/// Currently `CdpClient` is used directly; this trait is a placeholder
+/// for future mock-based testing.
+#[allow(dead_code)]
+pub trait CdpClientTrait: Debug + Send {
+    fn send(&mut self, method: &str, params: Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_>>;
+    fn send_to_target(
+        &mut self,
+        session_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_>>;
+    fn current_url(&mut self, session_id: &str) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>>;
+    fn resolve_page(
+        &mut self,
+        target: Option<&str>,
+        page: Option<usize>,
+    ) -> Pin<Box<dyn Future<Output = Result<TargetInfo>> + Send + '_>>;
+    fn attach_to_target(&mut self, target_id: &str) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>>;
+    fn detach_from_target(&mut self, session_id: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn activate_target(&mut self, target_id: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn create_target(&mut self, url: &str) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>>;
+    fn close_target(&mut self, target_id: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn set_dialog_action(&mut self, action: Option<String>);
+}
+
+use std::future::Future;
+use std::pin::Pin;
+
+/// Concrete CDP client backed by a WebSocket connection.
+#[derive(Debug)]
 pub struct CdpClient {
     write: SplitSink<WsStream, Message>,
     read: SplitStream<WsStream>,
@@ -248,6 +286,21 @@ impl CdpClient {
         Ok(())
     }
 
+    /// Get the current page URL via JavaScript evaluation.
+    pub async fn current_url(&mut self, session_id: &str) -> Result<String> {
+        let result = self
+            .send_to_target(
+                session_id,
+                "Runtime.evaluate",
+                json!({"expression": "window.location.href", "returnByValue": true}),
+            )
+            .await?;
+        Ok(result["result"]["value"]
+            .as_str()
+            .unwrap_or("")
+            .to_string())
+    }
+
     /// Resolve which page to operate on.
     /// Priority: --target (by ID or friendly name) > --page (by index) > first page.
     pub async fn resolve_page(
@@ -259,13 +312,11 @@ impl CdpClient {
 
         if let Some(tid) = target {
             if friendly::is_friendly(tid) {
-                // Resolve friendly name → target ID
                 return pages
                     .into_iter()
                     .find(|p| friendly::to_friendly(&p.target_id) == tid)
                     .ok_or_else(|| anyhow!("No page matching '{tid}'"));
             }
-            // Raw target ID
             return pages
                 .into_iter()
                 .find(|p| p.target_id == tid)
@@ -278,4 +329,28 @@ impl CdpClient {
             .nth(idx)
             .ok_or_else(|| anyhow!("No page at index {idx}"))
     }
+}
+
+/// Write a length-prefixed message to a stream.
+#[allow(dead_code)]
+pub async fn write_msg<W: AsyncWriteExt + Unpin>(w: &mut W, data: &[u8]) -> anyhow::Result<()> {
+    let len = (data.len() as u32).to_be_bytes();
+    w.write_all(&len).await?;
+    w.write_all(data).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+/// Read a length-prefixed message from a stream.
+#[allow(dead_code)]
+pub async fn read_msg<R: AsyncReadExt + Unpin>(r: &mut R) -> anyhow::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > 64 * 1024 * 1024 {
+        anyhow::bail!("Message too large: {len} bytes");
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf).await?;
+    Ok(buf)
 }

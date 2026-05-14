@@ -2,17 +2,21 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::cdp::CdpClient;
+use crate::result::CommandResult;
 
 pub async fn evaluate(
     client: &mut CdpClient,
     session_id: &str,
     expression: &str,
     as_json: bool,
-) -> Result<String> {
+    output: Option<&str>,
+) -> Result<CommandResult> {
     // Note: To handle JavaScript dialogs (alert, confirm, prompt) during evaluation,
     // client.dialog_action must be set to "accept", "dismiss", or a prompt response string
     // BEFORE calling this function. The underlying send_to_target call will then
     // automatically handle any Page.javascriptDialogOpening events that occur.
+
+    let initial_url = client.current_url(session_id).await?;
 
     let result = client
         .send_to_target(
@@ -39,7 +43,7 @@ pub async fn evaluate(
     let value = &result["result"];
     let val_type = value["type"].as_str().unwrap_or("undefined");
 
-    let mut output = if as_json {
+    let mut output_hint = if as_json {
         if let Some(v) = value.get("value") {
             serde_json::to_string_pretty(v)?
         } else {
@@ -64,8 +68,17 @@ pub async fn evaluate(
         || expression.contains("getElementById")
         || expression.contains("getElementsBy")
     {
-        output.push_str("\n\n[HINT: Avoid using `evaluate` for DOM traversal. Use the `snapshot` command to get a clean accessibility tree of the page, then use `click` or `fill`.]");
+        output_hint.push_str("\n\n[HINT: Avoid using `evaluate` for DOM traversal. Use the `snapshot` command to get a clean accessibility tree of the page, then use `click` or `fill`.]");
     }
 
-    Ok(output)
+    let new_url = client.current_url(session_id).await?;
+    let result = CommandResult::output(output_hint).with_navigated_to_if_changed(new_url, initial_url);
+
+    if let Some(path) = output {
+        let data = result.output.as_bytes();
+        std::fs::write(path, data)?;
+        Ok(CommandResult::output(format!("Output saved to {path}")))
+    } else {
+        Ok(result)
+    }
 }

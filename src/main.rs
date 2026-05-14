@@ -3,15 +3,18 @@ mod cdp;
 mod client;
 mod commands;
 mod daemon;
+mod error;
 mod friendly;
 mod protocol;
+mod result;
+mod telemetry;
 
 use anyhow::Result;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::json;
-
-use protocol::DaemonRequest;
+use crate::error::ErrorCode;
+use crate::protocol::DaemonRequest;
 
 #[derive(Parser)]
 #[command(
@@ -63,6 +66,9 @@ enum Commands {
         forward: bool,
         #[arg(long)]
         reload: bool,
+        /// Write output to a file instead of stdout
+        #[arg(long, short)]
+        output: Option<String>,
     },
 
     /// Open a new page/tab
@@ -103,6 +109,9 @@ enum Commands {
         /// Handle dialogs while execution: accept, dismiss, or string for prompt
         #[arg(long)]
         dialog_action: Option<String>,
+        /// Write output to a file instead of stdout
+        #[arg(long, short)]
+        output: Option<String>,
     },
 
     /// Click an element by CSS selector
@@ -129,7 +138,11 @@ enum Commands {
     Hover { selector: String },
 
     /// Take an accessibility tree snapshot
-    Snapshot,
+    Snapshot {
+        /// Write output to a file instead of stdout
+        #[arg(long, short)]
+        output: Option<String>,
+    },
 
     /// Resize the page viewport
     Resize { width: u32, height: u32 },
@@ -153,8 +166,41 @@ enum Commands {
     },
 }
 
+impl Cli {
+    /// Get the name of the subcommand as a static string for telemetry logging.
+    fn command_name(&self) -> &'static str {
+        match &self.command {
+            Commands::ListPages => "list-pages",
+            Commands::Navigate { .. } => "navigate",
+            Commands::NewPage { .. } => "new-page",
+            Commands::ClosePage { .. } => "close-page",
+            Commands::SelectPage { .. } => "select-page",
+            Commands::Screenshot { .. } => "screenshot",
+            Commands::Evaluate { .. } => "evaluate",
+            Commands::Click { .. } => "click",
+            Commands::ClickAt { .. } => "click-at",
+            Commands::Fill { .. } => "fill",
+            Commands::TypeText { .. } => "type-text",
+            Commands::PressKey { .. } => "press-key",
+            Commands::Hover { .. } => "hover",
+            Commands::Snapshot { output: _ } => "snapshot",
+            Commands::Resize { .. } => "resize",
+            Commands::WaitFor { .. } => "wait-for",
+            Commands::List3pTools => "list-3p-tools",
+            Commands::Execute3pTool { .. } => "execute-3p-tool",
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    // Initialize telemetry logger (non-blocking, best-effort)
+    let log_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".chrome-devtools-cli")
+        .join("logs");
+    telemetry::init_logger(telemetry::TelemetryLogger::new(log_dir));
+
     // Internal daemon mode — invoked by spawn_daemon(), not by users
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("__daemon__") {
@@ -167,8 +213,12 @@ async fn main() {
     }
 
     if let Err(e) = run().await {
+        let code = match e.downcast_ref::<error::CliError>() {
+            Some(ce) => ce.code().code(),
+            None => ErrorCode::Unspecified as u32,
+        };
         eprintln!("error: {e:#}");
-        std::process::exit(1);
+        std::process::exit(code as i32);
     }
 }
 
@@ -181,9 +231,10 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             back,
             forward,
             reload,
+            output,
         } => (
             "navigate",
-            json!({"url": url, "back": back, "forward": forward, "reload": reload}),
+            json!({"url": url, "back": back, "forward": forward, "reload": reload, "output": output}),
         ),
         Commands::NewPage { url } => ("new-page", json!({"url": url})),
         Commands::ClosePage { index } => ("close-page", json!({"index": index})),
@@ -199,9 +250,10 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         Commands::Evaluate {
             expression,
             dialog_action,
+            output,
         } => (
             "evaluate",
-            json!({"expression": expression, "dialog_action": dialog_action}),
+            json!({"expression": expression, "dialog_action": dialog_action, "output": output}),
         ),
         Commands::Click { selector } => ("click", json!({"selector": selector})),
         Commands::ClickAt { x, y } => ("click-at", json!({"x": x, "y": y})),
@@ -213,7 +265,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         }
         Commands::PressKey { key } => ("press-key", json!({"key": key})),
         Commands::Hover { selector } => ("hover", json!({"selector": selector})),
-        Commands::Snapshot => ("snapshot", json!({})),
+        Commands::Snapshot { output } => ("snapshot", json!({"output": output})),
         Commands::Resize { width, height } => ("resize", json!({"width": width, "height": height})),
         Commands::WaitFor { text, timeout } => {
             ("wait-for", json!({"text": text, "timeout": timeout}))
@@ -242,9 +294,27 @@ fn print_response(resp: &protocol::DaemonResponse) {
                 println!();
             }
         }
+        if let Some(navigated_to) = &resp.navigated_to {
+            eprintln!("[navigated to: {navigated_to}]");
+        }
     } else {
         eprintln!("error: {}", resp.error);
         std::process::exit(1);
+    }
+}
+
+fn print_result(result: &result::CommandResult) {
+    if !result.output.is_empty() {
+        print!("{}", result.output);
+        if !result.output.ends_with('\n') {
+            println!();
+        }
+    }
+    if let Some(navigated_to) = &result.navigated_to {
+        eprintln!("[navigated to: {navigated_to}]");
+    }
+    if let Some(target_id) = &result.target_id {
+        eprintln!("[target: {target_id}]");
     }
 }
 
@@ -302,18 +372,28 @@ async fn run() -> Result<()> {
 /// Fall back to direct execution when the daemon is unavailable.
 async fn run_direct_fallback(cli: &Cli, ws_url: &str, error: &anyhow::Error) -> Result<()> {
     eprintln!("Warning: daemon unavailable ({error}), running directly");
-    let output = run_direct(cli, ws_url).await?;
-    if !output.is_empty() {
-        print!("{output}");
-        if !output.ends_with('\n') {
-            println!();
+    let cmd_name = cli.command_name();
+    let start = std::time::Instant::now();
+    let result = run_direct(cli, ws_url).await;
+    let duration = start.elapsed();
+    match &result {
+        Ok(r) => {
+            telemetry::log_command(cmd_name, duration, true, r.error_code);
+            print_result(r);
+        }
+        Err(e) => {
+            let code = match e.downcast_ref::<error::CliError>() {
+                Some(ce) => Some(ce.code().code()),
+                None => None,
+            };
+            telemetry::log_command(cmd_name, duration, false, code);
         }
     }
-    Ok(())
+    result.map(|_| ())
 }
 
 /// Direct execution without daemon (fallback).
-async fn run_direct(cli: &Cli, ws_url: &str) -> Result<String> {
+async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
     let mut client = cdp::CdpClient::connect(ws_url).await?;
 
     let is_browser = matches!(
@@ -359,6 +439,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<String> {
             back,
             forward,
             reload,
+            output,
         } => {
             commands::navigate::navigate(
                 &mut client,
@@ -367,6 +448,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<String> {
                 *back,
                 *forward,
                 *reload,
+                output.as_deref(),
             )
             .await
         }
@@ -384,8 +466,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<String> {
             )
             .await
         }
-        Commands::Evaluate { expression, .. } => {
-            commands::evaluate::evaluate(&mut client, &session_id, expression, cli.json).await
+        Commands::Evaluate { expression, dialog_action: _, output } => {
+            commands::evaluate::evaluate(&mut client, &session_id, expression, cli.json, output.as_deref()).await
         }
         Commands::Click { selector } => {
             commands::input::click(&mut client, &session_id, selector).await
@@ -405,8 +487,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<String> {
         Commands::Hover { selector } => {
             commands::input::hover(&mut client, &session_id, selector).await
         }
-        Commands::Snapshot => {
-            commands::snapshot::take_snapshot(&mut client, &session_id, cli.json).await
+        Commands::Snapshot { output } => {
+            commands::snapshot::take_snapshot(&mut client, &session_id, cli.json, output.as_deref()).await
         }
         Commands::Resize { width, height } => {
             commands::pages::resize(&mut client, &session_id, *width, *height).await
@@ -431,6 +513,6 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<String> {
     };
 
     let _ = client.detach_from_target(&session_id).await;
-    let name = friendly::to_friendly(&target_id);
-    result.map(|output| format!("{output}\n[target:{name}]"))
+let name = friendly::to_friendly(&target_id);
+     result.map(|mut r| { r.target_id = Some(name); r })
 }

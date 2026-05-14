@@ -3,6 +3,7 @@ use base64::Engine;
 use serde_json::json;
 
 use crate::cdp::CdpClient;
+use crate::result::CommandResult;
 
 pub async fn take_screenshot(
     client: &mut CdpClient,
@@ -10,7 +11,7 @@ pub async fn take_screenshot(
     output: Option<&str>,
     format: &str,
     full_page: bool,
-) -> Result<String> {
+) -> Result<CommandResult> {
     let mut params = json!({
         "format": format,
         "optimizeForSpeed": true,
@@ -53,14 +54,14 @@ pub async fn take_screenshot(
     match output {
         Some(path) => {
             std::fs::write(path, &bytes)?;
-            Ok(format!(
+            Ok(CommandResult::output(format!(
                 "Screenshot saved to {path} ({} bytes)",
                 bytes.len()
-            ))
+            )))
         }
         None => {
             // Return raw base64 (agent can read it)
-            Ok(data_b64.to_string())
+            Ok(CommandResult::output(data_b64.to_string()))
         }
     }
 }

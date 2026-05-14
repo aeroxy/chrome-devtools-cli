@@ -1,20 +1,28 @@
 use anyhow::Result;
 use serde_json::json;
 use std::fmt::Write;
+use std::fs;
 
 use crate::cdp::CdpClient;
+use crate::result::CommandResult;
 
 pub async fn take_snapshot(
     client: &mut CdpClient,
     session_id: &str,
     as_json: bool,
-) -> Result<String> {
+    output: Option<&str>,
+) -> Result<CommandResult> {
     let result = client
         .send_to_target(session_id, "Accessibility.getFullAXTree", json!({}))
         .await?;
 
-    if as_json {
-        return Ok(serde_json::to_string_pretty(&result)?);
+if as_json {
+        let json = serde_json::to_string_pretty(&result)?;
+        if let Some(path) = output {
+            fs::write(path, &json)?;
+            return Ok(CommandResult::output(format!("Snapshot saved to {path}")));
+        }
+        return Ok(CommandResult::output(json));
     }
 
     let nodes = result["nodes"].as_array();
@@ -38,8 +46,17 @@ pub async fn take_snapshot(
                 writeln!(out, "{indent}[{role}] \"{name}\" #{node_id}").unwrap();
             }
         }
-        Ok(out)
+        if let Some(path) = output {
+            fs::write(path, &out)?;
+            return Ok(CommandResult::output(format!("Snapshot saved to {path}")));
+        }
+        Ok(CommandResult::output(out))
     } else {
-        Ok(serde_json::to_string_pretty(&result)?)
+        let json = serde_json::to_string_pretty(&result)?;
+        if let Some(path) = output {
+            fs::write(path, &json)?;
+            return Ok(CommandResult::output(format!("Snapshot saved to {path}")));
+        }
+        Ok(CommandResult::output(json))
     }
 }
