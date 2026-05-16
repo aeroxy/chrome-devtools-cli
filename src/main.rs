@@ -385,10 +385,9 @@ async fn run_direct_fallback(cli: &Cli, ws_url: &str, error: &anyhow::Error) -> 
             print_result(r);
         }
         Err(e) => {
-            let code = match e.downcast_ref::<error::CliError>() {
-                Some(ce) => Some(ce.code().code()),
-                None => None,
-            };
+            let code = e
+                .downcast_ref::<error::CliError>()
+                .map(|ce| ce.code().code());
             telemetry::log_command(cmd_name, duration, false, code);
         }
     }

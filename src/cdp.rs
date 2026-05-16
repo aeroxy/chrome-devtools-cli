@@ -77,6 +77,8 @@ pub struct CdpClient {
     /// Dialog action to automatically handle JavaScript dialogs during command execution.
     /// Valid values: "accept", "dismiss", or custom prompt text.
     pub dialog_action: Option<String>,
+    /// Buffer for storing unhandled events (e.g., navigation events)
+    pub events: std::collections::VecDeque<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +101,7 @@ impl CdpClient {
             read,
             next_id: 1,
             dialog_action: None,
+            events: std::collections::VecDeque::new(),
         })
     }
 
@@ -136,7 +139,7 @@ impl CdpClient {
         }
 
         let text = serde_json::to_string(&msg)?;
-        self.write.send(Message::Text(text.into())).await?;
+        self.write.send(Message::Text(text)).await?;
         Ok(id)
     }
 
@@ -204,30 +207,54 @@ impl CdpClient {
                     );
                 }
                 return Ok(resp.get("result").cloned().unwrap_or(Value::Null));
+            } else if resp.get("method").is_some() {
+                // Store events for later consumption
+                self.events.push_back(resp);
             }
-            // Skip events and unrelated responses
+            // Skip other unrelated responses
         }
     }
 
     /// Read until we get an event with the given method name (for waiting on page load, etc).
     #[allow(dead_code)]
-    pub async fn wait_for_event(
+    pub async fn wait_for_any_event(
         &mut self,
-        event_method: &str,
+        event_methods: &[&str],
         timeout: std::time::Duration,
-    ) -> Result<Value> {
+    ) -> Result<(String, Value)> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            // First check if we already have the event buffered
+            if let Some(idx) = self.events.iter().position(|e| {
+                if let Some(m) = e.get("method").and_then(|v| v.as_str()) {
+                    event_methods.contains(&m)
+                } else {
+                    false
+                }
+            }) {
+                let resp = self.events.remove(idx).unwrap();
+                let method = resp.get("method").unwrap().as_str().unwrap().to_string();
+                return Ok((method, resp.get("params").cloned().unwrap_or(Value::Null)));
+            }
+
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                bail!("Timeout waiting for event {event_method}");
+                bail!("Timeout waiting for any event {:?}", event_methods);
             }
             let text = tokio::time::timeout(remaining, self.read_text())
                 .await
-                .map_err(|_| anyhow!("Timeout waiting for event {event_method}"))??;
+                .map_err(|_| anyhow!("Timeout waiting for any event {:?}", event_methods))??;
             let resp: Value = serde_json::from_str(&text)?;
-            if resp.get("method").and_then(|v| v.as_str()) == Some(event_method) {
-                return Ok(resp.get("params").cloned().unwrap_or(Value::Null));
+
+            if let Some(m) = resp.get("method").and_then(|v| v.as_str()) {
+                if event_methods.contains(&m) {
+                    return Ok((
+                        m.to_string(),
+                        resp.get("params").cloned().unwrap_or(Value::Null),
+                    ));
+                } else {
+                    self.events.push_back(resp);
+                }
             }
         }
     }
@@ -317,7 +344,15 @@ impl CdpClient {
                 json!({"expression": "window.location.href", "returnByValue": true}),
             )
             .await?;
-        Ok(result["result"]["value"].as_str().unwrap_or("").to_string())
+        result["result"]["value"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Failed to get current URL: evaluation did not return a string. Result: {}",
+                    result
+                )
+            })
     }
 
     /// Resolve which page to operate on.

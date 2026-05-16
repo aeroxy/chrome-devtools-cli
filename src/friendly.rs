@@ -1,6 +1,5 @@
 /// Deterministic friendly name from a target ID, e.g. "bold-fox".
 /// Same target ID always produces the same name.
-
 const ADJECTIVES: &[&str] = &[
     "amber", "bold", "brave", "bright", "calm", "clear", "cool", "crisp", "dark", "deep", "eager",
     "fair", "fast", "firm", "fond", "free", "glad", "gold", "grand", "green", "happy", "hazy",

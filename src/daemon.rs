@@ -198,10 +198,9 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> DaemonRe
         }
         Err(e) => {
             let duration = start.elapsed();
-            let error_code = match e.downcast_ref::<crate::error::CliError>() {
-                Some(ce) => Some(ce.code().code()),
-                None => None,
-            };
+            let error_code = e
+                .downcast_ref::<crate::error::CliError>()
+                .map(|ce| ce.code().code());
             telemetry::log_command(cmd_name, duration, false, error_code);
             DaemonResponse {
                 success: false,

@@ -27,15 +27,24 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         return match cmd {
             "list-pages" => commands::pages::list_pages(client, req.json_output).await,
             "new-page" => {
-                let url = args.get("url").and_then(|v| v.as_str()).ok_or(anyhow!("url required"))?;
+                let url = args
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or(anyhow!("url required"))?;
                 commands::pages::new_page(client, url).await
             }
             "close-page" => {
-                let index = args.get("index").and_then(|v| v.as_u64()).ok_or(anyhow!("index required"))? as usize;
+                let index = args
+                    .get("index")
+                    .and_then(|v| v.as_u64())
+                    .ok_or(anyhow!("index required"))? as usize;
                 commands::pages::close_page(client, index).await
             }
             "select-page" => {
-                let index = args.get("index").and_then(|v| v.as_u64()).ok_or(anyhow!("index required"))? as usize;
+                let index = args
+                    .get("index")
+                    .and_then(|v| v.as_u64())
+                    .ok_or(anyhow!("index required"))? as usize;
                 commands::pages::select_page(client, index).await
             }
             _ => unreachable!(),
@@ -75,7 +84,10 @@ async fn inner_execute(
         .send_to_target(session_id, "Page.enable", json!({}))
         .await?;
 
-    client.dialog_action = args.get("dialog_action").and_then(|v| v.as_str()).map(|s| s.to_string());
+    client.dialog_action = args
+        .get("dialog_action")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     match cmd {
         "navigate" => {

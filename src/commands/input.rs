@@ -148,7 +148,25 @@ pub async fn click_at(
     dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0).await?;
     dispatch_mouse(client, session_id, "mousePressed", x, y, "left", 1).await?;
     dispatch_mouse(client, session_id, "mouseReleased", x, y, "left", 1).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Wait briefly to see if a navigation event is triggered by the click
+    let nav_events = ["Page.frameStartedLoading", "Page.navigatedWithinDocument"];
+    if let Ok((method, _)) = client
+        .wait_for_any_event(&nav_events, std::time::Duration::from_millis(150))
+        .await
+    {
+        if method == "Page.frameStartedLoading" {
+            // A full navigation started, so wait a bit longer for it to finish loading
+            let _ = client
+                .wait_for_any_event(
+                    &["Page.loadEventFired", "Page.frameStoppedLoading"],
+                    std::time::Duration::from_secs(10),
+                )
+                .await;
+        }
+        // If it was navigatedWithinDocument, it's instantaneous so we don't need to wait further
+    }
+
     let new_url = client.current_url(session_id).await?;
     Ok(CommandResult::output(format!("Clicked at ({x}, {y})"))
         .with_navigated_to_if_changed(new_url, initial_url))
@@ -343,6 +361,22 @@ pub async fn press_key(
             }),
         )
         .await?;
+
+    // Wait briefly to see if a navigation event is triggered by the key press
+    let nav_events = ["Page.frameStartedLoading", "Page.navigatedWithinDocument"];
+    if let Ok((method, _)) = client
+        .wait_for_any_event(&nav_events, std::time::Duration::from_millis(150))
+        .await
+    {
+        if method == "Page.frameStartedLoading" {
+            let _ = client
+                .wait_for_any_event(
+                    &["Page.loadEventFired", "Page.frameStoppedLoading"],
+                    std::time::Duration::from_secs(10),
+                )
+                .await;
+        }
+    }
 
     let new_url = client.current_url(session_id).await?;
     Ok(CommandResult::output(format!("Pressed: {key}"))
