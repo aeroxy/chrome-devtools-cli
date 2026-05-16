@@ -29,13 +29,14 @@ impl TelemetryWorker {
 
             while let Ok(entry) = receiver.recv() {
                 if current_path.as_deref() != Some(entry.path.as_path()) {
-                    let new_file = OpenOptions::new()
+                    if let Ok(new_file) = OpenOptions::new()
                         .create(true)
                         .append(true)
                         .open(&entry.path)
-                        .ok();
-                    current_path = Some(entry.path);
-                    current_file = new_file;
+                    {
+                        current_path = Some(entry.path);
+                        current_file = Some(new_file);
+                    }
                 }
                 if let Some(file) = current_file.as_mut() {
                     let _ = writeln!(file, "{}", entry.line);
