@@ -13,7 +13,7 @@ async fn get_element_center(
     let expr = format!(
         r#"(() => {{
             const el = document.querySelector({escaped});
-            if (!el) return JSON.stringify({{error: 'Element not found: {escaped}'}});
+            if (!el) return JSON.stringify({{error: "Element not found: " + {escaped}}});
             const rect = el.getBoundingClientRect();
             return JSON.stringify({{x: rect.x + rect.width/2, y: rect.y + rect.height/2}});
         }})()"#
