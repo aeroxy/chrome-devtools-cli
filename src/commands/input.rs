@@ -176,7 +176,7 @@ pub async fn fill(
 
     let expr = format!(
         r#"(() => {{
-            const el = document.querySelector('{escaped_sel}');
+            const el = document.querySelector({escaped_sel});
             if (!el) return 'not_found';
 
             const tagName = el.tagName.toLowerCase();
