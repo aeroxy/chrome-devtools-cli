@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 /// The result of executing a CLI command.
 ///
 /// Carries both the human-readable output string and structured metadata
@@ -54,12 +52,4 @@ impl CommandResult {
         self.error_code = Some(code);
         self
     }
-}
-
-/// How long a command took to execute, for telemetry.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-pub struct CommandTiming {
-    pub command: &'static str,
-    pub duration: Duration,
 }

@@ -52,7 +52,6 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         .send_to_target(&session_id, "Page.enable", json!({}))
         .await?;
 
-
     client.dialog_action = args["dialog_action"].as_str().map(|s| s.to_string());
 
     let result = match cmd {
@@ -92,7 +91,9 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                     expr,
                     req.json_output,
                     args.get("output").and_then(|v| v.as_str()),
-                    args.get("track_navigation").and_then(|v| v.as_bool()).unwrap_or(false),
+                    args.get("track_navigation")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                 )
                 .await
             }
