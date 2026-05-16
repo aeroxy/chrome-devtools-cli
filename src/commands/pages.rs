@@ -96,8 +96,8 @@ pub async fn wait_for(
     text: &str,
     timeout_ms: u64,
 ) -> Result<CommandResult> {
-    let escaped = text.replace('\\', "\\\\").replace('\'', "\\'");
-    let check_expr = format!("document.body && document.body.innerText.includes('{escaped}')");
+    let escaped = serde_json::to_string(text)?;
+    let check_expr = format!("document.body && document.body.innerText.includes({escaped})");
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
