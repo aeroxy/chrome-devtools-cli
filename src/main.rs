@@ -112,6 +112,9 @@ enum Commands {
         /// Write output to a file instead of stdout
         #[arg(long, short)]
         output: Option<String>,
+        /// Track URL changes caused by this evaluation (adds two extra CDP round-trips)
+        #[arg(long)]
+        track_navigation: bool,
     },
 
     /// Click an element by CSS selector
@@ -251,9 +254,10 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             expression,
             dialog_action,
             output,
+            track_navigation,
         } => (
             "evaluate",
-            json!({"expression": expression, "dialog_action": dialog_action, "output": output}),
+            json!({"expression": expression, "dialog_action": dialog_action, "output": output, "track_navigation": track_navigation}),
         ),
         Commands::Click { selector } => ("click", json!({"selector": selector})),
         Commands::ClickAt { x, y } => ("click-at", json!({"x": x, "y": y})),
@@ -470,6 +474,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             expression,
             dialog_action: _,
             output,
+            track_navigation,
         } => {
             commands::evaluate::evaluate(
                 &mut client,
@@ -477,6 +482,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 expression,
                 cli.json,
                 output.as_deref(),
+                *track_navigation,
             )
             .await
         }

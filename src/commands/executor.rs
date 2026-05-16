@@ -92,6 +92,7 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                     expr,
                     req.json_output,
                     args.get("output").and_then(|v| v.as_str()),
+                    args.get("track_navigation").and_then(|v| v.as_bool()).unwrap_or(false),
                 )
                 .await
             }
