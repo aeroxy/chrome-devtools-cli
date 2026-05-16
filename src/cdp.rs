@@ -80,6 +80,8 @@ pub struct CdpClient {
     pub events: std::collections::VecDeque<Value>,
 }
 
+const MAX_BUFFERED_EVENTS: usize = 1000;
+
 #[derive(Debug, Clone)]
 pub struct TargetInfo {
     pub target_id: String,
@@ -102,6 +104,22 @@ impl CdpClient {
             dialog_action: None,
             events: std::collections::VecDeque::new(),
         })
+    }
+
+    /// Clear all buffered events.
+    pub fn clear_events(&mut self) {
+        self.events.clear();
+    }
+
+    fn push_event(&mut self, event: Value) {
+        Self::push_to_buffer(&mut self.events, event);
+    }
+
+    fn push_to_buffer(events: &mut std::collections::VecDeque<Value>, event: Value) {
+        events.push_back(event);
+        if events.len() > MAX_BUFFERED_EVENTS {
+            events.pop_front();
+        }
     }
 
     /// Send a browser-level CDP command.
@@ -208,7 +226,7 @@ impl CdpClient {
                 return Ok(resp.get("result").cloned().unwrap_or(Value::Null));
             } else if resp.get("method").is_some() {
                 // Store events for later consumption
-                self.events.push_back(resp);
+                self.push_event(resp);
             }
             // Skip other unrelated responses
         }
@@ -252,7 +270,7 @@ impl CdpClient {
                         resp.get("params").cloned().unwrap_or(Value::Null),
                     ));
                 } else {
-                    self.events.push_back(resp);
+                    self.push_event(resp);
                 }
             }
         }
@@ -381,5 +399,29 @@ impl CdpClient {
             .into_iter()
             .nth(idx)
             .ok_or_else(|| anyhow!("No page at index {idx}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_event_buffer_capping() {
+        let mut events = std::collections::VecDeque::new();
+
+        // Push more than MAX_BUFFERED_EVENTS
+        for i in 0..(MAX_BUFFERED_EVENTS + 10) {
+            CdpClient::push_to_buffer(&mut events, json!({"method": "test", "params": {"i": i}}));
+        }
+
+        assert_eq!(events.len(), MAX_BUFFERED_EVENTS);
+        // The first 10 events should have been popped
+        assert_eq!(events.front().unwrap()["params"]["i"], json!(10));
+        assert_eq!(
+            events.back().unwrap()["params"]["i"],
+            json!(MAX_BUFFERED_EVENTS + 9)
+        );
     }
 }

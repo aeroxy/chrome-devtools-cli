@@ -20,6 +20,11 @@ fn is_browser_level(cmd: &str) -> bool {
 /// Handles target resolution, session attachment, dialog configuration,
 /// and target ID enrichment on success.
 pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Result<CommandResult> {
+    // Clear stale events from previous commands to prevent memory leak
+    // in long-running daemon mode and avoid stale events interfering
+    // with new command execution.
+    client.clear_events();
+
     let args = &req.args;
     let cmd = req.command.as_str();
 
@@ -37,7 +42,8 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                 let index = args
                     .get("index")
                     .and_then(|v| v.as_u64())
-                    .ok_or(anyhow!("index required"))?.try_into()?;
+                    .ok_or(anyhow!("index required"))?
+                    .try_into()?;
                 commands::pages::close_page(client, index).await
             }
             "select-page" => {
