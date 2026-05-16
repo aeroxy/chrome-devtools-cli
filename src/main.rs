@@ -170,6 +170,17 @@ enum Commands {
 }
 
 impl Cli {
+    /// Whether this command operates at the browser level (no page session needed).
+    fn is_browser_level(&self) -> bool {
+        matches!(
+            self.command,
+            Commands::ListPages
+                | Commands::NewPage { .. }
+                | Commands::ClosePage { .. }
+                | Commands::SelectPage { .. }
+        )
+    }
+
     /// Get the name of the subcommand as a static string for telemetry logging.
     fn command_name(&self) -> &'static str {
         match &self.command {
@@ -186,7 +197,7 @@ impl Cli {
             Commands::TypeText { .. } => "type-text",
             Commands::PressKey { .. } => "press-key",
             Commands::Hover { .. } => "hover",
-            Commands::Snapshot { output: _ } => "snapshot",
+            Commands::Snapshot { .. } => "snapshot",
             Commands::Resize { .. } => "resize",
             Commands::WaitFor { .. } => "wait-for",
             Commands::List3pTools => "list-3p-tools",
@@ -313,6 +324,7 @@ fn print_response(resp: &protocol::DaemonResponse) {
         print_output(&resp.output, resp.navigated_to.as_deref(), None);
     } else {
         eprintln!("error: {}", resp.error);
+        telemetry::shutdown_logger();
         std::process::exit(resp.error_code.unwrap_or(1) as i32);
     }
 }
@@ -402,13 +414,7 @@ async fn run_direct_fallback(cli: &Cli, ws_url: &str, error: &anyhow::Error) -> 
 async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
     let mut client = cdp::CdpClient::connect(ws_url).await?;
 
-    let is_browser = matches!(
-        cli.command,
-        Commands::ListPages
-            | Commands::NewPage { .. }
-            | Commands::ClosePage { .. }
-            | Commands::SelectPage { .. }
-    );
+    let is_browser = cli.is_browser_level();
 
     if is_browser {
         return match &cli.command {
@@ -427,9 +433,9 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
     let session_id = client.attach_to_target(&target_id).await?;
 
     // Enable Page domain to receive dialog events for proactive rejection
-    let _ = client
+    client
         .send_to_target(&session_id, "Page.enable", json!({}))
-        .await;
+        .await?;
 
     // Extract dialog_action if set (only available on Evaluate command, but
     // apply it for all commands in direct mode to match daemon behavior)

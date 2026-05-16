@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use crate::cdp::CdpClient;
@@ -26,6 +26,14 @@ async fn get_element_center(
             json!({"expression": expr, "returnByValue": true}),
         )
         .await?;
+
+    if let Some(exception) = result.get("exceptionDetails") {
+        let text = exception["text"].as_str().unwrap_or("Unknown error");
+        let desc = exception["exception"]["description"]
+            .as_str()
+            .unwrap_or(text);
+        bail!("JavaScript error evaluating element position: {desc}");
+    }
 
     let val_str = result["result"]["value"]
         .as_str()
@@ -144,7 +152,7 @@ async fn wait_for_navigation(client: &mut CdpClient, session_id: &str) -> Result
         .and_then(|t| t.get("frame"))
         .and_then(|f| f.get("id"))
         .and_then(|i| i.as_str())
-        .unwrap_or("")
+        .ok_or_else(|| anyhow!("Failed to determine main frame ID from Page.getFrameTree response: {frame_tree}"))?
         .to_string();
 
     let nav_events = ["Page.frameStartedLoading", "Page.navigatedWithinDocument"];
@@ -253,20 +261,32 @@ pub async fn fill(
                 return 'select_ok';
             }}
 
-            if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
-                const isTrue = {escaped_val}.toLowerCase() === 'true';
-                if (el.checked !== isTrue) {{
-                    el.checked = isTrue;
-                    el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                    el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                }}
-                return 'checkbox_ok';
-            }}
+if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
+                 const isTrue = {escaped_val}.toLowerCase() === 'true';
+                 if (el.checked !== isTrue) {{
+                     el.checked = isTrue;
+                     el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                     el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                 }}
+                 return 'checkbox_ok';
+             }}
 
-            el.focus();
-            el.value = '';
-            el.dispatchEvent(new Event('input', {{bubbles: true}}));
-            return 'ok';
+             if (tagName === 'textarea') {{
+                 el.value = {escaped_val};
+                 el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                 el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                 return 'textarea_ok';
+             }}
+
+             if (type === 'file') {{
+                 return 'file_input';
+             }}
+
+             // For contenteditable elements or other text-like elements
+             el.focus();
+             el.value = '';
+             el.dispatchEvent(new Event('input', {{bubbles: true}}));
+             return 'ok';
         }})()"#
     );
 
@@ -278,20 +298,30 @@ pub async fn fill(
         )
         .await?;
 
+    if let Some(exception) = result.get("exceptionDetails") {
+        let text = exception["text"].as_str().unwrap_or("Unknown error");
+        let desc = exception["exception"]["description"]
+            .as_str()
+            .unwrap_or(text);
+        bail!("JavaScript error during fill handling: {desc}");
+    }
+
     let res_val = result["result"]["value"].as_str().unwrap_or("error");
 
-    if res_val == "not_found" {
-        bail!("Element not found: {selector}");
-    } else if res_val == "option_not_found" {
-        bail!("Could not find option with text or value '{value}' in select element: {selector}");
-    } else if res_val == "select_ok" || res_val == "checkbox_ok" {
-        // For select/checkbox, the work is done entirely in JS
-        let new_url = client.current_url(session_id).await?;
-        return Ok(
-            CommandResult::output(format!("Filled '{selector}' with: {value}"))
-                .with_navigated_to_if_changed(new_url, initial_url),
-        );
-    }
+if res_val == "not_found" {
+         bail!("Element not found: {selector}");
+     } else if res_val == "option_not_found" {
+         bail!("Could not find option with text or value '{value}' in select element: {selector}");
+     } else if res_val == "file_input" {
+         bail!("Cannot fill file input with text: {selector}");
+     } else if res_val == "select_ok" || res_val == "checkbox_ok" || res_val == "textarea_ok" {
+         // For select/checkbox/textarea, the work is done entirely in JS
+         let new_url = client.current_url(session_id).await?;
+         return Ok(
+             CommandResult::output(format!("Filled '{selector}' with: {value}"))
+                 .with_navigated_to_if_changed(new_url, initial_url),
+         );
+     }
 
     client
         .send_to_target(session_id, "Input.insertText", json!({"text": value}))

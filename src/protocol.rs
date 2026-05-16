@@ -3,6 +3,8 @@ use serde_json::Value;
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use anyhow::Context;
+
 /// Request from CLI client to daemon.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DaemonRequest {
@@ -50,7 +52,8 @@ pub async fn write_msg<W: AsyncWriteExt + Unpin>(w: &mut W, data: &[u8]) -> anyh
 pub async fn read_msg<R: AsyncReadExt + Unpin>(r: &mut R) -> anyhow::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
+    let len = usize::try_from(u32::from_be_bytes(len_buf))
+        .context("Message length overflows usize")?;
     if len > 64 * 1024 * 1024 {
         anyhow::bail!("Message too large: {len} bytes");
     }
