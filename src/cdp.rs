@@ -6,7 +6,6 @@ use futures_util::{
 };
 use serde_json::{json, Value};
 use std::fmt::Debug;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
@@ -383,28 +382,4 @@ impl CdpClient {
             .nth(idx)
             .ok_or_else(|| anyhow!("No page at index {idx}"))
     }
-}
-
-/// Write a length-prefixed message to a stream.
-#[allow(dead_code)]
-pub async fn write_msg<W: AsyncWriteExt + Unpin>(w: &mut W, data: &[u8]) -> anyhow::Result<()> {
-    let len = (data.len() as u32).to_be_bytes();
-    w.write_all(&len).await?;
-    w.write_all(data).await?;
-    w.flush().await?;
-    Ok(())
-}
-
-/// Read a length-prefixed message from a stream.
-#[allow(dead_code)]
-pub async fn read_msg<R: AsyncReadExt + Unpin>(r: &mut R) -> anyhow::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 64 * 1024 * 1024 {
-        anyhow::bail!("Message too large: {len} bytes");
-    }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
-    Ok(buf)
 }
