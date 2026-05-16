@@ -95,6 +95,11 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
     let _ = std::fs::remove_file(addr_path());
 
     let _ = std::fs::remove_file(pid_path());
+
+    // Shut down telemetry before exiting so the background thread
+    // flushes pending entries and exits cleanly.
+    telemetry::shutdown_logger();
+
     Ok(())
 }
 
