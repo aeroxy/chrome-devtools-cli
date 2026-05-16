@@ -48,9 +48,10 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     let session_id = client.attach_to_target(&target_id).await?;
 
     // Enable Page domain to receive dialog events for proactive rejection
-    let _ = client
+    client
         .send_to_target(&session_id, "Page.enable", json!({}))
-        .await;
+        .await?;
+
 
     client.dialog_action = args["dialog_action"].as_str().map(|s| s.to_string());
 
