@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use crate::cdp::CdpClient;
@@ -138,25 +138,25 @@ async fn inner_execute(
                 )
                 .await
             }
-            None => Err(anyhow!("expression required")),
+            None => bail!("expression required"),
         },
         "click" => match args.get("selector").and_then(|v| v.as_str()) {
             Some(sel) => commands::input::click(client, session_id, sel).await,
-            None => Err(anyhow!("selector required")),
+            None => bail!("selector required"),
         },
         "click-at" => match (
             args.get("x").and_then(|v| v.as_f64()),
             args.get("y").and_then(|v| v.as_f64()),
         ) {
             (Some(x), Some(y)) => commands::input::click_at(client, session_id, x, y, None).await,
-            _ => Err(anyhow!("x and y required")),
+            _ => bail!("x and y required"),
         },
         "fill" => match (
             args.get("selector").and_then(|v| v.as_str()),
             args.get("value").and_then(|v| v.as_str()),
         ) {
             (Some(sel), Some(val)) => commands::input::fill(client, session_id, sel, val).await,
-            _ => Err(anyhow!("selector and value required")),
+            _ => bail!("selector and value required"),
         },
         "type-text" => match args.get("text").and_then(|v| v.as_str()) {
             Some(text) => {
@@ -168,15 +168,15 @@ async fn inner_execute(
                 )
                 .await
             }
-            None => Err(anyhow!("text required")),
+            None => bail!("text required"),
         },
         "press-key" => match args.get("key").and_then(|v| v.as_str()) {
             Some(key) => commands::input::press_key(client, session_id, key).await,
-            None => Err(anyhow!("key required")),
+            None => bail!("key required"),
         },
         "hover" => match args.get("selector").and_then(|v| v.as_str()) {
             Some(sel) => commands::input::hover(client, session_id, sel).await,
-            None => Err(anyhow!("selector required")),
+            None => bail!("selector required"),
         },
         "snapshot" => {
             commands::snapshot::take_snapshot(
@@ -195,10 +195,10 @@ async fn inner_execute(
                 (Ok(w_val), Ok(h_val)) => {
                     commands::pages::resize(client, session_id, w_val, h_val).await
                 }
-                (Err(_), _) => Err(anyhow!("width too large")),
-                (_, Err(_)) => Err(anyhow!("height too large")),
+                (Err(_), _) => bail!("width too large"),
+                (_, Err(_)) => bail!("height too large"),
             },
-            _ => Err(anyhow!("width and height required")),
+            _ => bail!("width and height required"),
         },
         "wait-for" => match args.get("text").and_then(|v| v.as_str()) {
             Some(text) => {
@@ -208,7 +208,7 @@ async fn inner_execute(
                     .unwrap_or(30_000);
                 commands::pages::wait_for(client, session_id, text, timeout).await
             }
-            None => Err(anyhow!("text required")),
+            None => bail!("text required"),
         },
         "list-3p-tools" => {
             commands::third_party::list_3p_tools(client, session_id, req.json_output).await
@@ -224,8 +224,8 @@ async fn inner_execute(
                 )
                 .await
             }
-            None => Err(anyhow!("name required")),
+            None => bail!("name required"),
         },
-        _ => Err(anyhow!("Unknown command: {cmd}")),
+        _ => bail!("Unknown command: {cmd}"),
     }
 }
