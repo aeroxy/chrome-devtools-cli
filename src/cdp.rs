@@ -258,7 +258,10 @@ impl CdpClient {
                         if queue.is_empty() {
                             self.events.remove(method);
                         }
-                        return Ok((method.to_string(), resp.get("params").cloned().unwrap_or(Value::Null)));
+                        return Ok((
+                            method.to_string(),
+                            resp.get("params").cloned().unwrap_or(Value::Null),
+                        ));
                     }
                 }
             }
@@ -422,10 +425,7 @@ mod tests {
 
         // Push more than MAX_BUFFERED_EVENTS
         for i in 0..(MAX_BUFFERED_EVENTS + 10) {
-            CdpClient::push_to_buffer(
-                &mut events,
-                json!({"method": "test", "params": {"i": i}}),
-            );
+            CdpClient::push_to_buffer(&mut events, json!({"method": "test", "params": {"i": i}}));
         }
 
         let total: usize = events.values().map(|q| q.len()).sum();
