@@ -5,7 +5,7 @@ use futures_util::{
     SinkExt, StreamExt,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
@@ -76,8 +76,8 @@ pub struct CdpClient {
     /// Dialog action to automatically handle JavaScript dialogs during command execution.
     /// Valid values: "accept", "dismiss", or custom prompt text.
     pub dialog_action: Option<String>,
-    /// Buffered events grouped by method name for O(1) lookup.
-    pub events: HashMap<String, VecDeque<Value>>,
+    /// Buffer for storing unhandled events (e.g., navigation events)
+    pub events: std::collections::VecDeque<Value>,
 }
 
 const MAX_BUFFERED_EVENTS: usize = 1000;
@@ -102,7 +102,7 @@ impl CdpClient {
             read,
             next_id: 1,
             dialog_action: None,
-            events: HashMap::new(),
+            events: std::collections::VecDeque::new(),
         })
     }
 
@@ -115,19 +115,10 @@ impl CdpClient {
         Self::push_to_buffer(&mut self.events, event);
     }
 
-    fn push_to_buffer(events: &mut HashMap<String, VecDeque<Value>>, event: Value) {
-        let method = event
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        events.entry(method).or_default().push_back(event);
-        // Enforce global cap across all method queues
-        let total: usize = events.values().map(|q| q.len()).sum();
-        if total > MAX_BUFFERED_EVENTS {
-            if let Some((_, queue)) = events.iter_mut().find(|(_, q)| !q.is_empty()) {
-                queue.pop_front();
-            }
+    fn push_to_buffer(events: &mut std::collections::VecDeque<Value>, event: Value) {
+        events.push_back(event);
+        if events.len() > MAX_BUFFERED_EVENTS {
+            events.pop_front();
         }
     }
 
@@ -243,34 +234,29 @@ impl CdpClient {
 
     /// Read until we get an event with the given method name (for waiting on page load, etc).
     #[allow(dead_code)]
-    pub async fn wait_for_any_event(
+    pub async fn wait_for_event_match<F>(
         &mut self,
         event_methods: &[&str],
         timeout: std::time::Duration,
-    ) -> Result<(String, Value)> {
+        mut predicate: F,
+    ) -> Result<(String, Value)>
+    where
+        F: FnMut(&str, &Value) -> bool,
+    {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            // First check if we already have the event buffered (O(1) per method)
-            for &method in event_methods {
-                let (resp, is_empty) = if let Some(queue) = self.events.get_mut(method) {
-                    if let Some(resp) = queue.pop_front() {
-                        (Some(resp), queue.is_empty())
-                    } else {
-                        (None, false)
-                    }
+            // First check if we already have any of the events buffered
+            if let Some(idx) = self.events.iter().position(|e| {
+                if let Some(m) = e.get("method").and_then(|v| v.as_str()) {
+                    let params = e.get("params").unwrap_or(&Value::Null);
+                    event_methods.contains(&m) && predicate(m, params)
                 } else {
-                    (None, false)
-                };
-
-                if let Some(resp) = resp {
-                    if is_empty {
-                        self.events.remove(method);
-                    }
-                    return Ok((
-                        method.to_string(),
-                        resp.get("params").cloned().unwrap_or(Value::Null),
-                    ));
+                    false
                 }
+            }) {
+                let resp = self.events.remove(idx).unwrap();
+                let method = resp.get("method").unwrap().as_str().unwrap().to_string();
+                return Ok((method, resp.get("params").cloned().unwrap_or(Value::Null)));
             }
 
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -283,16 +269,24 @@ impl CdpClient {
             let resp: Value = serde_json::from_str(&text)?;
 
             if let Some(m) = resp.get("method").and_then(|v| v.as_str()) {
-                if event_methods.contains(&m) {
-                    return Ok((
-                        m.to_string(),
-                        resp.get("params").cloned().unwrap_or(Value::Null),
-                    ));
+                let params = resp.get("params").cloned().unwrap_or(Value::Null);
+                if event_methods.contains(&m) && predicate(m, &params) {
+                    return Ok((m.to_string(), params));
                 } else {
                     self.push_event(resp);
                 }
             }
         }
+    }
+
+    #[allow(dead_code)]
+    pub async fn wait_for_any_event(
+        &mut self,
+        event_methods: &[&str],
+        timeout: std::time::Duration,
+    ) -> Result<(String, Value)> {
+        self.wait_for_event_match(event_methods, timeout, |_, _| true)
+            .await
     }
 
     pub async fn read_text(&mut self) -> Result<String> {
@@ -435,21 +429,18 @@ mod tests {
 
     #[test]
     fn test_event_buffer_capping() {
-        let mut events = HashMap::<String, VecDeque<Value>>::new();
+        let mut events = std::collections::VecDeque::new();
 
         // Push more than MAX_BUFFERED_EVENTS
         for i in 0..(MAX_BUFFERED_EVENTS + 10) {
             CdpClient::push_to_buffer(&mut events, json!({"method": "test", "params": {"i": i}}));
         }
 
-        let total: usize = events.values().map(|q| q.len()).sum();
-        assert_eq!(total, MAX_BUFFERED_EVENTS);
-        // Events should have been trimmed from the "test" queue
-        let queue = events.get("test").unwrap();
-        assert_eq!(queue.len(), MAX_BUFFERED_EVENTS);
-        assert_eq!(queue.front().unwrap()["params"]["i"], json!(10));
+        assert_eq!(events.len(), MAX_BUFFERED_EVENTS);
+        // The first 10 events should have been popped globally
+        assert_eq!(events.front().unwrap()["params"]["i"], json!(10));
         assert_eq!(
-            queue.back().unwrap()["params"]["i"],
+            events.back().unwrap()["params"]["i"],
             json!(MAX_BUFFERED_EVENTS + 9)
         );
     }
