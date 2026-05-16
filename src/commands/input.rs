@@ -128,7 +128,7 @@ pub async fn click(
         "select_multiple" => bail!("Manual clicking on <option> is not supported for <select multiple>. Use `evaluate` to update selection instead: {selector}"),
         "not_option" => {
             let (x, y) = get_element_center(client, session_id, selector).await?;
-            click_at(client, session_id, x, y).await
+            click_at(client, session_id, x, y, Some(initial_url)).await
         }
         _ => bail!("Unexpected response from page during click handling: {res_val}"),
     }
@@ -139,8 +139,12 @@ pub async fn click_at(
     session_id: &str,
     x: f64,
     y: f64,
+    initial_url: Option<String>,
 ) -> Result<CommandResult> {
-    let initial_url = client.current_url(session_id).await?;
+    let initial_url = match initial_url {
+        Some(url) => url,
+        None => client.current_url(session_id).await?,
+    };
     dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0).await?;
     dispatch_mouse(client, session_id, "mousePressed", x, y, "left", 1).await?;
     dispatch_mouse(client, session_id, "mouseReleased", x, y, "left", 1).await?;

@@ -484,7 +484,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             commands::input::click(&mut client, &session_id, selector).await
         }
         Commands::ClickAt { x, y } => {
-            commands::input::click_at(&mut client, &session_id, *x, *y).await
+            commands::input::click_at(&mut client, &session_id, *x, *y, None).await
         }
         Commands::Fill { selector, value } => {
             commands::input::fill(&mut client, &session_id, selector, value).await
