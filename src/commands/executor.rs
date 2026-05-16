@@ -75,7 +75,7 @@ async fn inner_execute(
         .send_to_target(session_id, "Page.enable", json!({}))
         .await?;
 
-    client.dialog_action = args["dialog_action"].as_str().map(|s| s.to_string());
+    client.dialog_action = args.get("dialog_action").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     match cmd {
         "navigate" => {
