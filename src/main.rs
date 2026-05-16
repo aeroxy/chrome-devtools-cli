@@ -313,7 +313,7 @@ fn print_response(resp: &protocol::DaemonResponse) {
         print_output(&resp.output, resp.navigated_to.as_deref(), None);
     } else {
         eprintln!("error: {}", resp.error);
-        std::process::exit(1);
+        std::process::exit(resp.error_code.unwrap_or(1) as i32);
     }
 }
 
