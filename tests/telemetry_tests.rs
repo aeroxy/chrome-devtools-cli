@@ -5,15 +5,14 @@ fn test_telemetry_module_accessible() {
     assert!(true);
 }
 
-/// Test that init_logger and log_command are callable.
+/// Test that init_logger_once and log_command are callable.
 #[test]
 fn test_telemetry_log_command() {
-    use chrome_devtools_cli::telemetry::{init_logger, log_command, TelemetryLogger};
+    use chrome_devtools_cli::telemetry::{init_logger_once, log_command};
     use std::time::Duration;
 
-    // Create a logger and initialize
-    let logger = TelemetryLogger::new(std::path::PathBuf::from("/tmp/test_telemetry_cmd"));
-    init_logger(logger);
+    // Initialize via the thread-safe path
+    init_logger_once(std::path::PathBuf::from("/tmp/test_telemetry_cmd"));
 
     // This should not panic — log is best-effort
     log_command("test-command", Duration::from_millis(42), true, None);

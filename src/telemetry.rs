@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,32 +34,68 @@ impl TelemetryWorker {
         std::thread::spawn(move || {
             let mut current_path: Option<PathBuf> = None;
             let mut current_file: Option<File> = None;
+            let mut consecutive_errors: u32 = 0;
+            const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 
             while let Ok(msg) = receiver.recv() {
                 match msg {
                     WorkerMessage::Log(entry) => {
+                        // If we've had too many consecutive errors, skip this entry
+                        // to avoid spamming the filesystem with failing operations.
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                            continue;
+                        }
+
+                        let path_display = entry.path.display().to_string();
+
+                        // Open (or re-open) the file if the path has changed.
                         if current_path.as_deref() != Some(entry.path.as_path()) {
-                            match OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(&entry.path)
-                            {
+                            match open_log_file(&entry.path) {
                                 Ok(new_file) => {
                                     current_path = Some(entry.path);
                                     current_file = Some(new_file);
+                                    consecutive_errors = 0;
                                 }
-                                Err(_) => {
+                                Err(e) => {
+                                    consecutive_errors += 1;
                                     current_path = None;
                                     current_file = None;
+                                    // Log to stderr as a fallback so the error is visible.
+                                    eprintln!(
+                                        "telemetry: failed to open {}: {} (consecutive errors: {})",
+                                        path_display,
+                                        e,
+                                        consecutive_errors
+                                    );
                                 }
                             }
                         }
+
+                        // Write the entry, with flush to ensure durability.
                         if let Some(file) = current_file.as_mut() {
-                            let _ = writeln!(file, "{}", entry.line);
+                            if let Err(e) = write_entry(file, &entry.line) {
+                                consecutive_errors += 1;
+                                eprintln!(
+                                    "telemetry: failed to write to {}: {} (consecutive errors: {})",
+                                    path_display,
+                                    e,
+                                    consecutive_errors
+                                );
+                                // Drop the file handle so we re-open on next entry.
+                                current_file = None;
+                                current_path = None;
+                            } else {
+                                consecutive_errors = 0;
+                            }
                         }
                     }
                     WorkerMessage::Shutdown => break,
                 }
+            }
+
+            // Flush any remaining data before exiting.
+            if let Some(file) = current_file.as_mut() {
+                let _ = file.flush();
             }
         });
         Self { sender }
@@ -165,12 +201,14 @@ impl TelemetryLogger {
 /// Initialized once in `main.rs` or `daemon.rs`.
 static LOGGER: std::sync::OnceLock<TelemetryLogger> = std::sync::OnceLock::new();
 
-/// Initialize the global telemetry logger.
+/// Initialize the global telemetry logger if not already initialized,
+/// returning the existing or new logger.
 ///
-/// Idempotent — repeated calls are silently ignored so tests and
-/// downstream callers don't need coordination.
-pub fn init_logger(logger: TelemetryLogger) {
-    let _ = LOGGER.set(logger);
+/// This is the thread-safe path: creation and registration happen
+/// atomically inside OnceLock, so concurrent calls cannot produce
+/// duplicate worker threads.
+pub fn init_logger_once(log_dir: PathBuf) -> &'static TelemetryLogger {
+    LOGGER.get_or_init(|| TelemetryLogger::new(log_dir))
 }
 
 /// Get a reference to the global logger, if initialized.
@@ -196,4 +234,25 @@ pub fn shutdown_logger() {
     if let Some(logger) = logger() {
         logger.shutdown();
     }
+}
+
+/// Open a log file with proper options for append-only writing.
+///
+/// Creates parent directories if they don't exist.
+fn open_log_file(path: &PathBuf) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// Write a single log entry to the file, followed by a flush.
+///
+/// Returns an error if either the write or flush fails.
+fn write_entry(file: &mut File, line: &str) -> io::Result<()> {
+    writeln!(file, "{}", line)?;
+    file.flush()
 }

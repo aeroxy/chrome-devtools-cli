@@ -202,7 +202,7 @@ async fn main() {
         .unwrap_or_default()
         .join(".chrome-devtools-cli")
         .join("logs");
-    telemetry::init_logger(telemetry::TelemetryLogger::new(log_dir));
+    telemetry::init_logger_once(log_dir);
 
     // Internal daemon mode — invoked by spawn_daemon(), not by users
     let args: Vec<String> = std::env::args().collect();
