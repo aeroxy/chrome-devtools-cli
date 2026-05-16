@@ -208,14 +208,18 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("__daemon__") {
         let ws_url = args.get(2).expect("daemon requires ws_url argument");
-        if let Err(e) = daemon::run_daemon(ws_url).await {
+        let result = daemon::run_daemon(ws_url).await;
+        telemetry::shutdown_logger();
+        if let Err(e) = result {
             eprintln!("daemon error: {e:#}");
             std::process::exit(1);
         }
         return;
     }
 
-    if let Err(e) = run().await {
+    let result = run().await;
+    telemetry::shutdown_logger();
+    if let Err(e) = result {
         let code = match e.downcast_ref::<error::CliError>() {
             Some(ce) => ce.code().code(),
             None => ErrorCode::Unspecified as u32,
