@@ -306,16 +306,23 @@ impl CdpClient {
         let result = self.send("Target.getTargets", json!({})).await?;
         let targets = result["targetInfos"]
             .as_array()
-            .ok_or_else(|| anyhow!("Unexpected getTargets response"))?;
+            .ok_or_else(|| anyhow!("Malformed Target.getTargets response: missing 'targetInfos' array"))?;
 
         let mut pages = Vec::new();
         for t in targets {
             let target_type = t["type"].as_str().unwrap_or("");
             if target_type == "page" {
+                let target_id = t["targetId"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Malformed TargetInfo: missing 'targetId'"))?
+                    .to_string();
+                let title = t["title"].as_str().unwrap_or("").to_string();
+                let url = t["url"].as_str().unwrap_or("").to_string();
+
                 pages.push(TargetInfo {
-                    target_id: t["targetId"].as_str().unwrap_or("").to_string(),
-                    title: t["title"].as_str().unwrap_or("").to_string(),
-                    url: t["url"].as_str().unwrap_or("").to_string(),
+                    target_id,
+                    title,
+                    url,
                     target_type: target_type.to_string(),
                 });
             }
@@ -438,5 +445,50 @@ mod tests {
             queue.back().unwrap()["params"]["i"],
             json!(MAX_BUFFERED_EVENTS + 9)
         );
+    }
+
+    #[test]
+    fn test_parse_target_infos() {
+        // Valid response with one page and one background_page
+        let valid_resp = json!({
+            "targetInfos": [
+                {
+                    "targetId": "123",
+                    "type": "page",
+                    "title": "Test Page",
+                    "url": "https://example.com"
+                },
+                {
+                    "targetId": "456",
+                    "type": "background_page",
+                    "title": "BG",
+                    "url": "chrome-extension://..."
+                }
+            ]
+        });
+
+        let mut pages = Vec::new();
+        let targets = valid_resp["targetInfos"].as_array().unwrap();
+        for t in targets {
+            if t["type"].as_str() == Some("page") {
+                pages.push(TargetInfo {
+                    target_id: t["targetId"].as_str().unwrap().to_string(),
+                    title: t["title"].as_str().unwrap_or("").to_string(),
+                    url: t["url"].as_str().unwrap_or("").to_string(),
+                    target_type: "page".to_string(),
+                });
+            }
+        }
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].target_id, "123");
+
+        // Empty response
+        let empty_resp = json!({"targetInfos": []});
+        let targets = empty_resp["targetInfos"].as_array().unwrap();
+        assert!(targets.is_empty());
+
+        // Malformed - missing targetInfos
+        let malformed_resp = json!({});
+        assert!(malformed_resp["targetInfos"].as_array().is_none());
     }
 }
