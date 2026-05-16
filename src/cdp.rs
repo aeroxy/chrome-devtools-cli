@@ -6,6 +6,8 @@ use futures_util::{
 };
 use serde_json::{json, Value};
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
@@ -63,9 +65,6 @@ pub trait CdpClientTrait: Debug + Send {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
     fn set_dialog_action(&mut self, action: Option<String>);
 }
-
-use std::future::Future;
-use std::pin::Pin;
 
 /// Concrete CDP client backed by a WebSocket connection.
 #[derive(Debug)]
