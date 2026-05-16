@@ -12,10 +12,11 @@ pub async fn evaluate(
     output: Option<&str>,
     track_navigation: bool,
 ) -> Result<CommandResult> {
-    // Note: To handle JavaScript dialogs (alert, confirm, prompt) during evaluation,
-    // client.dialog_action must be set to "accept", "dismiss", or a prompt response string
-    // BEFORE calling this function. The underlying send_to_target call will then
-    // automatically handle any Page.javascriptDialogOpening events that occur.
+    // Handle JavaScript dialogs (alert, confirm, prompt) during evaluation.
+    // `client.dialog_action` must be set to "accept", "dismiss", or a prompt
+    // response string before calling this function. The underlying
+    // `send_to_target` call will then automatically handle any
+    // `Page.javascriptDialogOpening` events that occur.
 
     let initial_url = if track_navigation {
         Some(client.current_url(session_id).await?)

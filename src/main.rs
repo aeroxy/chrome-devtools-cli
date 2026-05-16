@@ -113,7 +113,7 @@ enum Commands {
         #[arg(long, short)]
         output: Option<String>,
         /// Track URL changes caused by this evaluation (adds two extra CDP round-trips)
-        #[arg(long)]
+        #[arg(long, short = 't')]
         track_navigation: bool,
     },
 
@@ -289,18 +289,24 @@ fn build_request(cli: &Cli) -> DaemonRequest {
     }
 }
 
+fn print_output(output: &str, navigated_to: Option<&str>, target_id: Option<&str>) {
+    if !output.is_empty() {
+        print!("{output}");
+        if !output.ends_with('\n') {
+            println!();
+        }
+    }
+    if let Some(navigated_to) = navigated_to {
+        eprintln!("[navigated to: {navigated_to}]");
+    }
+    if let Some(target_id) = target_id {
+        eprintln!("[target: {target_id}]");
+    }
+}
+
 fn print_response(resp: &protocol::DaemonResponse) {
     if resp.success {
-        if !resp.output.is_empty() {
-            print!("{}", resp.output);
-            // Ensure trailing newline
-            if !resp.output.ends_with('\n') {
-                println!();
-            }
-        }
-        if let Some(navigated_to) = &resp.navigated_to {
-            eprintln!("[navigated to: {navigated_to}]");
-        }
+        print_output(&resp.output, resp.navigated_to.as_deref(), None);
     } else {
         eprintln!("error: {}", resp.error);
         std::process::exit(1);
@@ -308,18 +314,11 @@ fn print_response(resp: &protocol::DaemonResponse) {
 }
 
 fn print_result(result: &result::CommandResult) {
-    if !result.output.is_empty() {
-        print!("{}", result.output);
-        if !result.output.ends_with('\n') {
-            println!();
-        }
-    }
-    if let Some(navigated_to) = &result.navigated_to {
-        eprintln!("[navigated to: {navigated_to}]");
-    }
-    if let Some(target_id) = &result.target_id {
-        eprintln!("[target: {target_id}]");
-    }
+    print_output(
+        &result.output,
+        result.navigated_to.as_deref(),
+        result.target_id.as_deref(),
+    );
 }
 
 async fn run() -> Result<()> {
