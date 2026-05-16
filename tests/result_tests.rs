@@ -15,9 +15,14 @@ fn test_command_result_no_navigation() {
 fn test_command_result_navigation_changed() {
     use chrome_devtools_cli::result::CommandResult;
 
-    let result = CommandResult::output("hello")
-        .with_navigated_to_if_changed("https://example.com/new".to_string(), "https://example.com/old".to_string());
-    assert_eq!(result.navigated_to, Some("https://example.com/new".to_string()));
+    let result = CommandResult::output("hello").with_navigated_to_if_changed(
+        "https://example.com/new".to_string(),
+        "https://example.com/old".to_string(),
+    );
+    assert_eq!(
+        result.navigated_to,
+        Some("https://example.com/new".to_string())
+    );
 }
 
 /// Test that with_navigated_to_if_changed does NOT set navigated_to when URL unchanged.
@@ -25,8 +30,10 @@ fn test_command_result_navigation_changed() {
 fn test_command_result_navigation_unchanged() {
     use chrome_devtools_cli::result::CommandResult;
 
-    let result = CommandResult::output("hello")
-        .with_navigated_to_if_changed("https://example.com/same".to_string(), "https://example.com/same".to_string());
+    let result = CommandResult::output("hello").with_navigated_to_if_changed(
+        "https://example.com/same".to_string(),
+        "https://example.com/same".to_string(),
+    );
     assert!(result.navigated_to.is_none());
 }
 

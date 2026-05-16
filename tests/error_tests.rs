@@ -29,8 +29,8 @@ fn test_cli_error_display() {
 /// Test CliError with source error.
 #[test]
 fn test_cli_error_with_source() {
-    use chrome_devtools_cli::error::{CliError, ErrorCode};
     use anyhow::anyhow;
+    use chrome_devtools_cli::error::{CliError, ErrorCode};
 
     let source = anyhow!("connection refused");
     let err = CliError::with_source(ErrorCode::ChromeConnection, "Failed to connect", source);
@@ -43,8 +43,8 @@ fn test_cli_error_with_source() {
 /// Test From<anyhow::Error> for CliError.
 #[test]
 fn test_from_anyhow() {
-    use chrome_devtools_cli::error::{CliError, ErrorCode};
     use anyhow::anyhow;
+    use chrome_devtools_cli::error::{CliError, ErrorCode};
 
     let anyhow_err = anyhow!("something went wrong");
     let cli_err: CliError = anyhow_err.into();

@@ -9,12 +9,12 @@ mod protocol;
 mod result;
 mod telemetry;
 
+use crate::error::ErrorCode;
+use crate::protocol::DaemonRequest;
 use anyhow::Result;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::json;
-use crate::error::ErrorCode;
-use crate::protocol::DaemonRequest;
 
 #[derive(Parser)]
 #[command(
@@ -466,8 +466,19 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             )
             .await
         }
-        Commands::Evaluate { expression, dialog_action: _, output } => {
-            commands::evaluate::evaluate(&mut client, &session_id, expression, cli.json, output.as_deref()).await
+        Commands::Evaluate {
+            expression,
+            dialog_action: _,
+            output,
+        } => {
+            commands::evaluate::evaluate(
+                &mut client,
+                &session_id,
+                expression,
+                cli.json,
+                output.as_deref(),
+            )
+            .await
         }
         Commands::Click { selector } => {
             commands::input::click(&mut client, &session_id, selector).await
@@ -488,7 +499,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             commands::input::hover(&mut client, &session_id, selector).await
         }
         Commands::Snapshot { output } => {
-            commands::snapshot::take_snapshot(&mut client, &session_id, cli.json, output.as_deref()).await
+            commands::snapshot::take_snapshot(&mut client, &session_id, cli.json, output.as_deref())
+                .await
         }
         Commands::Resize { width, height } => {
             commands::pages::resize(&mut client, &session_id, *width, *height).await
@@ -513,6 +525,9 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
     };
 
     let _ = client.detach_from_target(&session_id).await;
-let name = friendly::to_friendly(&target_id);
-     result.map(|mut r| { r.target_id = Some(name); r })
+    let name = friendly::to_friendly(&target_id);
+    result.map(|mut r| {
+        r.target_id = Some(name);
+        r
+    })
 }

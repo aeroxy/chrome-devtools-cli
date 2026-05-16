@@ -97,7 +97,11 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection<S>(mut stream: S, client: &mut Option<CdpClient>, ws_url: &str) -> ConnectionOutcome
+async fn handle_connection<S>(
+    mut stream: S,
+    client: &mut Option<CdpClient>,
+    ws_url: &str,
+) -> ConnectionOutcome
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -174,32 +178,32 @@ where
 }
 
 async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> DaemonResponse {
-     let start = std::time::Instant::now();
-     let cmd_name = req.command.as_str();
-     match executor::execute_command(client, req).await {
-         Ok(result) => {
-             let duration = start.elapsed();
-             telemetry::log_command(cmd_name, duration, true, result.error_code);
-             DaemonResponse {
-                 success: true,
-                 output: result.output,
-                 error: String::new(),
-                 navigated_to: result.navigated_to,
-             }
-         }
-         Err(e) => {
-             let duration = start.elapsed();
-             let error_code = match e.downcast_ref::<crate::error::CliError>() {
-                 Some(ce) => Some(ce.code().code()),
-                 None => None,
-             };
-             telemetry::log_command(cmd_name, duration, false, error_code);
-             DaemonResponse {
-                 success: false,
-                 output: String::new(),
-                 error: format!("{e:#}"),
-                 navigated_to: None,
-             }
-         }
-     }
- }
+    let start = std::time::Instant::now();
+    let cmd_name = req.command.as_str();
+    match executor::execute_command(client, req).await {
+        Ok(result) => {
+            let duration = start.elapsed();
+            telemetry::log_command(cmd_name, duration, true, result.error_code);
+            DaemonResponse {
+                success: true,
+                output: result.output,
+                error: String::new(),
+                navigated_to: result.navigated_to,
+            }
+        }
+        Err(e) => {
+            let duration = start.elapsed();
+            let error_code = match e.downcast_ref::<crate::error::CliError>() {
+                Some(ce) => Some(ce.code().code()),
+                None => None,
+            };
+            telemetry::log_command(cmd_name, duration, false, error_code);
+            DaemonResponse {
+                success: false,
+                output: String::new(),
+                error: format!("{e:#}"),
+                navigated_to: None,
+            }
+        }
+    }
+}

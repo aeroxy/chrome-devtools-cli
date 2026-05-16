@@ -35,18 +35,23 @@ pub async fn navigate(
     }
 
     wait_for_load(client, session_id, 30_000).await?;
-    let result = CommandResult::output(format!("Navigated to {url}"))
-        .with_navigated_to(url.to_string());
+    let result =
+        CommandResult::output(format!("Navigated to {url}")).with_navigated_to(url.to_string());
 
     if let Some(path) = output {
         tokio::fs::write(path, result.output.as_bytes()).await?;
-        Ok(CommandResult::output(format!("Output saved to {path}")).with_navigated_to(url.to_string()))
+        Ok(CommandResult::output(format!("Output saved to {path}"))
+            .with_navigated_to(url.to_string()))
     } else {
         Ok(result)
     }
 }
 
-async fn go_back(client: &mut CdpClient, session_id: &str, output: Option<&str>) -> Result<CommandResult> {
+async fn go_back(
+    client: &mut CdpClient,
+    session_id: &str,
+    output: Option<&str>,
+) -> Result<CommandResult> {
     let history = client
         .send_to_target(session_id, "Page.getNavigationHistory", json!({}))
         .await?;
@@ -77,13 +82,18 @@ async fn go_back(client: &mut CdpClient, session_id: &str, output: Option<&str>)
         .with_navigated_to(url.to_string());
     if let Some(path) = output {
         tokio::fs::write(path, result.output.as_bytes()).await?;
-        Ok(CommandResult::output(format!("Output saved to {path}")).with_navigated_to(url.to_string()))
+        Ok(CommandResult::output(format!("Output saved to {path}"))
+            .with_navigated_to(url.to_string()))
     } else {
         Ok(result)
     }
 }
 
-async fn go_forward(client: &mut CdpClient, session_id: &str, output: Option<&str>) -> Result<CommandResult> {
+async fn go_forward(
+    client: &mut CdpClient,
+    session_id: &str,
+    output: Option<&str>,
+) -> Result<CommandResult> {
     let history = client
         .send_to_target(session_id, "Page.getNavigationHistory", json!({}))
         .await?;
@@ -114,20 +124,24 @@ async fn go_forward(client: &mut CdpClient, session_id: &str, output: Option<&st
         .with_navigated_to(url.to_string());
     if let Some(path) = output {
         tokio::fs::write(path, result.output.as_bytes()).await?;
-        Ok(CommandResult::output(format!("Output saved to {path}")).with_navigated_to(url.to_string()))
+        Ok(CommandResult::output(format!("Output saved to {path}"))
+            .with_navigated_to(url.to_string()))
     } else {
         Ok(result)
     }
 }
 
-async fn do_reload(client: &mut CdpClient, session_id: &str, output: Option<&str>) -> Result<CommandResult> {
+async fn do_reload(
+    client: &mut CdpClient,
+    session_id: &str,
+    output: Option<&str>,
+) -> Result<CommandResult> {
     client
         .send_to_target(session_id, "Page.reload", json!({}))
         .await?;
     wait_for_load(client, session_id, 30_000).await?;
     let url = client.current_url(session_id).await?;
-    let result = CommandResult::output("Reloaded page".to_string())
-        .with_navigated_to(url.clone());
+    let result = CommandResult::output("Reloaded page".to_string()).with_navigated_to(url.clone());
     if let Some(path) = output {
         tokio::fs::write(path, result.output.as_bytes()).await?;
         Ok(CommandResult::output(format!("Output saved to {path}")).with_navigated_to(url))

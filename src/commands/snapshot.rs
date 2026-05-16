@@ -16,7 +16,7 @@ pub async fn take_snapshot(
         .send_to_target(session_id, "Accessibility.getFullAXTree", json!({}))
         .await?;
 
-if as_json {
+    if as_json {
         let json = serde_json::to_string_pretty(&result)?;
         if let Some(path) = output {
             tokio::fs::write(path, &json).await?;

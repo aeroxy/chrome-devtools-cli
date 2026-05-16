@@ -22,24 +22,46 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// for future mock-based testing.
 #[allow(dead_code)]
 pub trait CdpClientTrait: Debug + Send {
-    fn send(&mut self, method: &str, params: Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_>>;
+    fn send(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_>>;
     fn send_to_target(
         &mut self,
         session_id: &str,
         method: &str,
         params: Value,
     ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_>>;
-    fn current_url(&mut self, session_id: &str) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>>;
+    fn current_url(
+        &mut self,
+        session_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>>;
     fn resolve_page(
         &mut self,
         target: Option<&str>,
         page: Option<usize>,
     ) -> Pin<Box<dyn Future<Output = Result<TargetInfo>> + Send + '_>>;
-    fn attach_to_target(&mut self, target_id: &str) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>>;
-    fn detach_from_target(&mut self, session_id: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
-    fn activate_target(&mut self, target_id: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
-    fn create_target(&mut self, url: &str) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>>;
-    fn close_target(&mut self, target_id: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn attach_to_target(
+        &mut self,
+        target_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>>;
+    fn detach_from_target(
+        &mut self,
+        session_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn activate_target(
+        &mut self,
+        target_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn create_target(
+        &mut self,
+        url: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>>;
+    fn close_target(
+        &mut self,
+        target_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
     fn set_dialog_action(&mut self, action: Option<String>);
 }
 
@@ -295,10 +317,7 @@ impl CdpClient {
                 json!({"expression": "window.location.href", "returnByValue": true}),
             )
             .await?;
-        Ok(result["result"]["value"]
-            .as_str()
-            .unwrap_or("")
-            .to_string())
+        Ok(result["result"]["value"].as_str().unwrap_or("").to_string())
     }
 
     /// Resolve which page to operate on.

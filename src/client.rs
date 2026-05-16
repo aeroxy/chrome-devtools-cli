@@ -57,11 +57,14 @@ pub fn spawn_daemon(ws_url: &str) -> Result<()> {
 
 /// Wait for the daemon socket to become available, with exponential backoff.
 pub async fn wait_for_daemon() -> Result<()> {
-     let deadline = tokio::time::Instant::now() + daemon_wait_timeout();
+    let deadline = tokio::time::Instant::now() + daemon_wait_timeout();
     let mut delay = Duration::from_millis(50);
     loop {
         if tokio::time::Instant::now() > deadline {
-            bail!("Daemon failed to start within {} seconds", daemon_wait_timeout().as_secs());
+            bail!(
+                "Daemon failed to start within {} seconds",
+                daemon_wait_timeout().as_secs()
+            );
         }
         if connect_daemon().await.is_ok() {
             return Ok(());
@@ -69,7 +72,9 @@ pub async fn wait_for_daemon() -> Result<()> {
         // Simple jitter based on current time subseconds
         let jitter = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| Duration::from_millis(d.subsec_nanos() as u64 % (delay.as_millis() as u64 + 1)))
+            .map(|d| {
+                Duration::from_millis(d.subsec_nanos() as u64 % (delay.as_millis() as u64 + 1))
+            })
             .unwrap_or_default();
         tokio::time::sleep(delay + jitter).await;
         delay = (delay * 2).min(Duration::from_millis(500));

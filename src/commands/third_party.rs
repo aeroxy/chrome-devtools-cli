@@ -46,7 +46,9 @@ pub async fn list_3p_tools(
             .ok_or_else(|| anyhow::anyhow!("Invalid response from page"))?;
 
         if tools.is_empty() {
-            return Ok(CommandResult::output("No third-party developer tools found on this page.".to_string()));
+            return Ok(CommandResult::output(
+                "No third-party developer tools found on this page.".to_string(),
+            ));
         }
 
         let mut output = String::new();

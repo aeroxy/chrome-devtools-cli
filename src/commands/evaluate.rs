@@ -72,7 +72,8 @@ pub async fn evaluate(
     }
 
     let new_url = client.current_url(session_id).await?;
-    let result = CommandResult::output(output_hint).with_navigated_to_if_changed(new_url, initial_url);
+    let result =
+        CommandResult::output(output_hint).with_navigated_to_if_changed(new_url, initial_url);
 
     if let Some(path) = output {
         let data = result.output.as_bytes();

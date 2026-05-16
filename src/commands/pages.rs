@@ -38,7 +38,9 @@ pub async fn list_pages(client: &mut CdpClient, as_json: bool) -> Result<Command
 
 pub async fn new_page(client: &mut CdpClient, url: &str) -> Result<CommandResult> {
     let target_id = client.create_target(url).await?;
-    Ok(CommandResult::output(format!("Opened new page: {url} (target: {target_id})")))
+    Ok(CommandResult::output(format!(
+        "Opened new page: {url} (target: {target_id})"
+    )))
 }
 
 pub async fn close_page(client: &mut CdpClient, index: usize) -> Result<CommandResult> {
@@ -47,7 +49,10 @@ pub async fn close_page(client: &mut CdpClient, index: usize) -> Result<CommandR
         .get(index)
         .ok_or_else(|| anyhow!("No page at index {index} (have {} pages)", pages.len()))?;
     client.close_target(&page.target_id).await?;
-    Ok(CommandResult::output(format!("Closed page [{index}]: {}", page.url)))
+    Ok(CommandResult::output(format!(
+        "Closed page [{index}]: {}",
+        page.url
+    )))
 }
 
 pub async fn select_page(client: &mut CdpClient, index: usize) -> Result<CommandResult> {
@@ -55,7 +60,7 @@ pub async fn select_page(client: &mut CdpClient, index: usize) -> Result<Command
     let page = pages
         .get(index)
         .ok_or_else(|| anyhow!("No page at index {index} (have {} pages)", pages.len()))?;
-client.activate_target(&page.target_id).await?;
+    client.activate_target(&page.target_id).await?;
     Ok(CommandResult::output(format!(
         "Activated page [{index}]: {} — {}",
         page.title, page.url
@@ -80,7 +85,9 @@ pub async fn resize(
             }),
         )
         .await?;
-    Ok(CommandResult::output(format!("Resized viewport to {width}x{height}")))
+    Ok(CommandResult::output(format!(
+        "Resized viewport to {width}x{height}"
+    )))
 }
 
 pub async fn wait_for(

@@ -233,8 +233,10 @@ pub async fn fill(
     } else if res_val == "select_ok" || res_val == "checkbox_ok" {
         // For select/checkbox, the work is done entirely in JS
         let new_url = client.current_url(session_id).await?;
-        return Ok(CommandResult::output(format!("Filled '{selector}' with: {value}"))
-            .with_navigated_to_if_changed(new_url, initial_url));
+        return Ok(
+            CommandResult::output(format!("Filled '{selector}' with: {value}"))
+                .with_navigated_to_if_changed(new_url, initial_url),
+        );
     }
 
     client
@@ -259,8 +261,10 @@ pub async fn fill(
         .await?;
 
     let new_url = client.current_url(session_id).await?;
-    Ok(CommandResult::output(format!("Filled '{selector}' with: {value}"))
-        .with_navigated_to_if_changed(new_url, initial_url))
+    Ok(
+        CommandResult::output(format!("Filled '{selector}' with: {value}"))
+            .with_navigated_to_if_changed(new_url, initial_url),
+    )
 }
 
 pub async fn type_text(
@@ -286,7 +290,11 @@ pub async fn type_text(
     .with_navigated_to_if_changed(new_url, initial_url))
 }
 
-pub async fn press_key(client: &mut CdpClient, session_id: &str, key: &str) -> Result<CommandResult> {
+pub async fn press_key(
+    client: &mut CdpClient,
+    session_id: &str,
+    key: &str,
+) -> Result<CommandResult> {
     let initial_url = client.current_url(session_id).await?;
     let parts: Vec<&str> = key.split('+').collect();
     let main_key = parts.last().ok_or_else(|| anyhow::anyhow!("Empty key"))?;
