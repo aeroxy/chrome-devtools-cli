@@ -53,7 +53,7 @@ pub async fn take_screenshot(
 
     match output {
         Some(path) => {
-            std::fs::write(path, &bytes)?;
+            tokio::fs::write(path, &bytes).await?;
             Ok(CommandResult::output(format!(
                 "Screenshot saved to {path} ({} bytes)",
                 bytes.len()
