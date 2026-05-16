@@ -37,7 +37,7 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                 let index = args
                     .get("index")
                     .and_then(|v| v.as_u64())
-                    .ok_or(anyhow!("index required"))? as usize;
+                    .ok_or(anyhow!("index required"))?.try_into()?;
                 commands::pages::close_page(client, index).await
             }
             "select-page" => {
