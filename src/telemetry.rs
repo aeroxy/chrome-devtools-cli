@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Sender};
@@ -24,25 +24,29 @@ impl TelemetryWorker {
     fn spawn() -> Self {
         let (sender, receiver) = channel::<LogEntry>();
         std::thread::spawn(move || {
+            let mut current_path: Option<PathBuf> = None;
+            let mut current_file: Option<File> = None;
+
             while let Ok(entry) = receiver.recv() {
-                let _ = Self::write_entry(&entry.path, &entry.line);
+                if current_path.as_deref() != Some(entry.path.as_path()) {
+                    let new_file = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&entry.path)
+                        .ok();
+                    current_path = Some(entry.path);
+                    current_file = new_file;
+                }
+                if let Some(file) = current_file.as_mut() {
+                    let _ = writeln!(file, "{}", entry.line);
+                }
             }
         });
         Self { sender }
     }
 
     fn send(&self, entry: LogEntry) {
-        // Best-effort: drop the entry if the channel is full or closed
         let _ = self.sender.send(entry);
-    }
-
-    fn write_entry(path: &PathBuf, line: &str) -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        writeln!(file, "{line}")?;
-        Ok(())
     }
 }
 
