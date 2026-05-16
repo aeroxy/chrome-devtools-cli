@@ -118,7 +118,9 @@ where
                 error: format!("Invalid request: {e}"),
                 navigated_to: None,
             };
-            let _ = write_msg(&mut stream, &serde_json::to_vec(&resp).unwrap()).await;
+            if let Ok(resp_bytes) = serde_json::to_vec(&resp) {
+                let _ = write_msg(&mut stream, &resp_bytes).await;
+            }
             return ConnectionOutcome::Continue;
         }
     };
@@ -134,7 +136,9 @@ where
                     error: format!("Failed to connect to Chrome: {e:#}"),
                     navigated_to: None,
                 };
-                let _ = write_msg(&mut stream, &serde_json::to_vec(&resp).unwrap()).await;
+                if let Ok(resp_bytes) = serde_json::to_vec(&resp) {
+                    let _ = write_msg(&mut stream, &resp_bytes).await;
+                }
                 // Exit daemon if we can't connect, so the next CLI call will spawn a fresh daemon
                 return ConnectionOutcome::Fatal;
             }
