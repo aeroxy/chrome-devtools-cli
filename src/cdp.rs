@@ -249,8 +249,15 @@ impl CdpClient {
                     false
                 }
             }) {
-                let resp = self.events.remove(idx).unwrap();
-                let method = resp.get("method").unwrap().as_str().unwrap().to_string();
+                let resp = self
+                    .events
+                    .remove(idx)
+                    .ok_or_else(|| anyhow!("Event disappeared from buffer"))?;
+                let method = resp
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("Invalid event format: missing method"))?
+                    .to_string();
                 return Ok((method, resp.get("params").cloned().unwrap_or(Value::Null)));
             }
 
