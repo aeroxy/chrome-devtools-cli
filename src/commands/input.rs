@@ -152,7 +152,7 @@ pub async fn click_at(
     // Wait briefly to see if a navigation event is triggered by the click
     let nav_events = ["Page.frameStartedLoading", "Page.navigatedWithinDocument"];
     if let Ok((method, _)) = client
-        .wait_for_any_event(&nav_events, std::time::Duration::from_millis(150))
+        .wait_for_any_event(&nav_events, std::time::Duration::from_millis(500))
         .await
     {
         if method == "Page.frameStartedLoading" {
@@ -207,7 +207,7 @@ pub async fn fill(
             if (tagName === 'select') {{
                 let optionFound = false;
                 for (const option of el.options) {{
-                    if (option.value === '{escaped_val}' || option.text === '{escaped_val}') {{
+                    if (option.value === {escaped_val} || option.text === {escaped_val}) {{
                         el.value = option.value;
                         optionFound = true;
                         break;
@@ -365,7 +365,7 @@ pub async fn press_key(
     // Wait briefly to see if a navigation event is triggered by the key press
     let nav_events = ["Page.frameStartedLoading", "Page.navigatedWithinDocument"];
     if let Ok((method, _)) = client
-        .wait_for_any_event(&nav_events, std::time::Duration::from_millis(150))
+        .wait_for_any_event(&nav_events, std::time::Duration::from_millis(500))
         .await
     {
         if method == "Page.frameStartedLoading" {
