@@ -8,6 +8,7 @@ use tokio::net::UnixListener;
 
 use crate::cdp::CdpClient;
 use crate::commands::executor;
+use crate::error::ErrorCode;
 use crate::protocol::*;
 use crate::telemetry;
 
@@ -121,6 +122,7 @@ where
                 output: String::new(),
                 error: format!("Invalid request: {e}"),
                 navigated_to: None,
+                error_code: Some(ErrorCode::InvalidInput as u32),
             };
             if let Ok(resp_bytes) = serde_json::to_vec(&resp) {
                 let _ = write_msg(&mut stream, &resp_bytes).await;
@@ -139,6 +141,7 @@ where
                     output: String::new(),
                     error: format!("Failed to connect to Chrome: {e:#}"),
                     navigated_to: None,
+                    error_code: Some(ErrorCode::ChromeConnection as u32),
                 };
                 if let Ok(resp_bytes) = serde_json::to_vec(&resp) {
                     let _ = write_msg(&mut stream, &resp_bytes).await;
@@ -156,6 +159,7 @@ where
             output: String::new(),
             error: String::from("Failed to connect to Chrome: client initialization failed"),
             navigated_to: None,
+            error_code: Some(ErrorCode::ChromeConnection as u32),
         },
     };
 
@@ -181,29 +185,31 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> DaemonRe
     let start = std::time::Instant::now();
     let cmd_name = req.command.as_str();
     match executor::execute_command(client, req).await {
-        Ok(result) => {
-            let duration = start.elapsed();
-            telemetry::log_command(cmd_name, duration, true, result.error_code);
-            DaemonResponse {
-                success: true,
-                output: result.output,
-                error: String::new(),
-                navigated_to: result.navigated_to,
-            }
-        }
-        Err(e) => {
-            let duration = start.elapsed();
-            let error_code = match e.downcast_ref::<crate::error::CliError>() {
-                Some(ce) => Some(ce.code().code()),
-                None => None,
-            };
-            telemetry::log_command(cmd_name, duration, false, error_code);
-            DaemonResponse {
-                success: false,
-                output: String::new(),
-                error: format!("{e:#}"),
-                navigated_to: None,
-            }
-        }
+Ok(result) => {
+             let duration = start.elapsed();
+             telemetry::log_command(cmd_name, duration, true, result.error_code);
+             DaemonResponse {
+                 success: true,
+                 output: result.output,
+                 error: String::new(),
+                 navigated_to: result.navigated_to,
+                 error_code: result.error_code,
+             }
+         }
+         Err(e) => {
+             let duration = start.elapsed();
+             let error_code = match e.downcast_ref::<crate::error::CliError>() {
+                 Some(ce) => Some(ce.code().code()),
+                 None => None,
+             };
+             telemetry::log_command(cmd_name, duration, false, error_code);
+             DaemonResponse {
+                 success: false,
+                 output: String::new(),
+                 error: format!("{e:#}"),
+                 navigated_to: None,
+                 error_code,
+             }
+         }
     }
 }

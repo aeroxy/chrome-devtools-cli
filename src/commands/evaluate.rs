@@ -73,12 +73,13 @@ pub async fn evaluate(
 
     let new_url = client.current_url(session_id).await?;
     let result =
-        CommandResult::output(output_hint).with_navigated_to_if_changed(new_url, initial_url);
+        CommandResult::output(output_hint).with_navigated_to_if_changed(new_url.clone(), initial_url.clone());
 
     if let Some(path) = output {
         let data = result.output.as_bytes();
         tokio::fs::write(path, data).await?;
-        Ok(CommandResult::output(format!("Output saved to {path}")))
+        Ok(CommandResult::output(format!("Output saved to {path}"))
+            .with_navigated_to_if_changed(new_url, initial_url))
     } else {
         Ok(result)
     }

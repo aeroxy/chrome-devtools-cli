@@ -104,7 +104,7 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
             args.get("x").and_then(|v| v.as_f64()),
             args.get("y").and_then(|v| v.as_f64()),
         ) {
-            (Some(x), Some(y)) => commands::input::click_at(client, &session_id, x, y).await,
+            (Some(x), Some(y)) => commands::input::click_at(client, &session_id, x, y, None).await,
             _ => Err(anyhow!("x and y required")),
         },
         "fill" => match (
