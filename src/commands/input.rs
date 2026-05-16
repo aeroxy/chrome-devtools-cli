@@ -134,6 +134,54 @@ pub async fn click(
     }
 }
 
+async fn wait_for_navigation(client: &mut CdpClient, session_id: &str) -> Result<()> {
+    // Get the main frame ID to ensure we only wait for top-level navigations
+    let frame_tree = client
+        .send_to_target(session_id, "Page.getFrameTree", json!({}))
+        .await?;
+    let main_frame_id = frame_tree
+        .get("frameTree")
+        .and_then(|t| t.get("frame"))
+        .and_then(|f| f.get("id"))
+        .and_then(|i| i.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let nav_events = ["Page.frameStartedLoading", "Page.navigatedWithinDocument"];
+    if let Ok((method, _)) = client
+        .wait_for_event_match(
+            &nav_events,
+            std::time::Duration::from_millis(500),
+            |m, p| {
+                if m == "Page.frameStartedLoading" || m == "Page.navigatedWithinDocument" {
+                    p.get("frameId").and_then(|f| f.as_str()) == Some(&main_frame_id)
+                } else {
+                    true
+                }
+            },
+        )
+        .await
+    {
+        if method == "Page.frameStartedLoading" {
+            // A full navigation started on the main frame, so wait for it to finish loading
+            let _ = client
+                .wait_for_event_match(
+                    &["Page.loadEventFired", "Page.frameStoppedLoading"],
+                    std::time::Duration::from_secs(10),
+                    |m, p| {
+                        if m == "Page.frameStoppedLoading" {
+                            p.get("frameId").and_then(|f| f.as_str()) == Some(&main_frame_id)
+                        } else {
+                            true // Page.loadEventFired is page-wide
+                        }
+                    },
+                )
+                .await;
+        }
+    }
+    Ok(())
+}
+
 pub async fn click_at(
     client: &mut CdpClient,
     session_id: &str,
@@ -149,23 +197,7 @@ pub async fn click_at(
     dispatch_mouse(client, session_id, "mousePressed", x, y, "left", 1).await?;
     dispatch_mouse(client, session_id, "mouseReleased", x, y, "left", 1).await?;
 
-    // Wait briefly to see if a navigation event is triggered by the click
-    let nav_events = ["Page.frameStartedLoading", "Page.navigatedWithinDocument"];
-    if let Ok((method, _)) = client
-        .wait_for_any_event(&nav_events, std::time::Duration::from_millis(500))
-        .await
-    {
-        if method == "Page.frameStartedLoading" {
-            // A full navigation started, so wait a bit longer for it to finish loading
-            let _ = client
-                .wait_for_any_event(
-                    &["Page.loadEventFired", "Page.frameStoppedLoading"],
-                    std::time::Duration::from_secs(10),
-                )
-                .await;
-        }
-        // If it was navigatedWithinDocument, it's instantaneous so we don't need to wait further
-    }
+    let _ = wait_for_navigation(client, session_id).await;
 
     let new_url = client.current_url(session_id).await?;
     Ok(CommandResult::output(format!("Clicked at ({x}, {y})"))
@@ -362,21 +394,7 @@ pub async fn press_key(
         )
         .await?;
 
-    // Wait briefly to see if a navigation event is triggered by the key press
-    let nav_events = ["Page.frameStartedLoading", "Page.navigatedWithinDocument"];
-    if let Ok((method, _)) = client
-        .wait_for_any_event(&nav_events, std::time::Duration::from_millis(500))
-        .await
-    {
-        if method == "Page.frameStartedLoading" {
-            let _ = client
-                .wait_for_any_event(
-                    &["Page.loadEventFired", "Page.frameStoppedLoading"],
-                    std::time::Duration::from_secs(10),
-                )
-                .await;
-        }
-    }
+    let _ = wait_for_navigation(client, session_id).await;
 
     let new_url = client.current_url(session_id).await?;
     Ok(CommandResult::output(format!("Pressed: {key}"))
