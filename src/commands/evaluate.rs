@@ -76,7 +76,7 @@ pub async fn evaluate(
 
     if let Some(path) = output {
         let data = result.output.as_bytes();
-        std::fs::write(path, data)?;
+        tokio::fs::write(path, data).await?;
         Ok(CommandResult::output(format!("Output saved to {path}")))
     } else {
         Ok(result)
