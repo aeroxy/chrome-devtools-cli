@@ -279,15 +279,6 @@ impl CdpClient {
         }
     }
 
-    #[allow(dead_code)]
-    pub async fn wait_for_any_event(
-        &mut self,
-        event_methods: &[&str],
-        timeout: std::time::Duration,
-    ) -> Result<(String, Value)> {
-        self.wait_for_event_match(event_methods, timeout, |_, _| true)
-            .await
-    }
 
     pub async fn read_text(&mut self) -> Result<String> {
         loop {
