@@ -200,7 +200,7 @@ pub async fn fill(
             }}
 
             if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
-                const isTrue = '{escaped_val}'.toLowerCase() === 'true';
+                const isTrue = {escaped_val}.toLowerCase() === 'true';
                 if (el.checked !== isTrue) {{
                     el.checked = isTrue;
                     el.dispatchEvent(new Event('input', {{bubbles: true}}));
