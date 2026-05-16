@@ -63,9 +63,7 @@ impl TelemetryWorker {
                                     // Log to stderr as a fallback so the error is visible.
                                     eprintln!(
                                         "telemetry: failed to open {}: {} (consecutive errors: {})",
-                                        path_display,
-                                        e,
-                                        consecutive_errors
+                                        path_display, e, consecutive_errors
                                     );
                                 }
                             }
@@ -77,9 +75,7 @@ impl TelemetryWorker {
                                 consecutive_errors += 1;
                                 eprintln!(
                                     "telemetry: failed to write to {}: {} (consecutive errors: {})",
-                                    path_display,
-                                    e,
-                                    consecutive_errors
+                                    path_display, e, consecutive_errors
                                 );
                                 // Drop the file handle so we re-open on next entry.
                                 current_file = None;
@@ -243,10 +239,7 @@ fn open_log_file(path: &PathBuf) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 /// Write a single log entry to the file, followed by a flush.

@@ -252,17 +252,24 @@ impl CdpClient {
         loop {
             // First check if we already have the event buffered (O(1) per method)
             for &method in event_methods {
-                if let Some(queue) = self.events.get_mut(method) {
+                let (resp, is_empty) = if let Some(queue) = self.events.get_mut(method) {
                     if let Some(resp) = queue.pop_front() {
-                        // Clean up empty queues
-                        if queue.is_empty() {
-                            self.events.remove(method);
-                        }
-                        return Ok((
-                            method.to_string(),
-                            resp.get("params").cloned().unwrap_or(Value::Null),
-                        ));
+                        (Some(resp), queue.is_empty())
+                    } else {
+                        (None, false)
                     }
+                } else {
+                    (None, false)
+                };
+
+                if let Some(resp) = resp {
+                    if is_empty {
+                        self.events.remove(method);
+                    }
+                    return Ok((
+                        method.to_string(),
+                        resp.get("params").cloned().unwrap_or(Value::Null),
+                    ));
                 }
             }
 
@@ -304,9 +311,9 @@ impl CdpClient {
 
     pub async fn get_page_targets(&mut self) -> Result<Vec<TargetInfo>> {
         let result = self.send("Target.getTargets", json!({})).await?;
-        let targets = result["targetInfos"]
-            .as_array()
-            .ok_or_else(|| anyhow!("Malformed Target.getTargets response: missing 'targetInfos' array"))?;
+        let targets = result["targetInfos"].as_array().ok_or_else(|| {
+            anyhow!("Malformed Target.getTargets response: missing 'targetInfos' array")
+        })?;
 
         let mut pages = Vec::new();
         for t in targets {
