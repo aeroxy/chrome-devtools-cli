@@ -149,11 +149,8 @@ impl TelemetryLogger {
 
     /// Get the current log file path (date-based rotation).
     fn log_path(&self) -> PathBuf {
-        let date = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() / 86400)
-            .unwrap_or(0);
-        self.log_dir.join(format!("telemetry-{date}.log"))
+        let date_str = chrono::Local::now().format("%Y-%m-%d");
+        self.log_dir.join(format!("telemetry-{date_str}.log"))
     }
 
     /// Log a command invocation.
