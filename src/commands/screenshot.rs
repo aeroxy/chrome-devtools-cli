@@ -59,9 +59,6 @@ pub async fn take_screenshot(
                 bytes.len()
             )))
         }
-        None => {
-            // Return raw base64 (agent can read it)
-            Ok(CommandResult::output(data_b64.to_string()))
-        }
+        None => Ok(CommandResult::output(data_b64.to_string())),
     }
 }

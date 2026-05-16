@@ -279,7 +279,6 @@ impl CdpClient {
         }
     }
 
-
     pub async fn read_text(&mut self) -> Result<String> {
         loop {
             match self.read.next().await {

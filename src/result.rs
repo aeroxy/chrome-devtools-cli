@@ -1,3 +1,5 @@
+use tokio::fs;
+
 /// The result of executing a CLI command.
 ///
 /// Carries both the human-readable output string and structured metadata
@@ -51,5 +53,20 @@ impl CommandResult {
     pub fn with_error_code(mut self, code: u32) -> Self {
         self.error_code = Some(code);
         self
+    }
+
+    /// Write output to a file and return a result with a confirmation message,
+    /// or return self unchanged if no output path is given.
+    ///
+    /// This is a shared helper to avoid duplicating the write-to-file pattern
+    /// across evaluate, navigate, snapshot, and screenshot commands.
+    pub async fn save_output(self, path: Option<&str>) -> Result<Self, std::io::Error> {
+        match path {
+            Some(p) => {
+                fs::write(p, &self.output).await?;
+                Ok(CommandResult::output(format!("Output saved to {p}")))
+            }
+            None => Ok(self),
+        }
     }
 }

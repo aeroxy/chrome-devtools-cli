@@ -42,9 +42,5 @@ pub async fn take_snapshot(
         serde_json::to_string_pretty(&result)?
     };
 
-    if let Some(path) = output {
-        tokio::fs::write(path, &content).await?;
-        return Ok(CommandResult::output(format!("Snapshot saved to {path}")));
-    }
-    Ok(CommandResult::output(content))
+    Ok(CommandResult::output(content).save_output(output).await?)
 }

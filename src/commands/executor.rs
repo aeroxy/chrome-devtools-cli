@@ -15,6 +15,15 @@ fn is_browser_level(cmd: &str) -> bool {
     )
 }
 
+/// Extract a page index from request args, validating that it's present and fits usize.
+fn parse_page_index(args: &serde_json::Value) -> Result<usize> {
+    args.get("index")
+        .and_then(|v| v.as_u64())
+        .ok_or(anyhow!("index required"))?
+        .try_into()
+        .map_err(|_| anyhow!("index too large"))
+}
+
 /// Execute a single command from a [`DaemonRequest`].
 ///
 /// Handles target resolution, session attachment, dialog configuration,
@@ -39,19 +48,11 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                 commands::pages::new_page(client, url).await
             }
             "close-page" => {
-                let index = args
-                    .get("index")
-                    .and_then(|v| v.as_u64())
-                    .ok_or(anyhow!("index required"))?
-                    .try_into()?;
+                let index = parse_page_index(args)?;
                 commands::pages::close_page(client, index).await
             }
             "select-page" => {
-                let index = args
-                    .get("index")
-                    .and_then(|v| v.as_u64())
-                    .ok_or(anyhow!("index required"))?
-                    .try_into()?;
+                let index = parse_page_index(args)?;
                 commands::pages::select_page(client, index).await
             }
             _ => unreachable!(),
