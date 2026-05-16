@@ -9,10 +9,10 @@ async fn get_element_center(
     session_id: &str,
     selector: &str,
 ) -> Result<(f64, f64)> {
-    let escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
+    let escaped = serde_json::to_string(selector)?;
     let expr = format!(
         r#"(() => {{
-            const el = document.querySelector('{escaped}');
+            const el = document.querySelector({escaped});
             if (!el) return JSON.stringify({{error: 'Element not found: {escaped}'}});
             const rect = el.getBoundingClientRect();
             return JSON.stringify({{x: rect.x + rect.width/2, y: rect.y + rect.height/2}});
@@ -77,10 +77,10 @@ pub async fn click(
 ) -> Result<CommandResult> {
     let initial_url = client.current_url(session_id).await?;
     // Special handling for native <option> elements which don't always respond to mouse clicks
-    let escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
+    let escaped = serde_json::to_string(selector)?;
     let check_expr = format!(
         r#"(() => {{
-            const el = document.querySelector('{escaped}');
+            const el = document.querySelector({escaped});
             if (!el) return 'not_found';
             if (el.tagName.toLowerCase() === 'option') {{
                 if (el.disabled) return 'option_disabled';
@@ -249,7 +249,7 @@ pub async fn fill(
 
     let change_expr = format!(
         r#"(() => {{
-            const el = document.querySelector('{escaped_sel}');
+            const el = document.querySelector({escaped_sel});
             if (el) {{
                 el.dispatchEvent(new Event('input', {{bubbles: true}}));
                 el.dispatchEvent(new Event('change', {{bubbles: true}}));
