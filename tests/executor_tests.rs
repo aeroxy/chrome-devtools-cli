@@ -3,7 +3,7 @@
 mod tests {
     use chrome_devtools_cli::commands::executor;
     use chrome_devtools_cli::protocol::DaemonRequest;
-    use chrome_devtools_cli::result::{CommandResult, CommandTiming};
+    use chrome_devtools_cli::result::CommandResult;
     use serde_json::json;
 
     // TODO: Add mock CdpClient for executor integration tests.
