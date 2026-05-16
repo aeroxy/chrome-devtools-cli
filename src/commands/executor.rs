@@ -118,7 +118,14 @@ let result = match cmd {
             commands::snapshot::take_snapshot(client, &session_id, req.json_output, args.get("output").and_then(|v| v.as_str())).await
         }
         "resize" => match (args.get("width").and_then(|v| v.as_u64()), args.get("height").and_then(|v| v.as_u64())) {
-            (Some(w), Some(h)) => commands::pages::resize(client, &session_id, w as u32, h as u32).await,
+        "resize" => match (args.get("width").and_then(|v| v.as_u64()), args.get("height").and_then(|v| v.as_u64())) {
+            (Some(w), Some(h)) => {
+                let w: u32 = w.try_into().map_err(|_| anyhow!("width too large"))?;
+                let h: u32 = h.try_into().map_err(|_| anyhow!("height too large"))?;
+                commands::pages::resize(client, &session_id, w, h).await
+            }
+            _ => Err(anyhow!("width and height required")),
+        },
             _ => Err(anyhow!("width and height required")),
         },
         "wait-for" => match args.get("text").and_then(|v| v.as_str()) {
