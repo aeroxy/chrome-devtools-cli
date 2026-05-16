@@ -76,7 +76,7 @@ async fn go_back(client: &mut CdpClient, session_id: &str, output: Option<&str>)
     let result = CommandResult::output(format!("Navigated back to {url}"))
         .with_navigated_to(url.to_string());
     if let Some(path) = output {
-        std::fs::write(path, result.output.as_bytes())?;
+        tokio::fs::write(path, result.output.as_bytes()).await?;
         Ok(CommandResult::output(format!("Output saved to {path}")).with_navigated_to(url.to_string()))
     } else {
         Ok(result)
@@ -113,7 +113,7 @@ async fn go_forward(client: &mut CdpClient, session_id: &str, output: Option<&st
     let result = CommandResult::output(format!("Navigated forward to {url}"))
         .with_navigated_to(url.to_string());
     if let Some(path) = output {
-        std::fs::write(path, result.output.as_bytes())?;
+        tokio::fs::write(path, result.output.as_bytes()).await?;
         Ok(CommandResult::output(format!("Output saved to {path}")).with_navigated_to(url.to_string()))
     } else {
         Ok(result)
@@ -129,7 +129,7 @@ async fn do_reload(client: &mut CdpClient, session_id: &str, output: Option<&str
     let result = CommandResult::output("Reloaded page".to_string())
         .with_navigated_to(url.clone());
     if let Some(path) = output {
-        std::fs::write(path, result.output.as_bytes())?;
+        tokio::fs::write(path, result.output.as_bytes()).await?;
         Ok(CommandResult::output(format!("Output saved to {path}")).with_navigated_to(url))
     } else {
         Ok(result)

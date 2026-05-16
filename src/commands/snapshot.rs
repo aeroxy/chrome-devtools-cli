@@ -19,7 +19,7 @@ pub async fn take_snapshot(
 if as_json {
         let json = serde_json::to_string_pretty(&result)?;
         if let Some(path) = output {
-            fs::write(path, &json)?;
+            tokio::fs::write(path, &json).await?;
             return Ok(CommandResult::output(format!("Snapshot saved to {path}")));
         }
         return Ok(CommandResult::output(json));
@@ -47,14 +47,14 @@ if as_json {
             }
         }
         if let Some(path) = output {
-            fs::write(path, &out)?;
+            tokio::fs::write(path, &out).await?;
             return Ok(CommandResult::output(format!("Snapshot saved to {path}")));
         }
         Ok(CommandResult::output(out))
     } else {
         let json = serde_json::to_string_pretty(&result)?;
         if let Some(path) = output {
-            fs::write(path, &json)?;
+            tokio::fs::write(path, &json).await?;
             return Ok(CommandResult::output(format!("Snapshot saved to {path}")));
         }
         Ok(CommandResult::output(json))
