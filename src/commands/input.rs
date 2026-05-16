@@ -170,9 +170,9 @@ pub async fn fill(
     value: &str,
 ) -> Result<CommandResult> {
     let initial_url = client.current_url(session_id).await?;
-    let escaped_sel = selector.replace('\\', "\\\\").replace('\'', "\\'");
+    let escaped_sel = serde_json::to_string(selector)?;
     // Escape value for safely injecting into JS
-    let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
+    let escaped_val = serde_json::to_string(value)?;
 
     let expr = format!(
         r#"(() => {{
