@@ -1,4 +1,6 @@
 use anyhow::{bail, Result};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::time::{Duration, SystemTime};
 #[cfg(windows)]
 use tokio::net::TcpStream;
