@@ -7,6 +7,46 @@ use crate::friendly;
 use crate::protocol::DaemonRequest;
 use crate::result::CommandResult;
 
+/// Known arguments for each command. Used to detect and report unknown arguments.
+fn known_args(cmd: &str) -> &'static [&'static str] {
+    match cmd {
+        "navigate" => &["url", "back", "forward", "reload", "extra_headers", "output"],
+        "screenshot" => &["output", "format", "full_page"],
+        "evaluate" => &["expression", "dialog_action", "output", "track_navigation"],
+        "click" => &["selector"],
+        "click-at" => &["x", "y"],
+        "fill" => &["selector", "value"],
+        "type-text" => &["text", "submit_key"],
+        "press-key" => &["key"],
+        "hover" => &["selector"],
+        "snapshot" => &["output"],
+        "resize" => &["width", "height"],
+        "set-geolocation" => &["latitude", "longitude", "accuracy", "clear"],
+        "wait-for" => &["text", "timeout"],
+        "list-3p-tools" => &[],
+        "execute-3p-tool" => &["name", "params"],
+        _ => &[],
+    }
+}
+
+/// Check for unknown arguments and return an error message if any are found.
+fn validate_args(cmd: &str, args: &serde_json::Value) -> Result<()> {
+    let known = known_args(cmd);
+    if let Some(obj) = args.as_object() {
+        let unknown: Vec<&String> = obj.keys().filter(|k| !known.contains(&k.as_str())).collect();
+        if !unknown.is_empty() {
+            let unknown_names: Vec<&str> = unknown.iter().map(|s| s.as_str()).collect();
+            bail!(
+                "Unknown argument(s) for '{}': {}. Expected: {}",
+                cmd,
+                unknown_names.join(", "),
+                known.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Whether a command operates at the browser level (no page session needed).
 fn is_browser_level(cmd: &str) -> bool {
     matches!(
@@ -87,6 +127,8 @@ async fn inner_execute(
     let args = &req.args;
     let cmd = req.command.as_str();
 
+    validate_args(cmd, args)?;
+
     // Enable Page domain to receive dialog events for proactive rejection
     client
         .send_to_target(session_id, "Page.enable", json!({}))
@@ -110,6 +152,7 @@ async fn inner_execute(
                 args.get("reload")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                args.get("extra_headers").and_then(|v| v.as_str()),
                 args.get("output").and_then(|v| v.as_str()),
             )
             .await
@@ -202,6 +245,30 @@ async fn inner_execute(
             },
             _ => bail!("width and height required"),
         },
+        "set-geolocation" => {
+            let clear = args
+                .get("clear")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if clear {
+                commands::emulation::set_geolocation(client, session_id, None, None, None, true)
+                    .await
+            } else {
+                let lat = args
+                    .get("latitude")
+                    .and_then(|v| v.as_f64())
+                    .ok_or(anyhow!("latitude required (or use --clear)"))?;
+                let lon = args
+                    .get("longitude")
+                    .and_then(|v| v.as_f64())
+                    .ok_or(anyhow!("longitude required (or use --clear)"))?;
+                let acc = args.get("accuracy").and_then(|v| v.as_f64());
+                commands::emulation::set_geolocation(
+                    client, session_id, Some(lat), Some(lon), acc, false,
+                )
+                .await
+            }
+        }
         "wait-for" => match args.get("text").and_then(|v| v.as_str()) {
             Some(text) => {
                 let timeout = args

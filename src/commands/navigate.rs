@@ -11,8 +11,25 @@ pub async fn navigate(
     back: bool,
     forward: bool,
     reload: bool,
+    extra_headers: Option<&str>,
     output: Option<&str>,
 ) -> Result<CommandResult> {
+    // Apply extra HTTP headers if provided (before any navigation)
+    if let Some(headers_json) = extra_headers {
+        let headers: serde_json::Value = serde_json::from_str(headers_json)
+            .map_err(|e| anyhow::anyhow!("Invalid --extra-headers JSON: {e}"))?;
+        if !headers.is_object() {
+            anyhow::bail!("--extra-headers must be a JSON object");
+        }
+        client
+            .send_to_target(
+                session_id,
+                "Network.setExtraHTTPHeaders",
+                json!({"headers": headers}),
+            )
+            .await?;
+    }
+
     if back {
         return go_back(client, session_id, output).await;
     }

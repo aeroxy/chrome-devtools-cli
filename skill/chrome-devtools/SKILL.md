@@ -44,6 +44,7 @@ chrome-devtools navigate <url> -o /tmp/res.txt # Save success/result to file
 chrome-devtools navigate --back
 chrome-devtools navigate --forward
 chrome-devtools navigate --reload
+chrome-devtools navigate <url> --extra-headers '{"Authorization":"Bearer token"}'  # Set custom HTTP headers
 chrome-devtools new-page <url>          # Open new tab
 chrome-devtools close-page <index>
 chrome-devtools select-page <index>
@@ -83,6 +84,9 @@ chrome-devtools execute-3p-tool <name> '<json-params>' # Execute a custom tool
 ```bash
 chrome-devtools --target <name> wait-for "Success" --timeout 10000
 chrome-devtools --target <name> resize 1280 720
+chrome-devtools --target <name> set-geolocation --latitude 37.7749 --longitude -122.4194
+chrome-devtools --target <name> set-geolocation --latitude 37.7749 --longitude -122.4194 --accuracy 10
+chrome-devtools --target <name> set-geolocation --clear
 ```
 
 ## Global flags & Environment Variables

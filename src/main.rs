@@ -66,6 +66,9 @@ enum Commands {
         forward: bool,
         #[arg(long)]
         reload: bool,
+        /// Extra HTTP headers as a JSON object (e.g. '{"Authorization":"Bearer token"}')
+        #[arg(long)]
+        extra_headers: Option<String>,
         /// Write output to a file instead of stdout
         #[arg(long, short)]
         output: Option<String>,
@@ -150,6 +153,22 @@ enum Commands {
     /// Resize the page viewport
     Resize { width: u32, height: u32 },
 
+    /// Set geolocation override (latitude, longitude in degrees; accuracy in meters)
+    SetGeolocation {
+        /// Latitude in degrees
+        #[arg(long)]
+        latitude: Option<f64>,
+        /// Longitude in degrees
+        #[arg(long)]
+        longitude: Option<f64>,
+        /// Accuracy in meters (default: 100)
+        #[arg(long)]
+        accuracy: Option<f64>,
+        /// Clear geolocation override
+        #[arg(long)]
+        clear: bool,
+    },
+
     /// Wait for text to appear on the page
     WaitFor {
         text: String,
@@ -199,6 +218,7 @@ impl Cli {
             Commands::Hover { .. } => "hover",
             Commands::Snapshot { .. } => "snapshot",
             Commands::Resize { .. } => "resize",
+            Commands::SetGeolocation { .. } => "set-geolocation",
             Commands::WaitFor { .. } => "wait-for",
             Commands::List3pTools => "list-3p-tools",
             Commands::Execute3pTool { .. } => "execute-3p-tool",
@@ -249,10 +269,11 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             back,
             forward,
             reload,
+            extra_headers,
             output,
         } => (
             "navigate",
-            json!({"url": url, "back": back, "forward": forward, "reload": reload, "output": output}),
+            json!({"url": url, "back": back, "forward": forward, "reload": reload, "extra_headers": extra_headers, "output": output}),
         ),
         Commands::NewPage { url } => ("new-page", json!({"url": url})),
         Commands::ClosePage { index } => ("close-page", json!({"index": index})),
@@ -286,6 +307,15 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         Commands::Hover { selector } => ("hover", json!({"selector": selector})),
         Commands::Snapshot { output } => ("snapshot", json!({"output": output})),
         Commands::Resize { width, height } => ("resize", json!({"width": width, "height": height})),
+        Commands::SetGeolocation {
+            latitude,
+            longitude,
+            accuracy,
+            clear,
+        } => (
+            "set-geolocation",
+            json!({"latitude": latitude, "longitude": longitude, "accuracy": accuracy, "clear": clear}),
+        ),
         Commands::WaitFor { text, timeout } => {
             ("wait-for", json!({"text": text, "timeout": timeout}))
         }
@@ -451,6 +481,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             back,
             forward,
             reload,
+            extra_headers,
             output,
         } => {
             commands::navigate::navigate(
@@ -460,6 +491,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 *back,
                 *forward,
                 *reload,
+                extra_headers.as_deref(),
                 output.as_deref(),
             )
             .await
@@ -518,6 +550,22 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
         }
         Commands::Resize { width, height } => {
             commands::pages::resize(&mut client, &session_id, *width, *height).await
+        }
+        Commands::SetGeolocation {
+            latitude,
+            longitude,
+            accuracy,
+            clear,
+        } => {
+            commands::emulation::set_geolocation(
+                &mut client,
+                &session_id,
+                *latitude,
+                *longitude,
+                *accuracy,
+                *clear,
+            )
+            .await
         }
         Commands::WaitFor { text, timeout } => {
             commands::pages::wait_for(&mut client, &session_id, text, *timeout).await

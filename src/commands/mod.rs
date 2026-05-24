@@ -1,3 +1,4 @@
+pub mod emulation;
 pub mod evaluate;
 pub mod executor;
 pub mod input;
