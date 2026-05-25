@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde_json::json;
 use std::fmt::Write;
 
@@ -36,35 +36,49 @@ pub async fn list_pages(client: &mut CdpClient, as_json: bool) -> Result<Command
     }
 }
 
-pub async fn new_page(client: &mut CdpClient, url: &str) -> Result<CommandResult> {
-    let target_id = client.create_target(url).await?;
-    Ok(CommandResult::output(format!(
-        "Opened new page: {url} (target: {target_id})"
-    )))
+pub async fn new_page(
+    client: &mut CdpClient,
+    url: &str,
+    emulation: Option<crate::commands::emulation::EmulateParams>,
+) -> Result<CommandResult> {
+    if let Some(params) = emulation {
+        // Create an empty page first so we can apply emulation before it loads the real URL
+        let target_id = client.create_target("about:blank").await?;
+        let session_id = client.attach_to_target(&target_id).await?;
+
+        // Apply emulation to the new session
+        crate::commands::emulation::emulate(client, &session_id, params, false).await?;
+
+        // Now navigate to the real URL
+        client
+            .send_to_target(&session_id, "Page.navigate", json!({ "url": url }))
+            .await?;
+
+        // Optional: wait for load (consistent with navigate command)
+        // Since we don't have wait_for_load easily available here (it's in navigate.rs),
+        // we'll just return. The user can wait-for if needed.
+
+        let _ = client.detach_from_target(&session_id).await;
+
+        Ok(CommandResult::output(format!(
+            "Opened new page with emulation: {url} (target: {target_id})"
+        )))
+    } else {
+        let target_id = client.create_target(url).await?;
+        Ok(CommandResult::output(format!(
+            "Opened new page: {url} (target: {target_id})"
+        )))
+    }
 }
 
-pub async fn close_page(client: &mut CdpClient, index: usize) -> Result<CommandResult> {
-    let pages = client.get_page_targets().await?;
-    let page = pages
-        .get(index)
-        .ok_or_else(|| anyhow!("No page at index {index} (have {} pages)", pages.len()))?;
-    client.close_target(&page.target_id).await?;
-    Ok(CommandResult::output(format!(
-        "Closed page [{index}]: {}",
-        page.url
-    )))
+pub async fn close_page(client: &mut CdpClient, target_id: &str) -> Result<CommandResult> {
+    client.close_target(target_id).await?;
+    Ok(CommandResult::output(format!("Closed page: {target_id}")))
 }
 
-pub async fn select_page(client: &mut CdpClient, index: usize) -> Result<CommandResult> {
-    let pages = client.get_page_targets().await?;
-    let page = pages
-        .get(index)
-        .ok_or_else(|| anyhow!("No page at index {index} (have {} pages)", pages.len()))?;
-    client.activate_target(&page.target_id).await?;
-    Ok(CommandResult::output(format!(
-        "Activated page [{index}]: {} — {}",
-        page.title, page.url
-    )))
+pub async fn select_page(client: &mut CdpClient, target_id: &str) -> Result<CommandResult> {
+    client.activate_target(target_id).await?;
+    Ok(CommandResult::output(format!("Activated page: {target_id}")))
 }
 
 pub async fn wait_for(

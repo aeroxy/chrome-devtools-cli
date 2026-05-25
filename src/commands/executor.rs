@@ -11,10 +11,10 @@ use crate::result::CommandResult;
 fn known_args(cmd: &str) -> &'static [&'static str] {
     match cmd {
         "list-pages" => &[],
-        "new-page" => &["url"],
+        "new-page" => &["url", "viewport", "geolocation", "accuracy"],
         "close-page" => &["index"],
         "select-page" => &["index"],
-        "navigate" => &["url", "back", "forward", "reload", "extra_headers", "latitude", "longitude", "accuracy", "clear_geolocation", "output"],
+        "navigate" => &["url", "back", "forward", "reload", "extra_headers", "viewport", "geolocation", "accuracy", "clear_all", "output"],
         "screenshot" => &["output", "format", "full_page"],
         "evaluate" => &["expression", "dialog_action", "output", "track_navigation"],
         "click" => &["selector"],
@@ -61,17 +61,8 @@ fn validate_args(cmd: &str, args: &serde_json::Value) -> Result<()> {
 fn is_browser_level(cmd: &str) -> bool {
     matches!(
         cmd,
-        "list-pages" | "new-page" | "close-page" | "select-page"
+        "list-pages" | "new-page"
     )
-}
-
-/// Extract a page index from request args, validating that it's present and fits usize.
-fn parse_page_index(args: &serde_json::Value) -> Result<usize> {
-    args.get("index")
-        .and_then(|v| v.as_u64())
-        .ok_or(anyhow!("index required"))?
-        .try_into()
-        .map_err(|_| anyhow!("index too large"))
 }
 
 /// Execute a single command from a [`DaemonRequest`].
@@ -97,15 +88,24 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                     .get("url")
                     .and_then(|v| v.as_str())
                     .ok_or(anyhow!("url required"))?;
-                commands::pages::new_page(client, url).await
-            }
-            "close-page" => {
-                let index = parse_page_index(args)?;
-                commands::pages::close_page(client, index).await
-            }
-            "select-page" => {
-                let index = parse_page_index(args)?;
-                commands::pages::select_page(client, index).await
+
+                let viewport = args.get("viewport").and_then(|v| v.as_str());
+                let geolocation = args.get("geolocation").and_then(|v| v.as_str());
+
+                let params = if viewport.is_some() || geolocation.is_some() {
+                    Some(commands::emulation::EmulateParams {
+                        viewport: viewport.map(|s| s.to_string()),
+                        geolocation: geolocation.map(|s| s.to_string()),
+                        accuracy: args.get("accuracy").and_then(|v| v.as_f64()),
+                        clear_viewport: false,
+                        clear_geolocation: false,
+                        clear_all: false,
+                    })
+                } else {
+                    None
+                };
+
+                commands::pages::new_page(client, url, params).await
             }
             _ => unreachable!(),
         };
@@ -114,6 +114,16 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     // Page-level: resolve and attach to target
     let target = client.resolve_page(req.target.as_deref(), req.page).await?;
     let target_id = target.target_id.clone();
+
+    // Special case for commands that target a page but don't need a session
+    if cmd == "close-page" || cmd == "select-page" {
+        return match cmd {
+            "close-page" => commands::pages::close_page(client, &target_id).await,
+            "select-page" => commands::pages::select_page(client, &target_id).await,
+            _ => unreachable!(),
+        };
+    }
+
     let session_id = client.attach_to_target(&target_id).await?;
 
     let result = inner_execute(client, &session_id, req).await;
@@ -151,6 +161,28 @@ async fn inner_execute(
 
     match cmd {
         "navigate" => {
+            // Apply emulation before navigation if requested
+            let viewport = args.get("viewport").and_then(|v| v.as_str());
+            let geolocation = args.get("geolocation").and_then(|v| v.as_str());
+            let clear_all = args.get("clear_all").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            if viewport.is_some() || geolocation.is_some() || clear_all {
+                commands::emulation::emulate(
+                    client,
+                    session_id,
+                    commands::emulation::EmulateParams {
+                        viewport: viewport.map(|s| s.to_string()),
+                        geolocation: geolocation.map(|s| s.to_string()),
+                        accuracy: args.get("accuracy").and_then(|v| v.as_f64()),
+                        clear_viewport: false,
+                        clear_geolocation: false,
+                        clear_all,
+                    },
+                    false, // hide emulation feedback during navigate
+                )
+                .await?;
+            }
+
             commands::navigate::navigate(
                 client,
                 session_id,
@@ -163,12 +195,6 @@ async fn inner_execute(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
                 args.get("extra_headers").and_then(|v| v.as_str()),
-                args.get("latitude").and_then(|v| v.as_f64()),
-                args.get("longitude").and_then(|v| v.as_f64()),
-                args.get("accuracy").and_then(|v| v.as_f64()),
-                args.get("clear_geolocation")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
                 args.get("output").and_then(|v| v.as_str()),
             )
             .await
@@ -252,19 +278,15 @@ async fn inner_execute(
             commands::emulation::emulate(
                 client,
                 session_id,
+                commands::emulation::EmulateParams {
+                    viewport: args.get("viewport").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    geolocation: args.get("geolocation").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    accuracy: args.get("accuracy").and_then(|v| v.as_f64()),
+                    clear_viewport: args.get("clear_viewport").and_then(|v| v.as_bool()).unwrap_or(false),
+                    clear_geolocation: args.get("clear_geolocation").and_then(|v| v.as_bool()).unwrap_or(false),
+                    clear_all: args.get("clear_all").and_then(|v| v.as_bool()).unwrap_or(false),
+                },
                 req.json_output,
-                args.get("viewport").and_then(|v| v.as_str()),
-                args.get("geolocation").and_then(|v| v.as_str()),
-                args.get("accuracy").and_then(|v| v.as_f64()),
-                args.get("clear_viewport")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                args.get("clear_geolocation")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                args.get("clear_all")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
             )
             .await
         }

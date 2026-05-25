@@ -69,18 +69,18 @@ enum Commands {
         /// Extra HTTP headers as a JSON object (e.g. '{"Authorization":"Bearer token"}')
         #[arg(long)]
         extra_headers: Option<String>,
-        /// Geolocation latitude in degrees (requires --longitude)
+        /// Set viewport size as WxH (e.g. 1280x720)
         #[arg(long)]
-        latitude: Option<f64>,
-        /// Geolocation longitude in degrees (requires --latitude)
+        viewport: Option<String>,
+        /// Set geolocation as lat,lon (e.g. 37.77,-122.41)
         #[arg(long)]
-        longitude: Option<f64>,
+        geolocation: Option<String>,
         /// Geolocation accuracy in meters (default: 100)
         #[arg(long)]
         accuracy: Option<f64>,
-        /// Clear geolocation override
+        /// Clear all emulation overrides
         #[arg(long)]
-        clear_geolocation: bool,
+        clear_all: bool,
         /// Write output to a file instead of stdout
         #[arg(long, short)]
         output: Option<String>,
@@ -90,19 +90,22 @@ enum Commands {
     NewPage {
         /// URL to open
         url: String,
+        /// Set viewport size as WxH (e.g. 1280x720)
+        #[arg(long)]
+        viewport: Option<String>,
+        /// Set geolocation as lat,lon (e.g. 37.77,-122.41)
+        #[arg(long)]
+        geolocation: Option<String>,
+        /// Geolocation accuracy in meters (default: 100)
+        #[arg(long)]
+        accuracy: Option<f64>,
     },
 
-    /// Close a page/tab by index
-    ClosePage {
-        /// Page index (from list-pages)
-        index: usize,
-    },
+    /// Close a page/tab
+    ClosePage,
 
     /// Bring a page to front
-    SelectPage {
-        /// Page index (from list-pages)
-        index: usize,
-    },
+    SelectPage,
 
     /// Take a screenshot
     Screenshot {
@@ -162,15 +165,17 @@ enum Commands {
         output: Option<String>,
     },
 
-    /// Get or set emulated page parameters (viewport, geolocation)
+    /// Manage page emulation (viewport, geolocation, etc.)
+    ///
+    /// No arguments: show active overrides.
     Emulate {
         /// Set viewport size as WxH (e.g. 1280x720)
         #[arg(long)]
         viewport: Option<String>,
-        /// Set geolocation as lat,lon (e.g. 37.7749,-122.4194)
+        /// Set geolocation as lat,lon (e.g. 37.77,-122.41)
         #[arg(long)]
         geolocation: Option<String>,
-        /// Geolocation accuracy in meters (default: 100, used with --geolocation)
+        /// Geolocation accuracy in meters (default: 100)
         #[arg(long)]
         accuracy: Option<f64>,
         /// Clear viewport override
@@ -208,10 +213,7 @@ impl Cli {
     fn is_browser_level(&self) -> bool {
         matches!(
             self.command,
-            Commands::ListPages
-                | Commands::NewPage { .. }
-                | Commands::ClosePage { .. }
-                | Commands::SelectPage { .. }
+            Commands::ListPages | Commands::NewPage { .. }
         )
     }
 
@@ -284,18 +286,42 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             forward,
             reload,
             extra_headers,
-            latitude,
-            longitude,
+            viewport,
+            geolocation,
             accuracy,
-            clear_geolocation,
+            clear_all,
             output,
         } => (
             "navigate",
-            json!({"url": url, "back": back, "forward": forward, "reload": reload, "extra_headers": extra_headers, "latitude": latitude, "longitude": longitude, "accuracy": accuracy, "clear_geolocation": clear_geolocation, "output": output}),
+            json!({
+                "url": url,
+                "back": back,
+                "forward": forward,
+                "reload": reload,
+                "extra_headers": extra_headers,
+                "viewport": viewport,
+                "geolocation": geolocation,
+                "accuracy": accuracy,
+                "clear_all": clear_all,
+                "output": output
+            }),
         ),
-        Commands::NewPage { url } => ("new-page", json!({"url": url})),
-        Commands::ClosePage { index } => ("close-page", json!({"index": index})),
-        Commands::SelectPage { index } => ("select-page", json!({"index": index})),
+        Commands::NewPage {
+            url,
+            viewport,
+            geolocation,
+            accuracy,
+        } => (
+            "new-page",
+            json!({
+                "url": url,
+                "viewport": viewport,
+                "geolocation": geolocation,
+                "accuracy": accuracy
+            }),
+        ),
+        Commands::ClosePage => ("close-page", json!({})),
+        Commands::SelectPage => ("select-page", json!({})),
         Commands::Screenshot {
             output,
             format,
@@ -477,10 +503,25 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
     if is_browser {
         return match &cli.command {
             Commands::ListPages => commands::pages::list_pages(&mut client, cli.json).await,
-            Commands::NewPage { url } => commands::pages::new_page(&mut client, url).await,
-            Commands::ClosePage { index } => commands::pages::close_page(&mut client, *index).await,
-            Commands::SelectPage { index } => {
-                commands::pages::select_page(&mut client, *index).await
+            Commands::NewPage {
+                url,
+                viewport,
+                geolocation,
+                accuracy,
+            } => {
+                let params = if viewport.is_some() || geolocation.is_some() {
+                    Some(commands::emulation::EmulateParams {
+                        viewport: viewport.clone(),
+                        geolocation: geolocation.clone(),
+                        accuracy: *accuracy,
+                        clear_viewport: false,
+                        clear_geolocation: false,
+                        clear_all: false,
+                    })
+                } else {
+                    None
+                };
+                commands::pages::new_page(&mut client, url, params).await
             }
             _ => unreachable!(),
         };
@@ -488,6 +529,16 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
 
     let target = client.resolve_page(cli.target.as_deref(), cli.page).await?;
     let target_id = target.target_id.clone();
+
+    // Special case for browser-level commands that target a specific page but don't need a session
+    if matches!(cli.command, Commands::ClosePage | Commands::SelectPage) {
+        return match &cli.command {
+            Commands::ClosePage => commands::pages::close_page(&mut client, &target_id).await,
+            Commands::SelectPage => commands::pages::select_page(&mut client, &target_id).await,
+            _ => unreachable!(),
+        };
+    }
+
     let session_id = client.attach_to_target(&target_id).await?;
 
     // Enable Page domain to receive dialog events for proactive rejection
@@ -510,12 +561,30 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             forward,
             reload,
             extra_headers,
-            latitude,
-            longitude,
+            viewport,
+            geolocation,
             accuracy,
-            clear_geolocation,
+            clear_all,
             output,
         } => {
+            // Apply emulation before navigation if requested
+            if viewport.is_some() || geolocation.is_some() || *clear_all {
+                commands::emulation::emulate(
+                    &mut client,
+                    &session_id,
+                    commands::emulation::EmulateParams {
+                        viewport: viewport.clone(),
+                        geolocation: geolocation.clone(),
+                        accuracy: *accuracy,
+                        clear_viewport: false,
+                        clear_geolocation: false,
+                        clear_all: *clear_all,
+                    },
+                    false, // hide emulation feedback during navigate
+                )
+                .await?;
+            }
+
             commands::navigate::navigate(
                 &mut client,
                 &session_id,
@@ -524,13 +593,29 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 *forward,
                 *reload,
                 extra_headers.as_deref(),
-                *latitude,
-                *longitude,
-                *accuracy,
-                *clear_geolocation,
                 output.as_deref(),
             )
             .await
+        }
+        Commands::NewPage {
+            url,
+            viewport,
+            geolocation,
+            accuracy,
+        } => {
+            let params = if viewport.is_some() || geolocation.is_some() {
+                Some(commands::emulation::EmulateParams {
+                    viewport: viewport.clone(),
+                    geolocation: geolocation.clone(),
+                    accuracy: *accuracy,
+                    clear_viewport: false,
+                    clear_geolocation: false,
+                    clear_all: false,
+                })
+            } else {
+                None
+            };
+            commands::pages::new_page(&mut client, url, params).await
         }
         Commands::Screenshot {
             output,
@@ -595,13 +680,15 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             commands::emulation::emulate(
                 &mut client,
                 &session_id,
+                commands::emulation::EmulateParams {
+                    viewport: viewport.clone(),
+                    geolocation: geolocation.clone(),
+                    accuracy: *accuracy,
+                    clear_viewport: *clear_viewport,
+                    clear_geolocation: *clear_geolocation,
+                    clear_all: *clear_all,
+                },
                 cli.json,
-                viewport.as_deref(),
-                geolocation.as_deref(),
-                *accuracy,
-                *clear_viewport,
-                *clear_geolocation,
-                *clear_all,
             )
             .await
         }
