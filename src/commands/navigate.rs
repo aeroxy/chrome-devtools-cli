@@ -12,6 +12,10 @@ pub async fn navigate(
     forward: bool,
     reload: bool,
     extra_headers: Option<&str>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    accuracy: Option<f64>,
+    clear_geolocation: bool,
     output: Option<&str>,
 ) -> Result<CommandResult> {
     // Validate navigation intent before mutating session state
@@ -19,18 +23,54 @@ pub async fn navigate(
         bail!("URL required (or use --back, --forward, --reload)");
     }
 
-    // Apply extra HTTP headers if provided
-    if let Some(headers_json) = extra_headers {
-        let headers: serde_json::Value = serde_json::from_str(headers_json)
-            .map_err(|e| anyhow::anyhow!("Invalid --extra-headers JSON: {e}"))?;
-        if !headers.is_object() {
-            anyhow::bail!("--extra-headers must be a JSON object");
+    // Apply geolocation override if requested (same session as navigation)
+    if clear_geolocation {
+        client
+            .send_to_target(session_id, "Emulation.clearGeolocationOverride", json!({}))
+            .await?;
+    } else if latitude.is_some() || longitude.is_some() {
+        let lat = latitude.ok_or_else(|| anyhow::anyhow!("--latitude required with --longitude"))?;
+        let lon =
+            longitude.ok_or_else(|| anyhow::anyhow!("--longitude required with --latitude"))?;
+        let acc = accuracy.unwrap_or(100.0);
+        if !(-90.0..=90.0).contains(&lat) {
+            bail!("latitude must be between -90 and 90");
+        }
+        if !(-180.0..=180.0).contains(&lon) {
+            bail!("longitude must be between -180 and 180");
+        }
+        if !acc.is_finite() || acc < 0.0 {
+            bail!("accuracy must be a non-negative finite number");
         }
         client
             .send_to_target(
                 session_id,
+                "Emulation.setGeolocationOverride",
+                json!({"latitude": lat, "longitude": lon, "accuracy": acc}),
+            )
+            .await?;
+    }
+
+    // Apply extra HTTP headers if provided
+    if let Some(headers_json) = extra_headers {
+        let headers: serde_json::Value = serde_json::from_str(headers_json)
+            .map_err(|e| anyhow::anyhow!("Invalid --extra-headers JSON: {e}"))?;
+        let headers_obj = headers
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("--extra-headers must be a JSON object"))?;
+        for (k, v) in headers_obj {
+            if !v.is_string() {
+                anyhow::bail!("Header value for '{}' must be a string", k);
+            }
+        }
+        client
+            .send_to_target(session_id, "Network.enable", json!({}))
+            .await?;
+        client
+            .send_to_target(
+                session_id,
                 "Network.setExtraHTTPHeaders",
-                json!({"headers": headers}),
+                json!({"headers": headers_obj}),
             )
             .await?;
     }
