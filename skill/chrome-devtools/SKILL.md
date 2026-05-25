@@ -45,6 +45,9 @@ chrome-devtools navigate --back
 chrome-devtools navigate --forward
 chrome-devtools navigate --reload
 chrome-devtools navigate <url> --extra-headers '{"Authorization":"Bearer token"}'  # Set custom HTTP headers
+chrome-devtools navigate <url> --latitude 37.7749 --longitude -122.4194            # Set geolocation then navigate
+chrome-devtools navigate <url> --latitude 37.7749 --longitude -122.4194 --accuracy 10
+chrome-devtools navigate <url> --clear-geolocation                                  # Clear geolocation override
 chrome-devtools new-page <url>          # Open new tab
 chrome-devtools close-page <index>
 chrome-devtools select-page <index>
@@ -83,10 +86,16 @@ chrome-devtools execute-3p-tool <name> '<json-params>' # Execute a custom tool
 ### Utilities
 ```bash
 chrome-devtools --target <name> wait-for "Success" --timeout 10000
-chrome-devtools --target <name> resize 1280 720
-chrome-devtools --target <name> set-geolocation --latitude 37.7749 --longitude -122.4194
-chrome-devtools --target <name> set-geolocation --latitude 37.7749 --longitude -122.4194 --accuracy 10
-chrome-devtools --target <name> set-geolocation --clear
+
+# Emulation — page-based overrides (persist until cleared or page closed)
+chrome-devtools --target <name> emulate                              # Show active overrides
+chrome-devtools --target <name> emulate --viewport 1280x720          # Set viewport
+chrome-devtools --target <name> emulate --geolocation 37.77,-122.41  # Set geolocation
+chrome-devtools --target <name> emulate --geolocation 37.77,-122.41 --accuracy 10
+chrome-devtools --target <name> emulate --viewport 1280x720 --geolocation 37.77,-122.41
+chrome-devtools --target <name> emulate --clear-viewport             # Clear viewport
+chrome-devtools --target <name> emulate --clear-geolocation          # Clear geolocation
+chrome-devtools --target <name> emulate --clear-all                  # Clear everything
 ```
 
 ## Global flags & Environment Variables

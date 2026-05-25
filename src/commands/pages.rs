@@ -67,29 +67,6 @@ pub async fn select_page(client: &mut CdpClient, index: usize) -> Result<Command
     )))
 }
 
-pub async fn resize(
-    client: &mut CdpClient,
-    session_id: &str,
-    width: u32,
-    height: u32,
-) -> Result<CommandResult> {
-    client
-        .send_to_target(
-            session_id,
-            "Emulation.setDeviceMetricsOverride",
-            json!({
-                "width": width,
-                "height": height,
-                "deviceScaleFactor": 1,
-                "mobile": false,
-            }),
-        )
-        .await?;
-    Ok(CommandResult::output(format!(
-        "Resized viewport to {width}x{height}"
-    )))
-}
-
 pub async fn wait_for(
     client: &mut CdpClient,
     session_id: &str,

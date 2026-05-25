@@ -14,7 +14,7 @@ fn known_args(cmd: &str) -> &'static [&'static str] {
         "new-page" => &["url"],
         "close-page" => &["index"],
         "select-page" => &["index"],
-        "navigate" => &["url", "back", "forward", "reload", "extra_headers", "output"],
+        "navigate" => &["url", "back", "forward", "reload", "extra_headers", "latitude", "longitude", "accuracy", "clear_geolocation", "output"],
         "screenshot" => &["output", "format", "full_page"],
         "evaluate" => &["expression", "dialog_action", "output", "track_navigation"],
         "click" => &["selector"],
@@ -24,8 +24,7 @@ fn known_args(cmd: &str) -> &'static [&'static str] {
         "press-key" => &["key"],
         "hover" => &["selector"],
         "snapshot" => &["output"],
-        "resize" => &["width", "height"],
-        "set-geolocation" => &["latitude", "longitude", "accuracy", "clear"],
+        "emulate" => &["viewport", "geolocation", "accuracy", "clear_viewport", "clear_geolocation", "clear_all"],
         "wait-for" => &["text", "timeout"],
         "list-3p-tools" => &[],
         "execute-3p-tool" => &["name", "params"],
@@ -164,6 +163,12 @@ async fn inner_execute(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
                 args.get("extra_headers").and_then(|v| v.as_str()),
+                args.get("latitude").and_then(|v| v.as_f64()),
+                args.get("longitude").and_then(|v| v.as_f64()),
+                args.get("accuracy").and_then(|v| v.as_f64()),
+                args.get("clear_geolocation")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 args.get("output").and_then(|v| v.as_str()),
             )
             .await
@@ -243,27 +248,23 @@ async fn inner_execute(
             )
             .await
         }
-        "resize" => match (
-            args.get("width").and_then(|v| v.as_u64()),
-            args.get("height").and_then(|v| v.as_u64()),
-        ) {
-            (Some(w), Some(h)) => match (w.try_into(), h.try_into()) {
-                (Ok(w_val), Ok(h_val)) => {
-                    commands::pages::resize(client, session_id, w_val, h_val).await
-                }
-                (Err(_), _) => bail!("width too large"),
-                (_, Err(_)) => bail!("height too large"),
-            },
-            _ => bail!("width and height required"),
-        },
-        "set-geolocation" => {
-            commands::emulation::set_geolocation(
+        "emulate" => {
+            commands::emulation::emulate(
                 client,
                 session_id,
-                args.get("latitude").and_then(|v| v.as_f64()),
-                args.get("longitude").and_then(|v| v.as_f64()),
+                req.json_output,
+                args.get("viewport").and_then(|v| v.as_str()),
+                args.get("geolocation").and_then(|v| v.as_str()),
                 args.get("accuracy").and_then(|v| v.as_f64()),
-                args.get("clear").and_then(|v| v.as_bool()).unwrap_or(false),
+                args.get("clear_viewport")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                args.get("clear_geolocation")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                args.get("clear_all")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             )
             .await
         }

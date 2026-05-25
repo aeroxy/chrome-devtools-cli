@@ -155,8 +155,13 @@ These commands interact with tools injected into the page via `window.__dtmcp.to
 
 | Command | Description |
 |---------|-------------|
-| `resize <w> <h>` | Set viewport size |
+| `emulate` | Get/set page-based emulation overrides (viewport, geolocation) |
+| `emulate --viewport 1280x720` | Set viewport size (page-based, persists) |
+| `emulate --geolocation 37.77,-122.41` | Set geolocation (page-based, persists) |
+| `emulate --clear-all` | Clear all emulation overrides |
 | `wait-for <text> [--timeout ms]` | Wait for text to appear (default 30s) |
+
+`emulate` with no flags shows all active overrides. Viewport and geolocation overrides are **page-based** — they persist until cleared or the page is closed.
 
 ## Global options
 
@@ -191,11 +196,12 @@ src/
 ├── friendly.rs     # Target ID → word-pair names
 └── commands/
     ├── navigate.rs
-    ├── pages.rs    # list/new/close/select/resize/wait-for
+    ├── pages.rs    # list/new/close/select/wait-for
     ├── screenshot.rs
     ├── evaluate.rs
     ├── input.rs    # click/fill/type/press/hover
     ├── snapshot.rs
+    ├── emulation.rs # emulate (viewport/geolocation get/set/clear)
     └── third_party.rs  # list-3p-tools/execute-3p-tool
 ```
 

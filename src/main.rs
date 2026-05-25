@@ -69,6 +69,18 @@ enum Commands {
         /// Extra HTTP headers as a JSON object (e.g. '{"Authorization":"Bearer token"}')
         #[arg(long)]
         extra_headers: Option<String>,
+        /// Geolocation latitude in degrees (requires --longitude)
+        #[arg(long)]
+        latitude: Option<f64>,
+        /// Geolocation longitude in degrees (requires --latitude)
+        #[arg(long)]
+        longitude: Option<f64>,
+        /// Geolocation accuracy in meters (default: 100)
+        #[arg(long)]
+        accuracy: Option<f64>,
+        /// Clear geolocation override
+        #[arg(long)]
+        clear_geolocation: bool,
         /// Write output to a file instead of stdout
         #[arg(long, short)]
         output: Option<String>,
@@ -150,23 +162,26 @@ enum Commands {
         output: Option<String>,
     },
 
-    /// Resize the page viewport
-    Resize { width: u32, height: u32 },
-
-    /// Set geolocation override (latitude, longitude in degrees; accuracy in meters)
-    SetGeolocation {
-        /// Latitude in degrees
+    /// Get or set emulated page parameters (viewport, geolocation)
+    Emulate {
+        /// Set viewport size as WxH (e.g. 1280x720)
         #[arg(long)]
-        latitude: Option<f64>,
-        /// Longitude in degrees
+        viewport: Option<String>,
+        /// Set geolocation as lat,lon (e.g. 37.7749,-122.4194)
         #[arg(long)]
-        longitude: Option<f64>,
-        /// Accuracy in meters (default: 100)
+        geolocation: Option<String>,
+        /// Geolocation accuracy in meters (default: 100, used with --geolocation)
         #[arg(long)]
         accuracy: Option<f64>,
+        /// Clear viewport override
+        #[arg(long)]
+        clear_viewport: bool,
         /// Clear geolocation override
         #[arg(long)]
-        clear: bool,
+        clear_geolocation: bool,
+        /// Clear all emulation overrides
+        #[arg(long)]
+        clear_all: bool,
     },
 
     /// Wait for text to appear on the page
@@ -217,8 +232,7 @@ impl Cli {
             Commands::PressKey { .. } => "press-key",
             Commands::Hover { .. } => "hover",
             Commands::Snapshot { .. } => "snapshot",
-            Commands::Resize { .. } => "resize",
-            Commands::SetGeolocation { .. } => "set-geolocation",
+            Commands::Emulate { .. } => "emulate",
             Commands::WaitFor { .. } => "wait-for",
             Commands::List3pTools => "list-3p-tools",
             Commands::Execute3pTool { .. } => "execute-3p-tool",
@@ -270,10 +284,14 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             forward,
             reload,
             extra_headers,
+            latitude,
+            longitude,
+            accuracy,
+            clear_geolocation,
             output,
         } => (
             "navigate",
-            json!({"url": url, "back": back, "forward": forward, "reload": reload, "extra_headers": extra_headers, "output": output}),
+            json!({"url": url, "back": back, "forward": forward, "reload": reload, "extra_headers": extra_headers, "latitude": latitude, "longitude": longitude, "accuracy": accuracy, "clear_geolocation": clear_geolocation, "output": output}),
         ),
         Commands::NewPage { url } => ("new-page", json!({"url": url})),
         Commands::ClosePage { index } => ("close-page", json!({"index": index})),
@@ -306,15 +324,16 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         Commands::PressKey { key } => ("press-key", json!({"key": key})),
         Commands::Hover { selector } => ("hover", json!({"selector": selector})),
         Commands::Snapshot { output } => ("snapshot", json!({"output": output})),
-        Commands::Resize { width, height } => ("resize", json!({"width": width, "height": height})),
-        Commands::SetGeolocation {
-            latitude,
-            longitude,
+        Commands::Emulate {
+            viewport,
+            geolocation,
             accuracy,
-            clear,
+            clear_viewport,
+            clear_geolocation,
+            clear_all,
         } => (
-            "set-geolocation",
-            json!({"latitude": latitude, "longitude": longitude, "accuracy": accuracy, "clear": clear}),
+            "emulate",
+            json!({"viewport": viewport, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all}),
         ),
         Commands::WaitFor { text, timeout } => {
             ("wait-for", json!({"text": text, "timeout": timeout}))
@@ -379,8 +398,17 @@ async fn run() -> Result<()> {
             let clean_err = err_str.replace("For more information, try '--help'.", "");
             eprintln!("{}", clean_err.trim_end());
             println!();
+
+            // Show subcommand-specific help when the error is about a subcommand's args
             let mut cmd = Cli::command();
-            let _ = cmd.print_help();
+            let sub = std::env::args()
+                .skip(1)
+                .find(|a| !a.starts_with('-'))
+                .and_then(|name| cmd.find_subcommand_mut(&name));
+            match sub {
+                Some(sub_cmd) => { let _ = sub_cmd.print_help(); }
+                None => { let _ = cmd.print_help(); }
+            }
             std::process::exit(1);
         }
     };
@@ -482,6 +510,10 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             forward,
             reload,
             extra_headers,
+            latitude,
+            longitude,
+            accuracy,
+            clear_geolocation,
             output,
         } => {
             commands::navigate::navigate(
@@ -492,6 +524,10 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 *forward,
                 *reload,
                 extra_headers.as_deref(),
+                *latitude,
+                *longitude,
+                *accuracy,
+                *clear_geolocation,
                 output.as_deref(),
             )
             .await
@@ -548,22 +584,24 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             commands::snapshot::take_snapshot(&mut client, &session_id, cli.json, output.as_deref())
                 .await
         }
-        Commands::Resize { width, height } => {
-            commands::pages::resize(&mut client, &session_id, *width, *height).await
-        }
-        Commands::SetGeolocation {
-            latitude,
-            longitude,
+        Commands::Emulate {
+            viewport,
+            geolocation,
             accuracy,
-            clear,
+            clear_viewport,
+            clear_geolocation,
+            clear_all,
         } => {
-            commands::emulation::set_geolocation(
+            commands::emulation::emulate(
                 &mut client,
                 &session_id,
-                *latitude,
-                *longitude,
+                cli.json,
+                viewport.as_deref(),
+                geolocation.as_deref(),
                 *accuracy,
-                *clear,
+                *clear_viewport,
+                *clear_geolocation,
+                *clear_all,
             )
             .await
         }
