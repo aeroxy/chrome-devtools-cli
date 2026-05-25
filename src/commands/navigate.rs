@@ -1,7 +1,8 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use crate::cdp::CdpClient;
+use crate::constants::NAVIGATION_TIMEOUT_MS;
 use crate::result::CommandResult;
 
 pub async fn navigate(
@@ -63,7 +64,7 @@ pub async fn navigate(
         bail!("Navigation error: {err}");
     }
 
-    wait_for_load(client, session_id, 30_000).await?;
+    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS).await?;
     let result =
         CommandResult::output(format!("Navigated to {url}")).with_navigated_to(url.to_string());
     Ok(result.save_output(output).await?)
@@ -98,7 +99,7 @@ async fn go_back(
         )
         .await?;
 
-    wait_for_load(client, session_id, 30_000).await?;
+    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS).await?;
     let url = prev_entry["url"].as_str().unwrap_or("unknown");
     let result = CommandResult::output(format!("Navigated back to {url}"))
         .with_navigated_to(url.to_string());
@@ -134,7 +135,7 @@ async fn go_forward(
         )
         .await?;
 
-    wait_for_load(client, session_id, 30_000).await?;
+    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS).await?;
     let url = next_entry["url"].as_str().unwrap_or("unknown");
     let result = CommandResult::output(format!("Navigated forward to {url}"))
         .with_navigated_to(url.to_string());
@@ -149,7 +150,7 @@ async fn do_reload(
     client
         .send_to_target(session_id, "Page.reload", json!({}))
         .await?;
-    wait_for_load(client, session_id, 30_000).await?;
+    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS).await?;
     let url = client.current_url(session_id).await?;
     let result = CommandResult::output("Reloaded page".to_string()).with_navigated_to(url.clone());
     Ok(result.save_output(output).await?.with_navigated_to(url))
@@ -177,9 +178,14 @@ pub async fn wait_for_load(client: &mut CdpClient, session_id: &str, timeout_ms:
             )
             .await;
 
-        if let Ok(val) = result {
-            if val["result"]["value"].as_str() == Some("complete") {
-                return Ok(());
+        match result {
+            Ok(val) => {
+                if val["result"]["value"].as_str() == Some("complete") {
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                return Err(anyhow!("wait_for_load failed for session {session_id}: {e}"));
             }
         }
 

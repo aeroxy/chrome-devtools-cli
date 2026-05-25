@@ -3,6 +3,7 @@ use serde_json::json;
 use std::fmt::Write;
 
 use crate::cdp::CdpClient;
+use crate::constants::NAVIGATION_TIMEOUT_MS;
 use crate::friendly;
 use crate::result::CommandResult;
 
@@ -49,11 +50,14 @@ pub async fn new_page(
         // Use a block to ensure detachment and closure occurs even if emulation or navigation fails
         let result: Result<()> = async {
             crate::commands::emulation::emulate(client, &session_id, params).await?;
-            client
+            let nav_result = client
                 .send_to_target(&session_id, "Page.navigate", json!({ "url": url }))
                 .await?;
+            if let Some(error_text) = nav_result.get("errorText").and_then(|v| v.as_str()) {
+                anyhow::bail!("Page.navigate failed: {error_text}");
+            }
             // Wait for load (consistent with navigate command)
-            crate::commands::navigate::wait_for_load(client, &session_id, 30_000).await?;
+            crate::commands::navigate::wait_for_load(client, &session_id, NAVIGATION_TIMEOUT_MS).await?;
             Ok(())
         }
         .await;

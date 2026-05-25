@@ -7,6 +7,8 @@ use crate::result::CommandResult;
 /// Combined emulation parameters for the `emulate` command.
 pub struct EmulateParams {
     pub viewport: Option<String>,
+    pub device_scale_factor: Option<f64>,
+    pub mobile: bool,
     pub geolocation: Option<String>,
     pub accuracy: Option<f64>,
     pub clear_viewport: bool,
@@ -45,6 +47,7 @@ pub async fn emulate(
         }
         let w: u32 = parts[0].parse().map_err(|_| anyhow!("Invalid width: {}", parts[0]))?;
         let h: u32 = parts[1].parse().map_err(|_| anyhow!("Invalid height: {}", parts[1]))?;
+        let dsf = params.device_scale_factor.unwrap_or(1.0);
 
         client
             .send_to_target(
@@ -53,12 +56,12 @@ pub async fn emulate(
                 json!({
                     "width": w,
                     "height": h,
-                    "deviceScaleFactor": 1,
-                    "mobile": false,
+                    "deviceScaleFactor": dsf,
+                    "mobile": params.mobile,
                 }),
             )
             .await?;
-        actions.push(format!("Viewport set to {}x{}", w, h));
+        actions.push(format!("Viewport set to {}x{} (scale: {}, mobile: {})", w, h, dsf, params.mobile));
     }
 
     // 3. Handle setting geolocation

@@ -2,6 +2,7 @@ mod browser;
 mod cdp;
 mod client;
 mod commands;
+mod constants;
 mod daemon;
 mod error;
 mod friendly;
@@ -72,6 +73,12 @@ enum Commands {
         /// Set viewport size as WxH (e.g. 1280x720)
         #[arg(long)]
         viewport: Option<String>,
+        /// Set device scale factor (default: 1.0)
+        #[arg(long)]
+        device_scale_factor: Option<f64>,
+        /// Emulate mobile device (sets mobile=true in CDP)
+        #[arg(long)]
+        mobile: bool,
         /// Set geolocation as lat,lon (e.g. 37.77,-122.41)
         #[arg(long)]
         geolocation: Option<String>,
@@ -93,6 +100,12 @@ enum Commands {
         /// Set viewport size as WxH (e.g. 1280x720)
         #[arg(long)]
         viewport: Option<String>,
+        /// Set device scale factor (default: 1.0)
+        #[arg(long)]
+        device_scale_factor: Option<f64>,
+        /// Emulate mobile device (sets mobile=true in CDP)
+        #[arg(long)]
+        mobile: bool,
         /// Set geolocation as lat,lon (e.g. 37.77,-122.41)
         #[arg(long)]
         geolocation: Option<String>,
@@ -176,6 +189,12 @@ enum Commands {
         /// Set viewport size as WxH (e.g. 1280x720)
         #[arg(long)]
         viewport: Option<String>,
+        /// Set device scale factor (default: 1.0)
+        #[arg(long)]
+        device_scale_factor: Option<f64>,
+        /// Emulate mobile device (sets mobile=true in CDP)
+        #[arg(long)]
+        mobile: bool,
         /// Set geolocation as lat,lon (e.g. 37.77,-122.41)
         #[arg(long)]
         geolocation: Option<String>,
@@ -291,6 +310,8 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             reload,
             extra_headers,
             viewport,
+            device_scale_factor,
+            mobile,
             geolocation,
             accuracy,
             clear_all,
@@ -304,6 +325,8 @@ fn build_request(cli: &Cli) -> DaemonRequest {
                 "reload": reload,
                 "extra_headers": extra_headers,
                 "viewport": viewport,
+                "device_scale_factor": device_scale_factor,
+                "mobile": mobile,
                 "geolocation": geolocation,
                 "accuracy": accuracy,
                 "clear_all": clear_all,
@@ -313,6 +336,8 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         Commands::NewPage {
             url,
             viewport,
+            device_scale_factor,
+            mobile,
             geolocation,
             accuracy,
         } => (
@@ -320,6 +345,8 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             json!({
                 "url": url,
                 "viewport": viewport,
+                "device_scale_factor": device_scale_factor,
+                "mobile": mobile,
                 "geolocation": geolocation,
                 "accuracy": accuracy
             }),
@@ -362,6 +389,8 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         Commands::Snapshot { output } => ("snapshot", json!({"output": output})),
         Commands::Emulate {
             viewport,
+            device_scale_factor,
+            mobile,
             geolocation,
             accuracy,
             clear_viewport,
@@ -369,7 +398,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             clear_all,
         } => (
             "emulate",
-            json!({"viewport": viewport, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all}),
+            json!({"viewport": viewport, "device_scale_factor": device_scale_factor, "mobile": mobile, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all}),
         ),
         Commands::WaitFor { text, timeout } => {
             ("wait-for", json!({"text": text, "timeout": timeout}))
@@ -523,6 +552,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             Commands::NewPage {
                 url,
                 viewport,
+                device_scale_factor,
+                mobile,
                 geolocation,
                 accuracy,
             } => {
@@ -533,6 +564,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 let params = if viewport.is_some() || geolocation.is_some() {
                     Some(commands::emulation::EmulateParams {
                         viewport: viewport.clone(),
+                        device_scale_factor: *device_scale_factor,
+                        mobile: *mobile,
                         geolocation: geolocation.clone(),
                         accuracy: *accuracy,
                         clear_viewport: false,
@@ -598,6 +631,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             reload,
             extra_headers,
             viewport,
+            device_scale_factor,
+            mobile,
             geolocation,
             accuracy,
             clear_all,
@@ -614,6 +649,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                     &session_id,
                     commands::emulation::EmulateParams {
                         viewport: viewport.clone(),
+                        device_scale_factor: *device_scale_factor,
+                        mobile: *mobile,
                         geolocation: geolocation.clone(),
                         accuracy: *accuracy,
                         clear_viewport: false,
@@ -690,6 +727,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
         }
         Commands::Emulate {
             viewport,
+            device_scale_factor,
+            mobile,
             geolocation,
             accuracy,
             clear_viewport,
@@ -701,6 +740,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 &session_id,
                 commands::emulation::EmulateParams {
                     viewport: viewport.clone(),
+                    device_scale_factor: *device_scale_factor,
+                    mobile: *mobile,
                     geolocation: geolocation.clone(),
                     accuracy: *accuracy,
                     clear_viewport: *clear_viewport,

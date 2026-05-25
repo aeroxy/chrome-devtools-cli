@@ -11,10 +11,10 @@ use crate::result::CommandResult;
 fn known_args(cmd: &str) -> &'static [&'static str] {
     match cmd {
         "list-pages" => &[],
-        "new-page" => &["url", "viewport", "geolocation", "accuracy"],
+        "new-page" => &["url", "viewport", "device_scale_factor", "mobile", "geolocation", "accuracy"],
         "close-page" => &["id_or_index"],
         "select-page" => &["id_or_index"],
-        "navigate" => &["url", "back", "forward", "reload", "extra_headers", "viewport", "geolocation", "accuracy", "clear_all", "output"],
+        "navigate" => &["url", "back", "forward", "reload", "extra_headers", "viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "clear_all", "output"],
         "screenshot" => &["output", "format", "full_page"],
         "evaluate" => &["expression", "dialog_action", "output", "track_navigation"],
         "click" => &["selector"],
@@ -24,7 +24,7 @@ fn known_args(cmd: &str) -> &'static [&'static str] {
         "press-key" => &["key"],
         "hover" => &["selector"],
         "snapshot" => &["output"],
-        "emulate" => &["viewport", "geolocation", "accuracy", "clear_viewport", "clear_geolocation", "clear_all"],
+        "emulate" => &["viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "clear_viewport", "clear_geolocation", "clear_all"],
         "wait-for" => &["text", "timeout"],
         "list-3p-tools" => &[],
         "execute-3p-tool" => &["name", "params"],
@@ -95,6 +95,8 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                 let params = if viewport.is_some() || geolocation.is_some() {
                     Some(commands::emulation::EmulateParams {
                         viewport: viewport.map(|s| s.to_string()),
+                        device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
+                        mobile: args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false),
                         geolocation: geolocation.map(|s| s.to_string()),
                         accuracy: args.get("accuracy").and_then(|v| v.as_f64()),
                         clear_viewport: false,
@@ -122,7 +124,11 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                     (Some(s), None)
                 }
             }
-            Some(v) if v.is_number() => (None, v.as_u64().map(|idx| idx as usize)),
+            Some(v) if v.is_number() => {
+                let idx = v.as_u64()
+                    .ok_or_else(|| anyhow!("invalid numeric id_or_index: must be a non-negative integer"))?;
+                (None, Some(idx as usize))
+            }
             _ => (req.target.as_deref(), req.page),
         }
     } else {
@@ -183,14 +189,21 @@ async fn inner_execute(
             let geolocation = args.get("geolocation").and_then(|v| v.as_str());
             let clear_all = args.get("clear_all").and_then(|v| v.as_bool()).unwrap_or(false);
 
+            let accuracy = args.get("accuracy").and_then(|v| v.as_f64());
+            if accuracy.is_some() && geolocation.is_none() {
+                bail!("--accuracy requires --geolocation");
+            }
+
             if viewport.is_some() || geolocation.is_some() || clear_all {
                 commands::emulation::emulate(
                     client,
-                    &session_id,
+                    session_id,
                     commands::emulation::EmulateParams {
                         viewport: viewport.map(|s| s.to_string()),
+                        device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
+                        mobile: args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false),
                         geolocation: geolocation.map(|s| s.to_string()),
-                        accuracy: args.get("accuracy").and_then(|v| v.as_f64()),
+                        accuracy,
                         clear_viewport: false,
                         clear_geolocation: false,
                         clear_all,
@@ -297,6 +310,8 @@ async fn inner_execute(
                 session_id,
                 commands::emulation::EmulateParams {
                     viewport: args.get("viewport").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
+                    mobile: args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false),
                     geolocation: args.get("geolocation").and_then(|v| v.as_str()).map(|s| s.to_string()),
                     accuracy: args.get("accuracy").and_then(|v| v.as_f64()),
                     clear_viewport: args.get("clear_viewport").and_then(|v| v.as_bool()).unwrap_or(false),
