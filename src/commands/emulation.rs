@@ -19,7 +19,6 @@ pub async fn emulate(
     client: &mut CdpClient,
     session_id: &str,
     params: EmulateParams,
-    as_json: bool,
 ) -> Result<CommandResult> {
     let mut actions = Vec::new();
 
@@ -72,6 +71,10 @@ pub async fn emulate(
         let lon: f64 = parts[1].parse().map_err(|_| anyhow!("Invalid longitude: {}", parts[1]))?;
         let acc = params.accuracy.unwrap_or(100.0);
 
+        if acc.is_sign_negative() || !acc.is_finite() {
+            anyhow::bail!("accuracy must be a non-negative finite value");
+        }
+
         if !(-90.0..=90.0).contains(&lat) {
             anyhow::bail!("latitude must be between -90 and 90");
         }
@@ -89,82 +92,10 @@ pub async fn emulate(
         actions.push(format!("Geolocation set to {}, {} (acc: {}m)", lat, lon, acc));
     }
 
-    // 4. If no specific action taken and not clearing, show current state
+    // 4. If no specific action taken, return error (getters removed due to CDP limitations)
     if actions.is_empty() && !params.clear_all && !params.clear_viewport && !params.clear_geolocation {
-        return get_emulation_state(client, session_id, as_json).await;
+        anyhow::bail!("No emulation action specified (use --viewport, --geolocation, or --clear flags)");
     }
 
     Ok(CommandResult::output(actions.join(", ")))
-}
-
-/// Retrieve all active emulation overrides.
-async fn get_emulation_state(
-    client: &mut CdpClient,
-    session_id: &str,
-    as_json: bool,
-) -> Result<CommandResult> {
-    // Get viewport override
-    let viewport_resp = client
-        .send_to_target(session_id, "Emulation.getDeviceMetricsOverride", json!({}))
-        .await?;
-    
-    let vw = viewport_resp["width"].as_u64();
-    let vh = viewport_resp["height"].as_u64();
-    let viewport = if let (Some(w), Some(h)) = (vw, vh) {
-        if w > 0 && h > 0 {
-            Some(json!({ "width": w, "height": h }))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // Get geolocation override via JS (since there is no CDP getter)
-    let geo_expr = r#"
-        new Promise((resolve) => {
-            navigator.geolocation.getCurrentPosition(
-                pos => resolve({latitude: pos.coords.latitude, longitude: pos.coords.longitude, accuracy: pos.coords.accuracy}),
-                err => resolve({error: err.message}),
-                {maximumAge: 0, timeout: 2000}
-            );
-        })
-    "#;
-
-    let geo_result = client
-        .send_to_target(
-            session_id,
-            "Runtime.evaluate",
-            json!({
-                "expression": geo_expr,
-                "returnByValue": true,
-                "awaitPromise": true,
-            }),
-        )
-        .await?;
-
-    let geo_val = &geo_result["result"]["value"];
-    let geolocation = if geo_val["error"].is_null() && !geo_val["latitude"].is_null() {
-        Some(geo_val.clone())
-    } else {
-        None
-    };
-
-    if as_json {
-        Ok(CommandResult::output(serde_json::to_string_pretty(&json!({
-            "viewport": viewport,
-            "geolocation": geolocation,
-        }))?))
-    } else {
-        let mut out = Vec::new();
-        match viewport {
-            Some(v) => out.push(format!("Viewport: {}x{}", v["width"], v["height"])),
-            None => out.push("Viewport: (default)".to_string()),
-        }
-        match geolocation {
-            Some(g) => out.push(format!("Geolocation: {}, {} (acc: {}m)", g["latitude"], g["longitude"], g["accuracy"])),
-            None => out.push("Geolocation: (default)".to_string()),
-        }
-        Ok(CommandResult::output(out.join("\n")))
-    }
 }

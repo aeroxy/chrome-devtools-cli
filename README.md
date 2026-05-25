@@ -30,9 +30,6 @@ chrome-devtools --target main screenshot --output screenshot.png
 Overrides like viewport size and geolocation are persistent per page.
 
 ```bash
-# View current active overrides
-chrome-devtools emulate
-
 # Set viewport and geolocation
 chrome-devtools emulate --viewport 1280x720 --geolocation 37.77,-122.41
 

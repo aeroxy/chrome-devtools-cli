@@ -102,10 +102,16 @@ enum Commands {
     },
 
     /// Close a page/tab
-    ClosePage,
+    ClosePage {
+        /// Target ID, friendly name, or 0-based index
+        id_or_index: Option<String>,
+    },
 
     /// Bring a page to front
-    SelectPage,
+    SelectPage {
+        /// Target ID, friendly name, or 0-based index
+        id_or_index: Option<String>,
+    },
 
     /// Take a screenshot
     Screenshot {
@@ -166,8 +172,6 @@ enum Commands {
     },
 
     /// Manage page emulation (viewport, geolocation, etc.)
-    ///
-    /// No arguments: show active overrides.
     Emulate {
         /// Set viewport size as WxH (e.g. 1280x720)
         #[arg(long)]
@@ -320,8 +324,14 @@ fn build_request(cli: &Cli) -> DaemonRequest {
                 "accuracy": accuracy
             }),
         ),
-        Commands::ClosePage => ("close-page", json!({})),
-        Commands::SelectPage => ("select-page", json!({})),
+        Commands::ClosePage { id_or_index } => (
+            "close-page",
+            json!({ "id_or_index": id_or_index }),
+        ),
+        Commands::SelectPage { id_or_index } => (
+            "select-page",
+            json!({ "id_or_index": id_or_index }),
+        ),
         Commands::Screenshot {
             output,
             format,
@@ -527,14 +537,29 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
         };
     }
 
-    let target = client.resolve_page(cli.target.as_deref(), cli.page).await?;
+    let (target_id_arg, page_idx_arg) = match &cli.command {
+        Commands::ClosePage { id_or_index } | Commands::SelectPage { id_or_index } => {
+            if let Some(s) = id_or_index {
+                if let Ok(idx) = s.parse::<usize>() {
+                    (None, Some(idx))
+                } else {
+                    (Some(s.as_str()), None)
+                }
+            } else {
+                (cli.target.as_deref(), cli.page)
+            }
+        }
+        _ => (cli.target.as_deref(), cli.page),
+    };
+
+    let target = client.resolve_page(target_id_arg, page_idx_arg).await?;
     let target_id = target.target_id.clone();
 
     // Special case for browser-level commands that target a specific page but don't need a session
-    if matches!(cli.command, Commands::ClosePage | Commands::SelectPage) {
+    if matches!(cli.command, Commands::ClosePage { .. } | Commands::SelectPage { .. }) {
         return match &cli.command {
-            Commands::ClosePage => commands::pages::close_page(&mut client, &target_id).await,
-            Commands::SelectPage => commands::pages::select_page(&mut client, &target_id).await,
+            Commands::ClosePage { .. } => commands::pages::close_page(&mut client, &target_id).await,
+            Commands::SelectPage { .. } => commands::pages::select_page(&mut client, &target_id).await,
             _ => unreachable!(),
         };
     }
@@ -580,7 +605,6 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                         clear_geolocation: false,
                         clear_all: *clear_all,
                     },
-                    false, // hide emulation feedback during navigate
                 )
                 .await?;
             }
@@ -596,26 +620,6 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 output.as_deref(),
             )
             .await
-        }
-        Commands::NewPage {
-            url,
-            viewport,
-            geolocation,
-            accuracy,
-        } => {
-            let params = if viewport.is_some() || geolocation.is_some() {
-                Some(commands::emulation::EmulateParams {
-                    viewport: viewport.clone(),
-                    geolocation: geolocation.clone(),
-                    accuracy: *accuracy,
-                    clear_viewport: false,
-                    clear_geolocation: false,
-                    clear_all: false,
-                })
-            } else {
-                None
-            };
-            commands::pages::new_page(&mut client, url, params).await
         }
         Commands::Screenshot {
             output,
@@ -688,7 +692,6 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                     clear_geolocation: *clear_geolocation,
                     clear_all: *clear_all,
                 },
-                cli.json,
             )
             .await
         }

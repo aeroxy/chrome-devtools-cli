@@ -28,9 +28,6 @@ Overrides are persistent per page. You can set them standalone or during navigat
 # Set viewport and geolocation standalone
 chrome-devtools --target main emulate --viewport 1920x1080 --geolocation 40.71,-74.00
 
-# View current active overrides
-chrome-devtools --target main emulate
-
 # Navigate with atomic emulation (sets environment before loading URL)
 chrome-devtools navigate https://geotargetly.com --geolocation 51.50,-0.12
 
@@ -66,6 +63,9 @@ chrome-devtools navigate <url> [--viewport WxH] [--geolocation lat,lon]
 chrome-devtools navigate --back
 chrome-devtools navigate --forward
 chrome-devtools navigate --reload
+chrome-devtools new-page <url> [--viewport WxH] [--geolocation lat,lon]
+chrome-devtools close-page [id_or_index]
+chrome-devtools select-page [id_or_index]
 ```
 
 ### Utilities

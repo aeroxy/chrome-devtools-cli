@@ -12,8 +12,8 @@ fn known_args(cmd: &str) -> &'static [&'static str] {
     match cmd {
         "list-pages" => &[],
         "new-page" => &["url", "viewport", "geolocation", "accuracy"],
-        "close-page" => &["index"],
-        "select-page" => &["index"],
+        "close-page" => &["id_or_index"],
+        "select-page" => &["id_or_index"],
         "navigate" => &["url", "back", "forward", "reload", "extra_headers", "viewport", "geolocation", "accuracy", "clear_all", "output"],
         "screenshot" => &["output", "format", "full_page"],
         "evaluate" => &["expression", "dialog_action", "output", "track_navigation"],
@@ -112,7 +112,21 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     }
 
     // Page-level: resolve and attach to target
-    let target = client.resolve_page(req.target.as_deref(), req.page).await?;
+    let (target_id_arg, page_idx_arg) = if cmd == "close-page" || cmd == "select-page" {
+        if let Some(s) = args.get("id_or_index").and_then(|v| v.as_str()) {
+            if let Ok(idx) = s.parse::<usize>() {
+                (None, Some(idx))
+            } else {
+                (Some(s), None)
+            }
+        } else {
+            (req.target.as_deref(), req.page)
+        }
+    } else {
+        (req.target.as_deref(), req.page)
+    };
+
+    let target = client.resolve_page(target_id_arg, page_idx_arg).await?;
     let target_id = target.target_id.clone();
 
     // Special case for commands that target a page but don't need a session
@@ -169,7 +183,7 @@ async fn inner_execute(
             if viewport.is_some() || geolocation.is_some() || clear_all {
                 commands::emulation::emulate(
                     client,
-                    session_id,
+                    &session_id,
                     commands::emulation::EmulateParams {
                         viewport: viewport.map(|s| s.to_string()),
                         geolocation: geolocation.map(|s| s.to_string()),
@@ -178,9 +192,9 @@ async fn inner_execute(
                         clear_geolocation: false,
                         clear_all,
                     },
-                    false, // hide emulation feedback during navigate
                 )
                 .await?;
+
             }
 
             commands::navigate::navigate(
@@ -286,7 +300,6 @@ async fn inner_execute(
                     clear_geolocation: args.get("clear_geolocation").and_then(|v| v.as_bool()).unwrap_or(false),
                     clear_all: args.get("clear_all").and_then(|v| v.as_bool()).unwrap_or(false),
                 },
-                req.json_output,
             )
             .await
         }

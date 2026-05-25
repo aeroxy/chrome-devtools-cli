@@ -47,7 +47,7 @@ pub async fn new_page(
         let session_id = client.attach_to_target(&target_id).await?;
 
         // Apply emulation to the new session
-        crate::commands::emulation::emulate(client, &session_id, params, false).await?;
+        crate::commands::emulation::emulate(client, &session_id, params).await?;
 
         // Now navigate to the real URL
         client
