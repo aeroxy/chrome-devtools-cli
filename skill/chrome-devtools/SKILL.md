@@ -1,6 +1,8 @@
-# Skill: Chrome DevTools CLI
-
-Interact with Chrome/Chromium browsers using the Chrome DevTools Protocol (CDP).
+---
+name: chrome-devtools
+description: Use when the user asks to "take a screenshot of a website", "navigate to a URL", "fill a form in the browser", "interact with Chrome", or when a chrome automation task is needed.
+user-invocable: true
+---
 
 ## Core Capabilities
 
