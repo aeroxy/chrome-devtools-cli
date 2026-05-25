@@ -155,7 +155,7 @@ async fn do_reload(
     Ok(result.save_output(output).await?.with_navigated_to(url))
 }
 
-async fn wait_for_load(client: &mut CdpClient, session_id: &str, timeout_ms: u64) -> Result<()> {
+pub async fn wait_for_load(client: &mut CdpClient, session_id: &str, timeout_ms: u64) -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

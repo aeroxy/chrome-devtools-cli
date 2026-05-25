@@ -113,14 +113,17 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
 
     // Page-level: resolve and attach to target
     let (target_id_arg, page_idx_arg) = if cmd == "close-page" || cmd == "select-page" {
-        if let Some(s) = args.get("id_or_index").and_then(|v| v.as_str()) {
-            if let Ok(idx) = s.parse::<usize>() {
-                (None, Some(idx))
-            } else {
-                (Some(s), None)
+        match args.get("id_or_index") {
+            Some(v) if v.is_string() => {
+                let s = v.as_str().unwrap();
+                if let Ok(idx) = s.parse::<usize>() {
+                    (None, Some(idx))
+                } else {
+                    (Some(s), None)
+                }
             }
-        } else {
-            (req.target.as_deref(), req.page)
+            Some(v) if v.is_number() => (None, v.as_u64().map(|idx| idx as usize)),
+            _ => (req.target.as_deref(), req.page),
         }
     } else {
         (req.target.as_deref(), req.page)

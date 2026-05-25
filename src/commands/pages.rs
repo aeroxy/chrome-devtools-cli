@@ -46,19 +46,23 @@ pub async fn new_page(
         let target_id = client.create_target("about:blank").await?;
         let session_id = client.attach_to_target(&target_id).await?;
 
-        // Apply emulation to the new session
-        crate::commands::emulation::emulate(client, &session_id, params).await?;
-
-        // Now navigate to the real URL
-        client
-            .send_to_target(&session_id, "Page.navigate", json!({ "url": url }))
-            .await?;
-
-        // Optional: wait for load (consistent with navigate command)
-        // Since we don't have wait_for_load easily available here (it's in navigate.rs),
-        // we'll just return. The user can wait-for if needed.
+        // Use a block to ensure detachment and closure occurs even if emulation or navigation fails
+        let result: Result<()> = async {
+            crate::commands::emulation::emulate(client, &session_id, params).await?;
+            client
+                .send_to_target(&session_id, "Page.navigate", json!({ "url": url }))
+                .await?;
+            // Wait for load (consistent with navigate command)
+            crate::commands::navigate::wait_for_load(client, &session_id, 30_000).await?;
+            Ok(())
+        }
+        .await;
 
         let _ = client.detach_from_target(&session_id).await;
+        if result.is_err() {
+            let _ = client.close_target(&target_id).await;
+            return Err(result.unwrap_err());
+        }
 
         Ok(CommandResult::output(format!(
             "Opened new page with emulation: {url} (target: {target_id})"
@@ -106,12 +110,10 @@ pub async fn wait_for(
                     "returnByValue": true,
                 }),
             )
-            .await;
+            .await?;
 
-        if let Ok(val) = result {
-            if val["result"]["value"].as_bool() == Some(true) {
-                return Ok(CommandResult::output(format!("Found text: {text}")));
-            }
+        if result["result"]["value"].as_bool() == Some(true) {
+            return Ok(CommandResult::output(format!("Found text: {text}")));
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

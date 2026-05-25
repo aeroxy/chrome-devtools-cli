@@ -93,7 +93,7 @@ pub async fn emulate(
     }
 
     // 4. If no specific action taken, return error (getters removed due to CDP limitations)
-    if actions.is_empty() && !params.clear_all && !params.clear_viewport && !params.clear_geolocation {
+    if actions.is_empty() {
         anyhow::bail!("No emulation action specified (use --viewport, --geolocation, or --clear flags)");
     }
 

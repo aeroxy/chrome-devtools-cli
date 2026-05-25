@@ -526,6 +526,10 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 geolocation,
                 accuracy,
             } => {
+                if accuracy.is_some() && geolocation.is_none() {
+                    anyhow::bail!("--accuracy requires --geolocation");
+                }
+
                 let params = if viewport.is_some() || geolocation.is_some() {
                     Some(commands::emulation::EmulateParams {
                         viewport: viewport.clone(),
@@ -599,6 +603,10 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             clear_all,
             output,
         } => {
+            if accuracy.is_some() && geolocation.is_none() {
+                anyhow::bail!("--accuracy requires --geolocation");
+            }
+
             // Apply emulation before navigation if requested
             if viewport.is_some() || geolocation.is_some() || *clear_all {
                 commands::emulation::emulate(
