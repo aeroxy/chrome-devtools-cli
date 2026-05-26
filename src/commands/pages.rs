@@ -79,25 +79,31 @@ pub async fn new_page(
     if emulation.is_some() || extra_headers.is_some() {
         // Create blank page so emulation/headers are applied before the real URL loads
         let target_id = client.create_target("about:blank").await?;
-        let session_id = client.attach_to_target(&target_id).await?;
 
         let result: Result<()> = async {
-            if let Some(params) = emulation {
-                crate::commands::emulation::emulate(client, &session_id, params).await?;
+            let session_id = client.attach_to_target(&target_id).await?;
+
+            let inner: Result<()> = async {
+                if let Some(params) = emulation {
+                    crate::commands::emulation::emulate(client, &session_id, params).await?;
+                }
+                apply_extra_headers(client, &session_id, extra_headers).await?;
+                let nav_result = client
+                    .send_to_target(&session_id, "Page.navigate", json!({ "url": url }))
+                    .await?;
+                if let Some(error_text) = nav_result.get("errorText").and_then(|v| v.as_str()) {
+                    anyhow::bail!("Page.navigate failed: {error_text}");
+                }
+                crate::commands::navigate::wait_for_load(client, &session_id, NAVIGATION_TIMEOUT_MS).await?;
+                Ok(())
             }
-            apply_extra_headers(client, &session_id, extra_headers).await?;
-            let nav_result = client
-                .send_to_target(&session_id, "Page.navigate", json!({ "url": url }))
-                .await?;
-            if let Some(error_text) = nav_result.get("errorText").and_then(|v| v.as_str()) {
-                anyhow::bail!("Page.navigate failed: {error_text}");
-            }
-            crate::commands::navigate::wait_for_load(client, &session_id, NAVIGATION_TIMEOUT_MS).await?;
-            Ok(())
+            .await;
+
+            let _ = client.detach_from_target(&session_id).await;
+            inner
         }
         .await;
 
-        let _ = client.detach_from_target(&session_id).await;
         if let Err(e) = result {
             let _ = client.close_target(&target_id).await;
             return Err(e);

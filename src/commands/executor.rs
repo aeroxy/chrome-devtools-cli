@@ -130,7 +130,9 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
             Some(v) if v.is_number() => {
                 let idx = v.as_u64()
                     .ok_or_else(|| anyhow!("invalid numeric id_or_index: must be a non-negative integer"))?;
-                (None, Some(idx as usize))
+                let idx_usize = usize::try_from(idx)
+                    .map_err(|_| anyhow!("index too large"))?;
+                (None, Some(idx_usize))
             }
             _ => (req.target.as_deref(), req.page),
         }

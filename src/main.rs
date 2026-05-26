@@ -471,9 +471,16 @@ async fn run() -> Result<()> {
 
             // Show subcommand-specific help when the error is about a subcommand's args
             let mut cmd = Cli::command();
-            let sub_name = std::env::args().skip(1).find(|name| {
-                !name.starts_with('-') && cmd.get_subcommands().any(|c| c.get_name() == name)
-            });
+            let sub_name = std::env::args_os()
+                .skip(1)
+                .find_map(|arg| {
+                    let s = arg.to_string_lossy();
+                    if !s.starts_with('-') && cmd.get_subcommands().any(|c| c.get_name() == s) {
+                        Some(s.into_owned())
+                    } else {
+                        None
+                    }
+                });
             match sub_name {
                 Some(name) => {
                     if let Some(sub_cmd) = cmd.find_subcommand_mut(&name) {
