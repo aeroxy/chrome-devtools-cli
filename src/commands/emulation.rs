@@ -19,6 +19,16 @@ pub struct EmulateParams {
 impl EmulateParams {
     /// Validate cross-field constraints before applying emulation.
     pub fn validate(&self) -> Result<()> {
+        if let Some(dsf) = self.device_scale_factor {
+            if !dsf.is_finite() || dsf <= 0.0 {
+                anyhow::bail!("device-scale-factor must be a positive finite value");
+            }
+        }
+        if let Some(acc) = self.accuracy {
+            if acc.is_sign_negative() || !acc.is_finite() {
+                anyhow::bail!("accuracy must be a non-negative finite value");
+            }
+        }
         if self.accuracy.is_some() && self.geolocation.is_none() {
             anyhow::bail!("--accuracy requires --geolocation");
         }
@@ -82,9 +92,6 @@ pub async fn emulate(
             anyhow::bail!("Invalid height: {} (must be > 0)", h);
         }
         let dsf = params.device_scale_factor.unwrap_or(1.0);
-        if !dsf.is_finite() || dsf <= 0.0 {
-            anyhow::bail!("device-scale-factor must be a positive finite value");
-        }
 
         client
             .send_to_target(
@@ -110,10 +117,6 @@ pub async fn emulate(
         let lat: f64 = parts[0].trim().parse().map_err(|_| anyhow!("Invalid latitude: {}", parts[0]))?;
         let lon: f64 = parts[1].trim().parse().map_err(|_| anyhow!("Invalid longitude: {}", parts[1]))?;
         let acc = params.accuracy.unwrap_or(100.0);
-
-        if acc.is_sign_negative() || !acc.is_finite() {
-            anyhow::bail!("accuracy must be a non-negative finite value");
-        }
 
         if !(-90.0..=90.0).contains(&lat) {
             anyhow::bail!("latitude must be between -90 and 90");
