@@ -131,7 +131,7 @@ async fn do_reload(
         .await?;
     wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS).await?;
     let url = client.current_url(session_id).await?;
-    let result = CommandResult::output("Reloaded page".to_string()).with_navigated_to(url.clone());
+    let result = CommandResult::output("Reloaded page".to_string());
     Ok(result.save_output(output).await?.with_navigated_to(url))
 }
 
