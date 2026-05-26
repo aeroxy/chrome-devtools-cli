@@ -3,7 +3,6 @@
 mod tests {
     use chrome_devtools_cli::commands::executor;
     use chrome_devtools_cli::protocol::DaemonRequest;
-    use chrome_devtools_cli::result::CommandResult;
     use serde_json::json;
 
     // TODO: Add mock CdpClient for executor integration tests.
@@ -41,41 +40,33 @@ mod tests {
         assert_eq!(req.command, "click");
     }
 
-    /// Verify that known_args covers all expected commands and their arguments.
-    /// This test acts as a reminder to update known_args when adding new CLI flags.
+    /// Verify that known_args stays in sync with the Clap Command definition.
+    /// This test dynamically inspects the Cli struct's subcommands and asserts
+    /// that known_args matches each subcommand's arguments, guaranteeing they
+    /// never get out of sync when CLI flags are added or removed.
     #[test]
-    fn test_known_args_coverage() {
-        // Each entry: (command_name, expected_args)
-        let expected: Vec<(&str, Vec<&str>)> = vec![
-            ("list-pages", vec![]),
-            ("new-page", vec!["url", "viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "extra_headers"]),
-            ("close-page", vec!["id_or_index"]),
-            ("select-page", vec!["id_or_index"]),
-            ("navigate", vec!["url", "back", "forward", "reload", "extra_headers", "viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "clear_all", "output"]),
-            ("screenshot", vec!["output", "format", "full_page"]),
-            ("evaluate", vec!["expression", "dialog_action", "output", "track_navigation"]),
-            ("click", vec!["selector"]),
-            ("click-at", vec!["x", "y"]),
-            ("fill", vec!["selector", "value"]),
-            ("type-text", vec!["text", "submit_key"]),
-            ("press-key", vec!["key"]),
-            ("hover", vec!["selector"]),
-            ("snapshot", vec!["output"]),
-            ("emulate", vec!["viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "clear_viewport", "clear_geolocation", "clear_all"]),
-            ("wait-for", vec!["text", "timeout"]),
-            ("list-3p-tools", vec![]),
-            ("execute-3p-tool", vec!["name", "params"]),
-        ];
+    fn test_known_args_sync_with_clap() {
+        use clap::CommandFactory;
+        use chrome_devtools_cli::Cli;
 
-        for (cmd, mut expected_args) in expected {
-            let actual = executor::known_args(cmd);
-            let mut actual_args: Vec<&str> = actual.to_vec();
-            actual_args.sort();
+        let cmd = Cli::command();
+        for sub in cmd.get_subcommands() {
+            let name = sub.get_name();
+            let mut expected_args: Vec<String> = sub
+                .get_arguments()
+                .filter(|a| !a.is_global_set())
+                .map(|a| a.get_id().as_str().replace('-', "_"))
+                .collect();
+            let mut actual_args: Vec<String> = executor::known_args(name)
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
             expected_args.sort();
+            actual_args.sort();
             assert_eq!(
                 actual_args, expected_args,
-                "known_args mismatch for command '{}'. If you added new CLI flags, update known_args in executor.rs.",
-                cmd
+                "known_args mismatch for command '{}'. Please update known_args in executor.rs.",
+                name
             );
         }
     }
