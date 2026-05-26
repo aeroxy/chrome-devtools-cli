@@ -54,7 +54,7 @@ mod tests {
             let name = sub.get_name();
             let mut expected_args: Vec<String> = sub
                 .get_arguments()
-                .filter(|a| !a.is_global_set())
+                .filter(|a| !a.is_global_set() && a.get_id() != "help" && a.get_id() != "version")
                 .map(|a| a.get_id().as_str().replace('-', "_"))
                 .collect();
             let mut actual_args: Vec<String> = executor::known_args(name)
