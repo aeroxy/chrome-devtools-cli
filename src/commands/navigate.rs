@@ -55,9 +55,11 @@ pub async fn navigate(
     }
     .await;
 
-    // Always clear headers, even on failure
-    if let Err(e) = super::pages::clear_extra_headers(client, session_id).await {
-        eprintln!("Warning: failed to clear extra headers: {e}");
+    // Only clear headers that this invocation applied.
+    if extra_headers.is_some() {
+        if let Err(e) = super::pages::clear_extra_headers(client, session_id).await {
+            eprintln!("Warning: failed to clear extra headers: {e}");
+        }
     }
 
     navigate_result

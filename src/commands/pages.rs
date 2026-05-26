@@ -47,6 +47,9 @@ pub async fn clear_extra_headers(client: &mut CdpClient, session_id: &str) -> Re
             json!({"headers": {}}),
         )
         .await?;
+    let _ = client
+        .send_to_target(session_id, "Network.disable", json!({}))
+        .await;
     Ok(())
 }
 
