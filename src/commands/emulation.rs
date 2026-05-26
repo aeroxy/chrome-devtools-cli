@@ -74,7 +74,16 @@ pub async fn emulate(
         }
         let w: u32 = parts[0].parse().map_err(|_| anyhow!("Invalid width: {}", parts[0]))?;
         let h: u32 = parts[1].parse().map_err(|_| anyhow!("Invalid height: {}", parts[1]))?;
+        if w == 0 {
+            anyhow::bail!("Invalid width: {} (must be > 0)", w);
+        }
+        if h == 0 {
+            anyhow::bail!("Invalid height: {} (must be > 0)", h);
+        }
         let dsf = params.device_scale_factor.unwrap_or(1.0);
+        if !dsf.is_finite() || dsf <= 0.0 {
+            anyhow::bail!("device-scale-factor must be a positive finite value");
+        }
 
         client
             .send_to_target(

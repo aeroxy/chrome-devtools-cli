@@ -7,6 +7,7 @@ use crate::constants::NAVIGATION_TIMEOUT_MS;
 use crate::friendly;
 use crate::result::CommandResult;
 
+/// Apply extra HTTP headers to a page session via Network.setExtraHTTPHeaders.
 pub async fn apply_extra_headers(
     client: &mut CdpClient,
     session_id: &str,
@@ -37,6 +38,7 @@ pub async fn apply_extra_headers(
     Ok(())
 }
 
+/// List all open page targets with their friendly names, titles, and URLs.
 pub async fn list_pages(client: &mut CdpClient, as_json: bool) -> Result<CommandResult> {
     let pages = client.get_page_targets().await?;
 
@@ -67,6 +69,7 @@ pub async fn list_pages(client: &mut CdpClient, as_json: bool) -> Result<Command
     }
 }
 
+/// Open a new page, optionally applying emulation and extra headers before navigation.
 pub async fn new_page(
     client: &mut CdpClient,
     url: &str,
@@ -95,9 +98,9 @@ pub async fn new_page(
         .await;
 
         let _ = client.detach_from_target(&session_id).await;
-        if result.is_err() {
+        if let Err(e) = result {
             let _ = client.close_target(&target_id).await;
-            return Err(result.unwrap_err());
+            return Err(e);
         }
 
         Ok(CommandResult::output(format!(
@@ -111,16 +114,19 @@ pub async fn new_page(
     }
 }
 
+/// Close a page target by its target ID.
 pub async fn close_page(client: &mut CdpClient, target_id: &str) -> Result<CommandResult> {
     client.close_target(target_id).await?;
     Ok(CommandResult::output(format!("Closed page: {target_id}")))
 }
 
+/// Activate (bring to front) a page target by its target ID.
 pub async fn select_page(client: &mut CdpClient, target_id: &str) -> Result<CommandResult> {
     client.activate_target(target_id).await?;
     Ok(CommandResult::output(format!("Activated page: {target_id}")))
 }
 
+/// Wait until the page body contains the given text, or timeout.
 pub async fn wait_for(
     client: &mut CdpClient,
     session_id: &str,
@@ -146,10 +152,24 @@ pub async fn wait_for(
                     "returnByValue": true,
                 }),
             )
-            .await?;
+            .await;
 
-        if result["result"]["value"].as_bool() == Some(true) {
-            return Ok(CommandResult::output(format!("Found text: {text}")));
+        match result {
+            Ok(val) => {
+                if val["result"]["value"].as_bool() == Some(true) {
+                    return Ok(CommandResult::output(format!("Found text: {text}")));
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("Execution context was destroyed")
+                    || msg.contains("Cannot find context")
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+                return Err(anyhow::anyhow!("wait_for failed for session {session_id}: {e}"));
+            }
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

@@ -5,6 +5,7 @@ use serde_json::json;
 use crate::cdp::CdpClient;
 use crate::result::CommandResult;
 
+/// Capture a screenshot of the current page.
 pub async fn take_screenshot(
     client: &mut CdpClient,
     session_id: &str,

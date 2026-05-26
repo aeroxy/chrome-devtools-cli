@@ -5,6 +5,7 @@ use crate::cdp::CdpClient;
 use crate::constants::NAVIGATION_TIMEOUT_MS;
 use crate::result::CommandResult;
 
+/// Navigate to a URL, go back/forward in history, or reload the page.
 pub async fn navigate(
     client: &mut CdpClient,
     session_id: &str,
@@ -134,6 +135,7 @@ async fn do_reload(
     Ok(result.save_output(output).await?.with_navigated_to(url))
 }
 
+/// Poll until document.readyState is "complete" or the timeout expires.
 pub async fn wait_for_load(client: &mut CdpClient, session_id: &str, timeout_ms: u64) -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 

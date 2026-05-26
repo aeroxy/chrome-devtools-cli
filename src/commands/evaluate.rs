@@ -4,6 +4,7 @@ use serde_json::json;
 use crate::cdp::CdpClient;
 use crate::result::CommandResult;
 
+/// Evaluate a JavaScript expression in the page and return the result.
 pub async fn evaluate(
     client: &mut CdpClient,
     session_id: &str,

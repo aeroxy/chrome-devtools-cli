@@ -82,6 +82,7 @@ pub struct CdpClient {
 
 const MAX_BUFFERED_EVENTS: usize = 1000;
 
+/// Metadata for a Chrome target (page, worker, etc.).
 #[derive(Debug, Clone)]
 pub struct TargetInfo {
     pub target_id: String,
@@ -92,6 +93,7 @@ pub struct TargetInfo {
 }
 
 impl CdpClient {
+    /// Connect to Chrome via WebSocket and return a CDP client.
     pub async fn connect(ws_url: &str) -> Result<Self> {
         let (ws, _) = connect_async(ws_url)
             .await
@@ -310,6 +312,7 @@ impl CdpClient {
         }
     }
 
+    /// Read the next text message from the WebSocket, skipping non-text frames.
     pub async fn read_text(&mut self) -> Result<String> {
         loop {
             match self.read.next().await {
@@ -324,6 +327,7 @@ impl CdpClient {
 
     // ── Target domain helpers ──
 
+    /// List all open page targets.
     pub async fn get_page_targets(&mut self) -> Result<Vec<TargetInfo>> {
         let result = self.send("Target.getTargets", json!({})).await?;
         let targets = result["targetInfos"].as_array().ok_or_else(|| {
@@ -352,6 +356,7 @@ impl CdpClient {
         Ok(pages)
     }
 
+    /// Attach to a target and return the session ID for subsequent commands.
     pub async fn attach_to_target(&mut self, target_id: &str) -> Result<String> {
         let result = self
             .send(
@@ -365,18 +370,21 @@ impl CdpClient {
             .ok_or_else(|| anyhow!("No sessionId in attachToTarget response"))
     }
 
+    /// Detach from a target session.
     pub async fn detach_from_target(&mut self, session_id: &str) -> Result<()> {
         self.send("Target.detachFromTarget", json!({"sessionId": session_id}))
             .await?;
         Ok(())
     }
 
+    /// Bring a target to the foreground.
     pub async fn activate_target(&mut self, target_id: &str) -> Result<()> {
         self.send("Target.activateTarget", json!({"targetId": target_id}))
             .await?;
         Ok(())
     }
 
+    /// Create a new page target and return its target ID.
     pub async fn create_target(&mut self, url: &str) -> Result<String> {
         let result = self
             .send("Target.createTarget", json!({"url": url}))
@@ -387,6 +395,7 @@ impl CdpClient {
             .ok_or_else(|| anyhow!("No targetId in createTarget response"))
     }
 
+    /// Close a target by its target ID.
     pub async fn close_target(&mut self, target_id: &str) -> Result<()> {
         self.send("Target.closeTarget", json!({"targetId": target_id}))
             .await?;

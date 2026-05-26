@@ -734,21 +734,19 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             clear_geolocation,
             clear_all,
         } => {
-            commands::emulation::emulate(
-                &mut client,
-                &session_id,
-                commands::emulation::EmulateParams {
-                    viewport: viewport.clone(),
-                    device_scale_factor: *device_scale_factor,
-                    mobile: *mobile,
-                    geolocation: geolocation.clone(),
-                    accuracy: *accuracy,
-                    clear_viewport: *clear_viewport,
-                    clear_geolocation: *clear_geolocation,
-                    clear_all: *clear_all,
-                },
-            )
-            .await
+            let params = commands::emulation::EmulateParams {
+                viewport: viewport.clone(),
+                device_scale_factor: *device_scale_factor,
+                mobile: *mobile,
+                geolocation: geolocation.clone(),
+                accuracy: *accuracy,
+                clear_viewport: *clear_viewport,
+                clear_geolocation: *clear_geolocation,
+                clear_all: *clear_all,
+            };
+            params.validate()?;
+            commands::emulation::emulate(&mut client, &session_id, params)
+                .await
         }
         Commands::WaitFor { text, timeout } => {
             commands::pages::wait_for(&mut client, &session_id, text, *timeout).await

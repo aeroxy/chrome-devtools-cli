@@ -78,6 +78,7 @@ async fn dispatch_mouse(
     Ok(())
 }
 
+/// Click an element identified by CSS selector.
 pub async fn click(
     client: &mut CdpClient,
     session_id: &str,
@@ -190,6 +191,7 @@ async fn wait_for_navigation(client: &mut CdpClient, session_id: &str) -> Result
     Ok(())
 }
 
+/// Click at absolute page coordinates (x, y).
 pub async fn click_at(
     client: &mut CdpClient,
     session_id: &str,
@@ -212,6 +214,7 @@ pub async fn click_at(
         .with_navigated_to_if_changed(new_url, initial_url))
 }
 
+/// Hover over an element identified by CSS selector.
 pub async fn hover(
     client: &mut CdpClient,
     session_id: &str,
@@ -225,6 +228,7 @@ pub async fn hover(
         .with_navigated_to_if_changed(new_url, initial_url))
 }
 
+/// Fill an input field identified by CSS selector with the given value.
 pub async fn fill(
     client: &mut CdpClient,
     session_id: &str,
@@ -351,6 +355,7 @@ if res_val == "not_found" {
     )
 }
 
+/// Insert text at the current focus point, optionally pressing a submit key.
 pub async fn type_text(
     client: &mut CdpClient,
     session_id: &str,
@@ -374,6 +379,7 @@ pub async fn type_text(
     .with_navigated_to_if_changed(new_url, initial_url))
 }
 
+/// Press a key or key combination (e.g. "Enter", "Ctrl+A").
 pub async fn press_key(
     client: &mut CdpClient,
     session_id: &str,

@@ -4,6 +4,7 @@ use serde_json::json;
 use crate::cdp::CdpClient;
 use crate::result::CommandResult;
 
+/// List third-party DevTools tools registered via __dtmcp on the page.
 pub async fn list_3p_tools(
     client: &mut CdpClient,
     session_id: &str,
@@ -70,6 +71,7 @@ pub async fn list_3p_tools(
     }
 }
 
+/// Execute a named third-party DevTools tool with optional JSON parameters.
 pub async fn execute_3p_tool(
     client: &mut CdpClient,
     session_id: &str,

@@ -5,6 +5,7 @@ use std::fmt::Write;
 use crate::cdp::CdpClient;
 use crate::result::CommandResult;
 
+/// Take an accessibility tree snapshot of the current page.
 pub async fn take_snapshot(
     client: &mut CdpClient,
     session_id: &str,

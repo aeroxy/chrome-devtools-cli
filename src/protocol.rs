@@ -25,16 +25,19 @@ pub struct DaemonResponse {
     pub error_code: Option<u32>,
 }
 
+/// Path to the Unix domain socket for daemon communication.
 #[cfg(unix)]
 pub fn socket_path() -> PathBuf {
     std::env::temp_dir().join("chrome-devtools-daemon.sock")
 }
 
+/// Path to the named-pipe address file for daemon communication (Windows).
 #[cfg(windows)]
 pub fn addr_path() -> PathBuf {
     std::env::temp_dir().join("chrome-devtools-daemon.addr")
 }
 
+/// Path to the daemon PID file.
 pub fn pid_path() -> PathBuf {
     std::env::temp_dir().join("chrome-devtools-daemon.pid")
 }
