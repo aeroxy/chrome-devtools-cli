@@ -17,6 +17,14 @@ A high-performance, developer-friendly CLI for interacting with Chrome via the D
 cargo install --path .
 ```
 
+## Prerequisites
+
+Chrome must have remote debugging enabled:
+
+1. Open Chrome
+2. Go to `chrome://inspect/#remote-debugging`
+3. Enable the remote debugging server
+
 ## Quick Start
 
 ### General Usage

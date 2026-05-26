@@ -20,29 +20,7 @@ pub async fn navigate(
         bail!("URL required (or use --back, --forward, --reload)");
     }
 
-    // Apply extra HTTP headers if provided
-    if let Some(headers_json) = extra_headers {
-        let headers: serde_json::Value = serde_json::from_str(headers_json)
-            .map_err(|e| anyhow::anyhow!("Invalid --extra-headers JSON: {e}"))?;
-        let headers_obj = headers
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("--extra-headers must be a JSON object"))?;
-        for (k, v) in headers_obj {
-            if !v.is_string() {
-                anyhow::bail!("Header value for '{}' must be a string", k);
-            }
-        }
-        client
-            .send_to_target(session_id, "Network.enable", json!({}))
-            .await?;
-        client
-            .send_to_target(
-                session_id,
-                "Network.setExtraHTTPHeaders",
-                json!({"headers": headers_obj}),
-            )
-            .await?;
-    }
+    super::pages::apply_extra_headers(client, session_id, extra_headers).await?;
 
     if back {
         return go_back(client, session_id, output).await;

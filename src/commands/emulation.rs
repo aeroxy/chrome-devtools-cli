@@ -16,6 +16,31 @@ pub struct EmulateParams {
     pub clear_all: bool,
 }
 
+impl EmulateParams {
+    /// Validate cross-field constraints before applying emulation.
+    pub fn validate(&self) -> Result<()> {
+        if self.accuracy.is_some() && self.geolocation.is_none() {
+            anyhow::bail!("--accuracy requires --geolocation");
+        }
+        if self.mobile && self.viewport.is_none() {
+            anyhow::bail!("--mobile requires --viewport");
+        }
+        if self.device_scale_factor.is_some() && self.viewport.is_none() {
+            anyhow::bail!("--device-scale-factor requires --viewport");
+        }
+        Ok(())
+    }
+
+    /// Returns true if any flag that triggers emulation is set.
+    pub fn has_emulation(&self) -> bool {
+        self.viewport.is_some()
+            || self.geolocation.is_some()
+            || self.device_scale_factor.is_some()
+            || self.mobile
+            || self.clear_all
+    }
+}
+
 /// Execute the unified emulation command.
 pub async fn emulate(
     client: &mut CdpClient,

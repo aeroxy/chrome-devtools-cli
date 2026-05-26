@@ -92,35 +92,20 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                 let viewport = args.get("viewport").and_then(|v| v.as_str());
                 let geolocation = args.get("geolocation").and_then(|v| v.as_str());
 
-                let accuracy = args.get("accuracy").and_then(|v| v.as_f64());
-                let mobile = args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false);
-                let device_scale_factor = args.get("device_scale_factor").and_then(|v| v.as_f64());
+                let params = commands::emulation::EmulateParams {
+                    viewport: viewport.map(|s| s.to_string()),
+                    device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
+                    mobile: args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false),
+                    geolocation: geolocation.map(|s| s.to_string()),
+                    accuracy: args.get("accuracy").and_then(|v| v.as_f64()),
+                    clear_viewport: false,
+                    clear_geolocation: false,
+                    clear_all: false,
+                };
+                params.validate()?;
 
-                if accuracy.is_some() && geolocation.is_none() {
-                    anyhow::bail!("--accuracy requires --geolocation");
-                }
-                if mobile && viewport.is_none() {
-                    anyhow::bail!("--mobile requires --viewport");
-                }
-                if device_scale_factor.is_some() && viewport.is_none() {
-                    anyhow::bail!("--device-scale-factor requires --viewport");
-                }
-
-                let params = if viewport.is_some()
-                    || geolocation.is_some()
-                    || device_scale_factor.is_some()
-                    || mobile
-                {
-                    Some(commands::emulation::EmulateParams {
-                        viewport: viewport.map(|s| s.to_string()),
-                        device_scale_factor,
-                        mobile,
-                        geolocation: geolocation.map(|s| s.to_string()),
-                        accuracy,
-                        clear_viewport: false,
-                        clear_geolocation: false,
-                        clear_all: false,
-                    })
+                let params = if params.has_emulation() {
+                    Some(params)
                 } else {
                     None
                 };
@@ -207,28 +192,20 @@ async fn inner_execute(
             let geolocation = args.get("geolocation").and_then(|v| v.as_str());
             let clear_all = args.get("clear_all").and_then(|v| v.as_bool()).unwrap_or(false);
 
-            let accuracy = args.get("accuracy").and_then(|v| v.as_f64());
-            if accuracy.is_some() && geolocation.is_none() {
-                bail!("--accuracy requires --geolocation");
-            }
+            let params = commands::emulation::EmulateParams {
+                viewport: viewport.map(|s| s.to_string()),
+                device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
+                mobile: args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false),
+                geolocation: geolocation.map(|s| s.to_string()),
+                accuracy: args.get("accuracy").and_then(|v| v.as_f64()),
+                clear_viewport: false,
+                clear_geolocation: false,
+                clear_all,
+            };
+            params.validate()?;
 
-            if viewport.is_some() || geolocation.is_some() || clear_all {
-                commands::emulation::emulate(
-                    client,
-                    session_id,
-                    commands::emulation::EmulateParams {
-                        viewport: viewport.map(|s| s.to_string()),
-                        device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
-                        mobile: args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false),
-                        geolocation: geolocation.map(|s| s.to_string()),
-                        accuracy,
-                        clear_viewport: false,
-                        clear_geolocation: false,
-                        clear_all,
-                    },
-                )
-                .await?;
-
+            if params.has_emulation() {
+                commands::emulation::emulate(client, session_id, params).await?;
             }
 
             commands::navigate::navigate(
@@ -323,28 +300,18 @@ async fn inner_execute(
             .await
         }
         "emulate" => {
-            let geolocation = args.get("geolocation").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let accuracy = args.get("accuracy").and_then(|v| v.as_f64());
-
-            if accuracy.is_some() && geolocation.is_none() {
-                anyhow::bail!("--accuracy requires --geolocation");
-            }
-
-            commands::emulation::emulate(
-                client,
-                session_id,
-                commands::emulation::EmulateParams {
-                    viewport: args.get("viewport").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
-                    mobile: args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false),
-                    geolocation,
-                    accuracy,
-                    clear_viewport: args.get("clear_viewport").and_then(|v| v.as_bool()).unwrap_or(false),
-                    clear_geolocation: args.get("clear_geolocation").and_then(|v| v.as_bool()).unwrap_or(false),
-                    clear_all: args.get("clear_all").and_then(|v| v.as_bool()).unwrap_or(false),
-                },
-            )
-            .await
+            let params = commands::emulation::EmulateParams {
+                viewport: args.get("viewport").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
+                mobile: args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false),
+                geolocation: args.get("geolocation").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                accuracy: args.get("accuracy").and_then(|v| v.as_f64()),
+                clear_viewport: args.get("clear_viewport").and_then(|v| v.as_bool()).unwrap_or(false),
+                clear_geolocation: args.get("clear_geolocation").and_then(|v| v.as_bool()).unwrap_or(false),
+                clear_all: args.get("clear_all").and_then(|v| v.as_bool()).unwrap_or(false),
+            };
+            params.validate()?;
+            commands::emulation::emulate(client, session_id, params).await
         }
         "wait-for" => match args.get("text").and_then(|v| v.as_str()) {
             Some(text) => {

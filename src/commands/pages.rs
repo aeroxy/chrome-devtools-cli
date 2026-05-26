@@ -7,7 +7,7 @@ use crate::constants::NAVIGATION_TIMEOUT_MS;
 use crate::friendly;
 use crate::result::CommandResult;
 
-async fn apply_extra_headers(
+pub async fn apply_extra_headers(
     client: &mut CdpClient,
     session_id: &str,
     extra_headers: Option<&str>,
@@ -103,13 +103,35 @@ pub async fn new_page(
         Ok(CommandResult::output(format!(
             "Opened new page with emulation: {url} (target: {target_id})"
         )))
+    } else if let Some(headers) = extra_headers {
+        // Create blank page so headers are applied before the real URL loads
+        let target_id = client.create_target("about:blank").await?;
+        let session_id = client.attach_to_target(&target_id).await?;
+
+        let result: Result<()> = async {
+            apply_extra_headers(client, &session_id, Some(headers)).await?;
+            let nav_result = client
+                .send_to_target(&session_id, "Page.navigate", json!({ "url": url }))
+                .await?;
+            if let Some(error_text) = nav_result.get("errorText").and_then(|v| v.as_str()) {
+                anyhow::bail!("Page.navigate failed: {error_text}");
+            }
+            crate::commands::navigate::wait_for_load(client, &session_id, NAVIGATION_TIMEOUT_MS).await?;
+            Ok(())
+        }
+        .await;
+
+        let _ = client.detach_from_target(&session_id).await;
+        if result.is_err() {
+            let _ = client.close_target(&target_id).await;
+            return Err(result.unwrap_err());
+        }
+
+        Ok(CommandResult::output(format!(
+            "Opened new page: {url} (target: {target_id})"
+        )))
     } else {
         let target_id = client.create_target(url).await?;
-        if let Some(headers) = extra_headers {
-            let session_id = client.attach_to_target(&target_id).await?;
-            let _ = apply_extra_headers(client, &session_id, Some(headers)).await;
-            let _ = client.detach_from_target(&session_id).await;
-        }
         Ok(CommandResult::output(format!(
             "Opened new page: {url} (target: {target_id})"
         )))

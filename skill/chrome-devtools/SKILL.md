@@ -109,6 +109,6 @@ chrome-devtools list-pages
 
 ### Third-party Developer Tools
 ```bash
-chrome-devtools list3p-tools
-chrome-devtools execute3p-tool <name> '<json-params>'
+chrome-devtools list-3p-tools
+chrome-devtools execute-3p-tool <name> '<json-params>'
 ```

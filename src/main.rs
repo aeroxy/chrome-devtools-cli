@@ -563,31 +563,20 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 accuracy,
                 extra_headers,
             } => {
-                if accuracy.is_some() && geolocation.is_none() {
-                    anyhow::bail!("--accuracy requires --geolocation");
-                }
-                if *mobile && viewport.is_none() {
-                    anyhow::bail!("--mobile requires --viewport");
-                }
-                if device_scale_factor.is_some() && viewport.is_none() {
-                    anyhow::bail!("--device-scale-factor requires --viewport");
-                }
+                let params = commands::emulation::EmulateParams {
+                    viewport: viewport.clone(),
+                    device_scale_factor: *device_scale_factor,
+                    mobile: *mobile,
+                    geolocation: geolocation.clone(),
+                    accuracy: *accuracy,
+                    clear_viewport: false,
+                    clear_geolocation: false,
+                    clear_all: false,
+                };
+                params.validate()?;
 
-                let params = if viewport.is_some()
-                    || geolocation.is_some()
-                    || device_scale_factor.is_some()
-                    || *mobile
-                {
-                    Some(commands::emulation::EmulateParams {
-                        viewport: viewport.clone(),
-                        device_scale_factor: *device_scale_factor,
-                        mobile: *mobile,
-                        geolocation: geolocation.clone(),
-                        accuracy: *accuracy,
-                        clear_viewport: false,
-                        clear_geolocation: false,
-                        clear_all: false,
-                    })
+                let params = if params.has_emulation() {
+                    Some(params)
                 } else {
                     None
                 };
@@ -654,38 +643,21 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             clear_all,
             output,
         } => {
-            if accuracy.is_some() && geolocation.is_none() {
-                anyhow::bail!("--accuracy requires --geolocation");
-            }
-            if *mobile && viewport.is_none() {
-                anyhow::bail!("--mobile requires --viewport");
-            }
-            if device_scale_factor.is_some() && viewport.is_none() {
-                anyhow::bail!("--device-scale-factor requires --viewport");
-            }
+            let params = commands::emulation::EmulateParams {
+                viewport: viewport.clone(),
+                device_scale_factor: *device_scale_factor,
+                mobile: *mobile,
+                geolocation: geolocation.clone(),
+                accuracy: *accuracy,
+                clear_viewport: false,
+                clear_geolocation: false,
+                clear_all: *clear_all,
+            };
+            params.validate()?;
 
             // Apply emulation before navigation if requested
-            if viewport.is_some()
-                || geolocation.is_some()
-                || device_scale_factor.is_some()
-                || *mobile
-                || *clear_all
-            {
-                commands::emulation::emulate(
-                    &mut client,
-                    &session_id,
-                    commands::emulation::EmulateParams {
-                        viewport: viewport.clone(),
-                        device_scale_factor: *device_scale_factor,
-                        mobile: *mobile,
-                        geolocation: geolocation.clone(),
-                        accuracy: *accuracy,
-                        clear_viewport: false,
-                        clear_geolocation: false,
-                        clear_all: *clear_all,
-                    },
-                )
-                .await?;
+            if params.has_emulation() {
+                commands::emulation::emulate(&mut client, &session_id, params).await?;
             }
 
             commands::navigate::navigate(
