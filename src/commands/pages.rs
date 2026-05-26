@@ -19,10 +19,15 @@ pub async fn apply_extra_headers(
         let headers_obj = headers
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("--extra-headers must be a JSON object"))?;
+        let mut converted_headers = serde_json::Map::new();
         for (k, v) in headers_obj {
-            if !v.is_string() {
-                anyhow::bail!("Header value for '{}' must be a string", k);
-            }
+            let val_str = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => anyhow::bail!("Header value for '{}' must be a primitive scalar (string, number, or boolean)", k),
+            };
+            converted_headers.insert(k.clone(), serde_json::Value::String(val_str));
         }
         client
             .send_to_target(session_id, "Network.enable", json!({}))
@@ -31,7 +36,7 @@ pub async fn apply_extra_headers(
             .send_to_target(
                 session_id,
                 "Network.setExtraHTTPHeaders",
-                json!({"headers": headers_obj}),
+                json!({"headers": converted_headers}),
             )
             .await?;
     }
