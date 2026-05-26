@@ -38,6 +38,8 @@ impl EmulateParams {
             || self.device_scale_factor.is_some()
             || self.mobile
             || self.clear_all
+            || self.clear_viewport
+            || self.clear_geolocation
     }
 }
 
