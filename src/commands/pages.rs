@@ -38,6 +38,18 @@ pub async fn apply_extra_headers(
     Ok(())
 }
 
+/// Clear extra HTTP headers for a page session.
+pub async fn clear_extra_headers(client: &mut CdpClient, session_id: &str) -> Result<()> {
+    client
+        .send_to_target(
+            session_id,
+            "Network.setExtraHTTPHeaders",
+            json!({"headers": {}}),
+        )
+        .await?;
+    Ok(())
+}
+
 /// List all open page targets with their friendly names, titles, and URLs.
 pub async fn list_pages(client: &mut CdpClient, as_json: bool) -> Result<CommandResult> {
     let pages = client.get_page_targets().await?;

@@ -17,36 +17,50 @@ pub async fn navigate(
     output: Option<&str>,
 ) -> Result<CommandResult> {
     // Validate navigation intent before mutating session state
-    if !back && !forward && !reload && url.is_none() {
+    let intent_count = [back, forward, reload, url.is_some()].iter().filter(|&&b| b).count();
+    if intent_count == 0 {
         bail!("URL required (or use --back, --forward, --reload)");
+    }
+    if intent_count > 1 {
+        bail!("Conflicting navigation intents: only one of URL, --back, --forward, or --reload can be specified");
     }
 
     super::pages::apply_extra_headers(client, session_id, extra_headers).await?;
 
-    if back {
-        return go_back(client, session_id, output).await;
+    let navigate_result = async {
+        if back {
+            return go_back(client, session_id, output).await;
+        }
+        if forward {
+            return go_forward(client, session_id, output).await;
+        }
+        if reload {
+            return do_reload(client, session_id, output).await;
+        }
+
+        let url = url.unwrap(); // safe: validated above
+
+        let result = client
+            .send_to_target(session_id, "Page.navigate", json!({"url": url}))
+            .await?;
+
+        if let Some(err) = result.get("errorText").and_then(|v| v.as_str()) {
+            bail!("Navigation error: {err}");
+        }
+
+        wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS).await?;
+        let result =
+            CommandResult::output(format!("Navigated to {url}")).with_navigated_to(url.to_string());
+        Ok(result.save_output(output).await?)
     }
-    if forward {
-        return go_forward(client, session_id, output).await;
-    }
-    if reload {
-        return do_reload(client, session_id, output).await;
+    .await;
+
+    // Always clear headers, even on failure
+    if let Err(e) = super::pages::clear_extra_headers(client, session_id).await {
+        eprintln!("Warning: failed to clear extra headers: {e}");
     }
 
-    let url = url.unwrap(); // safe: validated above
-
-    let result = client
-        .send_to_target(session_id, "Page.navigate", json!({"url": url}))
-        .await?;
-
-    if let Some(err) = result.get("errorText").and_then(|v| v.as_str()) {
-        bail!("Navigation error: {err}");
-    }
-
-    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS).await?;
-    let result =
-        CommandResult::output(format!("Navigated to {url}")).with_navigated_to(url.to_string());
-    Ok(result.save_output(output).await?)
+    navigate_result
 }
 
 async fn go_back(
