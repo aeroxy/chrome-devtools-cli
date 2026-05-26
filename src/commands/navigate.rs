@@ -162,6 +162,13 @@ pub async fn wait_for_load(client: &mut CdpClient, session_id: &str, timeout_ms:
                 }
             }
             Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("Execution context was destroyed")
+                    || msg.contains("Cannot find context")
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
                 return Err(anyhow!("wait_for_load failed for session {session_id}: {e}"));
             }
         }

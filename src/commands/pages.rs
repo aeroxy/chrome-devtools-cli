@@ -73,43 +73,16 @@ pub async fn new_page(
     emulation: Option<crate::commands::emulation::EmulateParams>,
     extra_headers: Option<&str>,
 ) -> Result<CommandResult> {
-    if let Some(params) = emulation {
-        // Create an empty page first so we can apply emulation before it loads the real URL
+    if emulation.is_some() || extra_headers.is_some() {
+        // Create blank page so emulation/headers are applied before the real URL loads
         let target_id = client.create_target("about:blank").await?;
         let session_id = client.attach_to_target(&target_id).await?;
 
-        // Use a block to ensure detachment and closure occurs even if emulation or navigation fails
         let result: Result<()> = async {
-            crate::commands::emulation::emulate(client, &session_id, params).await?;
-            apply_extra_headers(client, &session_id, extra_headers).await?;
-            let nav_result = client
-                .send_to_target(&session_id, "Page.navigate", json!({ "url": url }))
-                .await?;
-            if let Some(error_text) = nav_result.get("errorText").and_then(|v| v.as_str()) {
-                anyhow::bail!("Page.navigate failed: {error_text}");
+            if let Some(params) = emulation {
+                crate::commands::emulation::emulate(client, &session_id, params).await?;
             }
-            // Wait for load (consistent with navigate command)
-            crate::commands::navigate::wait_for_load(client, &session_id, NAVIGATION_TIMEOUT_MS).await?;
-            Ok(())
-        }
-        .await;
-
-        let _ = client.detach_from_target(&session_id).await;
-        if result.is_err() {
-            let _ = client.close_target(&target_id).await;
-            return Err(result.unwrap_err());
-        }
-
-        Ok(CommandResult::output(format!(
-            "Opened new page with emulation: {url} (target: {target_id})"
-        )))
-    } else if let Some(headers) = extra_headers {
-        // Create blank page so headers are applied before the real URL loads
-        let target_id = client.create_target("about:blank").await?;
-        let session_id = client.attach_to_target(&target_id).await?;
-
-        let result: Result<()> = async {
-            apply_extra_headers(client, &session_id, Some(headers)).await?;
+            apply_extra_headers(client, &session_id, extra_headers).await?;
             let nav_result = client
                 .send_to_target(&session_id, "Page.navigate", json!({ "url": url }))
                 .await?;
