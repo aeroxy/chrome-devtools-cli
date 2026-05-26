@@ -143,13 +143,17 @@ pub async fn new_page(
 /// Close a page target by its target ID.
 pub async fn close_page(client: &mut CdpClient, target_id: &str) -> Result<CommandResult> {
     client.close_target(target_id).await?;
-    Ok(CommandResult::output(format!("Closed page: {target_id}")))
+    let friendly_name = friendly::to_friendly(target_id);
+    Ok(CommandResult::output(format!("Closed page: {friendly_name}")))
 }
 
 /// Activate (bring to front) a page target by its target ID.
 pub async fn select_page(client: &mut CdpClient, target_id: &str) -> Result<CommandResult> {
     client.activate_target(target_id).await?;
-    Ok(CommandResult::output(format!("Activated page: {target_id}")))
+    let friendly_name = friendly::to_friendly(target_id);
+    let mut result = CommandResult::output(format!("Activated page: {friendly_name}"));
+    result.target_id = Some(friendly_name);
+    Ok(result)
 }
 
 /// Wait until the page body contains the given text, or timeout.
