@@ -31,7 +31,7 @@ pub struct Cli {
     #[arg(long, global = true, env = "CHROME_USER_DATA_DIR")]
     pub user_data_dir: Option<String>,
 
-    /// Chrome channel: stable, beta, canary, dev
+    /// Browser channel: stable, beta, canary, dev, edge, edge-beta, edge-canary, edge-dev
     #[arg(long, global = true, default_value = "stable", env = "CHROME_CHANNEL")]
     pub channel: String,
 

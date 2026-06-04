@@ -1,6 +1,6 @@
 # Chrome DevTools CLI
 
-High-performance rust CLI that connects to an existing Chrome browser via the DevTools Protocol. Auto-connects by default, no manual WebSocket URL needed.
+High-performance rust CLI that connects to an existing Chrome or Edge browser via the DevTools Protocol. Auto-connects by default, no manual WebSocket URL needed.
 
 [![crates.io](https://img.shields.io/crates/v/chrome-devtools-cli.svg)](https://crates.io/crates/chrome-devtools-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -42,12 +42,12 @@ This is a lightweight Rust binary that talks directly to Chrome's DevTools Proto
 ```
 chrome-devtools navigate https://example.com
         │
-        ├─ Try daemon (Unix socket /tmp/chrome-devtools-daemon.sock)
+        ├─ Try daemon (Unix socket on macOS/Linux, TCP localhost on Windows)
         │   └─ If running → send command → get result
         │
         ├─ If no daemon → spawn one (background process)
-        │   └─ Daemon connects to Chrome WebSocket (one-time approval)
-        │   └─ Listens on Unix socket, 5-min idle timeout
+        │   └─ Daemon connects to Chrome/Edge WebSocket (one-time approval)
+        │   └─ Listens for IPC connections, 5-min idle timeout
         │
         └─ Fallback → direct WebSocket connection (no daemon)
 ```
@@ -56,23 +56,23 @@ The daemon keeps a persistent WebSocket connection to Chrome, so the browser onl
 
 ## Prerequisites
 
-Chrome must have remote debugging enabled:
+Chrome or Edge must have remote debugging enabled:
 
-1. Open Chrome
-2. Go to `chrome://inspect/#remote-debugging`
+1. Open Chrome/Edge
+2. Go to `chrome://inspect/#remote-debugging` (or `edge://inspect/#remote-debugging`)
 3. Enable the remote debugging server
 
 ## Auto-connect
 
-By default, the CLI reads `DevToolsActivePort` from Chrome's user data directory:
+By default, the CLI reads `DevToolsActivePort` from the browser's user data directory:
 
-| OS | Default path |
-|----|-------------|
-| macOS | `~/Library/Application Support/Google/Chrome/` |
-| Linux | `~/.config/google-chrome/` |
-| Windows | `%LOCALAPPDATA%\Google\Chrome\User Data\` |
+| OS | Chrome (default) | Edge (`--channel edge`) |
+|----|-----------------|------------------------|
+| macOS | `~/Library/Application Support/Google/Chrome/` | `~/Library/Application Support/Microsoft Edge/` |
+| Linux | `~/.config/google-chrome/` | `~/.config/microsoft-edge/` |
+| Windows | `%LOCALAPPDATA%\Google\Chrome\User Data\` | `%LOCALAPPDATA%\Microsoft\Edge\User Data\` |
 
-Override with `--user-data-dir`, `--channel` (beta/canary/dev), or `--ws-endpoint`. All three also read from environment variables:
+Override with `--user-data-dir`, `--channel` (stable/beta/canary/dev/edge/edge-beta/edge-canary/edge-dev), or `--ws-endpoint`. All three also read from environment variables:
 
 | Environment Variable | Corresponding Flag |
 |----------------------|--------------------|
@@ -174,16 +174,17 @@ These commands interact with tools injected into the page via `window.__dtmcp.to
 | `--json` | JSON output |
 | `--ws-endpoint <url>` | Explicit WebSocket URL |
 | `--user-data-dir <path>` | Custom Chrome profile directory |
-| `--channel <ch>` | Chrome channel (stable/beta/canary/dev) |
+| `--channel <ch>` | Browser channel (stable/beta/canary/dev/edge/edge-beta/edge-canary/edge-dev) |
 
 ## Daemon details
 
-- **Socket**: `/tmp/chrome-devtools-daemon.sock`
-- **PID file**: `/tmp/chrome-devtools-daemon.pid`
-- **Idle timeout**: 5 minutes (auto-exits, cleans up socket)
-- **Protocol**: Length-prefixed JSON over Unix socket
+- **IPC (macOS/Linux)**: Unix socket at `/tmp/chrome-devtools-daemon.sock`
+- **IPC (Windows)**: TCP on `127.0.0.1` with address stored in `%TEMP%\chrome-devtools-daemon.addr`
+- **PID file**: `/tmp/chrome-devtools-daemon.pid` (Unix) or `%TEMP%\chrome-devtools-daemon.pid` (Windows)
+- **Idle timeout**: 5 minutes (auto-exits, cleans up)
+- **Protocol**: Length-prefixed JSON
 - **Spawned by**: First CLI invocation (transparent to user)
-- **Kill manually**: `pkill -f __daemon__` or delete the socket
+- **Kill manually**: `pkill -f __daemon__` (Unix) or terminate via PID file (Windows)
 
 ## Source layout
 

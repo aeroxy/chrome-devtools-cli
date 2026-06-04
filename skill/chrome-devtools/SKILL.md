@@ -1,17 +1,22 @@
 ---
 name: chrome-devtools
-description: Use when the user asks to "take a screenshot of a website", "navigate to a URL", "fill a form in the browser", "interact with Chrome", or when a chrome automation task is needed.
+description: Use when the user asks to "take a screenshot of a website", "navigate to a URL", "fill a form in the browser", "interact with Chrome/Edge", "connect Chrome/Edge", or when a browser automation task is needed.
 user-invocable: true
 ---
 
 ## Prerequisites
 
-Chrome must have remote debugging enabled:
-1. Open Chrome
-2. Go to `chrome://inspect/#remote-debugging`
+Chrome or Edge must have remote debugging enabled:
+1. Open Chrome/Edge
+2. Go to `chrome://inspect/#remote-debugging` (or `edge://inspect/#remote-debugging`)
 3. Enable the remote debugging server
 
-The CLI auto-connects by reading Chrome's `DevToolsActivePort` file — no WebSocket URL needed.
+The CLI auto-connects by reading the browser's `DevToolsActivePort` file — no WebSocket URL needed.
+
+For Edge, pass `--channel edge`:
+```bash
+chrome-devtools --channel edge list-pages
+```
 
 ## Core Capabilities
 
