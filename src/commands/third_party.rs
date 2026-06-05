@@ -12,18 +12,36 @@ pub async fn list_3p_tools(
 ) -> Result<CommandResult> {
     let expr = r#"(() => {
         const dtmcp = window.__dtmcp;
-        if (!dtmcp || !dtmcp.toolGroup) {
-            return JSON.stringify({ tools: [] });
+        if (!dtmcp) {
+            return JSON.stringify({ groups: [] });
         }
-        return JSON.stringify({
-            name: dtmcp.toolGroup.name,
-            description: dtmcp.toolGroup.description,
-            tools: dtmcp.toolGroup.tools.map(t => ({
-                name: t.name,
-                description: t.description,
-                inputSchema: t.inputSchema
-            }))
-        });
+        if (Array.isArray(dtmcp.toolGroups) && dtmcp.toolGroups.length > 0) {
+            return JSON.stringify({
+                groups: dtmcp.toolGroups.map(g => ({
+                    name: g.name,
+                    description: g.description,
+                    tools: (g.tools || []).map(t => ({
+                        name: t.name,
+                        description: t.description,
+                        inputSchema: t.inputSchema
+                    }))
+                }))
+            });
+        }
+        if (dtmcp.toolGroup) {
+            return JSON.stringify({
+                groups: [{
+                    name: dtmcp.toolGroup.name,
+                    description: dtmcp.toolGroup.description,
+                    tools: (dtmcp.toolGroup.tools || []).map(t => ({
+                        name: t.name,
+                        description: t.description,
+                        inputSchema: t.inputSchema
+                    }))
+                }]
+            });
+        }
+        return JSON.stringify({ groups: [] });
     })()"#;
 
     let result = client
@@ -42,29 +60,35 @@ pub async fn list_3p_tools(
         Ok(CommandResult::output(val_str.to_string()))
     } else {
         let val: serde_json::Value = serde_json::from_str(val_str)?;
-        let tools = val["tools"]
+        let groups = val["groups"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("Invalid response from page"))?;
 
-        if tools.is_empty() {
+        let total_tools: usize = groups
+            .iter()
+            .filter_map(|g| g["tools"].as_array().map(|a| a.len()))
+            .sum();
+
+        if total_tools == 0 {
             return Ok(CommandResult::output(
                 "No third-party developer tools found on this page.".to_string(),
             ));
         }
 
         let mut output = String::new();
-        if let Some(name) = val["name"].as_str() {
-            output.push_str(&format!("Tool Group: {}\n", name));
-        }
-        if let Some(desc) = val["description"].as_str() {
-            output.push_str(&format!("Description: {}\n", desc));
-        }
-        output.push_str("\nAvailable Tools:\n");
-
-        for tool in tools {
-            let name = tool["name"].as_str().unwrap_or("unknown");
-            let desc = tool["description"].as_str().unwrap_or("");
-            output.push_str(&format!("- {}: {}\n", name, desc));
+        for group in groups {
+            let name = group["name"].as_str().unwrap_or("unknown");
+            let desc = group["description"].as_str().unwrap_or("");
+            output.push_str(&format!("{}: {}\n", name, desc));
+            if let Some(tools) = group["tools"].as_array() {
+                output.push_str("Available tools:\n");
+                for tool in tools {
+                    let tname = tool["name"].as_str().unwrap_or("unknown");
+                    let tdesc = tool["description"].as_str().unwrap_or("");
+                    output.push_str(&format!("  - {}: {}\n", tname, tdesc));
+                }
+            }
+            output.push('\n');
         }
 
         Ok(CommandResult::output(output))
@@ -91,13 +115,24 @@ pub async fn execute_3p_tool(
     let expr = format!(
         r#"(async () => {{
         const dtmcp = window.__dtmcp;
-        if (!dtmcp || !dtmcp.executeTool) {{
+        if (!dtmcp) {{
             return JSON.stringify({{ error: 'Third-party tools not supported on this page' }});
         }}
         try {{
             const params = {safe_params_json};
-            const result = await dtmcp.executeTool({safe_name_json}, params);
-            return JSON.stringify({{ result }});
+            if (dtmcp.executeTool) {{
+                const result = await dtmcp.executeTool({safe_name_json}, params);
+                return JSON.stringify({{ result }});
+            }}
+            const groups = dtmcp.toolGroups || (dtmcp.toolGroup ? [dtmcp.toolGroup] : []);
+            for (const group of groups) {{
+                const tool = (group.tools || []).find(t => t.name === {safe_name_json});
+                if (tool && typeof tool.execute === 'function') {{
+                    const result = await tool.execute(params);
+                    return JSON.stringify({{ result }});
+                }}
+            }}
+            return JSON.stringify({{ error: 'Tool ' + {safe_name_json} + ' not found' }});
         }} catch (e) {{
             return JSON.stringify({{ error: e.message || String(e) }});
         }}
