@@ -81,11 +81,13 @@ pub async fn list_3p_tools(
             let desc = group["description"].as_str().unwrap_or("");
             output.push_str(&format!("{}: {}\n", name, desc));
             if let Some(tools) = group["tools"].as_array() {
-                output.push_str("Available tools:\n");
-                for tool in tools {
-                    let tname = tool["name"].as_str().unwrap_or("unknown");
-                    let tdesc = tool["description"].as_str().unwrap_or("");
-                    output.push_str(&format!("  - {}: {}\n", tname, tdesc));
+                if !tools.is_empty() {
+                    output.push_str("Available tools:\n");
+                    for tool in tools {
+                        let tname = tool["name"].as_str().unwrap_or("unknown");
+                        let tdesc = tool["description"].as_str().unwrap_or("");
+                        output.push_str(&format!("  - {}: {}\n", tname, tdesc));
+                    }
                 }
             }
             output.push('\n');
