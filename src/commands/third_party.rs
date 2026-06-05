@@ -76,7 +76,10 @@ pub async fn list_3p_tools(
         }
 
         let mut output = String::new();
-        for group in groups {
+        for (i, group) in groups.iter().enumerate() {
+            if i > 0 {
+                output.push('\n');
+            }
             let name = group["name"].as_str().unwrap_or("unknown");
             let desc = group["description"].as_str().unwrap_or("");
             output.push_str(&format!("{}: {}\n", name, desc));
@@ -90,7 +93,6 @@ pub async fn list_3p_tools(
                     }
                 }
             }
-            output.push('\n');
         }
 
         Ok(CommandResult::output(output))
