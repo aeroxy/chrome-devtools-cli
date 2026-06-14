@@ -261,7 +261,8 @@ pub enum Commands {
         /// Omit or 0 to drain accumulated events instantly.
         #[arg(long, short, default_value_t = 0)]
         duration: u64,
-        /// Filter by message type (e.g. error, warning, log, info). Repeatable.
+        /// Filter by message type (e.g. error, warning, log, info). Case-insensitive;
+        /// "warn" is accepted as an alias for "warning". Repeatable.
         #[arg(long)]
         r#type: Vec<String>,
     },
@@ -272,7 +273,8 @@ pub enum Commands {
         /// Omit or 0 to drain accumulated events instantly.
         #[arg(long, short, default_value_t = 0)]
         duration: u64,
-        /// Filter by resource type (e.g. document, xhr, fetch, script, stylesheet, image). Repeatable.
+        /// Filter by resource type (e.g. document, xhr, fetch, script, stylesheet, image).
+        /// Case-insensitive. Repeatable.
         #[arg(long)]
         r#type: Vec<String>,
     },
