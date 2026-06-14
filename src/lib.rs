@@ -618,8 +618,13 @@ pub async fn run() -> Result<()> {
                 println!("No daemon running (PID file not found).");
             }
             Err(e) => {
-                eprintln!("Failed to read PID file {}: {}", pid_path.display(), e);
-                std::process::exit(1);
+                // Surface via the standard error path (uniform formatting,
+                // telemetry flush, typed exit code) — matching the EPERM
+                // signal-failure case above rather than exiting directly.
+                return Err(anyhow::anyhow!(
+                    "Failed to read PID file {}: {e}",
+                    pid_path.display()
+                ));
             }
         }
         return Ok(());
