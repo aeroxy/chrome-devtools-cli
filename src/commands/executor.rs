@@ -211,20 +211,28 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         let _ = client.ensure_persistent_session(&target_id).await;
     }
 
-    // Apply the global --block-url/--unblock-url flags (from DaemonRequest
-    // top-level fields) to the daemon's persistent blocklist. These survive
-    // across commands and target switches. Skip for "emulate": its handler
-    // applies the same fields itself, ordered with --clear-blocks (clear first,
-    // then add), so merging here would both double-add and break that ordering.
-    if cmd != "emulate" && (!req.block_url.is_empty() || !req.unblock_url.is_empty()) {
+    // Merge the global --block-url/--unblock-url flags (from DaemonRequest
+    // top-level fields) into the blocklist and apply them. This MUST run after
+    // ensure_persistent_session: that call swaps `blocklist` to the resolved
+    // target's per-tab list, so merging here lands the flags on the intended
+    // tab. Merging earlier would mutate (and leak into) whichever tab was
+    // active before the switch, and the swap would then discard the change.
+    //
+    // Skip "emulate": its handler applies these fields itself, ordered with
+    // --clear-blocks (clear first, then add). Skip close/select: no session.
+    // Browser-level commands returned early above, so --block-url with them is
+    // intentionally a no-op (a per-tab rule has no target tab there).
+    if cmd != "emulate"
+        && cmd != "close-page"
+        && cmd != "select-page"
+        && (!req.block_url.is_empty() || !req.unblock_url.is_empty())
+    {
         for p in &req.block_url {
             if !client.blocklist.contains(p) {
                 client.blocklist.push(p.clone());
             }
         }
-        for p in &req.unblock_url {
-            client.blocklist.retain(|b| b != p);
-        }
+        client.blocklist.retain(|b| !req.unblock_url.contains(b));
         client.apply_network_rules().await?;
     }
 
