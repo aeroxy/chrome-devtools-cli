@@ -225,7 +225,7 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         for p in &req.unblock_url {
             client.blocklist.retain(|b| b != p);
         }
-        client.apply_network_rules().await;
+        client.apply_network_rules().await?;
     }
 
     // Special case for commands that target a page but don't need a session
@@ -254,7 +254,7 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         // normally applies. Re-apply it so blocking still takes effect.
         let sid = client.attach_to_target(&target_id).await?;
         if !client.blocklist.is_empty() {
-            client.apply_network_rules_internal(&sid).await;
+            client.apply_network_rules_internal(&sid).await?;
         }
         sid
     };

@@ -187,30 +187,33 @@ impl CdpClient {
         }
 
         // Apply any existing blocklist to the new session.
-        self.apply_network_rules_internal(&session_id).await;
+        self.apply_network_rules_internal(&session_id).await?;
 
         Ok(())
     }
 
     /// Apply the daemon's current `blocklist` to the persistent session via
     /// `Network.setBlockedURLs`. Patterns are Chrome-style globs (e.g. `*.png`).
-    pub async fn apply_network_rules(&mut self) {
+    /// Falls back silently if no persistent session is active (e.g. during
+    /// daemon startup or after a target switch that hasn't finished attaching).
+    pub async fn apply_network_rules(&mut self) -> Result<()> {
         if let Some(ref session) = self.persistent_session.clone() {
-            self.apply_network_rules_internal(session).await;
+            self.apply_network_rules_internal(session).await?;
         }
+        Ok(())
     }
 
     /// Apply the current `blocklist` to a specific session via
     /// `Network.setBlockedURLs`. Used for both the persistent session and
     /// fallback per-command sessions (when the persistent one is unavailable).
-    pub(crate) async fn apply_network_rules_internal(&mut self, session_id: &str) {
-        let _ = self
-            .send_to_target(
-                session_id,
-                "Network.setBlockedURLs",
-                json!({"urls": self.blocklist}),
-            )
-            .await;
+    pub(crate) async fn apply_network_rules_internal(&mut self, session_id: &str) -> Result<()> {
+        self.send_to_target(
+            session_id,
+            "Network.setBlockedURLs",
+            json!({"urls": self.blocklist}),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Drain accumulated network events from the persistent session.
@@ -600,7 +603,17 @@ impl CdpClient {
                         }
                     }
                 }
-                Ok(Err(_)) | Err(_) => break,
+                // Timeout expired — normal completion path.
+                Err(_) => break,
+                // read_text() itself failed (socket closed, decode error,
+                // etc.) — real transport error. Log it so the user has a
+                // signal when the partial result is suspicious, then stop.
+                Ok(Err(e)) => {
+                    eprintln!(
+                        "Warning: WebSocket read failed during event collection: {e}"
+                    );
+                    break;
+                }
             }
         }
 

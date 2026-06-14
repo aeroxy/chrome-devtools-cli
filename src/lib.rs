@@ -559,11 +559,24 @@ pub async fn run() -> Result<()> {
                     .map_err(|_| anyhow::anyhow!("Invalid PID in {}", pid_path.display()))?;
                 #[cfg(unix)]
                 {
+                    // Guard against a PID that doesn't fit in libc::pid_t (a
+                    // signed 32-bit integer on POSIX). The OS never produces such
+                    // PIDs, but a corrupted PID file could, and the cast below
+                    // would silently wrap to a negative number — which kill()
+                    // interprets as "signal all processes in process group -pid",
+                    // potentially killing unrelated processes.
+                    let pid_i32: i32 = i32::try_from(pid).map_err(|_| {
+                        anyhow::anyhow!(
+                            "PID {} in {} exceeds libc::pid_t; refusing to signal",
+                            pid,
+                            pid_path.display()
+                        )
+                    })?;
                     // Signal the process directly via libc to avoid shelling out
                     // to /usr/bin/kill. A return of 0 means the signal was
                     // delivered; -1 with errno ESRCH means the process is gone
                     // (and the PID file was stale).
-                    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                    let ret = unsafe { libc::kill(pid_i32 as libc::pid_t, libc::SIGTERM) };
                     if ret == 0 {
                         // Signal delivered — daemon is shutting down; clean up.
                         let _ = std::fs::remove_file(&sock_path);
@@ -682,6 +695,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                     clear_viewport: false,
                     clear_geolocation: false,
                     clear_all: false,
+                    // URL blocking is daemon-only state; new-page in direct mode
+                    // has no persistent session to apply it to.
                     block_url: Vec::new(),
                     unblock_url: Vec::new(),
                     clear_blocks: false,
@@ -784,6 +799,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 clear_viewport: false,
                 clear_geolocation: false,
                 clear_all: *clear_all,
+                // URL blocking is daemon-only state; navigate in direct mode has
+                // no persistent session to apply it to.
                 block_url: Vec::new(),
                 unblock_url: Vec::new(),
                 clear_blocks: false,

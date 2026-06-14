@@ -102,7 +102,7 @@ pub async fn emulate(
     }
 
     if network_changed {
-        client.apply_network_rules().await;
+        client.apply_network_rules().await?;
     }
 
     // 1. Handle clearing
