@@ -240,10 +240,10 @@ chrome-devtools --target warm-squid evaluate "JSON.stringify(performance.timing)
 **Avoid `evaluate` for DOM traversal.** Use `snapshot` to read page structure and `click`/`fill` to interact.
 
 ### Pattern 7: Output Formats
-All commands that produce structured output support `--text` (default), `--json`, and `--toon` (compact, LLM-friendly).
+All commands default to human-readable text output. Use `--json` or `--toon` (compact, LLM-friendly) for structured output.
 
 ```bash
-chrome-devtools list-pages                    # human-readable table
+chrome-devtools list-pages                    # human-readable table (default)
 chrome-devtools list-pages --json             # JSON
 chrome-devtools list-pages --toon             # TOON (compact)
 
