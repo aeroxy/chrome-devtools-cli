@@ -14,25 +14,28 @@ pub async fn collect_network(
     type_filter: Vec<String>,
     format: OutputFormat,
 ) -> Result<CommandResult> {
-    let events = if duration_ms > 0 {
-        // Live mode: the persistent session already has Network enabled,
-        // so we skip enabling it on the command's own session to avoid
-        // duplicate events from two sessions both receiving the same messages.
-        if client.persistent_session.is_none() {
-            client
-                .send_to_target(session_id, "Network.enable", json!({}))
-                .await?;
-        }
-        let events_result = client.read_events_for(duration_ms).await;
-        if client.persistent_session.is_none() {
-            let _ = client
-                .send_to_target(session_id, "Network.disable", json!({}))
-                .await;
-        }
-        events_result?
-    } else {
-        // Drain mode: return accumulated events from persistent session
+    let events = if duration_ms == 0 {
+        // Drain mode: return accumulated events from the persistent session.
         client.drain_network_events()
+    } else if client.persistent_session.is_some() {
+        // Live mode, daemon: the persistent session already has Network enabled
+        // and push_event accumulates its events into network_events. Read for the
+        // window so they land in the buffer, then drain the buffer as the single
+        // source of truth. Draining also consumes them, so a later drain can't
+        // repeat them (read_events_for's own return value would double-count).
+        client.read_events_for(duration_ms).await?;
+        client.drain_network_events()
+    } else {
+        // Live mode, direct/fallback: no persistent buffer. Enable Network on our
+        // own session, collect for the window, disable, and return what we read.
+        client
+            .send_to_target(session_id, "Network.enable", json!({}))
+            .await?;
+        let events_result = client.read_events_for(duration_ms).await;
+        let _ = client
+            .send_to_target(session_id, "Network.disable", json!({}))
+            .await;
+        events_result?
     };
 
     let requests = process_network_events(&events, &type_filter);
