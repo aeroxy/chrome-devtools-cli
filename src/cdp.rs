@@ -164,13 +164,21 @@ impl CdpClient {
             .ok_or_else(|| anyhow!("No sessionId in persistent attachToTarget"))?
             .to_string();
 
+        // Store the session id BEFORE enabling domains so events arriving
+        // during Network.enable / Runtime.enable are routed to persistent
+        // buffers instead of the generic events buffer.
+        self.persistent_session = Some(session_id.clone());
+        self.persistent_target_id = Some(target_id.to_string());
+
         // Enable Network and Runtime domains on the persistent session. If
-        // either fails, detach the just-attached session (so it isn't leaked in
-        // Chrome) and bail before marking the session persistent — per-command
-        // collectors then fall back to their own enable instead of silently
-        // draining an uninitialized (always-empty) buffer.
+        // either fails, clear the just-set session, detach it (so it isn't
+        // leaked in Chrome), and bail — per-command collectors then fall
+        // back to their own enable instead of silently draining an
+        // uninitialized (always-empty) buffer.
         for method in ["Network.enable", "Runtime.enable"] {
             if let Err(e) = self.send_to_target(&session_id, method, json!({})).await {
+                self.persistent_session = None;
+                self.persistent_target_id = None;
                 let _ = self
                     .send("Target.detachFromTarget", json!({"sessionId": session_id}))
                     .await;
@@ -178,11 +186,9 @@ impl CdpClient {
             }
         }
 
-        // Apply any existing blocklist to the new session before storing it.
+        // Apply any existing blocklist to the new session.
         self.apply_network_rules_internal(&session_id).await;
 
-        self.persistent_session = Some(session_id);
-        self.persistent_target_id = Some(target_id.to_string());
         Ok(())
     }
 

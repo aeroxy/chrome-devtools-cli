@@ -122,6 +122,8 @@ chrome-devtools --target warm-squid emulate --clear-geolocation
 ### Pattern 3: URL Blocking (Network Debugging)
 Block URL patterns using simple `*` wildcards: `*.png` (all PNG files), `cdn.example.com/*` (a domain path), `*analytics*` (any URL containing "analytics"). Patterns persist in the daemon until cleared.
 
+> **Scope:** blocking applies to **subresources** the page loads (images, scripts, fetch/XHR, stylesheets, CDN, trackers). It does **not** block the top-level navigation document itself — e.g. `--block-url "*example.com*"` then `navigate https://example.com` still loads the page, but any `example.com` subresources are blocked. This is a Chrome `Network.setBlockedURLs` limitation, not a CLI bug.
+
 ```bash
 # Add block patterns
 chrome-devtools --target warm-squid emulate --block-url "*.png"

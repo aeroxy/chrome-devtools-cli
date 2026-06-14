@@ -54,6 +54,8 @@ pub struct Cli {
 
     /// Add URL pattern to the daemon's network block list (e.g. "*.png").
     /// Repeatable. Persisted in daemon memory until un-blocked or cleared.
+    /// Blocks subresources (images, scripts, fetch/XHR, CDN, trackers); does
+    /// NOT block top-level navigations (a Chrome setBlockedURLs limitation).
     #[arg(long, global = true)]
     pub block_url: Vec<String>,
 
@@ -226,15 +228,11 @@ pub enum Commands {
         /// Clear all emulation overrides
         #[arg(long)]
         clear_all: bool,
-        /// Add URL pattern to block list (e.g. "*.png", "cdn.example.com/*"). Repeatable.
-        #[arg(long)]
-        block_url: Vec<String>,
-        /// Un-block a previously blocked URL pattern. Repeatable.
-        #[arg(long)]
-        unblock_url: Vec<String>,
         /// Clear network blocklist only
         #[arg(long)]
         clear_blocks: bool,
+        // Note: --block-url / --unblock-url are global flags (see `Cli`); they
+        // work on `emulate` via clap's global-arg inheritance.
     },
 
     /// Wait for text to appear on the page
@@ -439,12 +437,10 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             clear_viewport,
             clear_geolocation,
             clear_all,
-            block_url,
-            unblock_url,
             clear_blocks,
         } => (
             "emulate",
-            json!({"viewport": viewport, "device_scale_factor": device_scale_factor, "mobile": mobile, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all, "block_url": block_url, "unblock_url": unblock_url, "clear_blocks": clear_blocks}),
+            json!({"viewport": viewport, "device_scale_factor": device_scale_factor, "mobile": mobile, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all, "clear_blocks": clear_blocks}),
         ),
         Commands::WaitFor { text, timeout } => {
             ("wait-for", json!({"text": text, "timeout": timeout}))
@@ -873,8 +869,6 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             clear_viewport,
             clear_geolocation,
             clear_all,
-            block_url,
-            unblock_url,
             clear_blocks,
         } => {
             let params = commands::emulation::EmulateParams {
@@ -886,8 +880,9 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 clear_viewport: *clear_viewport,
                 clear_geolocation: *clear_geolocation,
                 clear_all: *clear_all,
-                block_url: block_url.clone(),
-                unblock_url: unblock_url.clone(),
+                // block/unblock come from the global flags, not the subcommand.
+                block_url: cli.block_url.clone(),
+                unblock_url: cli.unblock_url.clone(),
                 clear_blocks: *clear_blocks,
             };
             params.validate()?;

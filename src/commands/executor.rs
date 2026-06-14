@@ -24,7 +24,7 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "press-key" => &["key"],
         "hover" => &["selector"],
         "snapshot" => &["output"],
-        "emulate" => &["viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "clear_viewport", "clear_geolocation", "clear_all", "block_url", "unblock_url", "clear_blocks"],
+        "emulate" => &["viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "clear_viewport", "clear_geolocation", "clear_all", "clear_blocks"],
         "wait-for" => &["text", "timeout"],
         "list-3p-tools" => &[],
         "execute-3p-tool" => &["name", "params"],
@@ -170,11 +170,11 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         let _ = client.ensure_persistent_session(&target_id).await;
     }
 
-    // Apply global --block-url/--unblock-url flags (from DaemonRequest top-level
-    // fields) to the daemon's persistent blocklist. These survive across
-    // commands and target switches. Skip for "emulate" — the emulate handler
-    // manages its own block_url/unblock_url (the same CLI flags parse as both
-    // global and subcommand, so merging here would double-add).
+    // Apply the global --block-url/--unblock-url flags (from DaemonRequest
+    // top-level fields) to the daemon's persistent blocklist. These survive
+    // across commands and target switches. Skip for "emulate": its handler
+    // applies the same fields itself, ordered with --clear-blocks (clear first,
+    // then add), so merging here would both double-add and break that ordering.
     if cmd != "emulate" && (!req.block_url.is_empty() || !req.unblock_url.is_empty()) {
         for p in &req.block_url {
             if !client.blocklist.contains(p) {
@@ -196,12 +196,27 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         };
     }
 
-    let session_id = client.attach_to_target(&target_id).await?;
+    // Prefer the persistent session so navigation, emulation, and event
+    // collection all share one stable session per target. This is what makes
+    // blocklist/emulation state actually govern the commands that run here
+    // (e.g. `navigate` is subject to the blocklist; `emulate --clear-*` clears
+    // overrides set by a previous `emulate`, since both run on the same session).
+    // Fall back to a fresh per-command session only if the persistent session
+    // isn't available for this target (e.g. its setup failed).
+    let using_persistent = client.persistent_session.is_some()
+        && client.persistent_target_id.as_deref() == Some(target_id.as_str());
+    let session_id = if using_persistent {
+        client.persistent_session.clone().unwrap()
+    } else {
+        client.attach_to_target(&target_id).await?
+    };
 
     let result = inner_execute(client, &session_id, req).await;
 
-    // Always run cleanup regardless of success/failure
-    let _ = client.detach_from_target(&session_id).await;
+    // Clean up only sessions we created here — never detach the persistent one.
+    if !using_persistent {
+        let _ = client.detach_from_target(&session_id).await;
+    }
     client.dialog_action = None;
 
     // Append target ID so the caller can pin subsequent commands to this page
@@ -349,21 +364,10 @@ async fn inner_execute(
             .await
         }
         "emulate" => {
-            // For the emulate subcommand, clap parses --block-url/--unblock-url
-            // as both the global flag AND the subcommand flag (same name). The
-            // subcommand-specific args are the canonical source — use those
-            // directly without merging the global fields (which would duplicate).
-            let block_url: Vec<String> = args
-                .get("block_url")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            let unblock_url: Vec<String> = args
-                .get("unblock_url")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-
+            // block/unblock come from the global request fields (the single flag
+            // definition); the emulate handler applies them itself — in the right
+            // order relative to --clear-blocks — which is why the generic merge
+            // above skips "emulate".
             let params = commands::emulation::EmulateParams {
                 viewport: args.get("viewport").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
@@ -373,8 +377,8 @@ async fn inner_execute(
                 clear_viewport: args.get("clear_viewport").and_then(|v| v.as_bool()).unwrap_or(false),
                 clear_geolocation: args.get("clear_geolocation").and_then(|v| v.as_bool()).unwrap_or(false),
                 clear_all: args.get("clear_all").and_then(|v| v.as_bool()).unwrap_or(false),
-                block_url,
-                unblock_url,
+                block_url: req.block_url.clone(),
+                unblock_url: req.unblock_url.clone(),
                 clear_blocks: args.get("clear_blocks").and_then(|v| v.as_bool()).unwrap_or(false),
             };
             params.validate()?;
