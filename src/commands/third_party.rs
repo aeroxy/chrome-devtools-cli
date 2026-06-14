@@ -2,13 +2,14 @@ use anyhow::{bail, Result};
 use serde_json::json;
 
 use crate::cdp::CdpClient;
+use crate::format::{format_structured, OutputFormat};
 use crate::result::CommandResult;
 
 /// List third-party DevTools tools registered via __dtmcp on the page.
 pub async fn list_3p_tools(
     client: &mut CdpClient,
     session_id: &str,
-    json_output: bool,
+    format: OutputFormat,
 ) -> Result<CommandResult> {
     let expr = r#"(() => {
         const dtmcp = window.__dtmcp;
@@ -56,8 +57,9 @@ pub async fn list_3p_tools(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Failed to list third-party tools"))?;
 
-    if json_output {
-        Ok(CommandResult::output(val_str.to_string()))
+    if !format.is_text() {
+        let val: serde_json::Value = serde_json::from_str(val_str)?;
+        Ok(CommandResult::output(format_structured(&val, format)?))
     } else {
         let val: serde_json::Value = serde_json::from_str(val_str)?;
         let groups = val["groups"]
@@ -105,7 +107,7 @@ pub async fn execute_3p_tool(
     session_id: &str,
     name: &str,
     params: Option<&str>,
-    json_output: bool,
+    format: OutputFormat,
 ) -> Result<CommandResult> {
     let params_json = params.unwrap_or("{}");
     // Basic validation of params
@@ -160,8 +162,11 @@ pub async fn execute_3p_tool(
         bail!("Tool execution error: {err}");
     }
 
-    if json_output {
-        Ok(CommandResult::output(val["result"].to_string()))
+    if !format.is_text() {
+        Ok(CommandResult::output(format_structured(
+            &val["result"],
+            format,
+        )?))
     } else {
         Ok(CommandResult::output(format!(
             "Successfully executed tool '{}'. Result:\n{}",

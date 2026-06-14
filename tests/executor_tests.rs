@@ -18,6 +18,9 @@ mod tests {
             page: None,
             target: None,
             json_output: false,
+            output_format: None,
+            block_url: vec![],
+            allow_url: vec![],
         };
         assert_eq!(req.command, "list-pages");
 
@@ -27,6 +30,9 @@ mod tests {
             page: None,
             target: None,
             json_output: false,
+            output_format: None,
+            block_url: vec![],
+            allow_url: vec![],
         };
         assert_eq!(req.command, "navigate");
 
@@ -36,6 +42,9 @@ mod tests {
             page: None,
             target: None,
             json_output: false,
+            output_format: None,
+            block_url: vec![],
+            allow_url: vec![],
         };
         assert_eq!(req.command, "click");
     }

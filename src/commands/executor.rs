@@ -24,10 +24,14 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "press-key" => &["key"],
         "hover" => &["selector"],
         "snapshot" => &["output"],
-        "emulate" => &["viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "clear_viewport", "clear_geolocation", "clear_all"],
+        "emulate" => &["viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "clear_viewport", "clear_geolocation", "clear_all", "block_url", "allow_url", "clear_blocks", "clear_allows"],
         "wait-for" => &["text", "timeout"],
         "list-3p-tools" => &[],
         "execute-3p-tool" => &["name", "params"],
+        "console" => &["duration", "type"],
+        "network" => &["duration", "type"],
+        "sw-logs" => &["duration", "extension_id"],
+        "kill-daemon" => &[],
         _ => &[],
     }
 }
@@ -61,7 +65,7 @@ fn validate_args(cmd: &str, args: &serde_json::Value) -> Result<()> {
 fn is_browser_level(cmd: &str) -> bool {
     matches!(
         cmd,
-        "list-pages" | "new-page"
+        "list-pages" | "new-page" | "sw-logs" | "kill-daemon"
     )
 }
 
@@ -70,19 +74,22 @@ fn is_browser_level(cmd: &str) -> bool {
 /// Handles target resolution, session attachment, dialog configuration,
 /// and target ID enrichment on success.
 pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Result<CommandResult> {
-    // Clear stale events from previous commands to prevent memory leak
-    // in long-running daemon mode and avoid stale events interfering
-    // with new command execution.
-    client.clear_events();
+    let cmd = req.command.as_str();
+
+    // Event-collecting commands drain the buffer via read_events_for,
+    // so they can capture events that arrived between commands.
+    // All other commands clear stale events to prevent memory buildup.
+    if !matches!(cmd, "console" | "network" | "sw-logs") {
+        client.clear_events();
+    }
 
     let args = &req.args;
-    let cmd = req.command.as_str();
 
     validate_args(cmd, args)?;
 
     if is_browser_level(cmd) {
         return match cmd {
-            "list-pages" => commands::pages::list_pages(client, req.json_output).await,
+            "list-pages" => commands::pages::list_pages(client, req.format()).await,
             "new-page" => {
                 let url = args
                     .get("url")
@@ -101,6 +108,10 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                     clear_viewport: false,
                     clear_geolocation: false,
                     clear_all: false,
+                    block_url: Vec::new(),
+                    allow_url: Vec::new(),
+                    clear_blocks: false,
+                    clear_allows: false,
                 };
                 params.validate()?;
 
@@ -111,6 +122,17 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                 };
 
                 commands::pages::new_page(client, url, params, args.get("extra_headers").and_then(|v| v.as_str())).await
+            }
+            "sw-logs" => {
+                let duration = args
+                    .get("duration")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3000);
+                let extension_id = args.get("extension_id").and_then(|v| v.as_str());
+                commands::sw_logs::collect_sw_logs(client, duration, extension_id, req.format()).await
+            }
+            "kill-daemon" => {
+                Ok(CommandResult::output("kill-daemon is handled directly by the CLI, not the daemon."))
             }
             _ => unreachable!(),
         };
@@ -142,6 +164,29 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
 
     let target = client.resolve_page(target_id_arg, page_idx_arg).await?;
     let target_id = target.target_id.clone();
+
+    // Maintain a persistent CDP session for continuous event collection
+    // (Network + Console) across commands. Skip for close/select which don't need it.
+    if cmd != "close-page" && cmd != "select-page" {
+        let _ = client.ensure_persistent_session(&target_id).await;
+    }
+
+    // Apply global --block-url/--allow-url flags (from DaemonRequest top-level
+    // fields) to the daemon's persistent blocklist. These survive across
+    // commands and target switches. Skip for "emulate" — the emulate handler
+    // manages its own block_url/allow_url (the same CLI flags parse as both
+    // global and subcommand, so merging here would double-add).
+    if cmd != "emulate" && (!req.block_url.is_empty() || !req.allow_url.is_empty()) {
+        for p in &req.block_url {
+            if !client.blocklist.contains(p) {
+                client.blocklist.push(p.clone());
+            }
+        }
+        for p in &req.allow_url {
+            client.blocklist.retain(|b| b != p);
+        }
+        client.apply_network_rules().await;
+    }
 
     // Special case for commands that target a page but don't need a session
     if cmd == "close-page" || cmd == "select-page" {
@@ -203,6 +248,10 @@ async fn inner_execute(
                 clear_viewport: false,
                 clear_geolocation: false,
                 clear_all,
+                block_url: Vec::new(),
+                allow_url: Vec::new(),
+                clear_blocks: false,
+                clear_allows: false,
             };
             params.validate()?;
 
@@ -244,7 +293,7 @@ async fn inner_execute(
                     client,
                     session_id,
                     expr,
-                    req.json_output,
+                    req.format(),
                     args.get("output").and_then(|v| v.as_str()),
                     args.get("track_navigation")
                         .and_then(|v| v.as_bool())
@@ -296,12 +345,27 @@ async fn inner_execute(
             commands::snapshot::take_snapshot(
                 client,
                 session_id,
-                req.json_output,
+                req.format(),
                 args.get("output").and_then(|v| v.as_str()),
             )
             .await
         }
         "emulate" => {
+            // For the emulate subcommand, clap parses --block-url/--allow-url
+            // as both the global flag AND the subcommand flag (same name). The
+            // subcommand-specific args are the canonical source — use those
+            // directly without merging the global fields (which would duplicate).
+            let block_url: Vec<String> = args
+                .get("block_url")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let allow_url: Vec<String> = args
+                .get("allow_url")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+
             let params = commands::emulation::EmulateParams {
                 viewport: args.get("viewport").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
@@ -311,6 +375,10 @@ async fn inner_execute(
                 clear_viewport: args.get("clear_viewport").and_then(|v| v.as_bool()).unwrap_or(false),
                 clear_geolocation: args.get("clear_geolocation").and_then(|v| v.as_bool()).unwrap_or(false),
                 clear_all: args.get("clear_all").and_then(|v| v.as_bool()).unwrap_or(false),
+                block_url,
+                allow_url,
+                clear_blocks: args.get("clear_blocks").and_then(|v| v.as_bool()).unwrap_or(false),
+                clear_allows: args.get("clear_allows").and_then(|v| v.as_bool()).unwrap_or(false),
             };
             params.validate()?;
             commands::emulation::emulate(client, session_id, params).await
@@ -326,7 +394,7 @@ async fn inner_execute(
             None => bail!("text required"),
         },
         "list-3p-tools" => {
-            commands::third_party::list_3p_tools(client, session_id, req.json_output).await
+            commands::third_party::list_3p_tools(client, session_id, req.format()).await
         }
         "execute-3p-tool" => match args.get("name").and_then(|v| v.as_str()) {
             Some(name) => {
@@ -335,12 +403,58 @@ async fn inner_execute(
                     session_id,
                     name,
                     args.get("params").and_then(|v| v.as_str()),
-                    req.json_output,
+                    req.format(),
                 )
                 .await
             }
             None => bail!("name required"),
         },
+        "console" => {
+            let duration = args
+                .get("duration")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3000);
+            let types: Vec<String> = args
+                .get("type")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            commands::console::collect_console(
+                client,
+                session_id,
+                duration,
+                types,
+                req.format(),
+            )
+            .await
+        }
+        "network" => {
+            let duration = args
+                .get("duration")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3000);
+            let types: Vec<String> = args
+                .get("type")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            commands::network::collect_network(
+                client,
+                session_id,
+                duration,
+                types,
+                req.format(),
+            )
+            .await
+        }
         _ => bail!("Unknown command: {cmd}"),
     }
 }

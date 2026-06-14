@@ -14,6 +14,14 @@ pub struct EmulateParams {
     pub clear_viewport: bool,
     pub clear_geolocation: bool,
     pub clear_all: bool,
+    /// Patterns to add to the daemon's network blocklist (`*.png`, `*.gif`, etc.).
+    pub block_url: Vec<String>,
+    /// Patterns to remove from the daemon's network blocklist (effectively allowing them).
+    pub allow_url: Vec<String>,
+    /// Clear the entire network blocklist.
+    pub clear_blocks: bool,
+    /// Clear all blocked patterns (alias for clear_blocks — present for symmetry).
+    pub clear_allows: bool,
 }
 
 impl EmulateParams {
@@ -50,6 +58,10 @@ impl EmulateParams {
             || self.clear_all
             || self.clear_viewport
             || self.clear_geolocation
+            || !self.block_url.is_empty()
+            || !self.allow_url.is_empty()
+            || self.clear_blocks
+            || self.clear_allows
     }
 }
 
@@ -60,6 +72,46 @@ pub async fn emulate(
     params: EmulateParams,
 ) -> Result<CommandResult> {
     let mut actions = Vec::new();
+
+    // 0. Handle network blocklist (applied to the persistent session, not the
+    //    per-command session — so the blocklist survives across commands/targets).
+    let network_changed = !params.block_url.is_empty()
+        || !params.allow_url.is_empty()
+        || params.clear_blocks
+        || params.clear_allows
+        || params.clear_all;
+
+    if params.clear_all || params.clear_blocks || params.clear_allows {
+        client.blocklist.clear();
+        client.allowlist.clear();
+        actions.push("Network blocks cleared".to_string());
+    }
+
+    for pattern in &params.block_url {
+        if !client.blocklist.contains(pattern) {
+            client.blocklist.push(pattern.clone());
+        }
+    }
+    if !params.block_url.is_empty() {
+        actions.push(format!(
+            "Blocked URLs: {}",
+            params.block_url.join(", ")
+        ));
+    }
+
+    for pattern in &params.allow_url {
+        client.blocklist.retain(|p| p != pattern);
+    }
+    if !params.allow_url.is_empty() {
+        actions.push(format!(
+            "Allowed URLs: {}",
+            params.allow_url.join(", ")
+        ));
+    }
+
+    if network_changed {
+        client.apply_network_rules().await;
+    }
 
     // 1. Handle clearing
     if params.clear_all || params.clear_viewport {
@@ -135,9 +187,26 @@ pub async fn emulate(
         actions.push(format!("Geolocation set to {}, {} (acc: {}m)", lat, lon, acc));
     }
 
-    // 4. If no specific action taken, return error (getters removed due to CDP limitations)
+    // 4. If no specific action taken, show current overrides
     if actions.is_empty() {
-        anyhow::bail!("No emulation action specified (use --viewport, --geolocation, or --clear flags)");
+        let mut out = String::new();
+        if client.blocklist.is_empty() && client.allowlist.is_empty() {
+            out.push_str("No emulation overrides active.\n");
+        } else {
+            if !client.blocklist.is_empty() {
+                out.push_str("Blocked URLs:\n");
+                for p in &client.blocklist {
+                    out.push_str(&format!("  {p}\n"));
+                }
+            }
+            if !client.allowlist.is_empty() {
+                out.push_str("Allowed URLs:\n");
+                for p in &client.allowlist {
+                    out.push_str(&format!("  {p}\n"));
+                }
+            }
+        }
+        return Ok(CommandResult::output(out.trim_end().to_string()));
     }
 
     Ok(CommandResult::output(actions.join(", ")))

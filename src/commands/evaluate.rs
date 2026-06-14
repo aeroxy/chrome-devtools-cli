@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::cdp::CdpClient;
+use crate::format::{format_structured, OutputFormat};
 use crate::result::CommandResult;
 
 /// Evaluate a JavaScript expression in the page and return the result.
@@ -9,7 +10,7 @@ pub async fn evaluate(
     client: &mut CdpClient,
     session_id: &str,
     expression: &str,
-    as_json: bool,
+    format: OutputFormat,
     output: Option<&str>,
     track_navigation: bool,
 ) -> Result<CommandResult> {
@@ -50,13 +51,7 @@ pub async fn evaluate(
     let value = &result["result"];
     let val_type = value["type"].as_str().unwrap_or("undefined");
 
-    let mut output_hint = if as_json {
-        if let Some(v) = value.get("value") {
-            serde_json::to_string_pretty(v)?
-        } else {
-            serde_json::to_string_pretty(value)?
-        }
-    } else {
+    let mut output_hint = if format.is_text() {
         match val_type {
             "undefined" => "undefined".to_string(),
             "string" => value["value"].as_str().unwrap_or("").to_string(),
@@ -68,6 +63,9 @@ pub async fn evaluate(
                 }
             }
         }
+    } else {
+        let v = value.get("value").unwrap_or(value);
+        format_structured(v, format)?
     };
 
     if expression.contains("querySelector")
