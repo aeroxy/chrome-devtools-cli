@@ -1,9 +1,12 @@
+pub mod console;
 pub mod emulation;
 pub mod evaluate;
 pub mod executor;
 pub mod input;
 pub mod navigate;
+pub mod network;
 pub mod pages;
 pub mod screenshot;
 pub mod snapshot;
+pub mod sw_logs;
 pub mod third_party;

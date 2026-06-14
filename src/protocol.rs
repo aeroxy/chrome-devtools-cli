@@ -5,6 +5,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use anyhow::Context;
 
+use crate::format::OutputFormat;
+
 /// Request from CLI client to daemon.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DaemonRequest {
@@ -12,7 +14,29 @@ pub struct DaemonRequest {
     pub args: Value,
     pub page: Option<usize>,
     pub target: Option<String>,
+    #[serde(default)]
     pub json_output: bool,
+    #[serde(default)]
+    pub output_format: Option<OutputFormat>,
+    /// URL patterns to add to the daemon's network blocklist (from global CLI flags).
+    #[serde(default)]
+    pub block_url: Vec<String>,
+    /// URL patterns to remove from the daemon's network blocklist (from global CLI flags).
+    #[serde(default)]
+    pub allow_url: Vec<String>,
+}
+
+impl DaemonRequest {
+    /// Resolve the output format, preferring the new `output_format` field
+    /// and falling back to the legacy `json_output` bool.
+    pub fn format(&self) -> OutputFormat {
+        self.output_format
+            .unwrap_or(if self.json_output {
+                OutputFormat::Json
+            } else {
+                OutputFormat::Text
+            })
+    }
 }
 
 /// Response from daemon to CLI client.

@@ -5,6 +5,7 @@ pub mod commands;
 pub mod constants;
 pub mod daemon;
 pub mod error;
+pub mod format;
 pub mod friendly;
 pub mod protocol;
 pub mod result;
@@ -44,8 +45,22 @@ pub struct Cli {
     pub target: Option<String>,
 
     /// Output as JSON
-    #[arg(long, global = true)]
+    #[arg(long, global = true, conflicts_with = "toon")]
     pub json: bool,
+
+    /// Output as TOON (Token-Oriented Object Notation — compact encoding for LLMs)
+    #[arg(long, global = true, conflicts_with = "json")]
+    pub toon: bool,
+
+    /// Add URL pattern to the daemon's network block list (e.g. "*.png").
+    /// Repeatable. Persisted in daemon memory until cleared or --allow-url'd.
+    #[arg(long, global = true)]
+    pub block_url: Vec<String>,
+
+    /// Remove URL pattern from the daemon's network block list (allow it).
+    /// Repeatable.
+    #[arg(long, global = true)]
+    pub allow_url: Vec<String>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -152,7 +167,7 @@ pub enum Commands {
         #[arg(long, short)]
         output: Option<String>,
         /// Track URL changes caused by this evaluation (adds two extra CDP round-trips)
-        #[arg(long, short = 't')]
+        #[arg(long)]
         track_navigation: bool,
     },
 
@@ -212,6 +227,18 @@ pub enum Commands {
         /// Clear all emulation overrides
         #[arg(long)]
         clear_all: bool,
+        /// Add URL pattern to block list (e.g. "*.png", "cdn.example.com/*"). Repeatable.
+        #[arg(long)]
+        block_url: Vec<String>,
+        /// Remove URL pattern from block list (allow it). Repeatable.
+        #[arg(long)]
+        allow_url: Vec<String>,
+        /// Clear network blocklist only
+        #[arg(long)]
+        clear_blocks: bool,
+        /// Clear allowed network URLs only (symmetry alias)
+        #[arg(long)]
+        clear_allows: bool,
     },
 
     /// Wait for text to appear on the page
@@ -233,14 +260,56 @@ pub enum Commands {
         /// JSON-stringified parameters for the tool
         params: Option<String>,
     },
+
+    /// Collect console messages and exceptions from the page
+    Console {
+        /// Duration in ms for live collection. Omit or 0 to drain accumulated events instantly.
+        #[arg(long, short, default_value_t = 0)]
+        duration: u64,
+        /// Filter by message type (e.g. error, warning, log, info). Repeatable.
+        #[arg(long)]
+        r#type: Vec<String>,
+    },
+
+    /// Collect network requests from the page
+    Network {
+        /// Duration in ms for live collection. Omit or 0 to drain accumulated events instantly.
+        #[arg(long, short, default_value_t = 0)]
+        duration: u64,
+        /// Filter by resource type (e.g. document, xhr, fetch, script, stylesheet, image). Repeatable.
+        #[arg(long)]
+        r#type: Vec<String>,
+    },
+
+    /// Collect console logs from extension service workers
+    #[command(name = "sw-logs")]
+    SwLogs {
+        /// Duration in milliseconds to collect logs (default: 3000)
+        #[arg(long, short, default_value_t = 3000)]
+        duration: u64,
+        /// Filter by extension ID. If omitted, collects from all extensions.
+        #[arg(long)]
+        extension_id: Option<String>,
+    },
+
+    /// Stop the background daemon process
+    #[command(name = "kill-daemon")]
+    KillDaemon,
 }
 
 impl Cli {
+    pub fn output_format(&self) -> format::OutputFormat {
+        format::OutputFormat::from_flags(self.json, self.toon)
+    }
+
     /// Whether this command operates at the browser level (no page session needed).
     fn is_browser_level(&self) -> bool {
         matches!(
             self.command,
-            Commands::ListPages | Commands::NewPage { .. }
+            Commands::ListPages
+                | Commands::NewPage { .. }
+                | Commands::SwLogs { .. }
+                | Commands::KillDaemon
         )
     }
 
@@ -265,6 +334,10 @@ impl Cli {
             Commands::WaitFor { .. } => "wait-for",
             Commands::List3pTools => "list-3p-tools",
             Commands::Execute3pTool { .. } => "execute-3p-tool",
+            Commands::Console { .. } => "console",
+            Commands::Network { .. } => "network",
+            Commands::SwLogs { .. } => "sw-logs",
+            Commands::KillDaemon => "kill-daemon",
         }
     }
 }
@@ -368,9 +441,13 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             clear_viewport,
             clear_geolocation,
             clear_all,
+            block_url,
+            allow_url,
+            clear_blocks,
+            clear_allows,
         } => (
             "emulate",
-            json!({"viewport": viewport, "device_scale_factor": device_scale_factor, "mobile": mobile, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all}),
+            json!({"viewport": viewport, "device_scale_factor": device_scale_factor, "mobile": mobile, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all, "block_url": block_url, "allow_url": allow_url, "clear_blocks": clear_blocks, "clear_allows": clear_allows}),
         ),
         Commands::WaitFor { text, timeout } => {
             ("wait-for", json!({"text": text, "timeout": timeout}))
@@ -379,6 +456,20 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         Commands::Execute3pTool { name, params } => {
             ("execute-3p-tool", json!({"name": name, "params": params}))
         }
+        Commands::Console { duration, r#type } => {
+            ("console", json!({"duration": duration, "type": r#type}))
+        }
+        Commands::Network { duration, r#type } => {
+            ("network", json!({"duration": duration, "type": r#type}))
+        }
+        Commands::SwLogs {
+            duration,
+            extension_id,
+        } => (
+            "sw-logs",
+            json!({"duration": duration, "extension_id": extension_id}),
+        ),
+        Commands::KillDaemon => ("kill-daemon", json!({})),
     };
 
     DaemonRequest {
@@ -387,6 +478,9 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         page: cli.page,
         target: cli.target.clone(),
         json_output: cli.json,
+        output_format: Some(cli.output_format()),
+        block_url: cli.block_url.clone(),
+        allow_url: cli.allow_url.clone(),
     }
 }
 
@@ -464,6 +558,43 @@ pub async fn run() -> Result<()> {
         }
     };
 
+    // Handle kill-daemon without connecting to Chrome
+    if matches!(cli.command, Commands::KillDaemon) {
+        let pid_path = protocol::pid_path();
+        let sock_path = protocol::socket_path();
+        match std::fs::read_to_string(&pid_path) {
+            Ok(pid_str) => {
+                let pid: u32 = pid_str.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("Invalid PID in {}", pid_path.display())
+                })?;
+                #[cfg(unix)]
+                {
+                    use std::process::Command;
+                    let status = Command::new("kill")
+                        .arg(pid.to_string())
+                        .status()?;
+                    if status.success() {
+                        let _ = std::fs::remove_file(&sock_path);
+                        let _ = std::fs::remove_file(&pid_path);
+                        println!("Daemon (PID {pid}) stopped.");
+                    } else {
+                        let _ = std::fs::remove_file(&sock_path);
+                        let _ = std::fs::remove_file(&pid_path);
+                        println!("Daemon (PID {pid}) was not running. Cleaned up stale files.");
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    println!("kill-daemon is only supported on Unix systems.");
+                }
+            }
+            Err(_) => {
+                println!("No daemon running (PID file not found).");
+            }
+        }
+        return Ok(());
+    }
+
     let ws_url = browser::resolve_ws_url(
         cli.ws_endpoint.as_deref(),
         cli.user_data_dir.as_deref(),
@@ -527,7 +658,9 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
 
     if is_browser {
         return match &cli.command {
-            Commands::ListPages => commands::pages::list_pages(&mut client, cli.json).await,
+            Commands::ListPages => {
+                commands::pages::list_pages(&mut client, cli.output_format()).await
+            }
             Commands::NewPage {
                 url,
                 viewport,
@@ -546,6 +679,10 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                     clear_viewport: false,
                     clear_geolocation: false,
                     clear_all: false,
+                    block_url: Vec::new(),
+                    allow_url: Vec::new(),
+                    clear_blocks: false,
+                    clear_allows: false,
                 };
                 params.validate()?;
 
@@ -555,6 +692,18 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                     None
                 };
                 commands::pages::new_page(&mut client, url, params, extra_headers.as_deref()).await
+            }
+            Commands::SwLogs {
+                duration,
+                extension_id,
+            } => {
+                commands::sw_logs::collect_sw_logs(
+                    &mut client,
+                    *duration,
+                    extension_id.as_deref(),
+                    cli.output_format(),
+                )
+                .await
             }
             _ => unreachable!(),
         };
@@ -626,6 +775,10 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 clear_viewport: false,
                 clear_geolocation: false,
                 clear_all: *clear_all,
+                block_url: Vec::new(),
+                allow_url: Vec::new(),
+                clear_blocks: false,
+                clear_allows: false,
             };
             params.validate()?;
 
@@ -670,7 +823,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 &mut client,
                 &session_id,
                 expression,
-                cli.json,
+                cli.output_format(),
                 output.as_deref(),
                 *track_navigation,
             )
@@ -695,8 +848,13 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             commands::input::hover(&mut client, &session_id, selector).await
         }
         Commands::Snapshot { output } => {
-            commands::snapshot::take_snapshot(&mut client, &session_id, cli.json, output.as_deref())
-                .await
+            commands::snapshot::take_snapshot(
+                &mut client,
+                &session_id,
+                cli.output_format(),
+                output.as_deref(),
+            )
+            .await
         }
         Commands::Emulate {
             viewport,
@@ -707,6 +865,10 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             clear_viewport,
             clear_geolocation,
             clear_all,
+            block_url,
+            allow_url,
+            clear_blocks,
+            clear_allows,
         } => {
             let params = commands::emulation::EmulateParams {
                 viewport: viewport.clone(),
@@ -717,6 +879,10 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 clear_viewport: *clear_viewport,
                 clear_geolocation: *clear_geolocation,
                 clear_all: *clear_all,
+                block_url: block_url.clone(),
+                allow_url: allow_url.clone(),
+                clear_blocks: *clear_blocks,
+                clear_allows: *clear_allows,
             };
             params.validate()?;
             commands::emulation::emulate(&mut client, &session_id, params)
@@ -726,7 +892,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             commands::pages::wait_for(&mut client, &session_id, text, *timeout).await
         }
         Commands::List3pTools => {
-            commands::third_party::list_3p_tools(&mut client, &session_id, cli.json).await
+            commands::third_party::list_3p_tools(&mut client, &session_id, cli.output_format())
+                .await
         }
         Commands::Execute3pTool { name, params } => {
             commands::third_party::execute_3p_tool(
@@ -734,7 +901,27 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 &session_id,
                 name,
                 params.as_deref(),
-                cli.json,
+                cli.output_format(),
+            )
+            .await
+        }
+        Commands::Console { duration, r#type } => {
+            commands::console::collect_console(
+                &mut client,
+                &session_id,
+                *duration,
+                r#type.clone(),
+                cli.output_format(),
+            )
+            .await
+        }
+        Commands::Network { duration, r#type } => {
+            commands::network::collect_network(
+                &mut client,
+                &session_id,
+                *duration,
+                r#type.clone(),
+                cli.output_format(),
             )
             .await
         }

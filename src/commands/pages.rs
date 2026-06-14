@@ -4,6 +4,7 @@ use std::fmt::Write;
 
 use crate::cdp::CdpClient;
 use crate::constants::NAVIGATION_TIMEOUT_MS;
+use crate::format::{format_structured, OutputFormat};
 use crate::friendly;
 use crate::result::CommandResult;
 
@@ -59,10 +60,23 @@ pub async fn clear_extra_headers(client: &mut CdpClient, session_id: &str) -> Re
 }
 
 /// List all open page targets with their friendly names, titles, and URLs.
-pub async fn list_pages(client: &mut CdpClient, as_json: bool) -> Result<CommandResult> {
+pub async fn list_pages(
+    client: &mut CdpClient,
+    format: OutputFormat,
+) -> Result<CommandResult> {
     let pages = client.get_page_targets().await?;
 
-    if as_json {
+    if format.is_text() {
+        if pages.is_empty() {
+            return Ok(CommandResult::output("No pages open.".to_string()));
+        }
+        let mut out = String::new();
+        for (i, page) in pages.iter().enumerate() {
+            let name = friendly::to_friendly(&page.target_id);
+            writeln!(out, "[{i}] ({name}) {} — {}", page.title, page.url).unwrap();
+        }
+        Ok(CommandResult::output(out))
+    } else {
         let items: Vec<_> = pages
             .iter()
             .enumerate()
@@ -75,17 +89,8 @@ pub async fn list_pages(client: &mut CdpClient, as_json: bool) -> Result<Command
                 })
             })
             .collect();
-        Ok(CommandResult::output(serde_json::to_string_pretty(&items)?))
-    } else {
-        if pages.is_empty() {
-            return Ok(CommandResult::output("No pages open.".to_string()));
-        }
-        let mut out = String::new();
-        for (i, page) in pages.iter().enumerate() {
-            let name = friendly::to_friendly(&page.target_id);
-            writeln!(out, "[{i}] ({name}) {} — {}", page.title, page.url).unwrap();
-        }
-        Ok(CommandResult::output(out))
+        let value = serde_json::to_value(&items)?;
+        Ok(CommandResult::output(format_structured(&value, format)?))
     }
 }
 

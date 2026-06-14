@@ -78,9 +78,24 @@ pub struct CdpClient {
     pub dialog_action: Option<String>,
     /// Buffer for storing unhandled events (e.g., navigation events)
     pub events: std::collections::VecDeque<Value>,
+    /// Persistent CDP session for continuous event collection across commands.
+    pub persistent_session: Option<String>,
+    /// Target ID the persistent session is attached to.
+    pub persistent_target_id: Option<String>,
+    /// Accumulated network events from the persistent session.
+    pub network_events: Vec<Value>,
+    /// Accumulated console events from the persistent session.
+    pub console_events: Vec<Value>,
+    /// Persistent URL block patterns for `Network.setBlockedURLs`.
+    /// Re-applied by `ensure_persistent_session` whenever a new target is attached.
+    pub blocklist: Vec<String>,
+    /// Persistent URL allow patterns. When non-empty, only these URLs are allowed;
+    /// everything else is blocked. Re-applied on session (re)attach.
+    pub allowlist: Vec<String>,
 }
 
 const MAX_BUFFERED_EVENTS: usize = 1000;
+const MAX_PERSISTENT_EVENTS: usize = 5000;
 
 /// Metadata for a Chrome target (page, worker, etc.).
 #[derive(Debug, Clone)]
@@ -105,6 +120,12 @@ impl CdpClient {
             next_id: 1,
             dialog_action: None,
             events: std::collections::VecDeque::new(),
+            persistent_session: None,
+            persistent_target_id: None,
+            network_events: Vec::new(),
+            console_events: Vec::new(),
+            blocklist: Vec::new(),
+            allowlist: Vec::new(),
         })
     }
 
@@ -113,7 +134,104 @@ impl CdpClient {
         self.events.clear();
     }
 
+    /// Ensure a persistent CDP session is attached to the given target for continuous
+    /// event collection (Network + Console). If the target has changed, detaches
+    /// the old session and attaches to the new one.
+    pub async fn ensure_persistent_session(&mut self, target_id: &str) -> Result<()> {
+        // Already attached to this target
+        if self.persistent_target_id.as_deref() == Some(target_id) {
+            return Ok(());
+        }
+
+        // Detach old session if target changed
+        if let Some(old_session) = self.persistent_session.take() {
+            let _ = self
+                .send("Target.detachFromTarget", json!({"sessionId": old_session}))
+                .await;
+            self.persistent_target_id = None;
+        }
+
+        // Attach new persistent session
+        let result = self
+            .send(
+                "Target.attachToTarget",
+                json!({"targetId": target_id, "flatten": true}),
+            )
+            .await?;
+        let session_id = result["sessionId"]
+            .as_str()
+            .ok_or_else(|| anyhow!("No sessionId in persistent attachToTarget"))?
+            .to_string();
+
+        // Enable Network and Runtime domains on persistent session
+        let _ = self
+            .send_to_target(&session_id, "Network.enable", json!({}))
+            .await;
+        let _ = self
+            .send_to_target(&session_id, "Runtime.enable", json!({}))
+            .await;
+
+        self.persistent_session = Some(session_id);
+        self.persistent_target_id = Some(target_id.to_string());
+
+        // Apply any existing blocklist to the new session
+        self.apply_network_rules_internal(&self.persistent_session.clone().unwrap())
+            .await;
+        Ok(())
+    }
+
+    /// Apply the daemon's current `blocklist` to the persistent session via
+    /// `Network.setBlockedURLs`. Patterns are Chrome-style globs (e.g. `*.png`).
+    pub async fn apply_network_rules(&mut self) {
+        if let Some(ref session) = self.persistent_session.clone() {
+            self.apply_network_rules_internal(session).await;
+        }
+    }
+
+    async fn apply_network_rules_internal(&mut self, session_id: &str) {
+        let _ = self
+            .send_to_target(
+                session_id,
+                "Network.setBlockedURLs",
+                json!({"urls": self.blocklist}),
+            )
+            .await;
+    }
+
+    /// Drain accumulated network events from the persistent session.
+    pub fn drain_network_events(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.network_events)
+    }
+
+    /// Drain accumulated console events from the persistent session.
+    pub fn drain_console_events(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.console_events)
+    }
+
     fn push_event(&mut self, event: Value) {
+        if self.persistent_session.is_some() {
+            let method = event.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            match method {
+                "Network.requestWillBeSent"
+                | "Network.responseReceived"
+                | "Network.loadingFinished"
+                | "Network.loadingFailed" => {
+                    self.network_events.push(event);
+                    if self.network_events.len() > MAX_PERSISTENT_EVENTS {
+                        self.network_events.drain(..self.network_events.len() - MAX_PERSISTENT_EVENTS);
+                    }
+                    return;
+                }
+                "Runtime.consoleAPICalled" | "Runtime.exceptionThrown" => {
+                    self.console_events.push(event);
+                    if self.console_events.len() > MAX_PERSISTENT_EVENTS {
+                        self.console_events.drain(..self.console_events.len() - MAX_PERSISTENT_EVENTS);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         Self::push_to_buffer(&mut self.events, event);
     }
 
@@ -356,6 +474,28 @@ impl CdpClient {
         Ok(pages)
     }
 
+    /// List all targets (pages, workers, etc.).
+    pub async fn get_all_targets(&mut self) -> Result<Vec<TargetInfo>> {
+        let result = self.send("Target.getTargets", json!({})).await?;
+        let targets = result["targetInfos"].as_array().ok_or_else(|| {
+            anyhow!("Malformed Target.getTargets response: missing 'targetInfos' array")
+        })?;
+
+        let mut all = Vec::new();
+        for t in targets {
+            all.push(TargetInfo {
+                target_id: t["targetId"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Malformed TargetInfo: missing 'targetId'"))?
+                    .to_string(),
+                title: t["title"].as_str().unwrap_or("").to_string(),
+                url: t["url"].as_str().unwrap_or("").to_string(),
+                target_type: t["type"].as_str().unwrap_or("").to_string(),
+            });
+        }
+        Ok(all)
+    }
+
     /// Attach to a target and return the session ID for subsequent commands.
     pub async fn attach_to_target(&mut self, target_id: &str) -> Result<String> {
         let result = self
@@ -400,6 +540,37 @@ impl CdpClient {
         self.send("Target.closeTarget", json!({"targetId": target_id}))
             .await?;
         Ok(())
+    }
+
+    /// Collect CDP events for a given duration (milliseconds).
+    ///
+    /// Drains any already-buffered events first, then reads from the WebSocket
+    /// until the timeout expires. Events are also routed through persistent
+    /// session buffers when active to avoid duplicates.
+    pub async fn read_events_for(&mut self, duration_ms: u64) -> Result<Vec<Value>> {
+        let mut events: Vec<Value> = self.events.drain(..).collect();
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.read_text()).await {
+                Ok(Ok(text)) => {
+                    if let Ok(resp) = serde_json::from_str::<Value>(&text) {
+                        if resp.get("method").is_some() {
+                            self.push_event(resp.clone());
+                            events.push(resp);
+                        }
+                    }
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        Ok(events)
     }
 
     /// Get the current page URL via JavaScript evaluation.
