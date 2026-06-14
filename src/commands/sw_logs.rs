@@ -87,12 +87,13 @@ pub async fn collect_sw_logs(
                     .as_array()
                     .map(|arr| {
                         arr.iter()
-                            .map(|arg| {
-                                arg["value"]
-                                    .as_str()
-                                    .or_else(|| arg["description"].as_str())
-                                    .unwrap_or("<object>")
-                                    .to_string()
+                            .map(|arg| match arg.get("value") {
+                                // String primitives: emit the raw text (no quotes).
+                                Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
+                                // Other primitives (number, bool, null): stringify directly.
+                                Some(v) => v.to_string(),
+                                // Objects have no `value` — fall back to their description.
+                                None => arg["description"].as_str().unwrap_or("<object>").to_string(),
                             })
                             .collect()
                     })

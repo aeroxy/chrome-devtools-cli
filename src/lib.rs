@@ -571,16 +571,24 @@ pub async fn run() -> Result<()> {
                     // delivered; -1 with errno ESRCH means the process is gone
                     // (and the PID file was stale).
                     let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-                    let _ = std::fs::remove_file(&sock_path);
-                    let _ = std::fs::remove_file(&pid_path);
                     if ret == 0 {
+                        // Signal delivered — daemon is shutting down; clean up.
+                        let _ = std::fs::remove_file(&sock_path);
+                        let _ = std::fs::remove_file(&pid_path);
                         println!("Daemon (PID {pid}) stopped.");
                     } else {
                         let err = std::io::Error::last_os_error();
                         if err.raw_os_error() == Some(libc::ESRCH) {
+                            // Process is gone — the PID file was stale; clean up.
+                            let _ = std::fs::remove_file(&sock_path);
+                            let _ = std::fs::remove_file(&pid_path);
                             println!("Daemon (PID {pid}) was not running. Cleaned up stale files.");
                         } else {
-                            eprintln!("Failed to signal daemon (PID {pid}): {err}");
+                            // e.g. EPERM: the daemon may still be running. Leave the
+                            // socket/PID files so it stays reachable.
+                            eprintln!(
+                                "Failed to signal daemon (PID {pid}): {err}. Left socket/PID files in place."
+                            );
                         }
                     }
                 }

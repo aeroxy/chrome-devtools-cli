@@ -165,13 +165,18 @@ impl CdpClient {
             .to_string();
 
         // Enable Network and Runtime domains on the persistent session. If
-        // either fails, bail before marking the session persistent so that
-        // per-command collectors fall back to their own enable instead of
-        // silently draining an uninitialized (always-empty) buffer.
-        self.send_to_target(&session_id, "Network.enable", json!({}))
-            .await?;
-        self.send_to_target(&session_id, "Runtime.enable", json!({}))
-            .await?;
+        // either fails, detach the just-attached session (so it isn't leaked in
+        // Chrome) and bail before marking the session persistent — per-command
+        // collectors then fall back to their own enable instead of silently
+        // draining an uninitialized (always-empty) buffer.
+        for method in ["Network.enable", "Runtime.enable"] {
+            if let Err(e) = self.send_to_target(&session_id, method, json!({})).await {
+                let _ = self
+                    .send("Target.detachFromTarget", json!({"sessionId": session_id}))
+                    .await;
+                return Err(e);
+            }
+        }
 
         // Apply any existing blocklist to the new session before storing it.
         self.apply_network_rules_internal(&session_id).await;
