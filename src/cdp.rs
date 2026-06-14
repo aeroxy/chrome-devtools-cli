@@ -141,6 +141,27 @@ pub struct TabEmulation {
     pub geolocation: Option<GeolocationOverride>,
 }
 
+impl TabEmulation {
+    /// True when the tab has no overrides of any kind.
+    fn is_empty(&self) -> bool {
+        self.blocklist.is_empty() && self.viewport.is_none() && self.geolocation.is_none()
+    }
+}
+
+/// Stash an outgoing tab's emulation state under its target id so it can be
+/// restored when that tab becomes active again. Empty state is dropped so the
+/// map doesn't accumulate blank entries for every tab ever visited. Pure (no
+/// I/O) — this is the per-tab isolation invariant and is unit-tested below.
+fn stash_tab_emulation(
+    saved: &mut std::collections::HashMap<String, TabEmulation>,
+    target: String,
+    state: TabEmulation,
+) {
+    if !state.is_empty() {
+        saved.insert(target, state);
+    }
+}
+
 impl CdpClient {
     /// Connect to Chrome via WebSocket and return a CDP client.
     pub async fn connect(ws_url: &str) -> Result<Self> {
@@ -195,12 +216,7 @@ impl CdpClient {
                 viewport: self.viewport.take(),
                 geolocation: self.geolocation.take(),
             };
-            if !saved.blocklist.is_empty()
-                || saved.viewport.is_some()
-                || saved.geolocation.is_some()
-            {
-                self.emulation_saved.insert(old_target, saved);
-            }
+            stash_tab_emulation(&mut self.emulation_saved, old_target, saved);
         }
 
         // Detach old session if target changed
@@ -720,9 +736,7 @@ impl CdpClient {
                 // etc.) — real transport error. Log it so the user has a
                 // signal when the partial result is suspicious, then stop.
                 Ok(Err(e)) => {
-                    eprintln!(
-                        "Warning: WebSocket read failed during event collection: {e}"
-                    );
+                    eprintln!("Warning: WebSocket read failed during event collection: {e}");
                     break;
                 }
             }
@@ -847,5 +861,65 @@ mod tests {
         // Malformed - missing targetInfos
         let malformed_resp = json!({});
         assert!(malformed_resp["targetInfos"].as_array().is_none());
+    }
+
+    // Per-tab emulation isolation: the save/restore that `ensure_persistent_session`
+    // performs on target switch. These exercise the pure state logic directly,
+    // without a live CDP connection. They guard the invariant that one tab's
+    // blocklist/overrides never leak into another — the property a side-by-side
+    // two-tab comparison workflow depends on.
+
+    #[test]
+    fn switching_to_fresh_tab_does_not_inherit_blocklist() {
+        let mut saved = std::collections::HashMap::new();
+        // Leaving tab A, which has a block rule: stash it.
+        stash_tab_emulation(
+            &mut saved,
+            "A".to_string(),
+            TabEmulation {
+                blocklist: vec!["*.png".to_string()],
+                ..Default::default()
+            },
+        );
+
+        // Arriving at fresh tab B (no saved state) → clean slate, as
+        // ensure_persistent_session does via `remove(target).unwrap_or_default()`.
+        let b_state = saved.remove("B").unwrap_or_default();
+        assert!(
+            b_state.blocklist.is_empty(),
+            "tab B must not inherit tab A's block rule"
+        );
+        // A's rule is preserved for when we switch back.
+        assert_eq!(saved.get("A").unwrap().blocklist, vec!["*.png".to_string()]);
+    }
+
+    #[test]
+    fn returning_to_tab_restores_and_consumes_its_state() {
+        let mut saved = std::collections::HashMap::new();
+        stash_tab_emulation(
+            &mut saved,
+            "A".to_string(),
+            TabEmulation {
+                blocklist: vec!["*.png".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let restored = saved.remove("A").unwrap_or_default();
+        assert_eq!(restored.blocklist, vec!["*.png".to_string()]);
+        assert!(
+            saved.is_empty(),
+            "the restored entry should be consumed, not duplicated"
+        );
+    }
+
+    #[test]
+    fn empty_tab_state_is_not_stashed() {
+        let mut saved = std::collections::HashMap::new();
+        stash_tab_emulation(&mut saved, "A".to_string(), TabEmulation::default());
+        assert!(
+            !saved.contains_key("A"),
+            "an empty tab must not create a map entry"
+        );
     }
 }

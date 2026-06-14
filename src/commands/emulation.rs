@@ -102,7 +102,13 @@ pub async fn emulate(
     }
 
     if network_changed {
-        client.apply_network_rules().await?;
+        // Apply to persistent session if available; otherwise fall back to the
+        // command's session (e.g., direct mode or degraded daemon path).
+        if client.persistent_session.is_some() {
+            client.apply_network_rules().await?;
+        } else {
+            client.apply_network_rules_internal(session_id).await?;
+        }
     }
 
     // 1. Handle clearing

@@ -40,10 +40,21 @@ pub async fn collect_sw_logs(
     for target in &sw_targets {
         match client.attach_to_target(&target.target_id).await {
             Ok(session_id) => {
-                let _ = client
+                match client
                     .send_to_target(&session_id, "Runtime.enable", json!({}))
-                    .await;
-                sessions.push(((*target).clone(), session_id));
+                    .await
+                {
+                    Ok(_) => {
+                        sessions.push(((*target).clone(), session_id));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed to enable Runtime for service worker {}: {e}",
+                            target.url
+                        );
+                        let _ = client.detach_from_target(&session_id).await;
+                    }
+                }
             }
             Err(e) => {
                 eprintln!(

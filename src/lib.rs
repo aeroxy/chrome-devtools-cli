@@ -598,9 +598,9 @@ pub async fn run() -> Result<()> {
                         } else {
                             // e.g. EPERM: the daemon may still be running. Leave the
                             // socket/PID files so it stays reachable.
-                            eprintln!(
+                            return Err(anyhow::anyhow!(
                                 "Failed to signal daemon (PID {pid}): {err}. Left socket/PID files in place."
-                            );
+                            ));
                         }
                     }
                 }
