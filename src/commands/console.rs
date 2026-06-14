@@ -46,10 +46,25 @@ fn process_console_events(
     events: &[serde_json::Value],
     type_filter: &[String],
 ) -> Vec<serde_json::Value> {
-    let filter_set: Option<std::collections::HashSet<&str>> = if type_filter.is_empty() {
+    // Match case-insensitively and accept the common "warn" shorthand for the
+    // CDP type "warning" (mirrors `console.warn`). CDP console types are already
+    // lowercase, so this mainly hardens against odd-cased / shorthand input.
+    let filter_set: Option<std::collections::HashSet<String>> = if type_filter.is_empty() {
         None
     } else {
-        Some(type_filter.iter().map(|s| s.as_str()).collect())
+        Some(
+            type_filter
+                .iter()
+                .map(|s| {
+                    let s = s.to_lowercase();
+                    if s == "warn" {
+                        "warning".to_string()
+                    } else {
+                        s
+                    }
+                })
+                .collect(),
+        )
     };
 
     let mut messages = Vec::new();
@@ -62,7 +77,7 @@ fn process_console_events(
             "Runtime.consoleAPICalled" => {
                 let msg_type = params["type"].as_str().unwrap_or("log");
                 if let Some(ref set) = filter_set {
-                    if !set.contains(msg_type) {
+                    if !set.contains(&msg_type.to_lowercase()) {
                         continue;
                     }
                 }
@@ -95,6 +110,8 @@ fn process_console_events(
             }
             "Runtime.exceptionThrown" => {
                 if let Some(ref set) = filter_set {
+                    // `set` holds lowercase types (see filter_set), so these
+                    // literals must stay lowercase to match.
                     if !set.contains("exception") && !set.contains("error") {
                         continue;
                     }
@@ -207,6 +224,18 @@ mod tests {
         ];
         let filter = vec!["error".to_string()];
         let out = process_console_events(&events, &filter);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["text"], "kept");
+    }
+
+    #[test]
+    fn test_process_console_events_type_filter_warn_alias_and_case() {
+        let events = vec![
+            json!({"method": "Runtime.consoleAPICalled", "params": {"type": "warning", "args": [{"value": "kept"}], "timestamp": 0.0}}),
+            json!({"method": "Runtime.consoleAPICalled", "params": {"type": "log", "args": [{"value": "skipped"}], "timestamp": 0.0}}),
+        ];
+        // "warn" is an alias for the CDP type "warning"; matching is case-insensitive.
+        let out = process_console_events(&events, &vec!["WARN".to_string()]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["text"], "kept");
     }

@@ -46,10 +46,14 @@ fn process_network_events(
     events: &[serde_json::Value],
     type_filter: &[String],
 ) -> Vec<serde_json::Value> {
-    let filter_set: Option<std::collections::HashSet<&str>> = if type_filter.is_empty() {
+    // Match case-insensitively: CDP emits capitalized resource types
+    // (e.g. "Fetch", "XHR"), but the CLI help documents lowercase
+    // (e.g. "fetch", "xhr"). Normalize both sides to lowercase so the
+    // documented input actually matches.
+    let filter_set: Option<std::collections::HashSet<String>> = if type_filter.is_empty() {
         None
     } else {
-        Some(type_filter.iter().map(|s| s.as_str()).collect())
+        Some(type_filter.iter().map(|s| s.to_lowercase()).collect())
     };
 
     let mut requests: HashMap<String, serde_json::Value> = HashMap::new();
@@ -117,7 +121,7 @@ fn process_network_events(
         filtered.retain(|r| {
             r["resourceType"]
                 .as_str()
-                .map(|t| set.contains(t))
+                .map(|t| set.contains(&t.to_lowercase()))
                 .unwrap_or(false)
         });
     }
@@ -237,6 +241,37 @@ mod tests {
         let out = process_network_events(&events, &filter);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["url"], "https://example.com/page");
+    }
+
+    #[test]
+    fn test_process_network_events_type_filter_case_insensitive() {
+        // The CLI help documents lowercase resource types, but CDP emits them
+        // capitalized. Documented lowercase input must still match, and the
+        // output must preserve the original CDP casing.
+        let events = vec![
+            json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "req-a",
+                    "request": {"url": "https://example.com/api", "method": "GET"},
+                    "type": "Fetch"
+                }
+            }),
+            json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "req-b",
+                    "request": {"url": "https://example.com/x", "method": "GET"},
+                    "type": "XHR"
+                }
+            }),
+        ];
+        // lowercase "fetch" (as documented) and odd-cased "xhr"/"Xhr".
+        let filter = vec!["fetch".to_string(), "Xhr".to_string()];
+        let out = process_network_events(&events, &filter);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["resourceType"], "Fetch");
+        assert_eq!(out[1]["resourceType"], "XHR");
     }
 
     #[test]
