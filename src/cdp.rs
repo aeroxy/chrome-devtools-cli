@@ -200,7 +200,10 @@ impl CdpClient {
         }
     }
 
-    async fn apply_network_rules_internal(&mut self, session_id: &str) {
+    /// Apply the current `blocklist` to a specific session via
+    /// `Network.setBlockedURLs`. Used for both the persistent session and
+    /// fallback per-command sessions (when the persistent one is unavailable).
+    pub(crate) async fn apply_network_rules_internal(&mut self, session_id: &str) {
         let _ = self
             .send_to_target(
                 session_id,

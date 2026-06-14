@@ -249,7 +249,14 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     let session_id = if using_persistent {
         client.persistent_session.clone().unwrap()
     } else {
-        client.attach_to_target(&target_id).await?
+        // Degraded path: the persistent session is unavailable, so this fresh
+        // session won't have the blocklist that ensure_persistent_session
+        // normally applies. Re-apply it so blocking still takes effect.
+        let sid = client.attach_to_target(&target_id).await?;
+        if !client.blocklist.is_empty() {
+            client.apply_network_rules_internal(&sid).await;
+        }
+        sid
     };
 
     let result = inner_execute(client, &session_id, req).await;
