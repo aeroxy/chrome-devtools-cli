@@ -173,12 +173,11 @@ impl CdpClient {
         self.send_to_target(&session_id, "Runtime.enable", json!({}))
             .await?;
 
+        // Apply any existing blocklist to the new session before storing it.
+        self.apply_network_rules_internal(&session_id).await;
+
         self.persistent_session = Some(session_id);
         self.persistent_target_id = Some(target_id.to_string());
-
-        // Apply any existing blocklist to the new session
-        self.apply_network_rules_internal(&self.persistent_session.clone().unwrap())
-            .await;
         Ok(())
     }
 
