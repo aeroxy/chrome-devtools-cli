@@ -26,12 +26,12 @@ fn test_telemetry_log_command() {
         .collect();
     assert_eq!(log_files.len(), 1, "expected exactly one log file");
 
-    let content = std::fs::read_to_string(log_files[0].path())
-        .expect("should be able to read log file");
+    let content =
+        std::fs::read_to_string(log_files[0].path()).expect("should be able to read log file");
 
     // The entry should be valid JSON with the command we logged
-    let parsed: serde_json::Value = serde_json::from_str(content.trim())
-        .expect("log entry should be valid JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(content.trim()).expect("log entry should be valid JSON");
     assert_eq!(parsed["command"], "test-command");
     assert_eq!(parsed["duration_ms"], 42);
     assert_eq!(parsed["success"], true);

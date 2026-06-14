@@ -11,10 +11,31 @@ use crate::result::CommandResult;
 pub fn known_args(cmd: &str) -> &'static [&'static str] {
     match cmd {
         "list-pages" => &[],
-        "new-page" => &["url", "viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "extra_headers"],
+        "new-page" => &[
+            "url",
+            "viewport",
+            "device_scale_factor",
+            "mobile",
+            "geolocation",
+            "accuracy",
+            "extra_headers",
+        ],
         "close-page" => &["id_or_index"],
         "select-page" => &["id_or_index"],
-        "navigate" => &["url", "back", "forward", "reload", "extra_headers", "viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "clear_all", "output"],
+        "navigate" => &[
+            "url",
+            "back",
+            "forward",
+            "reload",
+            "extra_headers",
+            "viewport",
+            "device_scale_factor",
+            "mobile",
+            "geolocation",
+            "accuracy",
+            "clear_all",
+            "output",
+        ],
         "screenshot" => &["output", "format", "full_page"],
         "evaluate" => &["expression", "dialog_action", "output", "track_navigation"],
         "click" => &["selector"],
@@ -24,7 +45,17 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "press-key" => &["key"],
         "hover" => &["selector"],
         "snapshot" => &["output"],
-        "emulate" => &["viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "clear_viewport", "clear_geolocation", "clear_all", "clear_blocks"],
+        "emulate" => &[
+            "viewport",
+            "device_scale_factor",
+            "mobile",
+            "geolocation",
+            "accuracy",
+            "clear_viewport",
+            "clear_geolocation",
+            "clear_all",
+            "clear_blocks",
+        ],
         "wait-for" => &["text", "timeout"],
         "list-3p-tools" => &[],
         "execute-3p-tool" => &["name", "params"],
@@ -40,14 +71,17 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
 fn validate_args(cmd: &str, args: &serde_json::Value) -> Result<()> {
     let known = known_args(cmd);
     if let Some(obj) = args.as_object() {
-        let unknown: Vec<&String> = obj.keys().filter(|k| {
-            let key = k.as_str();
-            // dialog_action is handled globally for all page-level commands
-            if key == "dialog_action" && !is_browser_level(cmd) {
-                return false;
-            }
-            !known.contains(&key)
-        }).collect();
+        let unknown: Vec<&String> = obj
+            .keys()
+            .filter(|k| {
+                let key = k.as_str();
+                // dialog_action is handled globally for all page-level commands
+                if key == "dialog_action" && !is_browser_level(cmd) {
+                    return false;
+                }
+                !known.contains(&key)
+            })
+            .collect();
         if !unknown.is_empty() {
             let unknown_names: Vec<&str> = unknown.iter().map(|s| s.as_str()).collect();
             bail!(
@@ -63,10 +97,7 @@ fn validate_args(cmd: &str, args: &serde_json::Value) -> Result<()> {
 
 /// Whether a command operates at the browser level (no page session needed).
 fn is_browser_level(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        "list-pages" | "new-page" | "sw-logs" | "kill-daemon"
-    )
+    matches!(cmd, "list-pages" | "new-page" | "sw-logs" | "kill-daemon")
 }
 
 /// Execute a single command from a [`DaemonRequest`].
@@ -102,7 +133,10 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                 let params = commands::emulation::EmulateParams {
                     viewport: viewport.map(|s| s.to_string()),
                     device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
-                    mobile: args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false),
+                    mobile: args
+                        .get("mobile")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                     geolocation: geolocation.map(|s| s.to_string()),
                     accuracy: args.get("accuracy").and_then(|v| v.as_f64()),
                     clear_viewport: false,
@@ -120,7 +154,13 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                     None
                 };
 
-                commands::pages::new_page(client, url, params, args.get("extra_headers").and_then(|v| v.as_str())).await
+                commands::pages::new_page(
+                    client,
+                    url,
+                    params,
+                    args.get("extra_headers").and_then(|v| v.as_str()),
+                )
+                .await
             }
             "sw-logs" => {
                 let duration = args
@@ -128,11 +168,12 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                     .and_then(|v| v.as_u64())
                     .unwrap_or(3000);
                 let extension_id = args.get("extension_id").and_then(|v| v.as_str());
-                commands::sw_logs::collect_sw_logs(client, duration, extension_id, req.format()).await
+                commands::sw_logs::collect_sw_logs(client, duration, extension_id, req.format())
+                    .await
             }
-            "kill-daemon" => {
-                Ok(CommandResult::output("kill-daemon is handled directly by the CLI, not the daemon."))
-            }
+            "kill-daemon" => Ok(CommandResult::output(
+                "kill-daemon is handled directly by the CLI, not the daemon.",
+            )),
             _ => unreachable!(),
         };
     }
@@ -149,10 +190,10 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                 }
             }
             Some(v) if v.is_number() => {
-                let idx = v.as_u64()
-                    .ok_or_else(|| anyhow!("invalid numeric id_or_index: must be a non-negative integer"))?;
-                let idx_usize = usize::try_from(idx)
-                    .map_err(|_| anyhow!("index too large"))?;
+                let idx = v.as_u64().ok_or_else(|| {
+                    anyhow!("invalid numeric id_or_index: must be a non-negative integer")
+                })?;
+                let idx_usize = usize::try_from(idx).map_err(|_| anyhow!("index too large"))?;
                 (None, Some(idx_usize))
             }
             _ => (req.target.as_deref(), req.page),
@@ -251,12 +292,18 @@ async fn inner_execute(
             // Apply emulation before navigation if requested
             let viewport = args.get("viewport").and_then(|v| v.as_str());
             let geolocation = args.get("geolocation").and_then(|v| v.as_str());
-            let clear_all = args.get("clear_all").and_then(|v| v.as_bool()).unwrap_or(false);
+            let clear_all = args
+                .get("clear_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             let params = commands::emulation::EmulateParams {
                 viewport: viewport.map(|s| s.to_string()),
                 device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
-                mobile: args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false),
+                mobile: args
+                    .get("mobile")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 geolocation: geolocation.map(|s| s.to_string()),
                 accuracy: args.get("accuracy").and_then(|v| v.as_f64()),
                 clear_viewport: false,
@@ -369,17 +416,38 @@ async fn inner_execute(
             // order relative to --clear-blocks — which is why the generic merge
             // above skips "emulate".
             let params = commands::emulation::EmulateParams {
-                viewport: args.get("viewport").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                viewport: args
+                    .get("viewport")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
                 device_scale_factor: args.get("device_scale_factor").and_then(|v| v.as_f64()),
-                mobile: args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false),
-                geolocation: args.get("geolocation").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                mobile: args
+                    .get("mobile")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                geolocation: args
+                    .get("geolocation")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
                 accuracy: args.get("accuracy").and_then(|v| v.as_f64()),
-                clear_viewport: args.get("clear_viewport").and_then(|v| v.as_bool()).unwrap_or(false),
-                clear_geolocation: args.get("clear_geolocation").and_then(|v| v.as_bool()).unwrap_or(false),
-                clear_all: args.get("clear_all").and_then(|v| v.as_bool()).unwrap_or(false),
+                clear_viewport: args
+                    .get("clear_viewport")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                clear_geolocation: args
+                    .get("clear_geolocation")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                clear_all: args
+                    .get("clear_all")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 block_url: req.block_url.clone(),
                 unblock_url: req.unblock_url.clone(),
-                clear_blocks: args.get("clear_blocks").and_then(|v| v.as_bool()).unwrap_or(false),
+                clear_blocks: args
+                    .get("clear_blocks")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             };
             params.validate()?;
             commands::emulation::emulate(client, session_id, params).await
@@ -411,10 +479,7 @@ async fn inner_execute(
             None => bail!("name required"),
         },
         "console" => {
-            let duration = args
-                .get("duration")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let duration = args.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);
             let types: Vec<String> = args
                 .get("type")
                 .and_then(|v| v.as_array())
@@ -424,20 +489,11 @@ async fn inner_execute(
                         .collect()
                 })
                 .unwrap_or_default();
-            commands::console::collect_console(
-                client,
-                session_id,
-                duration,
-                types,
-                req.format(),
-            )
-            .await
+            commands::console::collect_console(client, session_id, duration, types, req.format())
+                .await
         }
         "network" => {
-            let duration = args
-                .get("duration")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let duration = args.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);
             let types: Vec<String> = args
                 .get("type")
                 .and_then(|v| v.as_array())
@@ -447,14 +503,8 @@ async fn inner_execute(
                         .collect()
                 })
                 .unwrap_or_default();
-            commands::network::collect_network(
-                client,
-                session_id,
-                duration,
-                types,
-                req.format(),
-            )
-            .await
+            commands::network::collect_network(client, session_id, duration, types, req.format())
+                .await
         }
         _ => bail!("Unknown command: {cmd}"),
     }

@@ -153,7 +153,11 @@ async fn wait_for_navigation(client: &mut CdpClient, session_id: &str) -> Result
         .and_then(|t| t.get("frame"))
         .and_then(|f| f.get("id"))
         .and_then(|i| i.as_str())
-        .ok_or_else(|| anyhow!("Failed to determine main frame ID from Page.getFrameTree response: {frame_tree}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "Failed to determine main frame ID from Page.getFrameTree response: {frame_tree}"
+            )
+        })?
         .to_string();
 
     let nav_events = ["Page.frameStartedLoading", "Page.navigatedWithinDocument"];
@@ -312,20 +316,20 @@ if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
 
     let res_val = result["result"]["value"].as_str().unwrap_or("error");
 
-if res_val == "not_found" {
-         bail!("Element not found: {selector}");
-     } else if res_val == "option_not_found" {
-         bail!("Could not find option with text or value '{value}' in select element: {selector}");
-     } else if res_val == "file_input" {
-         bail!("Cannot fill file input with text: {selector}");
-     } else if res_val == "select_ok" || res_val == "checkbox_ok" || res_val == "textarea_ok" {
-         // For select/checkbox/textarea, the work is done entirely in JS
-         let new_url = client.current_url(session_id).await?;
-         return Ok(
-             CommandResult::output(format!("Filled '{selector}' with: {value}"))
-                 .with_navigated_to_if_changed(new_url, initial_url),
-         );
-     }
+    if res_val == "not_found" {
+        bail!("Element not found: {selector}");
+    } else if res_val == "option_not_found" {
+        bail!("Could not find option with text or value '{value}' in select element: {selector}");
+    } else if res_val == "file_input" {
+        bail!("Cannot fill file input with text: {selector}");
+    } else if res_val == "select_ok" || res_val == "checkbox_ok" || res_val == "textarea_ok" {
+        // For select/checkbox/textarea, the work is done entirely in JS
+        let new_url = client.current_url(session_id).await?;
+        return Ok(
+            CommandResult::output(format!("Filled '{selector}' with: {value}"))
+                .with_navigated_to_if_changed(new_url, initial_url),
+        );
+    }
 
     client
         .send_to_target(session_id, "Input.insertText", json!({"text": value}))

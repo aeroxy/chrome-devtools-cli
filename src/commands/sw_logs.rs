@@ -18,9 +18,7 @@ pub async fn collect_sw_logs(
 
     let sw_targets: Vec<_> = targets
         .iter()
-        .filter(|t| {
-            t.target_type == "service_worker" && t.url.starts_with(EXTENSION_PREFIX)
-        })
+        .filter(|t| t.target_type == "service_worker" && t.url.starts_with(EXTENSION_PREFIX))
         .filter(|t| {
             if let Some(filter_id) = extension_id_filter {
                 extract_extension_id(&t.url)
@@ -75,7 +73,7 @@ pub async fn collect_sw_logs(
 
         let source = match sessions.iter().find(|(_, sid)| sid == session_id) {
             Some((t, _)) => t.url.as_str(),
-            None => continue,  // Skip events not from service worker sessions
+            None => continue, // Skip events not from service worker sessions
         };
 
         let ext_id = extract_extension_id(source).unwrap_or_default();
@@ -93,7 +91,10 @@ pub async fn collect_sw_logs(
                                 // Other primitives (number, bool, null): stringify directly.
                                 Some(v) => v.to_string(),
                                 // Objects have no `value` — fall back to their description.
-                                None => arg["description"].as_str().unwrap_or("<object>").to_string(),
+                                None => arg["description"]
+                                    .as_str()
+                                    .unwrap_or("<object>")
+                                    .to_string(),
                             })
                             .collect()
                     })
@@ -110,9 +111,7 @@ pub async fn collect_sw_logs(
             "Runtime.exceptionThrown" => {
                 let details = &params["exceptionDetails"];
                 let text = details["text"].as_str().unwrap_or("Unknown error");
-                let description = details["exception"]["description"]
-                    .as_str()
-                    .unwrap_or(text);
+                let description = details["exception"]["description"].as_str().unwrap_or(text);
 
                 messages.push(json!({
                     "extensionId": ext_id,
@@ -186,6 +185,9 @@ mod tests {
 
     #[test]
     fn extract_extension_id_prefix_only() {
-        assert_eq!(extract_extension_id("chrome-extension://"), Some("".to_string()));
+        assert_eq!(
+            extract_extension_id("chrome-extension://"),
+            Some("".to_string())
+        );
     }
 }

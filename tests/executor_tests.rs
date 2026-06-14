@@ -55,8 +55,8 @@ mod tests {
     /// never get out of sync when CLI flags are added or removed.
     #[test]
     fn test_known_args_sync_with_clap() {
-        use clap::CommandFactory;
         use chrome_devtools_cli::Cli;
+        use clap::CommandFactory;
 
         let cmd = Cli::command();
         for sub in cmd.get_subcommands() {

@@ -88,10 +88,7 @@ pub async fn emulate(
         }
     }
     if !params.block_url.is_empty() {
-        actions.push(format!(
-            "Blocked URLs: {}",
-            params.block_url.join(", ")
-        ));
+        actions.push(format!("Blocked URLs: {}", params.block_url.join(", ")));
     }
 
     for pattern in &params.unblock_url {
@@ -111,7 +108,11 @@ pub async fn emulate(
     // 1. Handle clearing
     if params.clear_all || params.clear_viewport {
         client
-            .send_to_target(session_id, "Emulation.clearDeviceMetricsOverride", json!({}))
+            .send_to_target(
+                session_id,
+                "Emulation.clearDeviceMetricsOverride",
+                json!({}),
+            )
             .await?;
         actions.push("Viewport cleared".to_string());
     }
@@ -130,8 +131,14 @@ pub async fn emulate(
         if parts.len() != 2 {
             anyhow::bail!("Viewport must be in WxH format (e.g. 1280x720)");
         }
-        let w: u32 = parts[0].trim().parse().map_err(|_| anyhow!("Invalid width: {}", parts[0]))?;
-        let h: u32 = parts[1].trim().parse().map_err(|_| anyhow!("Invalid height: {}", parts[1]))?;
+        let w: u32 = parts[0]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("Invalid width: {}", parts[0]))?;
+        let h: u32 = parts[1]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("Invalid height: {}", parts[1]))?;
         if w == 0 {
             anyhow::bail!("Invalid width: {} (must be > 0)", w);
         }
@@ -152,7 +159,10 @@ pub async fn emulate(
                 }),
             )
             .await?;
-        actions.push(format!("Viewport set to {}x{} (scale: {}, mobile: {})", w, h, dsf, params.mobile));
+        actions.push(format!(
+            "Viewport set to {}x{} (scale: {}, mobile: {})",
+            w, h, dsf, params.mobile
+        ));
     }
 
     // 3. Handle setting geolocation
@@ -161,8 +171,14 @@ pub async fn emulate(
         if parts.len() != 2 {
             anyhow::bail!("Geolocation must be in lat,lon format (e.g. 37.77,-122.41)");
         }
-        let lat: f64 = parts[0].trim().parse().map_err(|_| anyhow!("Invalid latitude: {}", parts[0]))?;
-        let lon: f64 = parts[1].trim().parse().map_err(|_| anyhow!("Invalid longitude: {}", parts[1]))?;
+        let lat: f64 = parts[0]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("Invalid latitude: {}", parts[0]))?;
+        let lon: f64 = parts[1]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("Invalid longitude: {}", parts[1]))?;
         let acc = params.accuracy.unwrap_or(100.0);
 
         if !(-90.0..=90.0).contains(&lat) {
@@ -179,7 +195,10 @@ pub async fn emulate(
                 json!({ "latitude": lat, "longitude": lon, "accuracy": acc }),
             )
             .await?;
-        actions.push(format!("Geolocation set to {}, {} (acc: {}m)", lat, lon, acc));
+        actions.push(format!(
+            "Geolocation set to {}, {} (acc: {}m)",
+            lat, lon, acc
+        ));
     }
 
     // 4. If no specific action taken, show current overrides

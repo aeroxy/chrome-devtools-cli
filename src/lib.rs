@@ -392,14 +392,12 @@ fn build_request(cli: &Cli) -> DaemonRequest {
                 "extra_headers": extra_headers
             }),
         ),
-        Commands::ClosePage { id_or_index } => (
-            "close-page",
-            json!({ "id_or_index": id_or_index }),
-        ),
-        Commands::SelectPage { id_or_index } => (
-            "select-page",
-            json!({ "id_or_index": id_or_index }),
-        ),
+        Commands::ClosePage { id_or_index } => {
+            ("close-page", json!({ "id_or_index": id_or_index }))
+        }
+        Commands::SelectPage { id_or_index } => {
+            ("select-page", json!({ "id_or_index": id_or_index }))
+        }
         Commands::Screenshot {
             output,
             format,
@@ -525,16 +523,14 @@ pub async fn run() -> Result<()> {
 
             // Show subcommand-specific help when the error is about a subcommand's args
             let mut cmd = Cli::command();
-            let sub_name = std::env::args_os()
-                .skip(1)
-                .find_map(|arg| {
-                    let s = arg.to_string_lossy();
-                    if !s.starts_with('-') && cmd.get_subcommands().any(|c| c.get_name() == s) {
-                        Some(s.into_owned())
-                    } else {
-                        None
-                    }
-                });
+            let sub_name = std::env::args_os().skip(1).find_map(|arg| {
+                let s = arg.to_string_lossy();
+                if !s.starts_with('-') && cmd.get_subcommands().any(|c| c.get_name() == s) {
+                    Some(s.into_owned())
+                } else {
+                    None
+                }
+            });
             match sub_name {
                 Some(name) => {
                     if let Some(sub_cmd) = cmd.find_subcommand_mut(&name) {
@@ -557,9 +553,10 @@ pub async fn run() -> Result<()> {
         let sock_path = protocol::socket_path();
         match std::fs::read_to_string(&pid_path) {
             Ok(pid_str) => {
-                let pid: u32 = pid_str.trim().parse().map_err(|_| {
-                    anyhow::anyhow!("Invalid PID in {}", pid_path.display())
-                })?;
+                let pid: u32 = pid_str
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid PID in {}", pid_path.display()))?;
                 #[cfg(unix)]
                 {
                     // Signal the process directly via libc to avoid shelling out
@@ -733,10 +730,17 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
     let target_id = target.target_id.clone();
 
     // Special case for browser-level commands that target a specific page but don't need a session
-    if matches!(cli.command, Commands::ClosePage { .. } | Commands::SelectPage { .. }) {
+    if matches!(
+        cli.command,
+        Commands::ClosePage { .. } | Commands::SelectPage { .. }
+    ) {
         return match &cli.command {
-            Commands::ClosePage { .. } => commands::pages::close_page(&mut client, &target_id).await,
-            Commands::SelectPage { .. } => commands::pages::select_page(&mut client, &target_id).await,
+            Commands::ClosePage { .. } => {
+                commands::pages::close_page(&mut client, &target_id).await
+            }
+            Commands::SelectPage { .. } => {
+                commands::pages::select_page(&mut client, &target_id).await
+            }
             _ => unreachable!(),
         };
     }
@@ -886,8 +890,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 clear_blocks: *clear_blocks,
             };
             params.validate()?;
-            commands::emulation::emulate(&mut client, &session_id, params)
-                .await
+            commands::emulation::emulate(&mut client, &session_id, params).await
         }
         Commands::WaitFor { text, timeout } => {
             commands::pages::wait_for(&mut client, &session_id, text, *timeout).await

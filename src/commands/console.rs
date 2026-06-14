@@ -42,7 +42,10 @@ pub async fn collect_console(
     format_console_output(&messages, format)
 }
 
-fn process_console_events(events: &[serde_json::Value], type_filter: &[String]) -> Vec<serde_json::Value> {
+fn process_console_events(
+    events: &[serde_json::Value],
+    type_filter: &[String],
+) -> Vec<serde_json::Value> {
     let filter_set: Option<std::collections::HashSet<&str>> = if type_filter.is_empty() {
         None
     } else {
@@ -73,7 +76,10 @@ fn process_console_events(events: &[serde_json::Value], type_filter: &[String]) 
                                 // Other primitives (number, bool, null): stringify directly.
                                 Some(v) => v.to_string(),
                                 // Objects have no `value` — fall back to their description.
-                                None => arg["description"].as_str().unwrap_or("<object>").to_string(),
+                                None => arg["description"]
+                                    .as_str()
+                                    .unwrap_or("<object>")
+                                    .to_string(),
                             })
                             .collect()
                     })
@@ -95,9 +101,7 @@ fn process_console_events(events: &[serde_json::Value], type_filter: &[String]) 
                 }
                 let details = &params["exceptionDetails"];
                 let text = details["text"].as_str().unwrap_or("Unknown error");
-                let description = details["exception"]["description"]
-                    .as_str()
-                    .unwrap_or(text);
+                let description = details["exception"]["description"].as_str().unwrap_or(text);
                 let timestamp = params["timestamp"].as_f64().unwrap_or(0.0);
 
                 messages.push(json!({
@@ -113,10 +117,15 @@ fn process_console_events(events: &[serde_json::Value], type_filter: &[String]) 
     messages
 }
 
-fn format_console_output(messages: &[serde_json::Value], format: OutputFormat) -> Result<CommandResult> {
+fn format_console_output(
+    messages: &[serde_json::Value],
+    format: OutputFormat,
+) -> Result<CommandResult> {
     if format.is_text() {
         if messages.is_empty() {
-            return Ok(CommandResult::output("No console messages collected.".to_string()));
+            return Ok(CommandResult::output(
+                "No console messages collected.".to_string(),
+            ));
         }
         let mut out = String::new();
         for msg in messages {

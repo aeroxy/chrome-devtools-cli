@@ -30,12 +30,11 @@ impl DaemonRequest {
     /// Resolve the output format, preferring the new `output_format` field
     /// and falling back to the legacy `json_output` bool.
     pub fn format(&self) -> OutputFormat {
-        self.output_format
-            .unwrap_or(if self.json_output {
-                OutputFormat::Json
-            } else {
-                OutputFormat::Text
-            })
+        self.output_format.unwrap_or(if self.json_output {
+            OutputFormat::Json
+        } else {
+            OutputFormat::Text
+        })
     }
 }
 
@@ -79,8 +78,8 @@ pub async fn write_msg<W: AsyncWriteExt + Unpin>(w: &mut W, data: &[u8]) -> anyh
 pub async fn read_msg<R: AsyncReadExt + Unpin>(r: &mut R) -> anyhow::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
-    let len = usize::try_from(u32::from_be_bytes(len_buf))
-        .context("Message length overflows usize")?;
+    let len =
+        usize::try_from(u32::from_be_bytes(len_buf)).context("Message length overflows usize")?;
     if len > 64 * 1024 * 1024 {
         anyhow::bail!("Message too large: {len} bytes");
     }

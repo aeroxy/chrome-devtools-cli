@@ -17,7 +17,10 @@ pub async fn navigate(
     output: Option<&str>,
 ) -> Result<CommandResult> {
     // Validate navigation intent before mutating session state
-    let intent_count = [back, forward, reload, url.is_some()].iter().filter(|&&b| b).count();
+    let intent_count = [back, forward, reload, url.is_some()]
+        .iter()
+        .filter(|&&b| b)
+        .count();
     if intent_count == 0 {
         bail!("URL required (or use --back, --forward, --reload)");
     }
@@ -152,7 +155,11 @@ async fn do_reload(
 }
 
 /// Poll until document.readyState is "complete" or the timeout expires.
-pub async fn wait_for_load(client: &mut CdpClient, session_id: &str, timeout_ms: u64) -> Result<()> {
+pub async fn wait_for_load(
+    client: &mut CdpClient,
+    session_id: &str,
+    timeout_ms: u64,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -187,7 +194,9 @@ pub async fn wait_for_load(client: &mut CdpClient, session_id: &str, timeout_ms:
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
-                return Err(anyhow!("wait_for_load failed for session {session_id}: {e}"));
+                return Err(anyhow!(
+                    "wait_for_load failed for session {session_id}: {e}"
+                ));
             }
         }
 

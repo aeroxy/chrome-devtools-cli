@@ -118,10 +118,7 @@ mod daemon_request_format_tests {
     use crate::protocol::DaemonRequest;
     use serde_json::json;
 
-    fn make_req(
-        json_output: bool,
-        output_format: Option<OutputFormat>,
-    ) -> DaemonRequest {
+    fn make_req(json_output: bool, output_format: Option<OutputFormat>) -> DaemonRequest {
         DaemonRequest {
             command: "list-pages".to_string(),
             args: json!({}),

@@ -26,7 +26,10 @@ pub async fn apply_extra_headers(
                 serde_json::Value::String(s) => s.clone(),
                 serde_json::Value::Number(n) => n.to_string(),
                 serde_json::Value::Bool(b) => b.to_string(),
-                _ => anyhow::bail!("Header value for '{}' must be a primitive scalar (string, number, or boolean)", k),
+                _ => anyhow::bail!(
+                    "Header value for '{}' must be a primitive scalar (string, number, or boolean)",
+                    k
+                ),
             };
             converted_headers.insert(k.clone(), serde_json::Value::String(val_str));
         }
@@ -60,10 +63,7 @@ pub async fn clear_extra_headers(client: &mut CdpClient, session_id: &str) -> Re
 }
 
 /// List all open page targets with their friendly names, titles, and URLs.
-pub async fn list_pages(
-    client: &mut CdpClient,
-    format: OutputFormat,
-) -> Result<CommandResult> {
+pub async fn list_pages(client: &mut CdpClient, format: OutputFormat) -> Result<CommandResult> {
     let pages = client.get_page_targets().await?;
 
     if format.is_text() {
@@ -119,7 +119,12 @@ pub async fn new_page(
                 if let Some(error_text) = nav_result.get("errorText").and_then(|v| v.as_str()) {
                     anyhow::bail!("Page.navigate failed: {error_text}");
                 }
-                crate::commands::navigate::wait_for_load(client, &session_id, NAVIGATION_TIMEOUT_MS).await?;
+                crate::commands::navigate::wait_for_load(
+                    client,
+                    &session_id,
+                    NAVIGATION_TIMEOUT_MS,
+                )
+                .await?;
                 Ok(())
             }
             .await;
@@ -149,7 +154,9 @@ pub async fn new_page(
 pub async fn close_page(client: &mut CdpClient, target_id: &str) -> Result<CommandResult> {
     client.close_target(target_id).await?;
     let friendly_name = friendly::to_friendly(target_id);
-    Ok(CommandResult::output(format!("Closed page: {friendly_name}")))
+    Ok(CommandResult::output(format!(
+        "Closed page: {friendly_name}"
+    )))
 }
 
 /// Activate (bring to front) a page target by its target ID.
@@ -203,7 +210,9 @@ pub async fn wait_for(
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     continue;
                 }
-                return Err(anyhow::anyhow!("wait_for failed for session {session_id}: {e}"));
+                return Err(anyhow::anyhow!(
+                    "wait_for failed for session {session_id}: {e}"
+                ));
             }
         }
 

@@ -227,16 +227,13 @@ impl CdpClient {
         // attach, per-command live sessions) fall through and go into the
         // general events buffer — otherwise a subsequent page `console` drain
         // would return extension service worker logs.
-        let from_persistent_session = self
-            .persistent_session
-            .as_deref()
-            .is_some_and(|s| {
-                event
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .map(|session_id| session_id == s)
-                    .unwrap_or(false)
-            });
+        let from_persistent_session = self.persistent_session.as_deref().is_some_and(|s| {
+            event
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(|session_id| session_id == s)
+                .unwrap_or(false)
+        });
 
         if from_persistent_session {
             let method = event.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -247,14 +244,16 @@ impl CdpClient {
                 | "Network.loadingFailed" => {
                     self.network_events.push(event);
                     if self.network_events.len() > MAX_PERSISTENT_EVENTS {
-                        self.network_events.drain(..self.network_events.len() - MAX_PERSISTENT_EVENTS);
+                        self.network_events
+                            .drain(..self.network_events.len() - MAX_PERSISTENT_EVENTS);
                     }
                     return;
                 }
                 "Runtime.consoleAPICalled" | "Runtime.exceptionThrown" => {
                     self.console_events.push(event);
                     if self.console_events.len() > MAX_PERSISTENT_EVENTS {
-                        self.console_events.drain(..self.console_events.len() - MAX_PERSISTENT_EVENTS);
+                        self.console_events
+                            .drain(..self.console_events.len() - MAX_PERSISTENT_EVENTS);
                     }
                     return;
                 }
@@ -434,7 +433,11 @@ impl CdpClient {
                 }
             }) {
                 if let Some(resp) = self.events.remove(idx) {
-                    let method = resp.get("method").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    let method = resp
+                        .get("method")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
                     return Ok((method, resp.get("params").cloned().unwrap_or(Value::Null)));
                 }
             }
@@ -578,8 +581,7 @@ impl CdpClient {
     /// session buffers when active to avoid duplicates.
     pub async fn read_events_for(&mut self, duration_ms: u64) -> Result<Vec<Value>> {
         let mut events: Vec<Value> = self.events.drain(..).collect();
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
 
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
