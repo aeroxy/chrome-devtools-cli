@@ -142,8 +142,11 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                     clear_viewport: false,
                     clear_geolocation: false,
                     clear_all: false,
-                    block_url: Vec::new(),
-                    unblock_url: Vec::new(),
+                    // Apply the global --block-url/--unblock-url flags to the new
+                    // tab during its initial load, matching direct mode and the
+                    // viewport/geolocation flags handled above.
+                    block_url: req.block_url.clone(),
+                    unblock_url: req.unblock_url.clone(),
                     clear_blocks: false,
                 };
                 params.validate()?;

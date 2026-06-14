@@ -52,10 +52,12 @@ pub struct Cli {
     #[arg(long, global = true, conflicts_with = "json")]
     pub toon: bool,
 
-    /// Add URL pattern to the daemon's network block list (e.g. "*.png").
-    /// Repeatable. Persisted in daemon memory until un-blocked or cleared.
-    /// Blocks subresources (images, scripts, fetch/XHR, CDN, trackers); does
-    /// NOT block top-level navigations (a Chrome setBlockedURLs limitation).
+    /// Add URL pattern to the network block list (e.g. "*.png"). Repeatable.
+    /// In daemon mode, persisted in daemon memory (per tab) until un-blocked or
+    /// cleared; in direct mode (no daemon), applied per-invocation to the
+    /// command's session only. Blocks subresources (images, scripts, fetch/XHR,
+    /// CDN, trackers); does NOT block top-level navigations (a Chrome
+    /// setBlockedURLs limitation).
     #[arg(long, global = true)]
     pub block_url: Vec<String>,
 
@@ -703,10 +705,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                     clear_viewport: false,
                     clear_geolocation: false,
                     clear_all: false,
-                    // URL blocking is daemon-only state; new-page in direct mode
-                    // has no persistent session to apply it to.
-                    block_url: Vec::new(),
-                    unblock_url: Vec::new(),
+                    block_url: cli.block_url.clone(),
+                    unblock_url: cli.unblock_url.clone(),
                     clear_blocks: false,
                 };
                 params.validate()?;
@@ -807,10 +807,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 clear_viewport: false,
                 clear_geolocation: false,
                 clear_all: *clear_all,
-                // URL blocking is daemon-only state; navigate in direct mode has
-                // no persistent session to apply it to.
-                block_url: Vec::new(),
-                unblock_url: Vec::new(),
+                block_url: cli.block_url.clone(),
+                unblock_url: cli.unblock_url.clone(),
                 clear_blocks: false,
             };
             params.validate()?;
