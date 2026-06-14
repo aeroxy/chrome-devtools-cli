@@ -53,6 +53,9 @@ fn process_network_events(
     };
 
     let mut requests: HashMap<String, serde_json::Value> = HashMap::new();
+    // First-seen order of request IDs, so output follows the network timeline
+    // rather than an arbitrary HashMap / alphabetical ordering.
+    let mut order: Vec<String> = Vec::new();
 
     for event in events {
         let method = event["method"].as_str().unwrap_or("");
@@ -68,6 +71,11 @@ fn process_network_events(
                     .unwrap_or("GET")
                     .to_string();
 
+                // Record first-seen position; redirects reuse the same requestId
+                // and update the record in place without changing its position.
+                if !requests.contains_key(&request_id) {
+                    order.push(request_id.clone());
+                }
                 requests.insert(
                     request_id,
                     json!({
@@ -100,7 +108,11 @@ fn process_network_events(
         }
     }
 
-    let mut filtered: Vec<serde_json::Value> = requests.into_values().collect();
+    // Emit in first-seen (chronological) order rather than HashMap order.
+    let mut filtered: Vec<serde_json::Value> = order
+        .into_iter()
+        .filter_map(|id| requests.remove(&id))
+        .collect();
     if let Some(ref set) = filter_set {
         filtered.retain(|r| {
             r["resourceType"]
@@ -109,14 +121,6 @@ fn process_network_events(
                 .unwrap_or(false)
         });
     }
-
-    // Sort by URL for stable output
-    filtered.sort_by(|a, b| {
-        a["url"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["url"].as_str().unwrap_or(""))
-    });
 
     filtered
 }
@@ -236,7 +240,8 @@ mod tests {
     }
 
     #[test]
-    fn test_process_network_events_sorts_by_url() {
+    fn test_process_network_events_preserves_chronological_order() {
+        // Output should follow first-seen (request order), NOT alphabetical URL.
         let events = vec![
             json!({
                 "method": "Network.requestWillBeSent",
@@ -256,8 +261,8 @@ mod tests {
             }),
         ];
         let out = process_network_events(&events, &[]);
-        assert_eq!(out[0]["url"], "https://a.example.com/");
-        assert_eq!(out[1]["url"], "https://z.example.com/");
+        assert_eq!(out[0]["url"], "https://z.example.com/");
+        assert_eq!(out[1]["url"], "https://a.example.com/");
     }
 
     #[test]
