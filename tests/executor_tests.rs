@@ -20,7 +20,7 @@ mod tests {
             json_output: false,
             output_format: None,
             block_url: vec![],
-            allow_url: vec![],
+            unblock_url: vec![],
         };
         assert_eq!(req.command, "list-pages");
 
@@ -32,7 +32,7 @@ mod tests {
             json_output: false,
             output_format: None,
             block_url: vec![],
-            allow_url: vec![],
+            unblock_url: vec![],
         };
         assert_eq!(req.command, "navigate");
 
@@ -44,7 +44,7 @@ mod tests {
             json_output: false,
             output_format: None,
             block_url: vec![],
-            allow_url: vec![],
+            unblock_url: vec![],
         };
         assert_eq!(req.command, "click");
     }

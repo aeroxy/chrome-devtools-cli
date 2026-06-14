@@ -16,12 +16,10 @@ pub struct EmulateParams {
     pub clear_all: bool,
     /// Patterns to add to the daemon's network blocklist (`*.png`, `*.gif`, etc.).
     pub block_url: Vec<String>,
-    /// Patterns to remove from the daemon's network blocklist (effectively allowing them).
-    pub allow_url: Vec<String>,
+    /// Patterns to remove from the daemon's network blocklist (un-block them).
+    pub unblock_url: Vec<String>,
     /// Clear the entire network blocklist.
     pub clear_blocks: bool,
-    /// Clear all blocked patterns (alias for clear_blocks — present for symmetry).
-    pub clear_allows: bool,
 }
 
 impl EmulateParams {
@@ -59,9 +57,8 @@ impl EmulateParams {
             || self.clear_viewport
             || self.clear_geolocation
             || !self.block_url.is_empty()
-            || !self.allow_url.is_empty()
+            || !self.unblock_url.is_empty()
             || self.clear_blocks
-            || self.clear_allows
     }
 }
 
@@ -76,14 +73,12 @@ pub async fn emulate(
     // 0. Handle network blocklist (applied to the persistent session, not the
     //    per-command session — so the blocklist survives across commands/targets).
     let network_changed = !params.block_url.is_empty()
-        || !params.allow_url.is_empty()
+        || !params.unblock_url.is_empty()
         || params.clear_blocks
-        || params.clear_allows
         || params.clear_all;
 
-    if params.clear_all || params.clear_blocks || params.clear_allows {
+    if params.clear_all || params.clear_blocks {
         client.blocklist.clear();
-        client.allowlist.clear();
         actions.push("Network blocks cleared".to_string());
     }
 
@@ -99,13 +94,13 @@ pub async fn emulate(
         ));
     }
 
-    for pattern in &params.allow_url {
+    for pattern in &params.unblock_url {
         client.blocklist.retain(|p| p != pattern);
     }
-    if !params.allow_url.is_empty() {
+    if !params.unblock_url.is_empty() {
         actions.push(format!(
-            "Allowed URLs: {}",
-            params.allow_url.join(", ")
+            "Un-blocked URLs: {}",
+            params.unblock_url.join(", ")
         ));
     }
 
@@ -190,20 +185,12 @@ pub async fn emulate(
     // 4. If no specific action taken, show current overrides
     if actions.is_empty() {
         let mut out = String::new();
-        if client.blocklist.is_empty() && client.allowlist.is_empty() {
+        if client.blocklist.is_empty() {
             out.push_str("No emulation overrides active.\n");
         } else {
-            if !client.blocklist.is_empty() {
-                out.push_str("Blocked URLs:\n");
-                for p in &client.blocklist {
-                    out.push_str(&format!("  {p}\n"));
-                }
-            }
-            if !client.allowlist.is_empty() {
-                out.push_str("Allowed URLs:\n");
-                for p in &client.allowlist {
-                    out.push_str(&format!("  {p}\n"));
-                }
+            out.push_str("Blocked URLs:\n");
+            for p in &client.blocklist {
+                out.push_str(&format!("  {p}\n"));
             }
         }
         return Ok(CommandResult::output(out.trim_end().to_string()));

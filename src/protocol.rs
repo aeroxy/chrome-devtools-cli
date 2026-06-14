@@ -23,7 +23,7 @@ pub struct DaemonRequest {
     pub block_url: Vec<String>,
     /// URL patterns to remove from the daemon's network blocklist (from global CLI flags).
     #[serde(default)]
-    pub allow_url: Vec<String>,
+    pub unblock_url: Vec<String>,
 }
 
 impl DaemonRequest {

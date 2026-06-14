@@ -56,7 +56,7 @@ pub async fn collect_sw_logs(
         }
     }
 
-    let events = client.read_events_for(duration_ms).await?;
+    let events_result = client.read_events_for(duration_ms).await;
 
     for (_, session_id) in &sessions {
         let _ = client
@@ -65,17 +65,18 @@ pub async fn collect_sw_logs(
         let _ = client.detach_from_target(session_id).await;
     }
 
+    let events = events_result?;
+
     let mut messages = Vec::new();
     for event in &events {
         let method = event["method"].as_str().unwrap_or("");
         let params = &event["params"];
         let session_id = event["sessionId"].as_str().unwrap_or("");
 
-        let source = sessions
-            .iter()
-            .find(|(_, sid)| sid == session_id)
-            .map(|(t, _)| t.url.as_str())
-            .unwrap_or("unknown");
+        let source = match sessions.iter().find(|(_, sid)| sid == session_id) {
+            Some((t, _)) => t.url.as_str(),
+            None => continue,  // Skip events not from service worker sessions
+        };
 
         let ext_id = extract_extension_id(source).unwrap_or_default();
 
@@ -147,4 +148,43 @@ fn extract_extension_id(url: &str) -> Option<String> {
     let rest = url.strip_prefix(EXTENSION_PREFIX)?;
     let slash = rest.find('/').unwrap_or(rest.len());
     Some(rest[..slash].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_extension_id_with_path() {
+        let url = "chrome-extension://abc123def/background.js";
+        assert_eq!(extract_extension_id(url), Some("abc123def".to_string()));
+    }
+
+    #[test]
+    fn extract_extension_id_no_path() {
+        let url = "chrome-extension://abc123def";
+        assert_eq!(extract_extension_id(url), Some("abc123def".to_string()));
+    }
+
+    #[test]
+    fn extract_extension_id_trailing_slash() {
+        let url = "chrome-extension://abc123def/";
+        assert_eq!(extract_extension_id(url), Some("abc123def".to_string()));
+    }
+
+    #[test]
+    fn extract_extension_id_not_extension_url() {
+        assert_eq!(extract_extension_id("https://example.com"), None);
+        assert_eq!(extract_extension_id("http://foo.bar/abc123"), None);
+    }
+
+    #[test]
+    fn extract_extension_id_empty_string() {
+        assert_eq!(extract_extension_id(""), None);
+    }
+
+    #[test]
+    fn extract_extension_id_prefix_only() {
+        assert_eq!(extract_extension_id("chrome-extension://"), Some("".to_string()));
+    }
 }

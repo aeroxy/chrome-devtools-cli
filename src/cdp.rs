@@ -89,9 +89,6 @@ pub struct CdpClient {
     /// Persistent URL block patterns for `Network.setBlockedURLs`.
     /// Re-applied by `ensure_persistent_session` whenever a new target is attached.
     pub blocklist: Vec<String>,
-    /// Persistent URL allow patterns. When non-empty, only these URLs are allowed;
-    /// everything else is blocked. Re-applied on session (re)attach.
-    pub allowlist: Vec<String>,
 }
 
 const MAX_BUFFERED_EVENTS: usize = 1000;
@@ -125,7 +122,6 @@ impl CdpClient {
             network_events: Vec::new(),
             console_events: Vec::new(),
             blocklist: Vec::new(),
-            allowlist: Vec::new(),
         })
     }
 
@@ -142,6 +138,11 @@ impl CdpClient {
         if self.persistent_target_id.as_deref() == Some(target_id) {
             return Ok(());
         }
+
+        // Target is changing — discard events accumulated under the previous
+        // target so a later drain under the new page can't return stale events.
+        self.network_events.clear();
+        self.console_events.clear();
 
         // Detach old session if target changed
         if let Some(old_session) = self.persistent_session.take() {
@@ -163,13 +164,14 @@ impl CdpClient {
             .ok_or_else(|| anyhow!("No sessionId in persistent attachToTarget"))?
             .to_string();
 
-        // Enable Network and Runtime domains on persistent session
-        let _ = self
-            .send_to_target(&session_id, "Network.enable", json!({}))
-            .await;
-        let _ = self
-            .send_to_target(&session_id, "Runtime.enable", json!({}))
-            .await;
+        // Enable Network and Runtime domains on the persistent session. If
+        // either fails, bail before marking the session persistent so that
+        // per-command collectors fall back to their own enable instead of
+        // silently draining an uninitialized (always-empty) buffer.
+        self.send_to_target(&session_id, "Network.enable", json!({}))
+            .await?;
+        self.send_to_target(&session_id, "Runtime.enable", json!({}))
+            .await?;
 
         self.persistent_session = Some(session_id);
         self.persistent_target_id = Some(target_id.to_string());
@@ -209,7 +211,24 @@ impl CdpClient {
     }
 
     fn push_event(&mut self, event: Value) {
-        if self.persistent_session.is_some() {
+        // Only route events into the persistent buffers when the event's
+        // sessionId matches the persistent page session (flatten-mode events
+        // are tagged with sessionId). Events from ad-hoc sessions (sw-logs
+        // attach, per-command live sessions) fall through and go into the
+        // general events buffer — otherwise a subsequent page `console` drain
+        // would return extension service worker logs.
+        let from_persistent_session = self
+            .persistent_session
+            .as_deref()
+            .is_some_and(|s| {
+                event
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .map(|session_id| session_id == s)
+                    .unwrap_or(false)
+            });
+
+        if from_persistent_session {
             let method = event.get("method").and_then(|v| v.as_str()).unwrap_or("");
             match method {
                 "Network.requestWillBeSent"

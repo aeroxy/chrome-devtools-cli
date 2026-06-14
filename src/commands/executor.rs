@@ -24,7 +24,7 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "press-key" => &["key"],
         "hover" => &["selector"],
         "snapshot" => &["output"],
-        "emulate" => &["viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "clear_viewport", "clear_geolocation", "clear_all", "block_url", "allow_url", "clear_blocks", "clear_allows"],
+        "emulate" => &["viewport", "device_scale_factor", "mobile", "geolocation", "accuracy", "clear_viewport", "clear_geolocation", "clear_all", "block_url", "unblock_url", "clear_blocks"],
         "wait-for" => &["text", "timeout"],
         "list-3p-tools" => &[],
         "execute-3p-tool" => &["name", "params"],
@@ -109,9 +109,8 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                     clear_geolocation: false,
                     clear_all: false,
                     block_url: Vec::new(),
-                    allow_url: Vec::new(),
+                    unblock_url: Vec::new(),
                     clear_blocks: false,
-                    clear_allows: false,
                 };
                 params.validate()?;
 
@@ -171,18 +170,18 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         let _ = client.ensure_persistent_session(&target_id).await;
     }
 
-    // Apply global --block-url/--allow-url flags (from DaemonRequest top-level
+    // Apply global --block-url/--unblock-url flags (from DaemonRequest top-level
     // fields) to the daemon's persistent blocklist. These survive across
     // commands and target switches. Skip for "emulate" — the emulate handler
-    // manages its own block_url/allow_url (the same CLI flags parse as both
+    // manages its own block_url/unblock_url (the same CLI flags parse as both
     // global and subcommand, so merging here would double-add).
-    if cmd != "emulate" && (!req.block_url.is_empty() || !req.allow_url.is_empty()) {
+    if cmd != "emulate" && (!req.block_url.is_empty() || !req.unblock_url.is_empty()) {
         for p in &req.block_url {
             if !client.blocklist.contains(p) {
                 client.blocklist.push(p.clone());
             }
         }
-        for p in &req.allow_url {
+        for p in &req.unblock_url {
             client.blocklist.retain(|b| b != p);
         }
         client.apply_network_rules().await;
@@ -249,9 +248,8 @@ async fn inner_execute(
                 clear_geolocation: false,
                 clear_all,
                 block_url: Vec::new(),
-                allow_url: Vec::new(),
+                unblock_url: Vec::new(),
                 clear_blocks: false,
-                clear_allows: false,
             };
             params.validate()?;
 
@@ -351,7 +349,7 @@ async fn inner_execute(
             .await
         }
         "emulate" => {
-            // For the emulate subcommand, clap parses --block-url/--allow-url
+            // For the emulate subcommand, clap parses --block-url/--unblock-url
             // as both the global flag AND the subcommand flag (same name). The
             // subcommand-specific args are the canonical source — use those
             // directly without merging the global fields (which would duplicate).
@@ -360,8 +358,8 @@ async fn inner_execute(
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            let allow_url: Vec<String> = args
-                .get("allow_url")
+            let unblock_url: Vec<String> = args
+                .get("unblock_url")
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
@@ -376,9 +374,8 @@ async fn inner_execute(
                 clear_geolocation: args.get("clear_geolocation").and_then(|v| v.as_bool()).unwrap_or(false),
                 clear_all: args.get("clear_all").and_then(|v| v.as_bool()).unwrap_or(false),
                 block_url,
-                allow_url,
+                unblock_url,
                 clear_blocks: args.get("clear_blocks").and_then(|v| v.as_bool()).unwrap_or(false),
-                clear_allows: args.get("clear_allows").and_then(|v| v.as_bool()).unwrap_or(false),
             };
             params.validate()?;
             commands::emulation::emulate(client, session_id, params).await
@@ -413,7 +410,7 @@ async fn inner_execute(
             let duration = args
                 .get("duration")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(3000);
+                .unwrap_or(0);
             let types: Vec<String> = args
                 .get("type")
                 .and_then(|v| v.as_array())
@@ -436,7 +433,7 @@ async fn inner_execute(
             let duration = args
                 .get("duration")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(3000);
+                .unwrap_or(0);
             let types: Vec<String> = args
                 .get("type")
                 .and_then(|v| v.as_array())

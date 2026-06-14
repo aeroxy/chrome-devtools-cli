@@ -138,8 +138,8 @@ chrome-devtools --target warm-squid emulate
 #           *.svg
 
 # Remove a specific pattern from the blocklist
-chrome-devtools --target warm-squid emulate --allow-url "*.png"
-# (Note: --allow-url REMOVES that pattern from the blocklist. It does not create a separate "allowlist".)
+chrome-devtools --target warm-squid emulate --unblock-url "*.png"
+# (Note: --unblock-url REMOVES that pattern from the blocklist. There is no separate "allowlist".)
 
 # Clear all blocks
 chrome-devtools --target warm-squid emulate --clear-blocks
@@ -332,7 +332,7 @@ chrome-devtools --target <name> wait-for "<text>" [--timeout <ms>]   # default 3
 chrome-devtools --target <name> emulate [--viewport WxH] [--mobile] [--geolocation lat,lon]
 chrome-devtools --target <name> emulate                                  # show current state
 chrome-devtools --target <name> emulate --block-url "<pattern>" [--block-url ...]
-chrome-devtools --target <name> emulate --allow-url "<pattern>"          # remove from blocklist
+chrome-devtools --target <name> emulate --unblock-url "<pattern>"          # remove from blocklist
 chrome-devtools --target <name> emulate --clear-blocks
 chrome-devtools --target <name> emulate --clear-viewport
 chrome-devtools --target <name> emulate --clear-geolocation
