@@ -157,13 +157,41 @@ These commands interact with tools injected into the page via `window.__dtmcp.to
 
 | Command | Description |
 |---------|-------------|
-| `emulate` | Get/set page-based emulation overrides (viewport, geolocation) |
+| `emulate` | Get/set page-based emulation overrides (viewport, geolocation, URL blocking) |
 | `emulate --viewport 1280x720` | Set viewport size (page-based, persists) |
 | `emulate --geolocation 37.77,-122.41` | Set geolocation (page-based, persists) |
-| `emulate --clear-all` | Clear all emulation overrides |
+| `emulate --block-url <pattern>` | Block URL pattern on subsequent requests (glob; persists in daemon) |
+| `emulate --unblock-url <pattern>` | Un-block a previously blocked pattern |
+| `emulate --clear-blocks` | Clear all blocked URL patterns |
+| `emulate --clear-all` | Clear all overrides (viewport, geolocation, blocks) |
 | `wait-for <text> [--timeout ms]` | Wait for text to appear (default 30s) |
 
-`emulate` with no flags shows all active overrides. Viewport and geolocation overrides are **page-based** — they persist until cleared or the page is closed.
+`emulate` with no flags shows all active overrides. Viewport and geolocation overrides are **page-based** — they persist until cleared or the page is closed. URL blocks are **daemon-wide** — they persist until you un-block them, clear them, or kill the daemon.
+
+### Network and console inspection
+
+The daemon keeps a persistent CDP session on the active page that continuously collects Network and Runtime events. `console` and `network` **drain** whatever has accumulated since the last call (or since the session attached, if never drained).
+
+| Command | Description |
+|---------|-------------|
+| `console` | Drain accumulated console messages |
+| `console --type error --type warning` | Filter by level (`log`, `warn`, `info`, `error`, `debug`, `exception`) |
+| `console --duration 5000` | Live collection for 5 s (consumes events — they won't reappear on a later drain) |
+| `network` | Drain accumulated network requests |
+| `network --type Fetch --type XHR` | Filter by resource type (`Document`, `Script`, `Stylesheet`, `Image`, `Font`, `XHR`, `Fetch`, `Manifest`, `Media`, `Other`) |
+| `network --duration 5000` | Live collection for 5 s |
+| `sw-logs [--duration 2000]` | Collect console logs from extension service workers (2 s default) |
+| `sw-logs --extension-id <id>` | Filter service-worker logs to one extension |
+
+A drain without a `--duration` returns instantly. Adding `--duration N` switches the command to *live mode* and blocks for `N` ms.
+
+### Daemon
+
+| Command | Description |
+|---------|-------------|
+| `kill-daemon` | Stop the background daemon cleanly |
+
+`kill-daemon` signals the running daemon with `SIGTERM`, removes the socket and PID file, and exits. It's a no-op if no daemon is running. Prefer this over `pkill -f __daemon__` — the process name is shared by legitimate Chrome children processes.
 
 ## Global options
 
@@ -172,9 +200,14 @@ These commands interact with tools injected into the page via `window.__dtmcp.to
 | `--target <name>` | Target page by friendly name or raw ID |
 | `--page <index>` | Target page by index |
 | `--json` | JSON output |
+| `--toon` | TOON output (compact tabular encoding for LLM agents; mutually exclusive with `--json`) |
+| `--block-url <pattern>` | Add a URL pattern to the daemon's block list (repeatable; persists until un-blocked or cleared) |
+| `--unblock-url <pattern>` | Remove a URL pattern from the daemon's block list (repeatable) |
 | `--ws-endpoint <url>` | Explicit WebSocket URL |
 | `--user-data-dir <path>` | Custom Chrome profile directory |
 | `--channel <ch>` | Chrome channel (stable/beta/canary/dev) |
+
+Global `--block-url` and `--unblock-url` are applied to the daemon's persistent block list and re-applied on every page-level command via `Network.setBlockedURLs`. **Note:** Chrome only blocks *subresources* (images, scripts, fetch/XHR, stylesheets, CDN, trackers, fonts). The top-level navigation document itself is never blocked — e.g. `--block-url "*example.com*"` then `navigate https://example.com` still loads the page, but any `*.png`, `*.woff2`, etc. subresources on it are blocked.
 
 ## Daemon details
 
@@ -183,7 +216,12 @@ These commands interact with tools injected into the page via `window.__dtmcp.to
 - **Idle timeout**: 5 minutes (auto-exits, cleans up socket)
 - **Protocol**: Length-prefixed JSON over Unix socket
 - **Spawned by**: First CLI invocation (transparent to user)
-- **Kill manually**: `pkill -f __daemon__` or delete the socket
+- **Kill**: `chrome-devtools kill-daemon` (or delete the socket + PID file)
+
+The daemon keeps a persistent CDP session on the current page to:
+- Continuously collect `Network.*` and `Runtime.consoleAPICalled`/`exceptionThrown` events for `console` and `network` drains.
+- Re-apply `Network.setBlockedURLs` and emulation state across page-level commands.
+- Re-attach to a new target when `--target` changes (the previous target's event buffers are discarded on the switch).
 
 ## Source layout
 
@@ -191,12 +229,13 @@ These commands interact with tools injected into the page via `window.__dtmcp.to
 src/
 ├── main.rs           # Entry point + daemon dispatch
 ├── lib.rs            # CLI (clap) + command routing
-├── cdp.rs            # Raw CDP over WebSocket (JSON-RPC)
+├── cdp.rs            # Raw CDP over WebSocket (JSON-RPC) + persistent session
 ├── browser.rs        # Auto-connect (DevToolsActivePort)
 ├── daemon.rs         # Background daemon (persistent connection)
 ├── client.rs         # Talks to daemon via Unix socket
-├── protocol.rs       # IPC message types
+├── protocol.rs       # IPC message types (DaemonRequest / DaemonResponse)
 ├── friendly.rs       # Target ID → word-pair names
+├── format.rs         # OutputFormat (text/json/toon) + format_structured helper
 ├── result.rs         # Command result types
 ├── error.rs          # CLI error types and codes
 ├── constants.rs      # Shared constants
@@ -207,10 +246,13 @@ src/
     ├── pages.rs      # list/new/close/select/wait-for
     ├── screenshot.rs
     ├── evaluate.rs
-    ├── executor.rs   # Command dispatch
+    ├── executor.rs   # Command dispatch + persistent-session reuse
     ├── input.rs      # click/fill/type/press/hover
     ├── snapshot.rs
-    ├── emulation.rs  # emulate (viewport/geolocation get/set/clear)
+    ├── emulation.rs  # emulate (viewport/geolocation/blocklist get/set/clear)
+    ├── console.rs    # console drain / live collection
+    ├── network.rs    # network drain / live collection
+    ├── sw_logs.rs    # extension service-worker log collection
     └── third_party.rs # list-3p-tools/execute-3p-tool
 ```
 
@@ -231,6 +273,10 @@ chrome-devtools --target red-snake click "#submit"
 
 # 4. Extract data
 chrome-devtools --target red-snake evaluate "document.title"
+
+# 5. Inspect what the page did under the hood
+chrome-devtools --target red-snake network      # drain accumulated requests
+chrome-devtools --target red-snake console       # drain console + exceptions
 ```
 
 Always pass `--target` from step 2 onward to stay on the same page.
