@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::json;
 
-use crate::cdp::CdpClient;
+use crate::cdp::{CdpClient, GeolocationOverride, ViewportOverride};
 use crate::result::CommandResult;
 
 /// Combined emulation parameters for the `emulate` command.
@@ -114,6 +114,7 @@ pub async fn emulate(
                 json!({}),
             )
             .await?;
+        client.viewport = None;
         actions.push("Viewport cleared".to_string());
     }
 
@@ -121,6 +122,7 @@ pub async fn emulate(
         client
             .send_to_target(session_id, "Emulation.clearGeolocationOverride", json!({}))
             .await?;
+        client.geolocation = None;
         actions.push("Geolocation cleared".to_string());
     }
 
@@ -159,6 +161,12 @@ pub async fn emulate(
                 }),
             )
             .await?;
+        client.viewport = Some(ViewportOverride {
+            width: w,
+            height: h,
+            device_scale_factor: dsf,
+            mobile: params.mobile,
+        });
         actions.push(format!(
             "Viewport set to {}x{} (scale: {}, mobile: {})",
             w, h, dsf, params.mobile
@@ -195,6 +203,11 @@ pub async fn emulate(
                 json!({ "latitude": lat, "longitude": lon, "accuracy": acc }),
             )
             .await?;
+        client.geolocation = Some(GeolocationOverride {
+            latitude: lat,
+            longitude: lon,
+            accuracy: acc,
+        });
         actions.push(format!(
             "Geolocation set to {}, {} (acc: {}m)",
             lat, lon, acc
@@ -204,13 +217,26 @@ pub async fn emulate(
     // 4. If no specific action taken, show current overrides
     if actions.is_empty() {
         let mut out = String::new();
-        if client.blocklist.is_empty() {
-            out.push_str("No emulation overrides active.\n");
-        } else {
+        if let Some(vp) = &client.viewport {
+            out.push_str(&format!(
+                "Viewport: {}x{} (scale: {}, mobile: {})\n",
+                vp.width, vp.height, vp.device_scale_factor, vp.mobile
+            ));
+        }
+        if let Some(geo) = &client.geolocation {
+            out.push_str(&format!(
+                "Geolocation: {}, {} (acc: {}m)\n",
+                geo.latitude, geo.longitude, geo.accuracy
+            ));
+        }
+        if !client.blocklist.is_empty() {
             out.push_str("Blocked URLs:\n");
             for p in &client.blocklist {
                 out.push_str(&format!("  {p}\n"));
             }
+        }
+        if out.is_empty() {
+            out.push_str("No emulation overrides active.");
         }
         return Ok(CommandResult::output(out.trim_end().to_string()));
     }

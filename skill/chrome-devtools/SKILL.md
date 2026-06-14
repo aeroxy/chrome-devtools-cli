@@ -94,7 +94,7 @@ chrome-devtools --target icy-goat snapshot
 **Note**: The `[navigated to: ...]` and `[target:...]` lines go to **stderr**, not stdout. The stdout contains only the main command output ("Navigated to …", "Opened: …").
 
 ### Pattern 2: Emulation (Viewport & Geolocation)
-Overrides persist per page. `emulate` with no flags shows current state.
+Overrides are per-tab: each page keeps its own viewport/geolocation/URL-blocks, persisting across navigation within that tab and isolated from other tabs (until cleared, the tab closes, or the daemon exits). `emulate` with no flags shows the active tab's state.
 
 ```bash
 # Set viewport and geolocation

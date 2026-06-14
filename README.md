@@ -157,16 +157,16 @@ These commands interact with tools injected into the page via `window.__dtmcp.to
 
 | Command | Description |
 |---------|-------------|
-| `emulate` | Get/set page-based emulation overrides (viewport, geolocation, URL blocking) |
-| `emulate --viewport 1280x720` | Set viewport size (page-based, persists) |
-| `emulate --geolocation 37.77,-122.41` | Set geolocation (page-based, persists) |
-| `emulate --block-url <pattern>` | Block URL pattern on subsequent requests (glob; persists in daemon) |
+| `emulate` | Get/set emulation overrides (viewport, geolocation, URL blocking) |
+| `emulate --viewport 1280x720` | Set viewport size (per-tab, persists across navigation) |
+| `emulate --geolocation 37.77,-122.41` | Set geolocation (per-tab, persists across navigation) |
+| `emulate --block-url <pattern>` | Block URL pattern on subsequent requests (glob; per-tab) |
 | `emulate --unblock-url <pattern>` | Un-block a previously blocked pattern |
 | `emulate --clear-blocks` | Clear all blocked URL patterns |
 | `emulate --clear-all` | Clear all overrides (viewport, geolocation, blocks) |
 | `wait-for <text> [--timeout ms]` | Wait for text to appear (default 30s) |
 
-`emulate` with no flags shows all active overrides. Viewport and geolocation overrides are **page-based** — they persist until cleared or the page is closed. URL blocks are **daemon-wide** — they persist until you un-block them, clear them, or kill the daemon.
+`emulate` with no flags shows the active tab's overrides. Viewport, geolocation, and URL blocks are all **per-tab** — each page keeps its own. They persist across navigation within that tab and do **not** leak to other tabs, so you can hold (say) a mobile viewport with images blocked on one tab and a desktop baseline on another at the same time. They persist until you clear them (`--clear-viewport`, `--clear-geolocation`, `--clear-blocks`, or `--clear-all`), the tab closes, or the daemon exits.
 
 ### Network and console inspection
 
@@ -201,13 +201,13 @@ A drain without a `--duration` returns instantly. Adding `--duration N` switches
 | `--page <index>` | Target page by index |
 | `--json` | JSON output |
 | `--toon` | TOON output (compact tabular encoding for LLM agents; mutually exclusive with `--json`) |
-| `--block-url <pattern>` | Add a URL pattern to the daemon's block list (repeatable; persists until un-blocked or cleared) |
-| `--unblock-url <pattern>` | Remove a URL pattern from the daemon's block list (repeatable) |
+| `--block-url <pattern>` | Add a URL pattern to the active tab's block list (repeatable; persists until un-blocked or cleared) |
+| `--unblock-url <pattern>` | Remove a URL pattern from the active tab's block list (repeatable) |
 | `--ws-endpoint <url>` | Explicit WebSocket URL |
 | `--user-data-dir <path>` | Custom Chrome profile directory |
 | `--channel <ch>` | Chrome channel (stable/beta/canary/dev) |
 
-Global `--block-url` and `--unblock-url` are applied to the daemon's persistent block list and re-applied on every page-level command via `Network.setBlockedURLs`. **Note:** Chrome only blocks *subresources* (images, scripts, fetch/XHR, stylesheets, CDN, trackers, fonts). The top-level navigation document itself is never blocked — e.g. `--block-url "*example.com*"` then `navigate https://example.com` still loads the page, but any `*.png`, `*.woff2`, etc. subresources on it are blocked.
+Global `--block-url` and `--unblock-url` update the **active tab's** block list and apply via `Network.setBlockedURLs`; the daemon re-applies each tab's list when that tab is in use, so blocking is isolated per tab. **Note:** Chrome only blocks *subresources* (images, scripts, fetch/XHR, stylesheets, CDN, trackers, fonts). The top-level navigation document itself is never blocked — e.g. `--block-url "*example.com*"` then `navigate https://example.com` still loads the page, but any `*.png`, `*.woff2`, etc. subresources on it are blocked.
 
 ## Daemon details
 

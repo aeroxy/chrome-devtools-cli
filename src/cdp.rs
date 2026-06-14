@@ -89,6 +89,15 @@ pub struct CdpClient {
     /// Persistent URL block patterns for `Network.setBlockedURLs`.
     /// Re-applied by `ensure_persistent_session` whenever a new target is attached.
     pub blocklist: Vec<String>,
+    /// Active viewport override, re-applied on target switch (like `blocklist`).
+    pub viewport: Option<ViewportOverride>,
+    /// Active geolocation override, re-applied on target switch.
+    pub geolocation: Option<GeolocationOverride>,
+    /// Per-tab emulation state for tabs that are NOT currently active. The active
+    /// tab's state lives in the `blocklist`/`viewport`/`geolocation` fields above;
+    /// `ensure_persistent_session` swaps state in/out of here on target switch so
+    /// each tab keeps its own overrides (per-tab isolation).
+    pub emulation_saved: std::collections::HashMap<String, TabEmulation>,
 }
 
 const MAX_BUFFERED_EVENTS: usize = 1000;
@@ -102,6 +111,33 @@ pub struct TargetInfo {
     pub url: String,
     #[allow(dead_code)]
     pub target_type: String,
+}
+
+/// Active viewport override. Stored structured (not as a display string) so it
+/// can be re-applied to a new session on target switch, like the blocklist.
+#[derive(Debug, Clone)]
+pub struct ViewportOverride {
+    pub width: u32,
+    pub height: u32,
+    pub device_scale_factor: f64,
+    pub mobile: bool,
+}
+
+/// Active geolocation override. Stored structured for the same reason.
+#[derive(Debug, Clone)]
+pub struct GeolocationOverride {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub accuracy: f64,
+}
+
+/// A tab's emulation state, saved while another tab is active so each tab keeps
+/// its own viewport/geolocation/blocklist (per-tab isolation).
+#[derive(Debug, Clone, Default)]
+pub struct TabEmulation {
+    pub blocklist: Vec<String>,
+    pub viewport: Option<ViewportOverride>,
+    pub geolocation: Option<GeolocationOverride>,
 }
 
 impl CdpClient {
@@ -122,6 +158,9 @@ impl CdpClient {
             network_events: Vec::new(),
             console_events: Vec::new(),
             blocklist: Vec::new(),
+            viewport: None,
+            geolocation: None,
+            emulation_saved: std::collections::HashMap::new(),
         })
     }
 
@@ -143,6 +182,25 @@ impl CdpClient {
         // target so a later drain under the new page can't return stale events.
         self.network_events.clear();
         self.console_events.clear();
+
+        // Save the previously-active tab's emulation state so it can be restored
+        // when we return to it (per-tab isolation). The active state lives in the
+        // top-level fields; stash it under the old target id — but only if the
+        // tab actually has overrides, so the map doesn't accumulate empty entries
+        // for every tab ever visited.
+        if let Some(old_target) = self.persistent_target_id.clone() {
+            let saved = TabEmulation {
+                blocklist: std::mem::take(&mut self.blocklist),
+                viewport: self.viewport.take(),
+                geolocation: self.geolocation.take(),
+            };
+            if !saved.blocklist.is_empty()
+                || saved.viewport.is_some()
+                || saved.geolocation.is_some()
+            {
+                self.emulation_saved.insert(old_target, saved);
+            }
+        }
 
         // Detach old session if target changed
         if let Some(old_session) = self.persistent_session.take() {
@@ -186,9 +244,63 @@ impl CdpClient {
             }
         }
 
-        // Apply any existing blocklist to the new session.
-        self.apply_network_rules_internal(&session_id).await?;
+        // Load the new tab's saved emulation state into the active fields (empty
+        // if this tab has none), then apply it to the new session. A tab with no
+        // saved state starts clean — overrides from other tabs don't leak in.
+        let restored = self.emulation_saved.remove(target_id).unwrap_or_default();
+        self.blocklist = restored.blocklist;
+        self.viewport = restored.viewport;
+        self.geolocation = restored.geolocation;
 
+        self.apply_network_rules_internal(&session_id).await?;
+        self.apply_emulation_internal(&session_id).await?;
+
+        Ok(())
+    }
+
+    /// Drop any stored emulation state for a target (e.g. when its tab closes).
+    /// If it's the active tab, also reset the active fields and the now-invalid
+    /// persistent session so the next command attaches cleanly.
+    pub fn forget_target(&mut self, target_id: &str) {
+        self.emulation_saved.remove(target_id);
+        if self.persistent_target_id.as_deref() == Some(target_id) {
+            self.blocklist.clear();
+            self.viewport = None;
+            self.geolocation = None;
+            self.persistent_session = None;
+            self.persistent_target_id = None;
+        }
+    }
+
+    /// Re-apply the current viewport/geolocation overrides to a session.
+    /// Mirrors `apply_network_rules_internal` so overrides persist across
+    /// target switches. No-op for whichever override isn't set.
+    pub(crate) async fn apply_emulation_internal(&mut self, session_id: &str) -> Result<()> {
+        if let Some(vp) = self.viewport.clone() {
+            self.send_to_target(
+                session_id,
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": vp.width,
+                    "height": vp.height,
+                    "deviceScaleFactor": vp.device_scale_factor,
+                    "mobile": vp.mobile,
+                }),
+            )
+            .await?;
+        }
+        if let Some(geo) = self.geolocation.clone() {
+            self.send_to_target(
+                session_id,
+                "Emulation.setGeolocationOverride",
+                json!({
+                    "latitude": geo.latitude,
+                    "longitude": geo.longitude,
+                    "accuracy": geo.accuracy,
+                }),
+            )
+            .await?;
+        }
         Ok(())
     }
 

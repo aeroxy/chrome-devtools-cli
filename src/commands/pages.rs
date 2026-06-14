@@ -153,6 +153,8 @@ pub async fn new_page(
 /// Close a page target by its target ID.
 pub async fn close_page(client: &mut CdpClient, target_id: &str) -> Result<CommandResult> {
     client.close_target(target_id).await?;
+    // Drop the closed tab's saved emulation state so it doesn't linger.
+    client.forget_target(target_id);
     let friendly_name = friendly::to_friendly(target_id);
     Ok(CommandResult::output(format!(
         "Closed page: {friendly_name}"
