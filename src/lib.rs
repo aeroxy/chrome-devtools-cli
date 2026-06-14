@@ -614,8 +614,12 @@ pub async fn run() -> Result<()> {
                     println!("kill-daemon is only supported on Unix systems.");
                 }
             }
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 println!("No daemon running (PID file not found).");
+            }
+            Err(e) => {
+                eprintln!("Failed to read PID file {}: {}", pid_path.display(), e);
+                std::process::exit(1);
             }
         }
         return Ok(());
