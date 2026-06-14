@@ -83,9 +83,10 @@ pub struct CdpClient {
     /// Target ID the persistent session is attached to.
     pub persistent_target_id: Option<String>,
     /// Accumulated network events from the persistent session.
-    pub network_events: Vec<Value>,
+    /// VecDeque so the size cap is O(1) (pop_front) instead of O(N) (Vec front drain).
+    pub network_events: std::collections::VecDeque<Value>,
     /// Accumulated console events from the persistent session.
-    pub console_events: Vec<Value>,
+    pub console_events: std::collections::VecDeque<Value>,
     /// Persistent URL block patterns for `Network.setBlockedURLs`.
     /// Re-applied by `ensure_persistent_session` whenever a new target is attached.
     pub blocklist: Vec<String>,
@@ -155,8 +156,8 @@ impl CdpClient {
             events: std::collections::VecDeque::new(),
             persistent_session: None,
             persistent_target_id: None,
-            network_events: Vec::new(),
-            console_events: Vec::new(),
+            network_events: std::collections::VecDeque::new(),
+            console_events: std::collections::VecDeque::new(),
             blocklist: Vec::new(),
             viewport: None,
             geolocation: None,
@@ -330,12 +331,12 @@ impl CdpClient {
 
     /// Drain accumulated network events from the persistent session.
     pub fn drain_network_events(&mut self) -> Vec<Value> {
-        std::mem::take(&mut self.network_events)
+        std::mem::take(&mut self.network_events).into()
     }
 
     /// Drain accumulated console events from the persistent session.
     pub fn drain_console_events(&mut self) -> Vec<Value> {
-        std::mem::take(&mut self.console_events)
+        std::mem::take(&mut self.console_events).into()
     }
 
     fn push_event(&mut self, event: Value) {
@@ -360,18 +361,16 @@ impl CdpClient {
                 | "Network.responseReceived"
                 | "Network.loadingFinished"
                 | "Network.loadingFailed" => {
-                    self.network_events.push(event);
+                    self.network_events.push_back(event);
                     if self.network_events.len() > MAX_PERSISTENT_EVENTS {
-                        self.network_events
-                            .drain(..self.network_events.len() - MAX_PERSISTENT_EVENTS);
+                        self.network_events.pop_front();
                     }
                     return;
                 }
                 "Runtime.consoleAPICalled" | "Runtime.exceptionThrown" => {
-                    self.console_events.push(event);
+                    self.console_events.push_back(event);
                     if self.console_events.len() > MAX_PERSISTENT_EVENTS {
-                        self.console_events
-                            .drain(..self.console_events.len() - MAX_PERSISTENT_EVENTS);
+                        self.console_events.pop_front();
                     }
                     return;
                 }

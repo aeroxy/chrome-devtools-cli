@@ -559,6 +559,12 @@ pub async fn run() -> Result<()> {
                     .map_err(|_| anyhow::anyhow!("Invalid PID in {}", pid_path.display()))?;
                 #[cfg(unix)]
                 {
+                    // Refuse PID 0: kill(0, ...) signals every process in the
+                    // caller's process group — it would take down this CLI and
+                    // its siblings. A corrupted/truncated PID file could read "0".
+                    if pid == 0 {
+                        anyhow::bail!("PID in {} is 0; refusing to signal", pid_path.display());
+                    }
                     // Guard against a PID that doesn't fit in libc::pid_t (a
                     // signed 32-bit integer on POSIX). The OS never produces such
                     // PIDs, but a corrupted PID file could, and the cast below
