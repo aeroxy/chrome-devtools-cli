@@ -23,13 +23,13 @@ pub async fn collect_network(
                 .send_to_target(session_id, "Network.enable", json!({}))
                 .await?;
         }
-        let events = client.read_events_for(duration_ms).await?;
+        let events_result = client.read_events_for(duration_ms).await;
         if client.persistent_session.is_none() {
             let _ = client
                 .send_to_target(session_id, "Network.disable", json!({}))
                 .await;
         }
-        events
+        events_result?
     } else {
         // Drain mode: return accumulated events from persistent session
         client.drain_network_events()
@@ -145,5 +145,138 @@ fn format_network_output(
     } else {
         let value = serde_json::to_value(requests)?;
         Ok(CommandResult::output(format_structured(&value, format)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_process_network_events_merges_request_and_response() {
+        let events = vec![
+            json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "req-1",
+                    "request": {"url": "https://example.com/api", "method": "POST"},
+                    "type": "Fetch"
+                }
+            }),
+            json!({
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "req-1",
+                    "response": {"status": 201, "statusText": "Created"}
+                }
+            }),
+        ];
+        let out = process_network_events(&events, &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["url"], "https://example.com/api");
+        assert_eq!(out[0]["method"], "POST");
+        assert_eq!(out[0]["resourceType"], "Fetch");
+        assert_eq!(out[0]["status"], 201);
+        assert_eq!(out[0]["statusText"], "Created");
+    }
+
+    #[test]
+    fn test_process_network_events_loading_failed() {
+        let events = vec![
+            json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "req-2",
+                    "request": {"url": "https://blocked.com/ads.js", "method": "GET"},
+                    "type": "Script"
+                }
+            }),
+            json!({
+                "method": "Network.loadingFailed",
+                "params": {
+                    "requestId": "req-2",
+                    "errorText": "net::ERR_BLOCKED_BY_CLIENT"
+                }
+            }),
+        ];
+        let out = process_network_events(&events, &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["status"], "failed");
+        assert_eq!(out[0]["error"], "net::ERR_BLOCKED_BY_CLIENT");
+    }
+
+    #[test]
+    fn test_process_network_events_type_filter() {
+        let events = vec![
+            json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "req-a",
+                    "request": {"url": "https://example.com/page", "method": "GET"},
+                    "type": "Document"
+                }
+            }),
+            json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "req-b",
+                    "request": {"url": "https://example.com/script.js", "method": "GET"},
+                    "type": "Script"
+                }
+            }),
+        ];
+        let filter = vec!["Document".to_string()];
+        let out = process_network_events(&events, &filter);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["url"], "https://example.com/page");
+    }
+
+    #[test]
+    fn test_process_network_events_sorts_by_url() {
+        let events = vec![
+            json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "r1",
+                    "request": {"url": "https://z.example.com/", "method": "GET"},
+                    "type": "Document"
+                }
+            }),
+            json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "r2",
+                    "request": {"url": "https://a.example.com/", "method": "GET"},
+                    "type": "Document"
+                }
+            }),
+        ];
+        let out = process_network_events(&events, &[]);
+        assert_eq!(out[0]["url"], "https://a.example.com/");
+        assert_eq!(out[1]["url"], "https://z.example.com/");
+    }
+
+    #[test]
+    fn test_process_network_events_ignores_unknown_methods() {
+        let events = vec![
+            json!({"method": "Network.dataReceived", "params": {"requestId": "r1", "dataLength": 100}}),
+        ];
+        let out = process_network_events(&events, &[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_process_network_events_handles_response_without_request() {
+        // responseReceived arrives with no prior requestWillBeSent — should be dropped
+        let events = vec![json!({
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": "orphan",
+                "response": {"status": 200, "statusText": "OK"}
+            }
+        })];
+        let out = process_network_events(&events, &[]);
+        assert!(out.is_empty());
     }
 }

@@ -22,13 +22,13 @@ pub async fn collect_console(
                 .send_to_target(session_id, "Runtime.enable", json!({}))
                 .await?;
         }
-        let events = client.read_events_for(duration_ms).await?;
+        let events_result = client.read_events_for(duration_ms).await;
         if client.persistent_session.is_none() {
             let _ = client
                 .send_to_target(session_id, "Runtime.disable", json!({}))
                 .await;
         }
-        events
+        events_result?
     } else {
         // Drain mode: return accumulated events from persistent session
         client.drain_console_events()
@@ -124,5 +124,102 @@ fn format_console_output(messages: &[serde_json::Value], format: OutputFormat) -
     } else {
         let value = serde_json::to_value(messages)?;
         Ok(CommandResult::output(format_structured(&value, format)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_process_console_events_joins_args() {
+        let events = vec![json!({
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [
+                    {"type": "string", "value": "hello"},
+                    {"type": "number", "value": "42"}
+                ],
+                "timestamp": 1000.0
+            }
+        })];
+        let out = process_console_events(&events, &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "log");
+        assert_eq!(out[0]["text"], "hello 42");
+        assert_eq!(out[0]["timestamp"], 1000.0);
+    }
+
+    #[test]
+    fn test_process_console_events_uses_description_when_value_missing() {
+        let events = vec![json!({
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [
+                    {"type": "object", "description": "Object"}
+                ],
+                "timestamp": 0.0
+            }
+        })];
+        let out = process_console_events(&events, &[]);
+        assert_eq!(out[0]["text"], "Object");
+    }
+
+    #[test]
+    fn test_process_console_events_exception() {
+        let events = vec![json!({
+            "method": "Runtime.exceptionThrown",
+            "params": {
+                "exceptionDetails": {
+                    "text": "TypeError",
+                    "exception": {"description": "Cannot read property 'x' of null"}
+                },
+                "timestamp": 2000.0
+            }
+        })];
+        let out = process_console_events(&events, &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "exception");
+        assert_eq!(out[0]["text"], "Cannot read property 'x' of null");
+    }
+
+    #[test]
+    fn test_process_console_events_type_filter_excludes() {
+        let events = vec![
+            json!({"method": "Runtime.consoleAPICalled", "params": {"type": "log", "args": [{"value": "skipped"}], "timestamp": 0.0}}),
+            json!({"method": "Runtime.consoleAPICalled", "params": {"type": "error", "args": [{"value": "kept"}], "timestamp": 0.0}}),
+        ];
+        let filter = vec!["error".to_string()];
+        let out = process_console_events(&events, &filter);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["text"], "kept");
+    }
+
+    #[test]
+    fn test_process_console_events_error_filter_includes_exceptions() {
+        let events = vec![json!({
+            "method": "Runtime.exceptionThrown",
+            "params": {
+                "exceptionDetails": {"text": "oops", "exception": {}},
+                "timestamp": 0.0
+            }
+        })];
+        // "error" filter should include exceptions
+        let filter = vec!["error".to_string()];
+        let out = process_console_events(&events, &filter);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn test_process_console_events_ignores_unknown_methods() {
+        let events = vec![json!({
+            "method": "Network.requestWillBeSent",
+            "params": {}
+        })];
+        let out = process_console_events(&events, &[]);
+        assert!(out.is_empty());
     }
 }

@@ -53,14 +53,13 @@ pub struct Cli {
     pub toon: bool,
 
     /// Add URL pattern to the daemon's network block list (e.g. "*.png").
-    /// Repeatable. Persisted in daemon memory until cleared or --allow-url'd.
+    /// Repeatable. Persisted in daemon memory until un-blocked or cleared.
     #[arg(long, global = true)]
     pub block_url: Vec<String>,
 
-    /// Remove URL pattern from the daemon's network block list (allow it).
-    /// Repeatable.
+    /// Un-block a previously blocked URL pattern. Repeatable.
     #[arg(long, global = true)]
-    pub allow_url: Vec<String>,
+    pub unblock_url: Vec<String>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -230,15 +229,12 @@ pub enum Commands {
         /// Add URL pattern to block list (e.g. "*.png", "cdn.example.com/*"). Repeatable.
         #[arg(long)]
         block_url: Vec<String>,
-        /// Remove URL pattern from block list (allow it). Repeatable.
+        /// Un-block a previously blocked URL pattern. Repeatable.
         #[arg(long)]
-        allow_url: Vec<String>,
+        unblock_url: Vec<String>,
         /// Clear network blocklist only
         #[arg(long)]
         clear_blocks: bool,
-        /// Clear allowed network URLs only (symmetry alias)
-        #[arg(long)]
-        clear_allows: bool,
     },
 
     /// Wait for text to appear on the page
@@ -263,7 +259,8 @@ pub enum Commands {
 
     /// Collect console messages and exceptions from the page
     Console {
-        /// Duration in ms for live collection. Omit or 0 to drain accumulated events instantly.
+        /// Duration in ms for live collection (events remain available to a later drain).
+        /// Omit or 0 to drain accumulated events instantly.
         #[arg(long, short, default_value_t = 0)]
         duration: u64,
         /// Filter by message type (e.g. error, warning, log, info). Repeatable.
@@ -273,7 +270,8 @@ pub enum Commands {
 
     /// Collect network requests from the page
     Network {
-        /// Duration in ms for live collection. Omit or 0 to drain accumulated events instantly.
+        /// Duration in ms for live collection (events remain available to a later drain).
+        /// Omit or 0 to drain accumulated events instantly.
         #[arg(long, short, default_value_t = 0)]
         duration: u64,
         /// Filter by resource type (e.g. document, xhr, fetch, script, stylesheet, image). Repeatable.
@@ -442,12 +440,11 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             clear_geolocation,
             clear_all,
             block_url,
-            allow_url,
+            unblock_url,
             clear_blocks,
-            clear_allows,
         } => (
             "emulate",
-            json!({"viewport": viewport, "device_scale_factor": device_scale_factor, "mobile": mobile, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all, "block_url": block_url, "allow_url": allow_url, "clear_blocks": clear_blocks, "clear_allows": clear_allows}),
+            json!({"viewport": viewport, "device_scale_factor": device_scale_factor, "mobile": mobile, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all, "block_url": block_url, "unblock_url": unblock_url, "clear_blocks": clear_blocks}),
         ),
         Commands::WaitFor { text, timeout } => {
             ("wait-for", json!({"text": text, "timeout": timeout}))
@@ -480,7 +477,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         json_output: cli.json,
         output_format: Some(cli.output_format()),
         block_url: cli.block_url.clone(),
-        allow_url: cli.allow_url.clone(),
+        unblock_url: cli.unblock_url.clone(),
     }
 }
 
@@ -569,22 +566,27 @@ pub async fn run() -> Result<()> {
                 })?;
                 #[cfg(unix)]
                 {
-                    use std::process::Command;
-                    let status = Command::new("kill")
-                        .arg(pid.to_string())
-                        .status()?;
-                    if status.success() {
-                        let _ = std::fs::remove_file(&sock_path);
-                        let _ = std::fs::remove_file(&pid_path);
+                    // Signal the process directly via libc to avoid shelling out
+                    // to /usr/bin/kill. A return of 0 means the signal was
+                    // delivered; -1 with errno ESRCH means the process is gone
+                    // (and the PID file was stale).
+                    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                    let _ = std::fs::remove_file(&sock_path);
+                    let _ = std::fs::remove_file(&pid_path);
+                    if ret == 0 {
                         println!("Daemon (PID {pid}) stopped.");
                     } else {
-                        let _ = std::fs::remove_file(&sock_path);
-                        let _ = std::fs::remove_file(&pid_path);
-                        println!("Daemon (PID {pid}) was not running. Cleaned up stale files.");
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::ESRCH) {
+                            println!("Daemon (PID {pid}) was not running. Cleaned up stale files.");
+                        } else {
+                            eprintln!("Failed to signal daemon (PID {pid}): {err}");
+                        }
                     }
                 }
                 #[cfg(not(unix))]
                 {
+                    let _ = pid;
                     println!("kill-daemon is only supported on Unix systems.");
                 }
             }
@@ -680,9 +682,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                     clear_geolocation: false,
                     clear_all: false,
                     block_url: Vec::new(),
-                    allow_url: Vec::new(),
+                    unblock_url: Vec::new(),
                     clear_blocks: false,
-                    clear_allows: false,
                 };
                 params.validate()?;
 
@@ -776,9 +777,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 clear_geolocation: false,
                 clear_all: *clear_all,
                 block_url: Vec::new(),
-                allow_url: Vec::new(),
+                unblock_url: Vec::new(),
                 clear_blocks: false,
-                clear_allows: false,
             };
             params.validate()?;
 
@@ -866,9 +866,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             clear_geolocation,
             clear_all,
             block_url,
-            allow_url,
+            unblock_url,
             clear_blocks,
-            clear_allows,
         } => {
             let params = commands::emulation::EmulateParams {
                 viewport: viewport.clone(),
@@ -880,9 +879,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 clear_geolocation: *clear_geolocation,
                 clear_all: *clear_all,
                 block_url: block_url.clone(),
-                allow_url: allow_url.clone(),
+                unblock_url: unblock_url.clone(),
                 clear_blocks: *clear_blocks,
-                clear_allows: *clear_allows,
             };
             params.validate()?;
             commands::emulation::emulate(&mut client, &session_id, params)
