@@ -65,6 +65,14 @@ pub async fn collect_sw_logs(
         }
     }
 
+    // Every attach/Runtime.enable failed: there are no sessions to collect from,
+    // so block-reading for the full window would just stall the CLI for nothing.
+    if sessions.is_empty() {
+        return Ok(CommandResult::output(
+            "Failed to attach to any extension service workers.".to_string(),
+        ));
+    }
+
     let events_result = client.read_events_for(duration_ms).await;
 
     for (_, session_id) in &sessions {

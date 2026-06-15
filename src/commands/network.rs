@@ -75,9 +75,33 @@ fn process_network_events(
                     .unwrap_or("GET")
                     .to_string();
 
-                // Record first-seen position; redirects reuse the same requestId
-                // and update the record in place without changing its position.
-                if !requests.contains_key(&request_id) {
+                // A redirect re-fires requestWillBeSent with the same requestId,
+                // and Chrome sends NO separate responseReceived for the hop — its
+                // 3xx status lives only on `redirectResponse`. Stash the prior hop
+                // (with that status) as its own entry so redirect chains stay
+                // visible instead of being overwritten by the final request.
+                if requests.contains_key(&request_id) {
+                    if let Some(redirect) = params.get("redirectResponse") {
+                        if let Some(mut prev) = requests.get(&request_id).cloned() {
+                            prev["status"] = json!(redirect["status"].as_u64().unwrap_or(0));
+                            prev["statusText"] =
+                                json!(redirect["statusText"].as_str().unwrap_or(""));
+
+                            let mut counter = 1;
+                            let mut redirect_id = format!("{request_id}#redirect{counter}");
+                            while requests.contains_key(&redirect_id) {
+                                counter += 1;
+                                redirect_id = format!("{request_id}#redirect{counter}");
+                            }
+                            // Insert the hop just before the final request so the
+                            // timeline reads request -> redirect(s) -> final.
+                            if let Some(pos) = order.iter().position(|id| id == &request_id) {
+                                order.insert(pos, redirect_id.clone());
+                            }
+                            requests.insert(redirect_id, prev);
+                        }
+                    }
+                } else {
                     order.push(request_id.clone());
                 }
                 requests.insert(
@@ -307,6 +331,51 @@ mod tests {
         ];
         let out = process_network_events(&events, &[]);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_process_network_events_preserves_redirect_chain() {
+        // A redirect re-fires requestWillBeSent with the same requestId and a
+        // redirectResponse carrying the 3xx status of the previous hop. The hop
+        // must survive as its own entry (with its 301), not be overwritten.
+        let events = vec![
+            json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "req-r",
+                    "request": {"url": "https://example.com/old", "method": "GET"},
+                    "type": "Document"
+                }
+            }),
+            json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "req-r",
+                    "request": {"url": "https://example.com/new", "method": "GET"},
+                    "type": "Document",
+                    "redirectResponse": {"status": 301, "statusText": "Moved Permanently"}
+                }
+            }),
+            json!({
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "req-r",
+                    "response": {"status": 200, "statusText": "OK"}
+                }
+            }),
+        ];
+        let out = process_network_events(&events, &[]);
+        assert_eq!(out.len(), 2);
+        // Redirect hop first (chronological), with its real 301 status.
+        assert_eq!(out[0]["url"], "https://example.com/old");
+        assert_eq!(out[0]["status"], 301);
+        assert_eq!(out[0]["statusText"], "Moved Permanently");
+        // Final request second, with its resolved 200.
+        assert_eq!(out[1]["url"], "https://example.com/new");
+        assert_eq!(out[1]["status"], 200);
+        // Synthetic redirect keys are internal — they must not leak into output.
+        assert!(out[0].get("requestId").is_none());
+        assert!(out[1].get("requestId").is_none());
     }
 
     #[test]
