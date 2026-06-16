@@ -795,6 +795,25 @@ impl CdpClient {
     }
 }
 
+/// Helper to join console API arguments into a single string.
+/// Chrome's `Runtime.consoleAPICalled` returns arguments as an array of RemoteObjects.
+pub fn join_console_args(args: &[Value]) -> String {
+    args.iter()
+        .map(|arg| match arg.get("value") {
+            // String primitives: emit the raw text (no quotes).
+            Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
+            // Other primitives (number, bool, null): stringify directly.
+            Some(v) => v.to_string(),
+            // Objects have no `value` — fall back to their description.
+            None => arg["description"]
+                .as_str()
+                .unwrap_or("<object>")
+                .to_string(),
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

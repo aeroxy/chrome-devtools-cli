@@ -36,6 +36,7 @@ pub async fn collect_sw_logs(
         ));
     }
 
+    let mut warnings = Vec::new();
     let mut sessions = Vec::new();
     for target in &sw_targets {
         match client.attach_to_target(&target.target_id).await {
@@ -48,19 +49,19 @@ pub async fn collect_sw_logs(
                         sessions.push(((*target).clone(), session_id));
                     }
                     Err(e) => {
-                        eprintln!(
-                            "Warning: failed to enable Runtime for service worker {}: {e}",
+                        warnings.push(format!(
+                            "Failed to enable Runtime for service worker {}: {e}",
                             target.url
-                        );
+                        ));
                         let _ = client.detach_from_target(&session_id).await;
                     }
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "Warning: failed to attach to service worker {}: {e}",
+                warnings.push(format!(
+                    "Failed to attach to service worker {}: {e}",
                     target.url
-                );
+                ));
             }
         }
     }
@@ -68,9 +69,12 @@ pub async fn collect_sw_logs(
     // Every attach/Runtime.enable failed: there are no sessions to collect from,
     // so block-reading for the full window would just stall the CLI for nothing.
     if sessions.is_empty() {
-        return Ok(CommandResult::output(
-            "Failed to attach to any extension service workers.".to_string(),
-        ));
+        let mut err = "Failed to attach to any extension service workers.".to_string();
+        if !warnings.is_empty() {
+            err.push_str("\nDetails:\n  ");
+            err.push_str(&warnings.join("\n  "));
+        }
+        return Ok(CommandResult::output(err));
     }
 
     let events_result = client.read_events_for(duration_ms).await;
@@ -100,25 +104,8 @@ pub async fn collect_sw_logs(
         match method {
             "Runtime.consoleAPICalled" => {
                 let msg_type = params["type"].as_str().unwrap_or("log");
-                let args: Vec<String> = params["args"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .map(|arg| match arg.get("value") {
-                                // String primitives: emit the raw text (no quotes).
-                                Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
-                                // Other primitives (number, bool, null): stringify directly.
-                                Some(v) => v.to_string(),
-                                // Objects have no `value` — fall back to their description.
-                                None => arg["description"]
-                                    .as_str()
-                                    .unwrap_or("<object>")
-                                    .to_string(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let text = args.join(" ");
+                let args = params["args"].as_array().map(|v| v.as_slice()).unwrap_or(&[]);
+                let text = crate::cdp::join_console_args(args);
 
                 messages.push(json!({
                     "extensionId": ext_id,
@@ -145,11 +132,17 @@ pub async fn collect_sw_logs(
 
     if format.is_text() {
         if messages.is_empty() {
-            return Ok(CommandResult::output(
-                "No service worker logs collected.".to_string(),
-            ));
+            let mut out = "No service worker logs collected.".to_string();
+            if !warnings.is_empty() {
+                out.push_str("\n\nWarnings:\n  ");
+                out.push_str(&warnings.join("\n  "));
+            }
+            return Ok(CommandResult::output(out));
         }
         let mut out = String::new();
+        if !warnings.is_empty() {
+            writeln!(out, "Warnings:\n  {}\n", warnings.join("\n  ")).unwrap();
+        }
         for msg in &messages {
             let ext_id = msg["extensionId"].as_str().unwrap_or("?");
             let msg_type = msg["type"].as_str().unwrap_or("?");
@@ -158,7 +151,10 @@ pub async fn collect_sw_logs(
         }
         Ok(CommandResult::output(out))
     } else {
-        let value = serde_json::to_value(&messages)?;
+        let value = json!({
+            "messages": messages,
+            "warnings": warnings,
+        });
         Ok(CommandResult::output(format_structured(&value, format)?))
     }
 }
