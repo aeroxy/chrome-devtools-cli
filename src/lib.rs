@@ -779,18 +779,32 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
 
     let session_id = client.attach_to_target(&target_id).await?;
 
-    // Enable Page domain to receive dialog events for proactive rejection
+    // Extract dialog_action if set (only available on Evaluate command, but
+    // apply it for all commands in direct mode to match daemon behavior)
+    client.dialog_action = match &cli.command {
+        Commands::Evaluate { dialog_action, .. } => dialog_action.clone(),
+        _ => None,
+    };
+
+    // Enable Page domain to receive dialog events for proactive rejection.
+    // Must run before any navigation or interaction triggers a dialog.
     client
         .send_to_target(&session_id, "Page.enable", json!({}))
         .await?;
 
-    // Extract dialog_action if set (only available on Evaluate command, but
-    // apply it for all commands in direct mode to match daemon behavior)
-    let dialog_action = match &cli.command {
-        Commands::Evaluate { dialog_action, .. } => dialog_action.clone(),
-        _ => None,
-    };
-    client.dialog_action = dialog_action;
+    // Apply the global --block-url/--unblock-url flags in direct mode.
+    // Order: skip for emulate (it handles blocks itself), close/select (no session).
+    if !matches!(cli.command, Commands::Emulate { .. } | Commands::ClosePage { .. } | Commands::SelectPage { .. })
+        && (!cli.block_url.is_empty() || !cli.unblock_url.is_empty())
+    {
+        for p in &cli.block_url {
+            if !client.blocklist.contains(p) {
+                client.blocklist.push(p.clone());
+            }
+        }
+        client.blocklist.retain(|b| !cli.unblock_url.contains(b));
+        client.apply_network_rules_internal(&session_id).await?;
+    }
 
     let result = match &cli.command {
         Commands::Navigate {
