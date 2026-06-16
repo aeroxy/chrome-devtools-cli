@@ -347,6 +347,8 @@ impl CdpClient {
     /// `Network.setBlockedURLs`. Used for both the persistent session and
     /// fallback per-command sessions (when the persistent one is unavailable).
     pub(crate) async fn apply_network_rules_internal(&mut self, session_id: &str) -> Result<()> {
+        self.send_to_target(session_id, "Network.enable", json!({}))
+            .await?;
         self.send_to_target(
             session_id,
             "Network.setBlockedURLs",
@@ -743,7 +745,13 @@ impl CdpClient {
                             // Network/Runtime events to the generic `self.events` buffer.
                             // This prevents them from being stashed and then returned
                             // again in a subsequent drain (double-processing).
-                            if self.persistent_session.is_some() {
+                            let is_persistent_event = self.persistent_session.as_deref().is_some_and(|s| {
+                                resp.get("sessionId")
+                                    .and_then(|v| v.as_str())
+                                    .map(|session_id| session_id == s)
+                                    .unwrap_or(false)
+                            });
+                            if is_persistent_event {
                                 self.push_event(resp.clone());
                             } else if !method.starts_with("Network.") && !method.starts_with("Runtime.") {
                                 self.push_event(resp.clone());
