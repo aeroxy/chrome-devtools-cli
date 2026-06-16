@@ -735,12 +735,19 @@ impl CdpClient {
             match tokio::time::timeout(remaining, self.read_text()).await {
                 Ok(Ok(text)) => {
                     if let Ok(resp) = serde_json::from_str::<Value>(&text) {
-                        if resp.get("method").is_some() {
+                        if let Some(method) = resp.get("method").and_then(|v| v.as_str()) {
                             // Events are routed to persistent session buffers (network_events,
                             // console_events) AND returned in the `events` vector here.
-                            // Callers using the persistent-session path should drain the
-                            // buffers and ignore this return value to avoid double-processing.
-                            self.push_event(resp.clone());
+                            //
+                            // In direct mode (no persistent session), we avoid pushing
+                            // Network/Runtime events to the generic `self.events` buffer.
+                            // This prevents them from being stashed and then returned
+                            // again in a subsequent drain (double-processing).
+                            if self.persistent_session.is_some() {
+                                self.push_event(resp.clone());
+                            } else if !method.starts_with("Network.") && !method.starts_with("Runtime.") {
+                                self.push_event(resp.clone());
+                            }
                             events.push(resp);
                         }
                     }
