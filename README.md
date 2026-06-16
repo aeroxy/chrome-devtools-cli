@@ -224,10 +224,12 @@ The daemon keeps a persistent CDP session on the current page to:
 - Re-attach to a new target when `--target` changes (the previous target's event buffers are discarded on the switch).
 
 ## Source layout
+ 
+-```
++```text
+ src/
+ ├── main.rs           # Entry point + daemon dispatch
 
-```
-src/
-├── main.rs           # Entry point + daemon dispatch
 ├── lib.rs            # CLI (clap) + command routing
 ├── cdp.rs            # Raw CDP over WebSocket (JSON-RPC) + persistent session
 ├── browser.rs        # Auto-connect (DevToolsActivePort)
