@@ -81,25 +81,8 @@ fn process_console_events(
                         continue;
                     }
                 }
-                let args: Vec<String> = params["args"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .map(|arg| match arg.get("value") {
-                                // String primitives: emit the raw text (no quotes).
-                                Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
-                                // Other primitives (number, bool, null): stringify directly.
-                                Some(v) => v.to_string(),
-                                // Objects have no `value` — fall back to their description.
-                                None => arg["description"]
-                                    .as_str()
-                                    .unwrap_or("<object>")
-                                    .to_string(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let text = args.join(" ");
+                let args = params["args"].as_array().map(|v| v.as_slice()).unwrap_or(&[]);
+                let text = crate::cdp::join_console_args(args);
                 let timestamp = params["timestamp"].as_f64().unwrap_or(0.0);
 
                 messages.push(json!({
