@@ -261,12 +261,14 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         client.persistent_session.clone().unwrap()
     } else {
         // Degraded path: the persistent session is unavailable, so this fresh
-        // session won't have the blocklist that ensure_persistent_session
-        // normally applies. Re-apply it so blocking still takes effect.
+        // session won't have the blocklist or emulation that
+        // ensure_persistent_session normally applies. Re-apply them so
+        // overrides still take effect.
         let sid = client.attach_to_target(&target_id).await?;
         if !client.blocklist.is_empty() {
             client.apply_network_rules_internal(&sid).await?;
         }
+        client.apply_emulation_internal(&sid).await?;
         sid
     };
 
