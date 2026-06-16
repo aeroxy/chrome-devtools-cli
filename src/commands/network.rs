@@ -64,7 +64,10 @@ fn process_network_events(
     for event in events {
         let method = event["method"].as_str().unwrap_or("");
         let params = &event["params"];
-        let request_id = params["requestId"].as_str().unwrap_or("").to_string();
+        let request_id = match params["requestId"].as_str() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => continue,
+        };
 
         match method {
             "Network.requestWillBeSent" => {
