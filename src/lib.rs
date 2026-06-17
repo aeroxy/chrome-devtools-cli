@@ -794,8 +794,10 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
 
     // Apply the global --block-url/--unblock-url flags in direct mode.
     // Order: skip for emulate (it handles blocks itself), close/select (no session).
-    if !matches!(cli.command, Commands::Emulate { .. } | Commands::ClosePage { .. } | Commands::SelectPage { .. })
-        && (!cli.block_url.is_empty() || !cli.unblock_url.is_empty())
+    if !matches!(
+        cli.command,
+        Commands::Emulate { .. } | Commands::ClosePage { .. } | Commands::SelectPage { .. }
+    ) && (!cli.block_url.is_empty() || !cli.unblock_url.is_empty())
     {
         for p in &cli.block_url {
             if !client.blocklist.contains(p) {

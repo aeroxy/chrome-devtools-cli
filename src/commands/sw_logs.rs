@@ -104,7 +104,10 @@ pub async fn collect_sw_logs(
         match method {
             "Runtime.consoleAPICalled" => {
                 let msg_type = params["type"].as_str().unwrap_or("log");
-                let args = params["args"].as_array().map(|v| v.as_slice()).unwrap_or(&[]);
+                let args = params["args"]
+                    .as_array()
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
                 let text = crate::cdp::join_console_args(args);
 
                 messages.push(json!({

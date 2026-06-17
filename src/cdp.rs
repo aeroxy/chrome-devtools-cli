@@ -227,12 +227,8 @@ impl CdpClient {
                 .send("Target.detachFromTarget", json!({"sessionId": old_session}))
                 .await;
             self.persistent_target_id = None;
-            self.events.retain(|event| {
-                event["sessionId"]
-                    .as_str()
-                    .map(|s| s != old_session)
-                    .unwrap_or(true)
-            });
+            self.events
+                .retain(|event| event["sessionId"].as_str() != Some(old_session.as_str()));
         }
 
         // Attach new persistent session
@@ -261,7 +257,8 @@ impl CdpClient {
         // uninitialized (always-empty) buffer.
         for method in ["Network.enable", "Runtime.enable"] {
             if let Err(e) = self.send_to_target(&session_id, method, json!({})).await {
-                self.cleanup_failed_session(&session_id, target_id, false).await;
+                self.cleanup_failed_session(&session_id, target_id, false)
+                    .await;
                 return Err(e);
             }
         }
@@ -275,12 +272,14 @@ impl CdpClient {
         self.geolocation = restored.geolocation;
 
         if let Err(e) = self.apply_network_rules_internal(&session_id).await {
-            self.cleanup_failed_session(&session_id, target_id, true).await;
+            self.cleanup_failed_session(&session_id, target_id, true)
+                .await;
             return Err(e);
         }
 
         if let Err(e) = self.apply_emulation_internal(&session_id).await {
-            self.cleanup_failed_session(&session_id, target_id, true).await;
+            self.cleanup_failed_session(&session_id, target_id, true)
+                .await;
             return Err(e);
         }
 
@@ -321,12 +320,8 @@ impl CdpClient {
         // (which can read from the websocket and thus trigger push_event).
         self.network_events.clear();
         self.console_events.clear();
-        self.events.retain(|event| {
-            event["sessionId"]
-                .as_str()
-                .map(|s| s != session_id)
-                .unwrap_or(true)
-        });
+        self.events
+            .retain(|event| event["sessionId"].as_str() != Some(session_id));
     }
 
     /// Drop any stored emulation state for a target (e.g. when its tab closes).
@@ -418,11 +413,10 @@ impl CdpClient {
         // attach, per-command live sessions) fall through and go into the
         // general events buffer — otherwise a subsequent page `console` drain
         // would return extension service worker logs.
-        let from_persistent_session = self.persistent_session.as_deref().is_some_and(|s| {
-            event["sessionId"]
-                .as_str()
-                .is_some_and(|session_id| session_id == s)
-        });
+        let from_persistent_session = self
+            .persistent_session
+            .as_deref()
+            .is_some_and(|s| event["sessionId"].as_str() == Some(s));
 
         if from_persistent_session {
             let method = event.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -786,14 +780,15 @@ impl CdpClient {
                             // Network/Runtime events to the generic `self.events` buffer.
                             // This prevents them from being stashed and then returned
                             // again in a subsequent drain (double-processing).
-                            let is_persistent_event = self.persistent_session.as_deref().is_some_and(|s| {
-                                resp["sessionId"]
-                                    .as_str()
-                                    .is_some_and(|session_id| session_id == s)
-                            });
+                            let is_persistent_event = self
+                                .persistent_session
+                                .as_deref()
+                                .is_some_and(|s| resp["sessionId"].as_str() == Some(s));
                             if is_persistent_event {
                                 self.push_event(resp.clone());
-                            } else if !method.starts_with("Network.") && !method.starts_with("Runtime.") {
+                            } else if !method.starts_with("Network.")
+                                && !method.starts_with("Runtime.")
+                            {
                                 self.push_event(resp.clone());
                             }
                             events.push(resp);

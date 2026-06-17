@@ -81,7 +81,10 @@ fn process_console_events(
                         continue;
                     }
                 }
-                let args = params["args"].as_array().map(|v| v.as_slice()).unwrap_or(&[]);
+                let args = params["args"]
+                    .as_array()
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
                 let text = crate::cdp::join_console_args(args);
                 let timestamp = params["timestamp"].as_f64().unwrap_or(0.0);
 
