@@ -226,6 +226,7 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     // Browser-level commands returned early above, so --block-url with them is
     // intentionally a no-op (a per-tab rule has no target tab there).
     if cmd != "emulate"
+        && cmd != "navigate"
         && cmd != "close-page"
         && cmd != "select-page"
         && (!req.block_url.is_empty() || !req.unblock_url.is_empty())
@@ -329,8 +330,8 @@ async fn inner_execute(
                 clear_viewport: false,
                 clear_geolocation: false,
                 clear_all,
-                block_url: Vec::new(),
-                unblock_url: Vec::new(),
+                block_url: req.block_url.clone(),
+                unblock_url: req.unblock_url.clone(),
                 clear_blocks: false,
             };
             params.validate()?;

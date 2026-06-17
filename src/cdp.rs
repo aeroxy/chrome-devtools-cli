@@ -269,18 +269,22 @@ impl CdpClient {
         self.viewport = restored.viewport;
         self.geolocation = restored.geolocation;
 
-        for res in [
-            self.apply_network_rules_internal(&session_id).await,
-            self.apply_emulation_internal(&session_id).await,
-        ] {
-            if let Err(e) = res {
-                self.persistent_session = None;
-                self.persistent_target_id = None;
-                let _ = self
-                    .send("Target.detachFromTarget", json!({"sessionId": session_id}))
-                    .await;
-                return Err(e);
-            }
+        if let Err(e) = self.apply_network_rules_internal(&session_id).await {
+            self.persistent_session = None;
+            self.persistent_target_id = None;
+            let _ = self
+                .send("Target.detachFromTarget", json!({"sessionId": session_id}))
+                .await;
+            return Err(e);
+        }
+
+        if let Err(e) = self.apply_emulation_internal(&session_id).await {
+            self.persistent_session = None;
+            self.persistent_target_id = None;
+            let _ = self
+                .send("Target.detachFromTarget", json!({"sessionId": session_id}))
+                .await;
+            return Err(e);
         }
 
         Ok(())
