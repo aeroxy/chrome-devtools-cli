@@ -200,6 +200,8 @@ impl CdpClient {
             return Ok(());
         }
 
+        let old_target_id = self.persistent_target_id.clone();
+
         // Target is changing — discard events accumulated under the previous
         // target so a later drain under the new page can't return stale events.
         self.network_events.clear();
@@ -228,16 +230,29 @@ impl CdpClient {
         }
 
         // Attach new persistent session
-        let result = self
+        let result = match self
             .send(
                 "Target.attachToTarget",
                 json!({"targetId": target_id, "flatten": true}),
             )
-            .await?;
-        let session_id = result["sessionId"]
-            .as_str()
-            .ok_or_else(|| anyhow!("No sessionId in persistent attachToTarget"))?
-            .to_string();
+            .await
+        {
+            Ok(res) => res,
+            Err(e) => {
+                self.rollback_session(old_target_id);
+                return Err(e);
+            }
+        };
+
+        let session_id = match result["sessionId"].as_str().ok_or_else(|| {
+            anyhow!("No sessionId in persistent attachToTarget")
+        }) {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                self.rollback_session(old_target_id);
+                return Err(e);
+            }
+        };
 
         // Store the session id BEFORE enabling domains so events arriving
         // during Network.enable / Runtime.enable are routed to persistent
@@ -252,11 +267,7 @@ impl CdpClient {
         // uninitialized (always-empty) buffer.
         for method in ["Network.enable", "Runtime.enable"] {
             if let Err(e) = self.send_to_target(&session_id, method, json!({})).await {
-                self.persistent_session = None;
-                self.persistent_target_id = None;
-                let _ = self
-                    .send("Target.detachFromTarget", json!({"sessionId": session_id}))
-                    .await;
+                self.cleanup_failed_session(&session_id, target_id, old_target_id).await;
                 return Err(e);
             }
         }
@@ -270,24 +281,62 @@ impl CdpClient {
         self.geolocation = restored.geolocation;
 
         if let Err(e) = self.apply_network_rules_internal(&session_id).await {
-            self.persistent_session = None;
-            self.persistent_target_id = None;
-            let _ = self
-                .send("Target.detachFromTarget", json!({"sessionId": session_id}))
-                .await;
+            self.cleanup_failed_session(&session_id, target_id, old_target_id).await;
             return Err(e);
         }
 
         if let Err(e) = self.apply_emulation_internal(&session_id).await {
-            self.persistent_session = None;
-            self.persistent_target_id = None;
-            let _ = self
-                .send("Target.detachFromTarget", json!({"sessionId": session_id}))
-                .await;
+            self.cleanup_failed_session(&session_id, target_id, old_target_id).await;
             return Err(e);
         }
 
         Ok(())
+    }
+
+    /// Restore active fields and persistent target ID from the stashed state
+    /// of a previous tab after a failed session attachment.
+    fn rollback_session(&mut self, old_target_id: Option<String>) {
+        self.persistent_session = None;
+        if let Some(old_id) = old_target_id {
+            let restored = self.emulation_saved.remove(&old_id).unwrap_or_default();
+            self.blocklist = restored.blocklist;
+            self.viewport = restored.viewport;
+            self.geolocation = restored.geolocation;
+            self.persistent_target_id = Some(old_id);
+        } else {
+            self.blocklist.clear();
+            self.viewport = None;
+            self.geolocation = None;
+            self.persistent_target_id = None;
+        }
+    }
+
+    /// Clean up a failed persistent session: detach from Chrome, stash the new
+    /// tab's state back into the map, and rollback to the previous tab's state.
+    async fn cleanup_failed_session(
+        &mut self,
+        session_id: &str,
+        failed_target_id: &str,
+        old_target_id: Option<String>,
+    ) {
+        // Stash the state of the tab we failed to initialize so it's not lost.
+        // It's currently in the active fields.
+        let failed_state = TabEmulation {
+            blocklist: std::mem::take(&mut self.blocklist),
+            viewport: self.viewport.take(),
+            geolocation: self.geolocation.take(),
+        };
+        stash_tab_emulation(
+            &mut self.emulation_saved,
+            failed_target_id.to_string(),
+            failed_state,
+        );
+
+        let _ = self
+            .send("Target.detachFromTarget", json!({"sessionId": session_id}))
+            .await;
+
+        self.rollback_session(old_target_id);
     }
 
     /// Drop any stored emulation state for a target (e.g. when its tab closes).
