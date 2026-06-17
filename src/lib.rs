@@ -306,10 +306,7 @@ impl Cli {
     fn is_browser_level(&self) -> bool {
         matches!(
             self.command,
-            Commands::ListPages
-                | Commands::NewPage { .. }
-                | Commands::SwLogs { .. }
-                | Commands::KillDaemon
+            Commands::ListPages | Commands::NewPage { .. } | Commands::SwLogs { .. }
         )
     }
 
@@ -464,7 +461,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             "sw-logs",
             json!({"duration": duration, "extension_id": extension_id}),
         ),
-        Commands::KillDaemon => ("kill-daemon", json!({})),
+        Commands::KillDaemon => unreachable!("KillDaemon is handled before build_request"),
     };
 
     DaemonRequest {
