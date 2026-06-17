@@ -227,6 +227,12 @@ impl CdpClient {
                 .send("Target.detachFromTarget", json!({"sessionId": old_session}))
                 .await;
             self.persistent_target_id = None;
+            self.events.retain(|event| {
+                event["sessionId"]
+                    .as_str()
+                    .map(|s| s != old_session)
+                    .unwrap_or(true)
+            });
         }
 
         // Attach new persistent session
@@ -316,9 +322,8 @@ impl CdpClient {
         self.network_events.clear();
         self.console_events.clear();
         self.events.retain(|event| {
-            event
-                .get("sessionId")
-                .and_then(|v| v.as_str())
+            event["sessionId"]
+                .as_str()
                 .map(|s| s != session_id)
                 .unwrap_or(true)
         });
@@ -414,11 +419,9 @@ impl CdpClient {
         // general events buffer — otherwise a subsequent page `console` drain
         // would return extension service worker logs.
         let from_persistent_session = self.persistent_session.as_deref().is_some_and(|s| {
-            event
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .map(|session_id| session_id == s)
-                .unwrap_or(false)
+            event["sessionId"]
+                .as_str()
+                .is_some_and(|session_id| session_id == s)
         });
 
         if from_persistent_session {
@@ -784,10 +787,9 @@ impl CdpClient {
                             // This prevents them from being stashed and then returned
                             // again in a subsequent drain (double-processing).
                             let is_persistent_event = self.persistent_session.as_deref().is_some_and(|s| {
-                                resp.get("sessionId")
-                                    .and_then(|v| v.as_str())
-                                    .map(|session_id| session_id == s)
-                                    .unwrap_or(false)
+                                resp["sessionId"]
+                                    .as_str()
+                                    .is_some_and(|session_id| session_id == s)
                             });
                             if is_persistent_event {
                                 self.push_event(resp.clone());
