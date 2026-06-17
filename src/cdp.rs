@@ -196,7 +196,9 @@ impl CdpClient {
     /// the old session and attaches to the new one.
     pub async fn ensure_persistent_session(&mut self, target_id: &str) -> Result<()> {
         // Already attached to this target
-        if self.persistent_target_id.as_deref() == Some(target_id) {
+        if self.persistent_target_id.as_deref() == Some(target_id)
+            && self.persistent_session.is_some()
+        {
             return Ok(());
         }
 
@@ -253,7 +255,7 @@ impl CdpClient {
         // uninitialized (always-empty) buffer.
         for method in ["Network.enable", "Runtime.enable"] {
             if let Err(e) = self.send_to_target(&session_id, method, json!({})).await {
-                self.cleanup_failed_session(&session_id, target_id).await;
+                self.cleanup_failed_session(&session_id, target_id, false).await;
                 return Err(e);
             }
         }
@@ -267,12 +269,12 @@ impl CdpClient {
         self.geolocation = restored.geolocation;
 
         if let Err(e) = self.apply_network_rules_internal(&session_id).await {
-            self.cleanup_failed_session(&session_id, target_id).await;
+            self.cleanup_failed_session(&session_id, target_id, true).await;
             return Err(e);
         }
 
         if let Err(e) = self.apply_emulation_internal(&session_id).await {
-            self.cleanup_failed_session(&session_id, target_id).await;
+            self.cleanup_failed_session(&session_id, target_id, true).await;
             return Err(e);
         }
 
@@ -281,19 +283,26 @@ impl CdpClient {
 
     /// Clean up a failed persistent session: detach from Chrome, stash the new
     /// tab's state back into the map, and transition to a clean detached state.
-    async fn cleanup_failed_session(&mut self, session_id: &str, failed_target_id: &str) {
-        // Stash the state of the tab we failed to initialize so it's not lost.
-        // It's currently in the active fields.
-        let failed_state = TabEmulation {
-            blocklist: std::mem::take(&mut self.blocklist),
-            viewport: self.viewport.take(),
-            geolocation: self.geolocation.take(),
-        };
-        stash_tab_emulation(
-            &mut self.emulation_saved,
-            failed_target_id.to_string(),
-            failed_state,
-        );
+    async fn cleanup_failed_session(
+        &mut self,
+        session_id: &str,
+        failed_target_id: &str,
+        state_loaded: bool,
+    ) {
+        if state_loaded {
+            // Stash the state of the tab we failed to initialize so it's not lost.
+            // It's currently in the active fields.
+            let failed_state = TabEmulation {
+                blocklist: std::mem::take(&mut self.blocklist),
+                viewport: self.viewport.take(),
+                geolocation: self.geolocation.take(),
+            };
+            stash_tab_emulation(
+                &mut self.emulation_saved,
+                failed_target_id.to_string(),
+                failed_state,
+            );
+        }
 
         let _ = self
             .send("Target.detachFromTarget", json!({"sessionId": session_id}))
@@ -301,6 +310,11 @@ impl CdpClient {
 
         self.persistent_session = None;
         self.persistent_target_id = None;
+
+        // Clear events captured from the failed session during the detach call
+        // (which can read from the websocket and thus trigger push_event).
+        self.network_events.clear();
+        self.console_events.clear();
     }
 
     /// Drop any stored emulation state for a target (e.g. when its tab closes).
