@@ -315,6 +315,13 @@ impl CdpClient {
         // (which can read from the websocket and thus trigger push_event).
         self.network_events.clear();
         self.console_events.clear();
+        self.events.retain(|event| {
+            event
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(|s| s != session_id)
+                .unwrap_or(true)
+        });
     }
 
     /// Drop any stored emulation state for a target (e.g. when its tab closes).
