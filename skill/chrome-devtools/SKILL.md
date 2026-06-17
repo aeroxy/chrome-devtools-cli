@@ -33,7 +33,7 @@ chrome-devtools list-pages
 ```
 
 Output:
-```
+```text
 [0] (warm-squid) Your Repositories — https://github.com/aeroxy
 [1] (pink-hen) Gmail — https://mail.google.com
 [2] (hazy-vole) Example — https://example.com
