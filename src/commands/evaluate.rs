@@ -51,8 +51,8 @@ pub async fn evaluate(
     let value = &result["result"];
     let val_type = value["type"].as_str().unwrap_or("undefined");
 
-    let mut output_hint = if format.is_text() {
-        match val_type {
+    let output_hint = if format.is_text() {
+        let mut text = match val_type {
             "undefined" => "undefined".to_string(),
             "string" => value["value"].as_str().unwrap_or("").to_string(),
             _ => {
@@ -62,19 +62,20 @@ pub async fn evaluate(
                     value["description"].as_str().unwrap_or("").to_string()
                 }
             }
+        };
+
+        if expression.contains("querySelector")
+            || expression.contains("document.body")
+            || expression.contains("getElementById")
+            || expression.contains("getElementsBy")
+        {
+            text.push_str("\n\n[HINT: Avoid using `evaluate` for DOM traversal. Use the `snapshot` command to get a clean accessibility tree of the page, then use `click` or `fill`.]");
         }
+        text
     } else {
         let v = value.get("value").unwrap_or(value);
         format_structured(v, format)?
     };
-
-    if expression.contains("querySelector")
-        || expression.contains("document.body")
-        || expression.contains("getElementById")
-        || expression.contains("getElementsBy")
-    {
-        output_hint.push_str("\n\n[HINT: Avoid using `evaluate` for DOM traversal. Use the `snapshot` command to get a clean accessibility tree of the page, then use `click` or `fill`.]");
-    }
 
     if let Some(initial_url) = initial_url {
         let new_url = client.current_url(session_id).await?;
