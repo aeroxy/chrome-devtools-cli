@@ -56,7 +56,7 @@ chrome-devtools --page 0 navigate https://example.com
 
 - **Navigation**: `navigate`, `navigate --back`, `navigate --forward`, `navigate --reload`
 - **Page management**: `list-pages`, `new-page`, `close-page`, `select-page`
-- **Extraction**: `screenshot`, `snapshot` (accessibility tree), `evaluate` (JavaScript)
+- **Extraction**: `screenshot`, `snapshot` (accessibility tree), `evaluate` (JavaScript), `read-page` (page content as markdown)
 - **Interaction**: `click`, `fill`, `type-text`, `press-key`, `hover`, `click-at`
 - **Emulation**: `emulate` (viewport, mobile, geolocation, URL blocking)
 - **Inspection**: `console` (logs), `network` (requests), `sw-logs` (extension service workers)
@@ -293,6 +293,24 @@ chrome-devtools --target warm-squid list-3p-tools
 chrome-devtools --target warm-squid execute-3p-tool "<tool-name>" '<json-params>'
 ```
 
+### Pattern 12: Reading Page Content as Markdown
+Extract the main article content of a page as clean markdown. Uses Readability to identify the article body and converts it to LLM-friendly markdown with metadata (title, byline, excerpt, URL). Non-article pages (SPAs, dashboards) fall back to converting the full page.
+
+```bash
+# Read the current page as markdown (title prepended as H1)
+chrome-devtools --target warm-squid read-page
+
+# Save to a file
+chrome-devtools --target warm-squid read-page --output /tmp/article.md
+
+# JSON output includes metadata fields (title, byline, excerpt, site_name, url)
+chrome-devtools --target warm-squid read-page --json
+```
+
+**When to use `read-page` vs `snapshot`:**
+- `read-page` — you want the page's textual content as readable markdown (articles, docs, wiki pages). Best for summarization, extraction, or feeding content to an LLM.
+- `snapshot` — you need the full accessibility tree with element IDs, roles, and interactive elements. Best for understanding page structure and finding elements to click/fill.
+
 ## Complete Command Reference
 
 ### Navigation
@@ -312,6 +330,7 @@ chrome-devtools select-page [index_or_target_name]
 ```bash
 chrome-devtools --target <name> screenshot [--output <path>] [--full-page]
 chrome-devtools --target <name> snapshot
+chrome-devtools --target <name> read-page [--output <path>]
 chrome-devtools --target <name> evaluate "<js-expression>" [--dialog-action accept|dismiss|text]
 chrome-devtools --target <name> network [--duration <ms>] [--type <resource>]
 chrome-devtools --target <name> console [--duration <ms>] [--type <level>]

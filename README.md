@@ -130,6 +130,8 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 |---------|-------------|
 | `screenshot --output <path>` | Save screenshot to file |
 | `screenshot --full-page` | Capture full scrollable page |
+| `read-page` | Read page content as clean markdown (extracts main article) |
+| `read-page --output <path>` | Save markdown to file |
 | `evaluate <expr> [--dialog-action <action>]` | Run JavaScript (optionally handle dialogs: accept, dismiss, or prompt text) |
 | `snapshot` | Accessibility tree dump |
 
@@ -247,10 +249,11 @@ The daemon keeps a persistent CDP session on the current page to:
     ├── navigate.rs
     ├── pages.rs      # list/new/close/select/wait-for
     ├── screenshot.rs
+    ├── snapshot.rs
+    ├── read_page.rs  # read-page (Readability extraction + HTML→Markdown)
     ├── evaluate.rs
     ├── executor.rs   # Command dispatch + persistent-session reuse
     ├── input.rs      # click/fill/type/press/hover
-    ├── snapshot.rs
     ├── emulation.rs  # emulate (viewport/geolocation/blocklist get/set/clear)
     ├── console.rs    # console drain / live collection
     ├── network.rs    # network drain / live collection
@@ -275,6 +278,8 @@ chrome-devtools --target red-snake click "#submit"
 
 # 4. Extract data
 chrome-devtools --target red-snake evaluate "document.title"
+chrome-devtools --target red-snake read-page                    # full article as markdown
+chrome-devtools --target red-snake read-page --json             # with metadata (title, byline, url)
 
 # 5. Inspect what the page did under the hood
 chrome-devtools --target red-snake network      # drain accumulated requests
