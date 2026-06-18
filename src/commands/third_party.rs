@@ -26,7 +26,7 @@ pub async fn list_3p_tools(
                         annotations: t.annotations || null,
                         origin: t.origin || null
                     }))
-                })
+                }]
             })).catch(e => JSON.stringify({ error: e.message || String(e) }));
         }
         const dtmcp = window.__dtmcp;
