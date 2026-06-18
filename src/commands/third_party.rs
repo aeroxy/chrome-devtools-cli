@@ -27,7 +27,7 @@ pub async fn list_3p_tools(
                         origin: t.origin || null
                     }))
                 })
-            }));
+            })).catch(e => JSON.stringify({ error: e.message || String(e) }));
         }
         const dtmcp = window.__dtmcp;
         if (!dtmcp) {
@@ -80,11 +80,14 @@ pub async fn list_3p_tools(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Failed to list third-party tools"))?;
 
+    let val: serde_json::Value = serde_json::from_str(val_str)?;
+    if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
+        bail!("Failed to list tools: {err}");
+    }
+
     if !format.is_text() {
-        let val: serde_json::Value = serde_json::from_str(val_str)?;
         Ok(CommandResult::output(format_structured(&val, format)?))
     } else {
-        let val: serde_json::Value = serde_json::from_str(val_str)?;
         let api = val["api"].as_str().unwrap_or("none");
         let groups = val["groups"]
             .as_array()
