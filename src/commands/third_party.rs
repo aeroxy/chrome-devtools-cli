@@ -132,9 +132,7 @@ pub async fn list_3p_tools(
                                     .as_object()
                                     .map(|obj| {
                                         obj.iter()
-                                            .filter_map(|(k, v)| {
-                                                Some(format!("{}={}", k, v))
-                                            })
+                                            .map(|(k, v)| format!("{}={}", k, v))
                                             .collect()
                                     })
                                     .unwrap_or_default();
