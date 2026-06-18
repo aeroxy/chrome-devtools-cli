@@ -12,15 +12,25 @@ use crate::result::CommandResult;
 const GET_HTML_AND_URL_JS: &str =
     "JSON.stringify({html: document.documentElement.outerHTML, url: window.location.href})";
 
+/// Case-insensitive substring search without allocating a lowercase copy.
+fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|w| w.iter().zip(needle.bytes()).all(|(a, b)| a.to_ascii_lowercase() == b))
+}
+
 /// Extract the `<title>` text from raw HTML via case-insensitive string search.
 /// Used as a fallback when Readability doesn't produce a title.
 fn extract_title_from_html(html: &str) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
     let open = "<title>";
     let close = "</title>";
 
-    let start = lower.find(open)? + open.len();
-    let end = lower[start..].find(close)? + start;
+    let start = find_ci(html, open)? + open.len();
+    let end = find_ci(&html[start..], close)? + start;
     let title = html[start..end].trim();
 
     if title.is_empty() {
@@ -33,13 +43,13 @@ fn extract_title_from_html(html: &str) -> Option<String> {
 /// Decode common HTML entities. `&amp;` is decoded last (via placeholder) to
 /// prevent double-decoding (e.g. `&amp;lt;` → `&lt;`, not `<`).
 fn decode_html_entities(s: &str) -> String {
-    let s = s.replace("&amp;", "\x00");
+    let s = s.replace("&amp;", "\u{E000}");
     let s = s.replace("&lt;", "<");
     let s = s.replace("&gt;", ">");
     let s = s.replace("&quot;", "\"");
     let s = s.replace("&#39;", "'");
     let s = s.replace("&apos;", "'");
-    s.replace("\x00", "&")
+    s.replace("\u{E000}", "&")
 }
 
 /// Run Mozilla-Readability-style extraction over `html`, returning the cleaned
@@ -119,25 +129,23 @@ struct ReadableMeta {
 fn unwrap_iframes(html: &str) -> String {
     let mut result = html.to_string();
     loop {
-        let lower = result.to_ascii_lowercase();
-
         // Find innermost iframe: an <iframe> with no nested <iframe> inside.
         let mut search_from = 0;
         let mut best_open = None;
         let mut best_close = None;
 
-        while let Some(open) = lower[search_from..].find("<iframe") {
+        while let Some(open) = find_ci(&result[search_from..], "<iframe") {
             let open = search_from + open;
             let tag_end = match result[open..].find('>') {
                 Some(i) => open + i + 1,
                 None => break,
             };
 
-            if let Some(close) = lower[tag_end..].find("</iframe") {
+            if let Some(close) = find_ci(&result[tag_end..], "</iframe") {
                 let close = tag_end + close;
-                let inner = &lower[tag_end..close];
+                let inner = &result[tag_end..close];
 
-                if !inner.contains("<iframe") {
+                if find_ci(inner, "<iframe").is_none() {
                     // Innermost — no nested <iframe> between open and close.
                     best_open = Some((open, tag_end));
                     best_close = Some(close);
