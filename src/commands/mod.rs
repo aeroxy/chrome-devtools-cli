@@ -6,6 +6,7 @@ pub mod input;
 pub mod navigate;
 pub mod network;
 pub mod pages;
+pub mod read_page;
 pub mod screenshot;
 pub mod snapshot;
 pub mod sw_logs;

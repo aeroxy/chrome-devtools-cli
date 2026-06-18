@@ -204,6 +204,14 @@ pub enum Commands {
         output: Option<String>,
     },
 
+    /// Read the current page as clean markdown (extracts the main article)
+    #[command(name = "read-page")]
+    ReadPage {
+        /// Write output to a file instead of stdout
+        #[arg(long, short)]
+        output: Option<String>,
+    },
+
     /// Manage page emulation (viewport, geolocation, etc.)
     Emulate {
         /// Set viewport size as WxH (e.g. 1280x720)
@@ -327,6 +335,7 @@ impl Cli {
             Commands::PressKey { .. } => "press-key",
             Commands::Hover { .. } => "hover",
             Commands::Snapshot { .. } => "snapshot",
+            Commands::ReadPage { .. } => "read-page",
             Commands::Emulate { .. } => "emulate",
             Commands::WaitFor { .. } => "wait-for",
             Commands::List3pTools => "list-3p-tools",
@@ -427,6 +436,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         Commands::PressKey { key } => ("press-key", json!({"key": key})),
         Commands::Hover { selector } => ("hover", json!({"selector": selector})),
         Commands::Snapshot { output } => ("snapshot", json!({"output": output})),
+        Commands::ReadPage { output } => ("read-page", json!({"output": output})),
         Commands::Emulate {
             viewport,
             device_scale_factor,
@@ -902,6 +912,15 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
         }
         Commands::Snapshot { output } => {
             commands::snapshot::take_snapshot(
+                &mut client,
+                &session_id,
+                cli.output_format(),
+                output.as_deref(),
+            )
+            .await
+        }
+        Commands::ReadPage { output } => {
+            commands::read_page::read_page(
                 &mut client,
                 &session_id,
                 cli.output_format(),

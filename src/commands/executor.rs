@@ -45,6 +45,7 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "press-key" => &["key"],
         "hover" => &["selector"],
         "snapshot" => &["output"],
+        "read-page" => &["output"],
         "emulate" => &[
             "viewport",
             "device_scale_factor",
@@ -424,6 +425,15 @@ async fn inner_execute(
         },
         "snapshot" => {
             commands::snapshot::take_snapshot(
+                client,
+                session_id,
+                req.format(),
+                args.get("output").and_then(|v| v.as_str()),
+            )
+            .await
+        }
+        "read-page" => {
+            commands::read_page::read_page(
                 client,
                 session_id,
                 req.format(),

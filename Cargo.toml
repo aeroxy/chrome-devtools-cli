@@ -24,6 +24,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 toon-format = "0.5"
 tokio-tungstenite = "0.24"
+htmd = "0.5.4"
+dom_smoothie = "0.18.0"
 
 [dev-dependencies]
 tempfile = "3"
