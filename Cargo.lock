@@ -258,6 +258,7 @@ dependencies = [
  "dom_smoothie",
  "futures-util",
  "htmd",
+ "html-escape",
  "libc",
  "serde",
  "serde_json",

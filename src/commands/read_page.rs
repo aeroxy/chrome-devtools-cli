@@ -20,17 +20,23 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     haystack
         .as_bytes()
         .windows(needle.len())
-        .position(|w| w.iter().zip(needle.bytes()).all(|(a, b)| a.to_ascii_lowercase() == b))
+        .position(|w| {
+            w.iter()
+                .zip(needle.bytes())
+                .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+        })
 }
 
 /// Extract the `<title>` text from raw HTML via case-insensitive string search.
 /// Used as a fallback when Readability doesn't produce a title.
 fn extract_title_from_html(html: &str) -> Option<String> {
-    let open = "<title>";
-    let close = "</title>";
+    let open_tag = "<title";
+    let close_tag = "</title>";
 
-    let start = find_ci(html, open)? + open.len();
-    let end = find_ci(&html[start..], close)? + start;
+    let open_pos = find_ci(html, open_tag)?;
+    let tag_end = html[open_pos..].find('>')?;
+    let start = open_pos + tag_end + 1;
+    let end = find_ci(&html[start..], close_tag)? + start;
     let title = html[start..end].trim();
 
     if title.is_empty() {
@@ -43,13 +49,7 @@ fn extract_title_from_html(html: &str) -> Option<String> {
 /// Decode common HTML entities. `&amp;` is decoded last (via placeholder) to
 /// prevent double-decoding (e.g. `&amp;lt;` → `&lt;`, not `<`).
 fn decode_html_entities(s: &str) -> String {
-    let s = s.replace("&amp;", "\u{E000}");
-    let s = s.replace("&lt;", "<");
-    let s = s.replace("&gt;", ">");
-    let s = s.replace("&quot;", "\"");
-    let s = s.replace("&#39;", "'");
-    let s = s.replace("&apos;", "'");
-    s.replace("\u{E000}", "&")
+    html_escape::decode_html_entities(s).into_owned()
 }
 
 /// Run Mozilla-Readability-style extraction over `html`, returning the cleaned
@@ -162,7 +162,7 @@ fn unwrap_iframes(html: &str) -> String {
             result = format!("{}{}", &result[..open], &result[tag_end..]);
             best_open = None;
             best_close = None;
-            break;
+            continue;
         }
 
         match (best_open, best_close) {
@@ -452,6 +452,14 @@ mod tests {
         assert_eq!(
             unwrap_iframes("<p>A</p><iframe src=\"x\"><p>B</p>"),
             "<p>A</p><p>B</p>"
+        );
+    }
+
+    #[test]
+    fn unwrap_iframes_unclosed_followed_by_well_formed() {
+        assert_eq!(
+            unwrap_iframes("<iframe src=\"broken\"><iframe src=\"ok\"><p>B</p></iframe>"),
+            "<p>B</p>"
         );
     }
 
