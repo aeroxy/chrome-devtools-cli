@@ -24,7 +24,7 @@ full page, so content is never silently dropped.
 Returns the article content as markdown with the page title prepended as an H1
 heading (unless the body already starts with one).
 
-```
+```md
 # Will Serfort
 
 **Will Serfort** is the protagonist of *Wistoria: Wand and Sword*...
@@ -43,9 +43,7 @@ Readability:
 {
   "markdown": "**Will Serfort** is the protagonist...",
   "title": "Will Serfort",
-  "byline": null,
   "excerpt": "Will Serfort is the protagonist of...",
-  "site_name": null,
   "url": "https://wistoria.fandom.com/wiki/Will_Serfort"
 }
 ```
@@ -58,7 +56,7 @@ Same fields as JSON in compact TOON encoding.
 
 ## Pipeline
 
-```
+```text
 CDP Runtime.evaluate (HTML + URL as JSON)
   → dom_smoothie Readability extraction
     → unwrap <iframe> tags (innermost-first for nested support)

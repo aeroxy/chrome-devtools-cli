@@ -8,7 +8,7 @@ no headless browser stack. One command in, one result out.
 
 ## Repository Structure
 
-```
+```text
 src/
 ├── main.rs           # Entry point + daemon dispatch
 ├── lib.rs            # CLI (clap) + command routing
