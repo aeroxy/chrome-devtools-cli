@@ -10,7 +10,7 @@ use crate::result::CommandResult;
 /// Inline JS that returns the page HTML and current URL in a single evaluation,
 /// avoiding a second CDP round trip for URL resolution.
 const GET_HTML_AND_URL_JS: &str =
-    "JSON.stringify({html: document.documentElement.outerHTML, url: window.location.href})";
+    "JSON.stringify({html: document.documentElement ? document.documentElement.outerHTML : '', url: window.location.href})";
 
 /// Case-insensitive substring search without allocating a lowercase copy.
 fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
@@ -28,6 +28,20 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
         })
 }
 
+fn find_tag_end(s: &str) -> Option<usize> {
+    let mut in_double_quote = false;
+    let mut in_single_quote = false;
+    for (idx, b) in s.bytes().enumerate() {
+        match b {
+            b'"' if !in_single_quote => in_double_quote = !in_double_quote,
+            b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            b'>' if !in_double_quote && !in_single_quote => return Some(idx),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Extract the `<title>` text from raw HTML via case-insensitive string search.
 /// Used as a fallback when Readability doesn't produce a title.
 fn extract_title_from_html(html: &str) -> Option<String> {
@@ -35,7 +49,7 @@ fn extract_title_from_html(html: &str) -> Option<String> {
     let close_tag = "</title>";
 
     let open_pos = find_ci(html, open_tag)?;
-    let tag_end = html[open_pos..].find('>')?;
+    let tag_end = find_tag_end(&html[open_pos..])?;
     let start = open_pos + tag_end + 1;
     let end = find_ci(&html[start..], close_tag)? + start;
     let title = html[start..end].trim();
@@ -136,7 +150,7 @@ fn unwrap_iframes(html: &str) -> String {
 
         while let Some(open) = find_ci(&result[search_from..], "<iframe") {
             let open = search_from + open;
-            let tag_end = match result[open..].find('>') {
+            let tag_end = match find_tag_end(&result[open..]) {
                 Some(i) => open + i + 1,
                 None => {
                     // Malformed tag: no closing '>' found. Skip past this '<' and continue
@@ -172,7 +186,7 @@ fn unwrap_iframes(html: &str) -> String {
 
         match (best_open, best_close) {
             (Some((open, tag_end)), Some(close)) => {
-                let close_end = match result[close..].find('>') {
+                let close_end = match find_tag_end(&result[close..]) {
                     Some(i) => {
                         // Check if there's a '<' before the '>' to avoid crossing tag boundaries
                         if result[close + 1..close + i].contains('<') {

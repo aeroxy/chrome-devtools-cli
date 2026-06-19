@@ -107,6 +107,7 @@ pub async fn list_3p_tools(
         let api_label = match api {
             "modelContext" => "WebMCP",
             "dtmcp" => "DTMCP (legacy)",
+            "none" => "None",
             _ => "unknown",
         };
 
