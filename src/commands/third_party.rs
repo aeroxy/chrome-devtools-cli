@@ -76,6 +76,14 @@ pub async fn list_3p_tools(
         )
         .await?;
 
+    if let Some(exception) = result.get("exceptionDetails") {
+        let text = exception["text"]
+            .as_str()
+            .or_else(|| exception["exception"]["description"].as_str())
+            .unwrap_or("Unknown error evaluating third-party tools");
+        anyhow::bail!("{text}");
+    }
+
     let val_str = result["result"]["value"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Failed to list third-party tools"))?;
@@ -225,6 +233,14 @@ pub async fn execute_3p_tool(
             json!({"expression": expr, "returnByValue": true, "awaitPromise": true}),
         )
         .await?;
+
+    if let Some(exception) = result.get("exceptionDetails") {
+        let text = exception["text"]
+            .as_str()
+            .or_else(|| exception["exception"]["description"].as_str())
+            .unwrap_or("Unknown error executing third-party tool");
+        anyhow::bail!("{text}");
+    }
 
     let val_str = result["result"]["value"]
         .as_str()
