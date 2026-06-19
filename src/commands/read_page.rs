@@ -17,12 +17,13 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
     }
+    let needle_bytes = needle.as_bytes();
     haystack
         .as_bytes()
-        .windows(needle.len())
+        .windows(needle_bytes.len())
         .position(|w| {
             w.iter()
-                .zip(needle.bytes())
+                .zip(needle_bytes)
                 .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
         })
 }
@@ -46,8 +47,7 @@ fn extract_title_from_html(html: &str) -> Option<String> {
     }
 }
 
-/// Decode common HTML entities. `&amp;` is decoded last (via placeholder) to
-/// prevent double-decoding (e.g. `&amp;lt;` → `&lt;`, not `<`).
+/// Decode common HTML entities.
 fn decode_html_entities(s: &str) -> String {
     html_escape::decode_html_entities(s).into_owned()
 }
@@ -173,7 +173,13 @@ fn unwrap_iframes(html: &str) -> String {
         match (best_open, best_close) {
             (Some((open, tag_end)), Some(close)) => {
                 let close_end = match result[close..].find('>') {
-                    Some(i) => close + i + 1,
+                    Some(i) => {
+                        // Check if there's a '<' before the '>' to avoid crossing tag boundaries
+                        if result[close..close + i].contains('<') {
+                            break;
+                        }
+                        close + i + 1
+                    }
                     None => break,
                 };
                 let inner = &result[tag_end..close];
