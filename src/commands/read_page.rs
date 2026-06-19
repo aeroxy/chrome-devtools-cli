@@ -138,7 +138,12 @@ fn unwrap_iframes(html: &str) -> String {
             let open = search_from + open;
             let tag_end = match result[open..].find('>') {
                 Some(i) => open + i + 1,
-                None => break,
+                None => {
+                    // Malformed tag: no closing '>' found. Skip past this '<' and continue
+                    // searching for the next potential tag.
+                    search_from = open + 1;
+                    continue;
+                }
             };
 
             if let Some(close) = find_ci(&result[tag_end..], "</iframe") {
