@@ -1,7 +1,7 @@
 use anyhow::Result;
 use dom_smoothie::{CandidateSelectMode, Config, Readability};
 use htmd::HtmlToMarkdown;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::cdp::CdpClient;
 use crate::format::{format_structured, OutputFormat};
@@ -10,7 +10,7 @@ use crate::result::CommandResult;
 /// Inline JS that returns the page HTML and current URL in a single evaluation,
 /// avoiding a second CDP round trip for URL resolution.
 const GET_HTML_AND_URL_JS: &str =
-    "JSON.stringify({html: document.documentElement ? document.documentElement.outerHTML : '', url: window.location.href})";
+    "({html: document.documentElement ? document.documentElement.outerHTML : '', url: window.location.href})";
 
 /// Case-insensitive substring search without allocating a lowercase copy.
 fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
@@ -288,18 +288,13 @@ pub async fn read_page(
         anyhow::bail!("{text}");
     }
 
-    let raw = result["result"]["value"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Failed to read page content"))?;
+    let val = &result["result"]["value"];
+    if val.is_null() {
+        anyhow::bail!("Failed to read page content");
+    }
 
-    let (html, url) = match serde_json::from_str::<Value>(raw) {
-        Ok(v) if v.is_object() => (
-            v["html"].as_str().unwrap_or("").to_string(),
-            v["url"].as_str().map(|s| s.to_string()),
-        ),
-        // Fallback: treat as plain HTML string (shouldn't happen with our JS).
-        _ => (raw.to_string(), None),
-    };
+    let html = val["html"].as_str().unwrap_or("").to_string();
+    let url = val["url"].as_str().map(|s| s.to_string());
 
     let (content_html, meta) = extract_content(&html, url.as_deref());
     let content = format_output(&content_html, &meta, url.as_deref(), format)?;
