@@ -183,7 +183,7 @@ pub async fn execute_3p_tool(
                 const tools = await document.modelContext.getTools();
                 const tool = tools.find(t => t.name === {safe_name_json});
                 if (tool) {{
-                    const result = await document.modelContext.executeTool(tool, {safe_params_json});
+                    const result = await document.modelContext.executeTool(tool, params);
                     return JSON.stringify({{ api: 'modelContext', result }});
                 }}
             }} catch (e) {{

@@ -175,7 +175,7 @@ fn unwrap_iframes(html: &str) -> String {
                 let close_end = match result[close..].find('>') {
                     Some(i) => {
                         // Check if there's a '<' before the '>' to avoid crossing tag boundaries
-                        if result[close..close + i].contains('<') {
+                        if result[close + 1..close + i].contains('<') {
                             break;
                         }
                         close + i + 1
