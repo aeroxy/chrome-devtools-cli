@@ -46,6 +46,8 @@ pub async fn take_heapsnapshot(
                 if let Some(chunk) = event["params"]["chunk"].as_str() {
                     file.write_all(chunk.as_bytes()).await?;
                 }
+            } else if method == "HeapProfiler.reportHeapSnapshotProgress" {
+                // Ignore progress events to avoid polluting the client events buffer
             } else if event.get("method").is_some() {
                 client.events.push_back(event);
             }
@@ -118,6 +120,10 @@ pub fn parse_node_from_snapshot(
         Some(idx) => idx,
         None => bail!("Node with ID {} not found", node_id),
     };
+
+    if target_node_index + node_size > nodes.len() {
+        bail!("Invalid snapshot: node fields out of bounds");
+    }
 
     let name_str_idx = nodes[target_node_index + name_offset] as usize;
     let name = val.strings.get(name_str_idx).cloned().unwrap_or_else(|| "unknown".to_string());

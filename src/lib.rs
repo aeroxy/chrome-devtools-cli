@@ -949,16 +949,6 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             )
             .await
         }
-        Commands::InspectHeapSnapshotNode { file_path, node_id } => {
-            commands::memory::inspect_heapsnapshot_node(
-                &mut client,
-                &session_id,
-                file_path,
-                *node_id,
-                cli.output_format(),
-            )
-            .await
-        }
         Commands::Evaluate {
             expression,
             dialog_action: _,
