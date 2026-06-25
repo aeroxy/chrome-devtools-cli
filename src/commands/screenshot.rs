@@ -23,7 +23,7 @@ pub async fn take_screenshot(
 
     if let Some(q) = quality {
         if format != "png" {
-            params["quality"] = json!(q);
+            params["quality"] = json!(q.min(100));
         }
     }
 

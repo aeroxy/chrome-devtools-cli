@@ -46,6 +46,8 @@ pub async fn take_heapsnapshot(
                 if let Some(chunk) = event["params"]["chunk"].as_str() {
                     file.write_all(chunk.as_bytes()).await?;
                 }
+            } else if event.get("method").is_some() {
+                client.events.push_back(event);
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -115,7 +117,12 @@ pub async fn inspect_heapsnapshot_node(
     node_id: u64,
     format: crate::format::OutputFormat,
 ) -> Result<CommandResult> {
-    let (name, self_size) = parse_node_from_snapshot(file_path, node_id)?;
+    let file_path_owned = file_path.to_string();
+    let (name, self_size) = tokio::task::spawn_blocking(move || {
+        parse_node_from_snapshot(&file_path_owned, node_id)
+    })
+    .await
+    .map_err(|e| anyhow!("Failed to execute blocking snapshot parser: {e}"))??;
 
     if format.is_text() {
         let mut out = String::new();
