@@ -12,11 +12,26 @@ pub async fn take_screenshot(
     output: Option<&str>,
     format: &str,
     full_page: bool,
+    quality: Option<u64>,
+    max_width: Option<f64>,
+    max_height: Option<f64>,
 ) -> Result<CommandResult> {
     let mut params = json!({
         "format": format,
         "optimizeForSpeed": true,
     });
+
+    if let Some(q) = quality {
+        if format != "png" {
+            params["quality"] = json!(q);
+        }
+    }
+
+    // Determine the viewport or document scroll dimensions
+    let mut src_w = 1920.0;
+    let mut src_h = 1080.0;
+    let is_full_page = full_page;
+
     if full_page {
         params["captureBeyondViewport"] = json!(true);
         let metrics = client
@@ -31,15 +46,50 @@ pub async fn take_screenshot(
             .await?;
         if let Some(val) = metrics["result"]["value"].as_str() {
             if let Ok(dims) = serde_json::from_str::<serde_json::Value>(val) {
-                let w = dims["width"].as_f64().unwrap_or(1920.0);
-                let h = dims["height"].as_f64().unwrap_or(1080.0);
-                params["clip"] = json!({
-                    "x": 0, "y": 0,
-                    "width": w, "height": h,
-                    "scale": 1,
-                });
+                src_w = dims["width"].as_f64().unwrap_or(1920.0);
+                src_h = dims["height"].as_f64().unwrap_or(1080.0);
             }
         }
+    } else {
+        // Query current viewport bounds if not capturing the full page
+        let metrics = client
+            .send_to_target(
+                session_id,
+                "Runtime.evaluate",
+                json!({
+                    "expression": "JSON.stringify({width: window.innerWidth, height: window.innerHeight})",
+                    "returnByValue": true,
+                }),
+            )
+            .await?;
+        if let Some(val) = metrics["result"]["value"].as_str() {
+            if let Ok(dims) = serde_json::from_str::<serde_json::Value>(val) {
+                src_w = dims["width"].as_f64().unwrap_or(1920.0);
+                src_h = dims["height"].as_f64().unwrap_or(1080.0);
+            }
+        }
+    }
+
+    // Downscaling logic (calculate custom clip with scale factor)
+    let mut clip_scale = 1.0;
+    if max_width.is_some() || max_height.is_some() {
+        let width_scale = match max_width {
+            Some(max_w) if src_w > 0.0 => (max_w / src_w).min(1.0),
+            _ => 1.0,
+        };
+        let height_scale = match max_height {
+            Some(max_h) if src_h > 0.0 => (max_h / src_h).min(1.0),
+            _ => 1.0,
+        };
+        clip_scale = width_scale.min(height_scale);
+    }
+
+    if is_full_page || clip_scale < 1.0 {
+        params["clip"] = json!({
+            "x": 0, "y": 0,
+            "width": src_w, "height": src_h,
+            "scale": clip_scale,
+        });
     }
 
     let result = client

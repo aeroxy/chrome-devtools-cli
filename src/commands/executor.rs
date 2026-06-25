@@ -36,7 +36,14 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
             "clear_all",
             "output",
         ],
-        "screenshot" => &["output", "format", "full_page"],
+        "screenshot" => &[
+            "output",
+            "format",
+            "full_page",
+            "quality",
+            "max_width",
+            "max_height",
+        ],
         "evaluate" => &["expression", "dialog_action", "output", "track_navigation"],
         "click" => &["selector"],
         "click-at" => &["x", "y"],
@@ -45,7 +52,11 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "press-key" => &["key"],
         "hover" => &["selector"],
         "snapshot" => &["output"],
+        "screencast-start" => &["output", "format"],
+        "screencast-stop" => &[],
         "read-page" => &["output"],
+        "take-heapsnapshot" => &["output"],
+        "get-heapsnapshot-dominators" => &["file_path", "node_id"],
         "emulate" => &[
             "viewport",
             "device_scale_factor",
@@ -366,6 +377,9 @@ async fn inner_execute(
                 args.get("full_page")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                args.get("quality").and_then(|v| v.as_u64()),
+                args.get("max_width").and_then(|v| v.as_f64()),
+                args.get("max_height").and_then(|v| v.as_f64()),
             )
             .await
         }
@@ -432,6 +446,21 @@ async fn inner_execute(
             )
             .await
         }
+        "screencast-start" => match args.get("output").and_then(|v| v.as_str()) {
+            Some(output) => {
+                commands::screencast::screencast_start(
+                    client,
+                    session_id,
+                    output,
+                    args.get("format").and_then(|v| v.as_str()),
+                )
+                .await
+            }
+            None => bail!("output required"),
+        },
+        "screencast-stop" => {
+            commands::screencast::screencast_stop(client, session_id).await
+        }
         "read-page" => {
             commands::read_page::read_page(
                 client,
@@ -441,6 +470,21 @@ async fn inner_execute(
             )
             .await
         }
+        "take-heapsnapshot" => match args.get("output").and_then(|v| v.as_str()) {
+            Some(output) => {
+                commands::memory::take_heapsnapshot(client, session_id, output).await
+            }
+            None => bail!("output required"),
+        },
+        "get-heapsnapshot-dominators" => match (
+            args.get("file_path").and_then(|v| v.as_str()),
+            args.get("node_id").and_then(|v| v.as_u64()),
+        ) {
+            (Some(file_path), Some(node_id)) => {
+                commands::memory::get_heapsnapshot_dominators(file_path, node_id).await
+            }
+            _ => bail!("file_path and node_id required"),
+        },
         "emulate" => {
             // block/unblock come from the global request fields (the single flag
             // definition); the emulate handler applies them itself — in the right

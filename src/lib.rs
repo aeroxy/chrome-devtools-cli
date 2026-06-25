@@ -157,6 +157,15 @@ pub enum Commands {
         /// Capture full scrollable page
         #[arg(long)]
         full_page: bool,
+        /// Compression quality (0-100) for jpeg and webp formats
+        #[arg(long)]
+        quality: Option<u64>,
+        /// Max width in pixels to downscale the captured screenshot
+        #[arg(long)]
+        max_width: Option<f64>,
+        /// Max height in pixels to downscale the captured screenshot
+        #[arg(long)]
+        max_height: Option<f64>,
     },
 
     /// Evaluate a JavaScript expression
@@ -204,12 +213,46 @@ pub enum Commands {
         output: Option<String>,
     },
 
+    /// Start recording the browser screencast
+    #[command(name = "screencast-start")]
+    ScreencastStart {
+        /// Output file path (e.g. video.webm or video.mp4)
+        #[arg(long, short)]
+        output: String,
+        /// Optional format: mp4, webm
+        #[arg(long, short)]
+        format: Option<String>,
+    },
+
+    /// Stop recording and finalize screencast video file
+    #[command(name = "screencast-stop")]
+    ScreencastStop,
+
     /// Read the current page as clean markdown (extracts the main article)
     #[command(name = "read-page")]
     ReadPage {
         /// Write output to a file instead of stdout
         #[arg(long, short)]
         output: Option<String>,
+    },
+
+    /// Take a heap snapshot of the page and save it to a file
+    #[command(name = "take-heapsnapshot")]
+    TakeHeapSnapshot {
+        /// Output file path to save the heap snapshot (e.g. heap.heapsnapshot)
+        #[arg(long, short)]
+        output: String,
+    },
+
+    /// Retrieve the dominator chain for a specific node ID from a local heap snapshot
+    #[command(name = "get-heapsnapshot-dominators")]
+    GetHeapSnapshotDominators {
+        /// Path to the .heapsnapshot file to analyze
+        #[arg(long, short)]
+        file_path: String,
+        /// Node ID to get the dominator chain for
+        #[arg(long, short)]
+        node_id: u64,
     },
 
     /// Manage page emulation (viewport, geolocation, etc.)
@@ -335,7 +378,11 @@ impl Cli {
             Commands::PressKey { .. } => "press-key",
             Commands::Hover { .. } => "hover",
             Commands::Snapshot { .. } => "snapshot",
+            Commands::ScreencastStart { .. } => "screencast-start",
+            Commands::ScreencastStop => "screencast-stop",
             Commands::ReadPage { .. } => "read-page",
+            Commands::TakeHeapSnapshot { .. } => "take-heapsnapshot",
+            Commands::GetHeapSnapshotDominators { .. } => "get-heapsnapshot-dominators",
             Commands::Emulate { .. } => "emulate",
             Commands::WaitFor { .. } => "wait-for",
             Commands::List3pTools => "list-3p-tools",
@@ -408,13 +455,31 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         Commands::SelectPage { id_or_index } => {
             ("select-page", json!({ "id_or_index": id_or_index }))
         }
+        Commands::TakeHeapSnapshot { output } => (
+            "take-heapsnapshot",
+            json!({ "output": output }),
+        ),
+        Commands::GetHeapSnapshotDominators { file_path, node_id } => (
+            "get-heapsnapshot-dominators",
+            json!({ "file_path": file_path, "node_id": node_id }),
+        ),
         Commands::Screenshot {
             output,
             format,
             full_page,
+            quality,
+            max_width,
+            max_height,
         } => (
             "screenshot",
-            json!({"output": output, "format": format, "full_page": full_page}),
+            json!({
+                "output": output,
+                "format": format,
+                "full_page": full_page,
+                "quality": quality,
+                "max_width": max_width,
+                "max_height": max_height
+            }),
         ),
         Commands::Evaluate {
             expression,
@@ -436,6 +501,14 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         Commands::PressKey { key } => ("press-key", json!({"key": key})),
         Commands::Hover { selector } => ("hover", json!({"selector": selector})),
         Commands::Snapshot { output } => ("snapshot", json!({"output": output})),
+        Commands::ScreencastStart { output, format } => (
+            "screencast-start",
+            json!({ "output": output, "format": format }),
+        ),
+        Commands::ScreencastStop => (
+            "screencast-stop",
+            json!({}),
+        ),
         Commands::ReadPage { output } => ("read-page", json!({"output": output})),
         Commands::Emulate {
             viewport,
@@ -867,6 +940,9 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             output,
             format,
             full_page,
+            quality,
+            max_width,
+            max_height,
         } => {
             commands::screenshot::take_screenshot(
                 &mut client,
@@ -874,6 +950,24 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 output.as_deref(),
                 format,
                 *full_page,
+                *quality,
+                *max_width,
+                *max_height,
+            )
+            .await
+        }
+        Commands::TakeHeapSnapshot { output } => {
+            commands::memory::take_heapsnapshot(
+                &mut client,
+                &session_id,
+                output,
+            )
+            .await
+        }
+        Commands::GetHeapSnapshotDominators { file_path, node_id } => {
+            commands::memory::get_heapsnapshot_dominators(
+                file_path,
+                *node_id,
             )
             .await
         }
@@ -917,6 +1011,22 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 &session_id,
                 cli.output_format(),
                 output.as_deref(),
+            )
+            .await
+        }
+        Commands::ScreencastStart { output, format } => {
+            commands::screencast::screencast_start(
+                &mut client,
+                &session_id,
+                output,
+                format.as_deref(),
+            )
+            .await
+        }
+        Commands::ScreencastStop => {
+            commands::screencast::screencast_stop(
+                &mut client,
+                &session_id,
             )
             .await
         }
