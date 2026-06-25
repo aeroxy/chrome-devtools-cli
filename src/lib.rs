@@ -561,6 +561,7 @@ pub async fn run() -> Result<()> {
     // Handle kill-daemon without connecting to Chrome
     if matches!(cli.command, Commands::KillDaemon) {
         let pid_path = protocol::pid_path();
+        #[cfg(unix)]
         let sock_path = protocol::socket_path();
         match std::fs::read_to_string(&pid_path) {
             Ok(pid_str) => {
