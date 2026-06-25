@@ -27,9 +27,10 @@ pub async fn take_screenshot(
         }
     }
 
-    // Determine the viewport or document scroll dimensions
     let mut src_w = 1920.0;
     let mut src_h = 1080.0;
+    let mut scroll_x = 0.0;
+    let mut scroll_y = 0.0;
     let is_full_page = full_page;
 
     if full_page {
@@ -51,13 +52,12 @@ pub async fn take_screenshot(
             }
         }
     } else {
-        // Query current viewport bounds if not capturing the full page
         let metrics = client
             .send_to_target(
                 session_id,
                 "Runtime.evaluate",
                 json!({
-                    "expression": "JSON.stringify({width: window.innerWidth, height: window.innerHeight})",
+                    "expression": "JSON.stringify({width: window.innerWidth, height: window.innerHeight, scrollX: window.scrollX || window.pageXOffset || 0, scrollY: window.scrollY || window.pageYOffset || 0})",
                     "returnByValue": true,
                 }),
             )
@@ -66,6 +66,8 @@ pub async fn take_screenshot(
             if let Ok(dims) = serde_json::from_str::<serde_json::Value>(val) {
                 src_w = dims["width"].as_f64().unwrap_or(1920.0);
                 src_h = dims["height"].as_f64().unwrap_or(1080.0);
+                scroll_x = dims["scrollX"].as_f64().unwrap_or(0.0);
+                scroll_y = dims["scrollY"].as_f64().unwrap_or(0.0);
             }
         }
     }
@@ -86,7 +88,7 @@ pub async fn take_screenshot(
 
     if is_full_page || clip_scale < 1.0 {
         params["clip"] = json!({
-            "x": 0, "y": 0,
+            "x": scroll_x, "y": scroll_y,
             "width": src_w, "height": src_h,
             "scale": clip_scale,
         });

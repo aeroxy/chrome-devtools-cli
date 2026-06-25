@@ -946,6 +946,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 &mut client,
                 &session_id,
                 output,
+                cli.output_format(),
             )
             .await
         }

@@ -464,7 +464,7 @@ async fn inner_execute(
         }
         "take-heapsnapshot" => match args.get("output").and_then(|v| v.as_str()) {
             Some(output) => {
-                commands::memory::take_heapsnapshot(client, session_id, output).await
+                commands::memory::take_heapsnapshot(client, session_id, output, req.format()).await
             }
             None => bail!("output required"),
         },
