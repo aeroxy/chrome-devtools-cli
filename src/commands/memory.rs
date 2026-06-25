@@ -151,9 +151,14 @@ pub async fn inspect_heapsnapshot_node(
     if format.is_text() {
         let mut out = String::new();
         out.push_str("nodeId,nodeName,selfSize,retainedSize\n");
+        let escaped_name = if name.contains(',') || name.contains('"') || name.contains('\n') || name.contains('\r') {
+            format!("\"{}\"", name.replace('"', "\"\""))
+        } else {
+            name.clone()
+        };
         out.push_str(&format!(
             "{},{},{} B,unknown\n",
-            node_id, name, self_size
+            node_id, escaped_name, self_size
         ));
         Ok(CommandResult::output(out))
     } else {
