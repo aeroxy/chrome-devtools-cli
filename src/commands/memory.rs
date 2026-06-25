@@ -63,6 +63,23 @@ pub async fn take_heapsnapshot(
     )))
 }
 
+#[derive(serde::Deserialize)]
+struct MetaDetails {
+    node_fields: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SnapshotMeta {
+    meta: MetaDetails,
+}
+
+#[derive(serde::Deserialize)]
+struct HeapSnapshot {
+    snapshot: SnapshotMeta,
+    nodes: Vec<u64>,
+    strings: Vec<String>,
+}
+
 /// Parse the JSON heap snapshot and locate details for the given node ID.
 /// Returns a tuple of (node_name, self_size).
 pub fn parse_node_from_snapshot(
@@ -71,24 +88,25 @@ pub fn parse_node_from_snapshot(
 ) -> Result<(String, u64)> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
-    let val: serde_json::Value = serde_json::from_reader(reader)?;
+    let val: HeapSnapshot = serde_json::from_reader(reader)?;
 
-    let nodes = val["nodes"].as_array().ok_or_else(|| anyhow!("Invalid snapshot: nodes array missing"))?;
-
-    let meta = &val["snapshot"]["meta"];
-    let node_fields = meta["node_fields"].as_array().ok_or_else(|| anyhow!("Invalid snapshot: node_fields missing"))?;
+    let nodes = &val.nodes;
+    let node_fields = &val.snapshot.meta.node_fields;
     
     // Find fields offsets within the flat nodes array
-    let id_offset = node_fields.iter().position(|f| f.as_str() == Some("id")).ok_or_else(|| anyhow!("id field missing"))?;
-    let name_offset = node_fields.iter().position(|f| f.as_str() == Some("name")).ok_or_else(|| anyhow!("name field missing"))?;
-    let self_size_offset = node_fields.iter().position(|f| f.as_str() == Some("self_size")).ok_or_else(|| anyhow!("self_size field missing"))?;
+    let id_offset = node_fields.iter().position(|f| f == "id").ok_or_else(|| anyhow!("id field missing"))?;
+    let name_offset = node_fields.iter().position(|f| f == "name").ok_or_else(|| anyhow!("name field missing"))?;
+    let self_size_offset = node_fields.iter().position(|f| f == "self_size").ok_or_else(|| anyhow!("self_size field missing"))?;
     let node_size = node_fields.len();
+    if node_size == 0 {
+        bail!("Invalid snapshot: node_fields is empty");
+    }
 
     // Iterate over nodes using chunk sizes defined by the schema meta
     let mut target_index = None;
     let mut current_idx = 0;
     while current_idx + id_offset < nodes.len() {
-        let id = nodes.get(current_idx + id_offset).and_then(|v| v.as_u64()).unwrap_or(0);
+        let id = nodes[current_idx + id_offset];
         if id == node_id {
             target_index = Some(current_idx);
             break;
@@ -101,9 +119,9 @@ pub fn parse_node_from_snapshot(
         None => bail!("Node with ID {} not found", node_id),
     };
 
-    let name_str_idx = nodes.get(target_node_index + name_offset).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let name = val["strings"].get(name_str_idx).and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-    let self_size = nodes.get(target_node_index + self_size_offset).and_then(|v| v.as_u64()).unwrap_or(0);
+    let name_str_idx = nodes[target_node_index + name_offset] as usize;
+    let name = val.strings.get(name_str_idx).cloned().unwrap_or_else(|| "unknown".to_string());
+    let self_size = nodes[target_node_index + self_size_offset];
 
     Ok((name, self_size))
 }
