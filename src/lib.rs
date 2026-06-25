@@ -213,21 +213,6 @@ pub enum Commands {
         output: Option<String>,
     },
 
-    /// Start recording the browser screencast
-    #[command(name = "screencast-start")]
-    ScreencastStart {
-        /// Output file path (e.g. video.webm or video.mp4)
-        #[arg(long, short)]
-        output: String,
-        /// Optional format: mp4, webm
-        #[arg(long, short)]
-        format: Option<String>,
-    },
-
-    /// Stop recording and finalize screencast video file
-    #[command(name = "screencast-stop")]
-    ScreencastStop,
-
     /// Read the current page as clean markdown (extracts the main article)
     #[command(name = "read-page")]
     ReadPage {
@@ -378,8 +363,6 @@ impl Cli {
             Commands::PressKey { .. } => "press-key",
             Commands::Hover { .. } => "hover",
             Commands::Snapshot { .. } => "snapshot",
-            Commands::ScreencastStart { .. } => "screencast-start",
-            Commands::ScreencastStop => "screencast-stop",
             Commands::ReadPage { .. } => "read-page",
             Commands::TakeHeapSnapshot { .. } => "take-heapsnapshot",
             Commands::GetHeapSnapshotDominators { .. } => "get-heapsnapshot-dominators",
@@ -501,14 +484,6 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         Commands::PressKey { key } => ("press-key", json!({"key": key})),
         Commands::Hover { selector } => ("hover", json!({"selector": selector})),
         Commands::Snapshot { output } => ("snapshot", json!({"output": output})),
-        Commands::ScreencastStart { output, format } => (
-            "screencast-start",
-            json!({ "output": output, "format": format }),
-        ),
-        Commands::ScreencastStop => (
-            "screencast-stop",
-            json!({}),
-        ),
         Commands::ReadPage { output } => ("read-page", json!({"output": output})),
         Commands::Emulate {
             viewport,
@@ -1011,22 +986,6 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 &session_id,
                 cli.output_format(),
                 output.as_deref(),
-            )
-            .await
-        }
-        Commands::ScreencastStart { output, format } => {
-            commands::screencast::screencast_start(
-                &mut client,
-                &session_id,
-                output,
-                format.as_deref(),
-            )
-            .await
-        }
-        Commands::ScreencastStop => {
-            commands::screencast::screencast_stop(
-                &mut client,
-                &session_id,
             )
             .await
         }

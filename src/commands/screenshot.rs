@@ -74,11 +74,11 @@ pub async fn take_screenshot(
     let mut clip_scale = 1.0;
     if max_width.is_some() || max_height.is_some() {
         let width_scale = match max_width {
-            Some(max_w) if src_w > 0.0 => (max_w / src_w).min(1.0),
+            Some(max_w) if max_w > 0.0 && src_w > 0.0 => (max_w / src_w).min(1.0),
             _ => 1.0,
         };
         let height_scale = match max_height {
-            Some(max_h) if src_h > 0.0 => (max_h / src_h).min(1.0),
+            Some(max_h) if max_h > 0.0 && src_h > 0.0 => (max_h / src_h).min(1.0),
             _ => 1.0,
         };
         clip_scale = width_scale.min(height_scale);

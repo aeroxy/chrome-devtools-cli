@@ -19,33 +19,38 @@ pub async fn take_heapsnapshot(
     // First, let's enable the HeapProfiler.
     client.send_to_target(session_id, "HeapProfiler.enable", json!({})).await?;
 
-    client.send_to_target(
-        session_id,
-        "HeapProfiler.takeHeapSnapshot",
-        json!({ "reportProgress": false, "treatGlobalObjectsAsRoots": true, "captureNumericValue": true }),
-    ).await?;
+    let snapshot_result = async {
+        client.send_to_target(
+            session_id,
+            "HeapProfiler.takeHeapSnapshot",
+            json!({ "reportProgress": false, "treatGlobalObjectsAsRoots": true, "captureNumericValue": true }),
+        ).await?;
 
-    use tokio::io::AsyncWriteExt;
-    loop {
-        // Read text from WebSocket directly
-        let text = client.read_text().await?;
-        let event: serde_json::Value = serde_json::from_str(&text)?;
-        let method = event["method"].as_str().unwrap_or("");
-        
-        if method == "HeapProfiler.addHeapSnapshotChunk" {
-            if let Some(chunk) = event["params"]["chunk"].as_str() {
-                file.write_all(chunk.as_bytes()).await?;
-            }
-        } else if method == "HeapProfiler.reportHeapSnapshotProgress" {
-            if let Some(finished) = event["params"]["finished"].as_bool() {
-                if finished {
-                    break;
+        use tokio::io::AsyncWriteExt;
+        loop {
+            // Read text from WebSocket directly
+            let text = client.read_text().await?;
+            let event: serde_json::Value = serde_json::from_str(&text)?;
+            let method = event["method"].as_str().unwrap_or("");
+            
+            if method == "HeapProfiler.addHeapSnapshotChunk" {
+                if let Some(chunk) = event["params"]["chunk"].as_str() {
+                    file.write_all(chunk.as_bytes()).await?;
+                }
+            } else if method == "HeapProfiler.reportHeapSnapshotProgress" {
+                if let Some(finished) = event["params"]["finished"].as_bool() {
+                    if finished {
+                        break;
+                    }
                 }
             }
         }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
 
     let _ = client.send_to_target(session_id, "HeapProfiler.disable", json!({})).await;
+    snapshot_result?;
 
     Ok(CommandResult::output(format!(
         "Heap snapshot successfully saved to {}",
@@ -86,8 +91,8 @@ pub async fn get_heapsnapshot_dominators(
     // Find the target node
     let mut target_index = None;
     let mut current_idx = 0;
-    while current_idx < nodes.len() {
-        let id = nodes[current_idx + id_offset].as_u64().unwrap_or(0);
+    while current_idx + id_offset < nodes.len() {
+        let id = nodes.get(current_idx + id_offset).and_then(|v| v.as_u64()).unwrap_or(0);
         if id == node_id {
             target_index = Some(current_idx);
             break;
@@ -100,9 +105,9 @@ pub async fn get_heapsnapshot_dominators(
         None => bail!("Node with ID {} not found", node_id),
     };
 
-    let name_str_idx = nodes[target_node_index + name_offset].as_u64().unwrap_or(0) as usize;
+    let name_str_idx = nodes.get(target_node_index + name_offset).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let name = val["strings"].get(name_str_idx).and_then(|v| v.as_str()).unwrap_or("unknown");
-    let self_size = nodes[target_node_index + self_size_offset].as_u64().unwrap_or(0);
+    let self_size = nodes.get(target_node_index + self_size_offset).and_then(|v| v.as_u64()).unwrap_or(0);
 
     // Render a friendly message with the node details
     let mut out = String::new();

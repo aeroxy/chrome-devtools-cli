@@ -52,8 +52,6 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "press-key" => &["key"],
         "hover" => &["selector"],
         "snapshot" => &["output"],
-        "screencast-start" => &["output", "format"],
-        "screencast-stop" => &[],
         "read-page" => &["output"],
         "take-heapsnapshot" => &["output"],
         "get-heapsnapshot-dominators" => &["file_path", "node_id"],
@@ -445,21 +443,6 @@ async fn inner_execute(
                 args.get("output").and_then(|v| v.as_str()),
             )
             .await
-        }
-        "screencast-start" => match args.get("output").and_then(|v| v.as_str()) {
-            Some(output) => {
-                commands::screencast::screencast_start(
-                    client,
-                    session_id,
-                    output,
-                    args.get("format").and_then(|v| v.as_str()),
-                )
-                .await
-            }
-            None => bail!("output required"),
-        },
-        "screencast-stop" => {
-            commands::screencast::screencast_stop(client, session_id).await
         }
         "read-page" => {
             commands::read_page::read_page(
