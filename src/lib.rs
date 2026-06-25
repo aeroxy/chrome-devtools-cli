@@ -229,13 +229,13 @@ pub enum Commands {
         output: String,
     },
 
-    /// Retrieve the dominator chain for a specific node ID from a local heap snapshot
-    #[command(name = "get-heapsnapshot-dominators")]
-    GetHeapSnapshotDominators {
+    /// Inspect a specific node ID details from a local heap snapshot
+    #[command(name = "inspect-heapsnapshot-node")]
+    InspectHeapSnapshotNode {
         /// Path to the .heapsnapshot file to analyze
         #[arg(long, short)]
         file_path: String,
-        /// Node ID to get the dominator chain for
+        /// Node ID to inspect
         #[arg(long, short)]
         node_id: u64,
     },
@@ -342,7 +342,7 @@ impl Cli {
     fn is_browser_level(&self) -> bool {
         matches!(
             self.command,
-            Commands::ListPages | Commands::NewPage { .. } | Commands::SwLogs { .. }
+            Commands::ListPages | Commands::NewPage { .. } | Commands::SwLogs { .. } | Commands::InspectHeapSnapshotNode { .. }
         )
     }
 
@@ -365,7 +365,7 @@ impl Cli {
             Commands::Snapshot { .. } => "snapshot",
             Commands::ReadPage { .. } => "read-page",
             Commands::TakeHeapSnapshot { .. } => "take-heapsnapshot",
-            Commands::GetHeapSnapshotDominators { .. } => "get-heapsnapshot-dominators",
+            Commands::InspectHeapSnapshotNode { .. } => "inspect-heapsnapshot-node",
             Commands::Emulate { .. } => "emulate",
             Commands::WaitFor { .. } => "wait-for",
             Commands::List3pTools => "list-3p-tools",
@@ -442,8 +442,8 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             "take-heapsnapshot",
             json!({ "output": output }),
         ),
-        Commands::GetHeapSnapshotDominators { file_path, node_id } => (
-            "get-heapsnapshot-dominators",
+        Commands::InspectHeapSnapshotNode { file_path, node_id } => (
+            "inspect-heapsnapshot-node",
             json!({ "file_path": file_path, "node_id": node_id }),
         ),
         Commands::Screenshot {
@@ -795,6 +795,16 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 )
                 .await
             }
+            Commands::InspectHeapSnapshotNode { file_path, node_id } => {
+                commands::memory::inspect_heapsnapshot_node(
+                    &mut client,
+                    "",
+                    file_path,
+                    *node_id,
+                    cli.output_format(),
+                )
+                .await
+            }
             _ => unreachable!(),
         };
     }
@@ -939,10 +949,13 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             )
             .await
         }
-        Commands::GetHeapSnapshotDominators { file_path, node_id } => {
-            commands::memory::get_heapsnapshot_dominators(
+        Commands::InspectHeapSnapshotNode { file_path, node_id } => {
+            commands::memory::inspect_heapsnapshot_node(
+                &mut client,
+                &session_id,
                 file_path,
                 *node_id,
+                cli.output_format(),
             )
             .await
         }

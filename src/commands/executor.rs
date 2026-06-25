@@ -54,7 +54,7 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "snapshot" => &["output"],
         "read-page" => &["output"],
         "take-heapsnapshot" => &["output"],
-        "get-heapsnapshot-dominators" => &["file_path", "node_id"],
+        "inspect-heapsnapshot-node" => &["file_path", "node_id"],
         "emulate" => &[
             "viewport",
             "device_scale_factor",
@@ -107,7 +107,7 @@ fn validate_args(cmd: &str, args: &serde_json::Value) -> Result<()> {
 
 /// Whether a command operates at the browser level (no page session needed).
 fn is_browser_level(cmd: &str) -> bool {
-    matches!(cmd, "list-pages" | "new-page" | "sw-logs" | "kill-daemon")
+    matches!(cmd, "list-pages" | "new-page" | "sw-logs" | "inspect-heapsnapshot-node" | "kill-daemon")
 }
 
 /// Execute a single command from a [`DaemonRequest`].
@@ -184,6 +184,15 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                 commands::sw_logs::collect_sw_logs(client, duration, extension_id, req.format())
                     .await
             }
+            "inspect-heapsnapshot-node" => match (
+                args.get("file_path").and_then(|v| v.as_str()),
+                args.get("node_id").and_then(|v| v.as_u64()),
+            ) {
+                (Some(file_path), Some(node_id)) => {
+                    commands::memory::inspect_heapsnapshot_node(client, "", file_path, node_id, req.format()).await
+                }
+                _ => bail!("file_path and node_id required"),
+            },
             "kill-daemon" => Ok(CommandResult::output(
                 "kill-daemon is handled directly by the CLI, not the daemon.",
             )),
@@ -458,15 +467,6 @@ async fn inner_execute(
                 commands::memory::take_heapsnapshot(client, session_id, output).await
             }
             None => bail!("output required"),
-        },
-        "get-heapsnapshot-dominators" => match (
-            args.get("file_path").and_then(|v| v.as_str()),
-            args.get("node_id").and_then(|v| v.as_u64()),
-        ) {
-            (Some(file_path), Some(node_id)) => {
-                commands::memory::get_heapsnapshot_dominators(file_path, node_id).await
-            }
-            _ => bail!("file_path and node_id required"),
         },
         "emulate" => {
             // block/unblock come from the global request fields (the single flag
