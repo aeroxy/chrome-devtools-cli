@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 use serde_json::json;
 
@@ -51,38 +51,27 @@ pub async fn take_screenshot(
     if needs_metrics {
         if full_page {
             params["captureBeyondViewport"] = json!(true);
-            let metrics = client
-                .send_to_target(
-                    session_id,
-                    "Runtime.evaluate",
-                    json!({
-                        "expression": "JSON.stringify({width: (document.documentElement?.scrollWidth ?? window.innerWidth), height: (document.documentElement?.scrollHeight ?? window.innerHeight)})",
-                        "returnByValue": true,
-                    }),
-                )
-                .await?;
-            if let Some(val) = metrics["result"]["value"].as_str() {
-                if let Ok(dims) = serde_json::from_str::<serde_json::Value>(val) {
-                    src_w = dims["width"].as_f64().unwrap_or(1920.0);
-                    src_h = dims["height"].as_f64().unwrap_or(1080.0);
-                }
+        }
+
+        // Use Page.getLayoutMetrics instead of Runtime.evaluate: it queries the
+        // renderer's layout system directly, works on non-HTML pages (PDF viewers,
+        // chrome://), and avoids a JS execution round-trip.
+        let metrics = client
+            .send_to_target(session_id, "Page.getLayoutMetrics", json!({}))
+            .await
+            .context("Failed to query page layout metrics")?;
+
+        if full_page {
+            // contentSize is the full scrollable content area.
+            if let Some(size) = metrics.get("contentSize") {
+                src_w = size["width"].as_f64().unwrap_or(1920.0);
+                src_h = size["height"].as_f64().unwrap_or(1080.0);
             }
         } else {
-            let metrics = client
-                .send_to_target(
-                    session_id,
-                    "Runtime.evaluate",
-                    json!({
-                        "expression": "JSON.stringify({width: window.innerWidth, height: window.innerHeight})",
-                        "returnByValue": true,
-                    }),
-                )
-                .await?;
-            if let Some(val) = metrics["result"]["value"].as_str() {
-                if let Ok(dims) = serde_json::from_str::<serde_json::Value>(val) {
-                    src_w = dims["width"].as_f64().unwrap_or(1920.0);
-                    src_h = dims["height"].as_f64().unwrap_or(1080.0);
-                }
+            // layoutViewport.clientWidth/Height is the visible viewport.
+            if let Some(viewport) = metrics.get("layoutViewport") {
+                src_w = viewport["clientWidth"].as_f64().unwrap_or(1920.0);
+                src_h = viewport["clientHeight"].as_f64().unwrap_or(1080.0);
             }
         }
     }
@@ -102,7 +91,8 @@ pub async fn take_screenshot(
 
     let result = client
         .send_to_target(session_id, "Page.captureScreenshot", params)
-        .await?;
+        .await
+        .context("Failed to capture screenshot via CDP")?;
 
     let data_b64 = result["data"]
         .as_str()
@@ -112,7 +102,9 @@ pub async fn take_screenshot(
 
     match output {
         Some(path) => {
-            tokio::fs::write(&path, &bytes).await?;
+            tokio::fs::write(&path, &bytes)
+                .await
+                .with_context(|| format!("Failed to write screenshot to {}", path))?;
             Ok(CommandResult::output(format!(
                 "Screenshot saved to {path} ({} bytes)",
                 bytes.len()

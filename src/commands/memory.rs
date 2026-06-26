@@ -14,12 +14,17 @@ pub async fn take_heapsnapshot(
     format: crate::format::OutputFormat,
 ) -> Result<CommandResult> {
     use anyhow::Context;
+    // Write to a temp file in the same directory so a failed/partial stream
+    // never leaves a corrupt file at the final output path. The temp file is
+    // renamed to `output` only after the snapshot completes successfully.
+    let output_path = std::path::Path::new(output);
+    let temp_path = output_path.with_extension("heapsnapshot.tmp");
     // Heap snapshots can be tens or hundreds of MB; buffer the writes to avoid a
     // syscall per streamed chunk.
     let mut file = tokio::io::BufWriter::new(
-        tokio::fs::File::create(output)
+        tokio::fs::File::create(&temp_path)
             .await
-            .with_context(|| format!("Failed to create heap snapshot output file: {}", output))?,
+            .with_context(|| format!("Failed to create heap snapshot temp file: {}", temp_path.display()))?,
     );
     
     // First, let's enable the HeapProfiler.
@@ -80,7 +85,17 @@ pub async fn take_heapsnapshot(
     .await;
 
     let _ = client.send_to_target(session_id, "HeapProfiler.disable", json!({})).await;
-    snapshot_result?;
+
+    if let Err(e) = snapshot_result {
+        // Clean up the partial temp file so a failed run leaves no artifacts.
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(e);
+    }
+
+    // Atomically move the completed temp file to the final output path.
+    tokio::fs::rename(&temp_path, output_path)
+        .await
+        .with_context(|| format!("Failed to rename temp file to final output: {}", output))?;
 
     if format.is_text() {
         Ok(CommandResult::output(format!(
@@ -164,7 +179,8 @@ pub fn parse_node_from_snapshot(
     }
 
     let name_str_idx = nodes[target_node_index + name_offset] as usize;
-    let name = val.strings.get(name_str_idx).cloned().unwrap_or_else(|| "unknown".to_string());
+    let name = val.strings.get(name_str_idx).cloned()
+        .ok_or_else(|| anyhow!("Corrupt snapshot: string index {} out of bounds (strings len {})", name_str_idx, val.strings.len()))?;
     let self_size = nodes[target_node_index + self_size_offset];
 
     Ok((name, self_size))
