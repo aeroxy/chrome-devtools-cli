@@ -14,9 +14,13 @@ pub async fn take_heapsnapshot(
     format: crate::format::OutputFormat,
 ) -> Result<CommandResult> {
     use anyhow::Context;
-    let mut file = tokio::fs::File::create(output)
-        .await
-        .with_context(|| format!("Failed to create heap snapshot output file: {}", output))?;
+    // Heap snapshots can be tens or hundreds of MB; buffer the writes to avoid a
+    // syscall per streamed chunk.
+    let mut file = tokio::io::BufWriter::new(
+        tokio::fs::File::create(output)
+            .await
+            .with_context(|| format!("Failed to create heap snapshot output file: {}", output))?,
+    );
     
     // First, let's enable the HeapProfiler.
     client.send_to_target(session_id, "HeapProfiler.enable", json!({}))
@@ -65,6 +69,11 @@ pub async fn take_heapsnapshot(
                 client.events.push_back(event);
             }
         }
+        // Flush any buffered snapshot bytes before the writer is dropped;
+        // BufWriter::drop performs a blocking flush, which we avoid in async code.
+        file.flush()
+            .await
+            .context("Failed to flush buffered heap snapshot bytes to output file")?;
         Ok::<(), anyhow::Error>(())
     }
     .await;
