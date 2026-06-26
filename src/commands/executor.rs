@@ -379,14 +379,21 @@ async fn inner_execute(
             commands::screenshot::take_screenshot(
                 client,
                 session_id,
-                args.get("output").and_then(|v| v.as_str()),
-                args.get("format").and_then(|v| v.as_str()).unwrap_or("png"),
-                args.get("full_page")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                args.get("quality").and_then(|v| v.as_u64()),
-                args.get("max_width").and_then(|v| v.as_f64()),
-                args.get("max_height").and_then(|v| v.as_f64()),
+                commands::screenshot::ScreenshotOptions {
+                    output: args.get("output").and_then(|v| v.as_str()).map(String::from),
+                    format: args
+                        .get("format")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("png")
+                        .to_string(),
+                    full_page: args
+                        .get("full_page")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    quality: args.get("quality").and_then(|v| v.as_u64()),
+                    max_width: args.get("max_width").and_then(|v| v.as_f64()),
+                    max_height: args.get("max_height").and_then(|v| v.as_f64()),
+                },
             )
             .await
         }
