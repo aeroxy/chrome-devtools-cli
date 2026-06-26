@@ -184,15 +184,6 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                 commands::sw_logs::collect_sw_logs(client, duration, extension_id, req.format())
                     .await
             }
-            "inspect-heapsnapshot-node" => match (
-                args.get("file_path").and_then(|v| v.as_str()),
-                args.get("node_id").and_then(|v| v.as_u64()),
-            ) {
-                (Some(file_path), Some(node_id)) => {
-                    commands::memory::inspect_heapsnapshot_node(client, "", file_path, node_id, req.format()).await
-                }
-                _ => bail!("file_path and node_id required"),
-            },
             "kill-daemon" => Ok(CommandResult::output(
                 "kill-daemon is handled directly by the CLI, not the daemon.",
             )),
