@@ -18,7 +18,13 @@ pub async fn take_heapsnapshot(
     // never leaves a corrupt file at the final output path. The temp file is
     // renamed to `output` only after the snapshot completes successfully.
     let output_path = std::path::Path::new(output);
-    let temp_path = output_path.with_extension("heapsnapshot.tmp");
+    // Unique temp file (PID-suffixed) in the same directory so concurrent runs
+    // can't collide, and rename is atomic (same filesystem).
+    let temp_path = output_path.with_file_name(format!(
+        ".{}.{}.tmp",
+        output_path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+    ));
     // Heap snapshots can be tens or hundreds of MB; buffer the writes to avoid a
     // syscall per streamed chunk.
     let mut file = tokio::io::BufWriter::new(
@@ -142,9 +148,16 @@ pub fn parse_node_from_snapshot(
     let val: HeapSnapshot = serde_json::from_reader(reader)
         .context("Failed to deserialize heap snapshot file. Ensure it is valid JSON.")?;
 
+    find_node_in_snapshot(&val, node_id)
+}
+
+/// Pure schema-validation + node-lookup logic, separated from I/O so it can be
+/// unit-tested without writing a temp file.
+fn find_node_in_snapshot(val: &HeapSnapshot, node_id: u64) -> Result<(String, u64)> {
+    use anyhow::Context;
     let nodes = &val.nodes;
     let node_fields = &val.snapshot.meta.node_fields;
-    
+
     // Find fields offsets within the flat nodes array
     let id_offset = node_fields.iter().position(|f| f == "id")
         .context("Invalid snapshot schema: 'id' node field meta is missing")?;
@@ -178,7 +191,9 @@ pub fn parse_node_from_snapshot(
         bail!("Corrupted snapshot structure: target node index out of flat bounds");
     }
 
-    let name_str_idx = nodes[target_node_index + name_offset] as usize;
+    let name_str_idx = usize::try_from(nodes[target_node_index + name_offset])
+        .ok()
+        .context("Corrupt snapshot: string index overflow on 32-bit architecture")?;
     let name = val.strings.get(name_str_idx).cloned()
         .ok_or_else(|| anyhow!("Corrupt snapshot: string index {} out of bounds (strings len {})", name_str_idx, val.strings.len()))?;
     let self_size = nodes[target_node_index + self_size_offset];
@@ -226,6 +241,17 @@ pub async fn inspect_heapsnapshot_node(
     node_id: u64,
     format: crate::format::OutputFormat,
 ) -> Result<CommandResult> {
+    inspect_heapsnapshot_node_offline(file_path, node_id, format).await
+}
+
+/// Offline variant that doesn't require a Chrome connection. Used by the CLI's
+/// early-intercept path so `inspect-heapsnapshot-node` works without a running
+/// browser or daemon.
+pub async fn inspect_heapsnapshot_node_offline(
+    file_path: &str,
+    node_id: u64,
+    format: crate::format::OutputFormat,
+) -> Result<CommandResult> {
     let file_path_owned = file_path.to_string();
     let (name, self_size) = tokio::task::spawn_blocking(move || {
         parse_node_from_snapshot(&file_path_owned, node_id)
@@ -261,6 +287,56 @@ mod tests {
         let (name, size) = parse_node_from_snapshot(file.path().to_str().unwrap(), 456).unwrap();
         assert_eq!(name, "AnotherObject");
         assert_eq!(size, 2048);
+    }
+
+    #[test]
+    fn test_find_node_in_snapshot_directly() {
+        // Exercise the pure helper without going through file I/O.
+        let snapshot = HeapSnapshot {
+            snapshot: SnapshotMeta {
+                meta: MetaDetails {
+                    node_fields: vec!["id".into(), "name".into(), "self_size".into()],
+                },
+            },
+            nodes: vec![10, 0, 100, 20, 1, 200],
+            strings: vec!["Alpha".into(), "Beta".into()],
+        };
+
+        let (name, size) = find_node_in_snapshot(&snapshot, 20).unwrap();
+        assert_eq!(name, "Beta");
+        assert_eq!(size, 200);
+    }
+
+    #[test]
+    fn test_find_node_not_found() {
+        let snapshot = HeapSnapshot {
+            snapshot: SnapshotMeta {
+                meta: MetaDetails {
+                    node_fields: vec!["id".into(), "name".into(), "self_size".into()],
+                },
+            },
+            nodes: vec![10, 0, 100],
+            strings: vec!["Alpha".into()],
+        };
+
+        assert!(find_node_in_snapshot(&snapshot, 999).is_err());
+    }
+
+    #[test]
+    fn test_find_node_corrupt_string_index() {
+        // string index 5 is out of bounds (only 1 string exists)
+        let snapshot = HeapSnapshot {
+            snapshot: SnapshotMeta {
+                meta: MetaDetails {
+                    node_fields: vec!["id".into(), "name".into(), "self_size".into()],
+                },
+            },
+            nodes: vec![10, 5, 100],
+            strings: vec!["Alpha".into()],
+        };
+
+        let err = find_node_in_snapshot(&snapshot, 10).unwrap_err();
+        assert!(err.to_string().contains("out of bounds"));
     }
 
     #[test]

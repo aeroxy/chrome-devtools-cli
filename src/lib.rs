@@ -342,7 +342,7 @@ impl Cli {
     fn is_browser_level(&self) -> bool {
         matches!(
             self.command,
-            Commands::ListPages | Commands::NewPage { .. } | Commands::SwLogs { .. } | Commands::InspectHeapSnapshotNode { .. }
+            Commands::ListPages | Commands::NewPage { .. } | Commands::SwLogs { .. }
         )
     }
 
@@ -379,7 +379,29 @@ impl Cli {
 }
 
 /// Build a DaemonRequest from parsed CLI args.
+/// Resolve a relative path to an absolute one using the CLI process's CWD.
+/// The daemon retains its own startup CWD, so relative paths sent to it would
+/// resolve against the wrong directory.
+fn absolutize_path(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        path.to_string()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(p)
+            .to_string_lossy()
+            .to_string()
+    }
+}
+
 fn build_request(cli: &Cli) -> DaemonRequest {
+    // Resolve relative file paths to absolute so the daemon (which retains its
+    // own startup CWD) resolves them correctly.
+    let absolutize = |p: &Option<String>| -> Option<String> {
+        p.as_ref().map(|s| absolutize_path(s))
+    };
+
     let (command, args) = match &cli.command {
         Commands::ListPages => ("list-pages", json!({})),
         Commands::Navigate {
@@ -409,7 +431,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
                 "geolocation": geolocation,
                 "accuracy": accuracy,
                 "clear_all": clear_all,
-                "output": output
+                "output": absolutize(output)
             }),
         ),
         Commands::NewPage {
@@ -440,11 +462,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         }
         Commands::TakeHeapSnapshot { output } => (
             "take-heapsnapshot",
-            json!({ "output": output }),
-        ),
-        Commands::InspectHeapSnapshotNode { file_path, node_id } => (
-            "inspect-heapsnapshot-node",
-            json!({ "file_path": file_path, "node_id": node_id }),
+            json!({ "output": absolutize_path(output) }),
         ),
         Commands::Screenshot {
             output,
@@ -456,7 +474,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         } => (
             "screenshot",
             json!({
-                "output": output,
+                "output": absolutize(output),
                 "format": format,
                 "full_page": full_page,
                 "quality": quality,
@@ -471,7 +489,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             track_navigation,
         } => (
             "evaluate",
-            json!({"expression": expression, "dialog_action": dialog_action, "output": output, "track_navigation": track_navigation}),
+            json!({"expression": expression, "dialog_action": dialog_action, "output": absolutize(output), "track_navigation": track_navigation}),
         ),
         Commands::Click { selector } => ("click", json!({"selector": selector})),
         Commands::ClickAt { x, y } => ("click-at", json!({"x": x, "y": y})),
@@ -483,8 +501,8 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         }
         Commands::PressKey { key } => ("press-key", json!({"key": key})),
         Commands::Hover { selector } => ("hover", json!({"selector": selector})),
-        Commands::Snapshot { output } => ("snapshot", json!({"output": output})),
-        Commands::ReadPage { output } => ("read-page", json!({"output": output})),
+        Commands::Snapshot { output } => ("snapshot", json!({"output": absolutize(output)})),
+        Commands::ReadPage { output } => ("read-page", json!({"output": absolutize(output)})),
         Commands::Emulate {
             viewport,
             device_scale_factor,
@@ -520,6 +538,9 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             json!({"duration": duration, "extension_id": extension_id}),
         ),
         Commands::KillDaemon => unreachable!("KillDaemon is handled before build_request"),
+        Commands::InspectHeapSnapshotNode { .. } => {
+            unreachable!("InspectHeapSnapshotNode is handled before build_request")
+        }
     };
 
     DaemonRequest {
@@ -686,6 +707,19 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
+    // Handle inspect-heapsnapshot-node without connecting to Chrome — it's a
+    // purely offline operation that parses a local .heapsnapshot file.
+    if let Commands::InspectHeapSnapshotNode { file_path, node_id } = &cli.command {
+        let result = commands::memory::inspect_heapsnapshot_node_offline(
+            file_path,
+            *node_id,
+            cli.output_format(),
+        )
+        .await?;
+        print_result(&result);
+        return Ok(());
+    }
+
     let ws_url = browser::resolve_ws_url(
         cli.ws_endpoint.as_deref(),
         cli.user_data_dir.as_deref(),
@@ -791,16 +825,6 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                     &mut client,
                     *duration,
                     extension_id.as_deref(),
-                    cli.output_format(),
-                )
-                .await
-            }
-            Commands::InspectHeapSnapshotNode { file_path, node_id } => {
-                commands::memory::inspect_heapsnapshot_node(
-                    &mut client,
-                    "",
-                    file_path,
-                    *node_id,
                     cli.output_format(),
                 )
                 .await
