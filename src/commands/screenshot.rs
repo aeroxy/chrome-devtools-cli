@@ -56,7 +56,7 @@ pub async fn take_screenshot(
                     session_id,
                     "Runtime.evaluate",
                     json!({
-                        "expression": "JSON.stringify({width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight})",
+                        "expression": "JSON.stringify({width: (document.documentElement?.scrollWidth ?? window.innerWidth), height: (document.documentElement?.scrollHeight ?? window.innerHeight)})",
                         "returnByValue": true,
                     }),
                 )

@@ -32,7 +32,7 @@ pub async fn take_heapsnapshot(
         let msg_id = client.send_raw_no_wait(
             Some(session_id),
             "HeapProfiler.takeHeapSnapshot",
-            json!({ "reportProgress": true, "treatGlobalObjectsAsRoots": true, "captureNumericValue": true }),
+            json!({ "reportProgress": false, "treatGlobalObjectsAsRoots": true, "captureNumericValue": true }),
         )
         .await
         .context("Failed to trigger non-blocking HeapProfiler.takeHeapSnapshot command")?;
@@ -63,8 +63,6 @@ pub async fn take_heapsnapshot(
                         .await
                         .context("Failed to write snapshot chunk bytes to output file")?;
                 }
-            } else if method == "HeapProfiler.reportHeapSnapshotProgress" {
-                // Ignore progress events to avoid polluting the client events buffer
             } else if event.get("method").is_some() {
                 // Route through push_event so Network/Runtime events land in
                 // network_events/console_events (capped) instead of the generic
