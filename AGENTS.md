@@ -30,6 +30,7 @@ src/
     ├── screenshot.rs
     ├── snapshot.rs
     ├── read_page.rs  # read-page (Readability + HTML→Markdown)
+    ├── memory.rs     # take-heapsnapshot (CDP streaming) + inspect-heapsnapshot-node (offline)
     ├── evaluate.rs
     ├── input.rs      # click/fill/type/press/hover
     ├── emulation.rs  # emulate (viewport/geolocation/blocklist)
@@ -69,6 +70,18 @@ continuously collects `Network.*` and `Runtime.*` events. `console` and
 
 All commands default to human-readable text. `--json` and `--toon` (compact,
 LLM-friendly) produce structured output. Mutually exclusive.
+
+### Offline Commands
+
+`inspect-heapsnapshot-node` and `kill-daemon` are intercepted early in `run()`
+before any Chrome connection or daemon spawn. `inspect-heapsnapshot-node` parses
+a local `.heapsnapshot` file purely offline.
+
+### Path Resolution
+
+The daemon retains its startup CWD, so the CLI resolves all relative file-path
+arguments (`--output`, `--file-path`) to absolute paths in `build_request`
+before sending them to the daemon.
 
 ## Build & Test
 

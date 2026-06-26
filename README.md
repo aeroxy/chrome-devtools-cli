@@ -130,10 +130,13 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 |---------|-------------|
 | `screenshot --output <path>` | Save screenshot to file |
 | `screenshot --full-page` | Capture full scrollable page |
+| `screenshot --max-width <px> --max-height <px>` | Downscale screenshot to fit within dimensions |
 | `read-page` | Read page content as clean markdown (extracts main article) |
 | `read-page --output <path>` | Save markdown to file |
 | `evaluate <expr> [--dialog-action <action>]` | Run JavaScript (optionally handle dialogs: accept, dismiss, or prompt text) |
 | `snapshot` | Accessibility tree dump |
+| `take-heapsnapshot --output <path>` | Capture V8 heap snapshot (streamed via CDP) |
+| `inspect-heapsnapshot-node --file-path <path> --node-id <id>` | Inspect a node in a local `.heapsnapshot` file (offline, no Chrome needed) |
 
 ### Interaction
 
@@ -226,12 +229,10 @@ The daemon keeps a persistent CDP session on the current page to:
 - Re-attach to a new target when `--target` changes (the previous target's event buffers are discarded on the switch).
 
 ## Source layout
- 
--```
-+```text
- src/
- ├── main.rs           # Entry point + daemon dispatch
 
+```text
+src/
+├── main.rs           # Entry point + daemon dispatch
 ├── lib.rs            # CLI (clap) + command routing
 ├── cdp.rs            # Raw CDP over WebSocket (JSON-RPC) + persistent session
 ├── browser.rs        # Auto-connect (DevToolsActivePort)
@@ -251,6 +252,7 @@ The daemon keeps a persistent CDP session on the current page to:
     ├── screenshot.rs
     ├── snapshot.rs
     ├── read_page.rs  # read-page (Readability extraction + HTML→Markdown)
+    ├── memory.rs     # take-heapsnapshot (CDP streaming) + inspect-heapsnapshot-node (offline)
     ├── evaluate.rs
     ├── executor.rs   # Command dispatch + persistent-session reuse
     ├── input.rs      # click/fill/type/press/hover
