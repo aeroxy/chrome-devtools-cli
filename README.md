@@ -131,8 +131,8 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 | `screenshot --output <path>` | Save screenshot to file |
 | `screenshot --full-page` | Capture full scrollable page |
 | `screenshot --max-width <px> --max-height <px>` | Downscale screenshot to fit within dimensions |
-| `read-page` | Read page content as clean markdown (extracts main article) |
-| `read-page --output <path>` | Save markdown to file |
+| `read-page` | Read page content as clean Markdown (extracts main article) |
+| `read-page --output <path>` | Save Markdown to file |
 | `evaluate <expr> [--dialog-action <action>]` | Run JavaScript (optionally handle dialogs: accept, dismiss, or prompt text) |
 | `snapshot` | Accessibility tree dump |
 | `take-heapsnapshot --output <path>` | Capture V8 heap snapshot (streamed via CDP) |

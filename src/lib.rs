@@ -382,24 +382,28 @@ impl Cli {
 /// Resolve a relative path to an absolute one using the CLI process's CWD.
 /// The daemon retains its own startup CWD, so relative paths sent to it would
 /// resolve against the wrong directory.
-fn absolutize_path(path: &str) -> String {
+fn absolutize_path(path: &str) -> Result<String> {
     let p = std::path::Path::new(path);
     if p.is_absolute() {
-        path.to_string()
+        Ok(path.to_string())
     } else {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join(p)
-            .to_string_lossy()
-            .to_string()
+        // Fail loudly if the CWD can't be resolved: silently falling back to an
+        // empty path would send a bogus relative path to the daemon, which would
+        // resolve it against the daemon's (different) startup CWD.
+        let cwd = std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("Failed to resolve CLI working directory to absolutize path '{path}': {e}"))?;
+        Ok(cwd.join(p).to_string_lossy().to_string())
     }
 }
 
-fn build_request(cli: &Cli) -> DaemonRequest {
+fn build_request(cli: &Cli) -> Result<DaemonRequest> {
     // Resolve relative file paths to absolute so the daemon (which retains its
     // own startup CWD) resolves them correctly.
-    let absolutize = |p: &Option<String>| -> Option<String> {
-        p.as_ref().map(|s| absolutize_path(s))
+    let absolutize = |p: &Option<String>| -> Result<Option<String>> {
+        match p {
+            None => Ok(None),
+            Some(s) => Ok(Some(absolutize_path(s)?)),
+        }
     };
 
     let (command, args) = match &cli.command {
@@ -431,7 +435,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
                 "geolocation": geolocation,
                 "accuracy": accuracy,
                 "clear_all": clear_all,
-                "output": absolutize(output)
+                "output": absolutize(output)?
             }),
         ),
         Commands::NewPage {
@@ -462,7 +466,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         }
         Commands::TakeHeapSnapshot { output } => (
             "take-heapsnapshot",
-            json!({ "output": absolutize_path(output) }),
+            json!({ "output": absolutize_path(output)? }),
         ),
         Commands::Screenshot {
             output,
@@ -474,7 +478,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         } => (
             "screenshot",
             json!({
-                "output": absolutize(output),
+                "output": absolutize(output)?,
                 "format": format,
                 "full_page": full_page,
                 "quality": quality,
@@ -489,7 +493,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
             track_navigation,
         } => (
             "evaluate",
-            json!({"expression": expression, "dialog_action": dialog_action, "output": absolutize(output), "track_navigation": track_navigation}),
+            json!({"expression": expression, "dialog_action": dialog_action, "output": absolutize(output)?, "track_navigation": track_navigation}),
         ),
         Commands::Click { selector } => ("click", json!({"selector": selector})),
         Commands::ClickAt { x, y } => ("click-at", json!({"x": x, "y": y})),
@@ -501,8 +505,8 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         }
         Commands::PressKey { key } => ("press-key", json!({"key": key})),
         Commands::Hover { selector } => ("hover", json!({"selector": selector})),
-        Commands::Snapshot { output } => ("snapshot", json!({"output": absolutize(output)})),
-        Commands::ReadPage { output } => ("read-page", json!({"output": absolutize(output)})),
+        Commands::Snapshot { output } => ("snapshot", json!({"output": absolutize(output)?})),
+        Commands::ReadPage { output } => ("read-page", json!({"output": absolutize(output)?})),
         Commands::Emulate {
             viewport,
             device_scale_factor,
@@ -543,7 +547,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         }
     };
 
-    DaemonRequest {
+    Ok(DaemonRequest {
         command: command.to_string(),
         args,
         page: cli.page,
@@ -552,7 +556,7 @@ fn build_request(cli: &Cli) -> DaemonRequest {
         output_format: Some(cli.output_format()),
         block_url: cli.block_url.clone(),
         unblock_url: cli.unblock_url.clone(),
-    }
+    })
 }
 
 fn print_output(output: &str, navigated_to: Option<&str>, target_id: Option<&str>) {
@@ -726,7 +730,7 @@ pub async fn run() -> Result<()> {
         &cli.channel,
     )?;
 
-    let request = build_request(&cli);
+    let request = build_request(&cli)?;
 
     // Try daemon first
     if let Ok(resp) = client::send_to_daemon(&request).await {

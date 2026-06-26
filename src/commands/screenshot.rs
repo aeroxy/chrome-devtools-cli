@@ -69,14 +69,16 @@ pub async fn take_screenshot(
         if full_page {
             // contentSize is the full scrollable content area.
             if let Some(size) = metrics.get("contentSize") {
-                src_w = size["width"].as_f64().unwrap_or(1920.0);
-                src_h = size["height"].as_f64().unwrap_or(1080.0);
+                // Filter non-positive values (empty/unrendered pages, certain
+                // document types) — they'd produce an invalid CDP clip.
+                src_w = size["width"].as_f64().filter(|&v| v > 0.0).unwrap_or(1920.0);
+                src_h = size["height"].as_f64().filter(|&v| v > 0.0).unwrap_or(1080.0);
             }
         } else {
             // layoutViewport.clientWidth/Height is the visible viewport.
             if let Some(viewport) = metrics.get("layoutViewport") {
-                src_w = viewport["clientWidth"].as_f64().unwrap_or(1920.0);
-                src_h = viewport["clientHeight"].as_f64().unwrap_or(1080.0);
+                src_w = viewport["clientWidth"].as_f64().filter(|&v| v > 0.0).unwrap_or(1920.0);
+                src_h = viewport["clientHeight"].as_f64().filter(|&v| v > 0.0).unwrap_or(1080.0);
             }
         }
     }
