@@ -66,7 +66,10 @@ pub async fn take_heapsnapshot(
             } else if method == "HeapProfiler.reportHeapSnapshotProgress" {
                 // Ignore progress events to avoid polluting the client events buffer
             } else if event.get("method").is_some() {
-                client.events.push_back(event);
+                // Route through push_event so Network/Runtime events land in
+                // network_events/console_events (capped) instead of the generic
+                // unbounded buffer, and other events get capped too.
+                client.push_event(event);
             }
         }
         // Flush any buffered snapshot bytes before the writer is dropped;

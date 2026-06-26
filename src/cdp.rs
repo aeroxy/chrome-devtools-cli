@@ -406,7 +406,7 @@ impl CdpClient {
         std::mem::take(&mut self.console_events).into()
     }
 
-    fn push_event(&mut self, event: Value) {
+    pub(crate) fn push_event(&mut self, event: Value) {
         // Only route events into the persistent buffers when the event's
         // sessionId matches the persistent page session (flatten-mode events
         // are tagged with sessionId). Events from ad-hoc sessions (sw-logs
