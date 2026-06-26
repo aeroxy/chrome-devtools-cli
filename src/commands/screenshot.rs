@@ -6,16 +6,28 @@ use crate::cdp::CdpClient;
 use crate::result::CommandResult;
 
 /// Capture a screenshot of the current page.
+pub struct ScreenshotOptions {
+    pub output: Option<String>,
+    pub format: String,
+    pub full_page: bool,
+    pub quality: Option<u64>,
+    pub max_width: Option<f64>,
+    pub max_height: Option<f64>,
+}
+
 pub async fn take_screenshot(
     client: &mut CdpClient,
     session_id: &str,
-    output: Option<&str>,
-    format: &str,
-    full_page: bool,
-    quality: Option<u64>,
-    max_width: Option<f64>,
-    max_height: Option<f64>,
+    opts: ScreenshotOptions,
 ) -> Result<CommandResult> {
+    let ScreenshotOptions {
+        output,
+        format,
+        full_page,
+        quality,
+        max_width,
+        max_height,
+    } = opts;
     // Normalize so case-insensitive input (e.g. "PNG") is handled correctly:
     // CDP expects lowercase format values, and the quality check below relies on it.
     let format = format.to_ascii_lowercase();
@@ -109,7 +121,7 @@ pub async fn take_screenshot(
 
     match output {
         Some(path) => {
-            tokio::fs::write(path, &bytes).await?;
+            tokio::fs::write(&path, &bytes).await?;
             Ok(CommandResult::output(format!(
                 "Screenshot saved to {path} ({} bytes)",
                 bytes.len()

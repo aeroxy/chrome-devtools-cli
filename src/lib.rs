@@ -932,12 +932,14 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             commands::screenshot::take_screenshot(
                 &mut client,
                 &session_id,
-                output.as_deref(),
-                format,
-                *full_page,
-                *quality,
-                *max_width,
-                *max_height,
+                commands::screenshot::ScreenshotOptions {
+                    output: output.clone(),
+                    format: format.clone(),
+                    full_page: *full_page,
+                    quality: *quality,
+                    max_width: *max_width,
+                    max_height: *max_height,
+                },
             )
             .await
         }
