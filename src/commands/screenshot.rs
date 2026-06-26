@@ -16,6 +16,9 @@ pub async fn take_screenshot(
     max_width: Option<f64>,
     max_height: Option<f64>,
 ) -> Result<CommandResult> {
+    // Normalize so case-insensitive input (e.g. "PNG") is handled correctly:
+    // CDP expects lowercase format values, and the quality check below relies on it.
+    let format = format.to_ascii_lowercase();
     let mut params = json!({
         "format": format,
         "optimizeForSpeed": true,
