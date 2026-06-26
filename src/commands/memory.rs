@@ -210,14 +210,14 @@ pub fn format_node_details(
 ) -> Result<String> {
     if format.is_text() {
         let mut out = String::new();
-        out.push_str("nodeId,nodeName,selfSize,retainedSize\n");
+        out.push_str("nodeId,nodeName,selfSize\n");
         let escaped_name = if name.contains(',') || name.contains('"') || name.contains('\n') || name.contains('\r') {
             format!("\"{}\"", name.replace('"', "\"\""))
         } else {
             name.to_string()
         };
         out.push_str(&format!(
-            "{},{},{} B,unknown\n",
+            "{},{},{}\n",
             node_id, escaped_name, self_size
         ));
         Ok(out)
@@ -226,22 +226,9 @@ pub fn format_node_details(
             "nodeId": node_id,
             "nodeName": name,
             "selfSize": self_size,
-            "retainedSize": null
         });
         Ok(crate::format::format_structured(&details, format)?)
     }
-}
-
-/// Look up details of a specific node from a local heap snapshot.
-/// Adheres to the command-function contract, accepting client, session_id, and OutputFormat.
-pub async fn inspect_heapsnapshot_node(
-    _client: &mut CdpClient,
-    _session_id: &str,
-    file_path: &str,
-    node_id: u64,
-    format: crate::format::OutputFormat,
-) -> Result<CommandResult> {
-    inspect_heapsnapshot_node_offline(file_path, node_id, format).await
 }
 
 /// Offline variant that doesn't require a Chrome connection. Used by the CLI's
@@ -345,19 +332,19 @@ mod tests {
 
         // Regular name
         let out_normal = format_node_details(123, "MyClass", 100, OutputFormat::Text).unwrap();
-        assert_eq!(out_normal, "nodeId,nodeName,selfSize,retainedSize\n123,MyClass,100 B,unknown\n");
+        assert_eq!(out_normal, "nodeId,nodeName,selfSize\n123,MyClass,100\n");
 
         // Name with comma
         let out_comma = format_node_details(123, "My,Class", 100, OutputFormat::Text).unwrap();
-        assert_eq!(out_comma, "nodeId,nodeName,selfSize,retainedSize\n123,\"My,Class\",100 B,unknown\n");
+        assert_eq!(out_comma, "nodeId,nodeName,selfSize\n123,\"My,Class\",100\n");
 
         // Name with quotes
         let out_quotes = format_node_details(123, "My\"Class", 100, OutputFormat::Text).unwrap();
-        assert_eq!(out_quotes, "nodeId,nodeName,selfSize,retainedSize\n123,\"My\"\"Class\",100 B,unknown\n");
+        assert_eq!(out_quotes, "nodeId,nodeName,selfSize\n123,\"My\"\"Class\",100\n");
 
         // Name with newline
         let out_nl = format_node_details(123, "My\nClass", 100, OutputFormat::Text).unwrap();
-        assert_eq!(out_nl, "nodeId,nodeName,selfSize,retainedSize\n123,\"My\nClass\",100 B,unknown\n");
+        assert_eq!(out_nl, "nodeId,nodeName,selfSize\n123,\"My\nClass\",100\n");
     }
 
     #[test]

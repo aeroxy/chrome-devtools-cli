@@ -2,7 +2,9 @@
 #[test]
 fn test_telemetry_module_accessible() {
     use chrome_devtools_cli::telemetry;
-    assert!(true);
+    // Reference the module so the import isn't flagged unused; this test exists
+    // to assert the module path compiles (i.e. is publicly exported).
+    let _ = telemetry::init_logger_once;
 }
 
 /// Test that TelemetryLogger writes a valid JSON entry and cleans up.

@@ -33,8 +33,13 @@ pub async fn take_screenshot(
     let format = format.to_ascii_lowercase();
     let mut params = json!({
         "format": format,
-        "optimizeForSpeed": true,
     });
+
+    // optimizeForSpeed trades compression/quality for speed, which would override
+    // an explicit --quality setting; only enable it when quality isn't requested.
+    if quality.is_none() {
+        params["optimizeForSpeed"] = json!(true);
+    }
 
     if let Some(q) = quality {
         if format != "png" {
