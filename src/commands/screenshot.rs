@@ -51,6 +51,11 @@ pub async fn take_screenshot(
     // (full-page capture, or downscaling via max_width/max_height).
     let mut src_w = 1920.0;
     let mut src_h = 1080.0;
+    // Scroll offsets of the layout viewport. Clip x/y are relative to the
+    // document origin, so a non-full-page capture of a scrolled viewport must
+    // use these to frame the visible region.
+    let mut scroll_x = 0.0;
+    let mut scroll_y = 0.0;
     let needs_metrics = full_page || max_width.is_some() || max_height.is_some();
 
     if needs_metrics {
@@ -79,18 +84,22 @@ pub async fn take_screenshot(
             if let Some(viewport) = metrics.get("layoutViewport") {
                 src_w = viewport["clientWidth"].as_f64().filter(|&v| v > 0.0).unwrap_or(1920.0);
                 src_h = viewport["clientHeight"].as_f64().filter(|&v| v > 0.0).unwrap_or(1080.0);
+                scroll_x = viewport["pageX"].as_f64().unwrap_or(0.0);
+                scroll_y = viewport["pageY"].as_f64().unwrap_or(0.0);
             }
         }
     }
 
     let clip_scale = clip_scale_factor(src_w, src_h, max_width, max_height);
 
-    // Clip coordinates are relative to the captured region's top-left
-    // (the document origin for full-page, the viewport origin otherwise),
-    // so x/y are always 0.0 — document scroll offsets must NOT be used here.
+    // Clip coordinates are relative to the document origin. For full-page
+    // captures the region starts at the document origin (scroll is irrelevant
+    // since the whole content is captured). For viewport captures with
+    // downscaling, the layout viewport's scroll offsets (pageX/pageY) must be
+    // used so the visible region — not the document's top-left — is framed.
     if full_page || clip_scale < 1.0 {
         params["clip"] = json!({
-            "x": 0.0, "y": 0.0,
+            "x": scroll_x, "y": scroll_y,
             "width": src_w, "height": src_h,
             "scale": clip_scale,
         });

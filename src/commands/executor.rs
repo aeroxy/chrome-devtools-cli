@@ -106,8 +106,15 @@ fn validate_args(cmd: &str, args: &serde_json::Value) -> Result<()> {
 }
 
 /// Whether a command operates at the browser level (no page session needed).
+///
+/// `inspect-heapsnapshot-node` is intentionally excluded: it is intercepted
+/// offline in the CLI before any daemon connection is established, so the
+/// daemon should never receive it. If it ever does, omitting it here lets it
+/// fall through to `inner_execute`'s catch-all `bail!("Unknown command")`
+/// rather than hitting the `_ => unreachable!()` arm in the browser-level
+/// dispatch and panicking.
 fn is_browser_level(cmd: &str) -> bool {
-    matches!(cmd, "list-pages" | "new-page" | "sw-logs" | "inspect-heapsnapshot-node" | "kill-daemon")
+    matches!(cmd, "list-pages" | "new-page" | "sw-logs" | "kill-daemon")
 }
 
 /// Execute a single command from a [`DaemonRequest`].
