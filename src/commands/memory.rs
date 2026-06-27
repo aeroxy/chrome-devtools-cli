@@ -25,6 +25,21 @@ pub async fn take_heapsnapshot(
         output_path.file_name().unwrap_or_default().to_string_lossy(),
         std::process::id(),
     ));
+    // Drop guard ensures the temp file is removed under all termination paths
+    // — including future cancellation (timeout, client disconnect, Ctrl+C) and
+    // panics — where the async cleanup below would never run. On the success
+    // path the file has been renamed away, so `remove_file` is a harmless no-op.
+    struct TempFileGuard {
+        path: std::path::PathBuf,
+    }
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+    let _guard = TempFileGuard {
+        path: temp_path.clone(),
+    };
     // Heap snapshots can be tens or hundreds of MB; buffer the writes to avoid a
     // syscall per streamed chunk.
     let mut file = tokio::io::BufWriter::new(
@@ -93,8 +108,6 @@ pub async fn take_heapsnapshot(
     let _ = client.send_to_target(session_id, "HeapProfiler.disable", json!({})).await;
 
     if let Err(e) = snapshot_result {
-        // Clean up the partial temp file so a failed run leaves no artifacts.
-        let _ = tokio::fs::remove_file(&temp_path).await;
         return Err(e);
     }
 
