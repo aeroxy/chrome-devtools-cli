@@ -111,6 +111,11 @@ pub async fn take_heapsnapshot(
         return Err(e);
     }
 
+    // Drop the writer (and its underlying file handle) before the rename: on
+    // Windows an open handle blocks the move, and even on Unix releasing it
+    // before the atomic rename is the safe, portable ordering.
+    drop(file);
+
     // Atomically move the completed temp file to the final output path.
     tokio::fs::rename(&temp_path, output_path)
         .await
