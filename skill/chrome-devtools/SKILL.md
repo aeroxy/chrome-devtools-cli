@@ -56,7 +56,7 @@ chrome-devtools --page 0 navigate https://example.com
 
 - **Navigation**: `navigate`, `navigate --back`, `navigate --forward`, `navigate --reload`
 - **Page management**: `list-pages`, `new-page`, `close-page`, `select-page`
-- **Extraction**: `screenshot`, `snapshot` (accessibility tree), `evaluate` (JavaScript), `read-page` (page content as markdown)
+- **Extraction**: `screenshot`, `snapshot` (accessibility tree), `evaluate` (JavaScript), `read-page` (page content as markdown), `run-script` (run local JS file), `adapter` (run site adapter)
 - **Interaction**: `click`, `fill`, `type-text`, `press-key`, `hover`, `click-at`
 - **Emulation**: `emulate` (viewport, mobile, geolocation, URL blocking)
 - **Inspection**: `console` (logs), `network` (requests), `sw-logs` (extension service workers)
@@ -311,6 +311,24 @@ chrome-devtools --target warm-squid read-page --json
 - `read-page` — you want the page's textual content as readable markdown (articles, docs, wiki pages). Best for summarization, extraction, or feeding content to an LLM.
 - `snapshot` — you need the full accessibility tree with element IDs, roles, and interactive elements. Best for understanding page structure and finding elements to click/fill.
 
+### Pattern 13: Local JS Scripting (run-script)
+
+Evaluate a local JavaScript file inside the page context. Dynamic arguments passed via `-a/--arg` are automatically typed and injected into the execution context as `ctx.args`. Standard helper functions are also injected.
+
+```bash
+# Run a script with dynamic arguments
+chrome-devtools --target warm-squid run-script skill/chrome-devtools/examples/search_deepwiki.js --arg query="aeroxy/ast-bro"
+```
+
+### Pattern 14: Custom Domain-Aware Adapters (adapter)
+
+Run site-specific adapter actions. If the browser is not currently on a matching domain (as defined by `@domain` comments in the JSDoc header), the CLI auto-navigates to that domain first.
+
+```bash
+# Run an adapter function with automatic domain protection and navigation
+chrome-devtools --target warm-squid adapter skill/chrome-devtools/examples/deepwiki_adapter.js ask --arg query="how to write adapter"
+```
+
 ## Complete Command Reference
 
 ### Navigation
@@ -364,6 +382,12 @@ chrome-devtools --target <name> emulate --clear-all                      # clear
 ```bash
 chrome-devtools --target <name> list-3p-tools
 chrome-devtools --target <name> execute-3p-tool <name> '<json-params>'
+```
+
+### Custom Scripting & Adapters
+```bash
+chrome-devtools --target <name> run-script <file-path> [--arg key=value] [--output <path>] [--track-navigation]
+chrome-devtools --target <name> adapter <file-path> <function-name> [--arg key=value] [--output <path>] [--track-navigation]
 ```
 
 ### Daemon
