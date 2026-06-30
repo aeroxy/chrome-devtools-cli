@@ -180,6 +180,30 @@ fn url_matches_domain(url: &str, domain: &str) -> bool {
     host == domain_lower || host.ends_with(&format!(".{}", domain_lower))
 }
 
+/// Normalize ES-module `export` keywords out of adapter source.
+///
+/// Adapters are injected as statements into an async IIFE, where a top-level
+/// `export` is a SyntaxError. The supported adapter format is plain function
+/// declarations; this strips a leading `export` / `export default` so the common
+/// authoring habit parses instead of failing before the function-existence check.
+fn strip_export_keywords(content: &str) -> String {
+    content
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let indent = &line[..line.len() - trimmed.len()];
+            if let Some(rest) = trimmed.strip_prefix("export default ") {
+                format!("{indent}{rest}")
+            } else if let Some(rest) = trimmed.strip_prefix("export ") {
+                format!("{indent}{rest}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Run a structured custom adapter function inside the page context
 pub async fn run_adapter(
     client: &mut CdpClient,
@@ -202,10 +226,14 @@ pub async fn run_adapter(
 
         if !matched {
             let target_domain = &domains[0];
+            // Preserve the host exactly as declared in `@domain`; only supply a
+            // scheme when one is missing. Forcing a `www.` subdomain breaks apex
+            // hosts and adapters that target an existing subdomain
+            // (e.g. `creator.xiaohongshu.com`).
             let target_url = if target_domain.starts_with("http://") || target_domain.starts_with("https://") {
                 target_domain.clone()
             } else {
-                format!("https://www.{}", target_domain)
+                format!("https://{}", target_domain)
             };
             eprintln!("[adapter] Current URL '{}' does not match adapter domains {:?}. Auto-navigating to '{}'...", current_url, domains, target_url);
             
@@ -222,6 +250,11 @@ pub async fn run_adapter(
             .await?;
         }
     }
+
+    // Normalize away `export` so module-style adapter declarations parse when
+    // injected as statements below. Domain parsing above used the raw source,
+    // which is unaffected (domains live in comments).
+    let script_content = strip_export_keywords(&script_content);
 
     let args_str = serde_json::to_string(script_args)?;
 
@@ -287,6 +320,16 @@ mod tests {
         "#;
         let domains = parse_adapter_domains(content);
         assert_eq!(domains, vec!["xiaohongshu.com", "creator.xiaohongshu.com"]);
+    }
+
+    #[test]
+    fn test_strip_export_keywords() {
+        let src = "export async function ask(ctx) {}\n  export function read() {}\nexport const helper = 1;\nexport default function main() {}\nconst x = \"export inside string\";";
+        let out = strip_export_keywords(src);
+        assert_eq!(
+            out,
+            "async function ask(ctx) {}\n  function read() {}\nconst helper = 1;\nfunction main() {}\nconst x = \"export inside string\";"
+        );
     }
 
     #[test]

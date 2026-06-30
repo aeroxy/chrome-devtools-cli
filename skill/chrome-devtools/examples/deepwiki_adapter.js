@@ -27,12 +27,9 @@ async function ask(ctx) {
 }
 
 async function readWiki(ctx) {
-  const wikiUrl = ctx.args.url;
-  if (!wikiUrl) throw new Error("url argument is required");
-
-  window.location.href = wikiUrl;
-  await ctx.waitForSelector("article, .wiki-content", 10000);
-
+  // Navigation must happen before running this adapter (e.g. via the `navigate`
+  // command). Changing window.location here would tear down the Runtime.evaluate
+  // context mid-execution, so readWiki only scrapes the already-loaded page.
   return {
     title: document.querySelector("h1, .wiki-title")?.innerText.trim() || "",
     content: document.querySelector("article, .wiki-content")?.innerText.trim() || ""

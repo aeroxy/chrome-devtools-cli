@@ -432,31 +432,37 @@ fn absolutize_path(path: &str) -> Result<String> {
     }
 }
 
-fn parse_args(args: &[String]) -> serde_json::Value {
+fn parse_args(args: &[String]) -> Result<serde_json::Value> {
     let mut map = serde_json::Map::new();
     for arg in args {
-        if let Some((k, v)) = arg.split_once('=') {
-            let k = k.trim().to_string();
-            let v = v.trim();
-            let val = if v.eq_ignore_ascii_case("true") {
-                serde_json::Value::Bool(true)
-            } else if v.eq_ignore_ascii_case("false") {
-                serde_json::Value::Bool(false)
-            } else if let Ok(n) = v.parse::<i64>() {
-                serde_json::Value::Number(n.into())
-            } else if let Ok(f) = v.parse::<f64>() {
-                if let Some(num) = serde_json::Number::from_f64(f) {
-                    serde_json::Value::Number(num)
-                } else {
-                    serde_json::Value::String(v.to_string())
-                }
+        // Reject malformed tokens up front so bad `--arg` input surfaces a clear
+        // error here instead of failing later with a misleading message.
+        let (k, v) = arg
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("Invalid argument '{arg}': expected key=value"))?;
+        let k = k.trim();
+        if k.is_empty() {
+            anyhow::bail!("Invalid argument '{arg}': key must not be empty");
+        }
+        let v = v.trim();
+        let val = if v.eq_ignore_ascii_case("true") {
+            serde_json::Value::Bool(true)
+        } else if v.eq_ignore_ascii_case("false") {
+            serde_json::Value::Bool(false)
+        } else if let Ok(n) = v.parse::<i64>() {
+            serde_json::Value::Number(n.into())
+        } else if let Ok(f) = v.parse::<f64>() {
+            if let Some(num) = serde_json::Number::from_f64(f) {
+                serde_json::Value::Number(num)
             } else {
                 serde_json::Value::String(v.to_string())
-            };
-            map.insert(k, val);
-        }
+            }
+        } else {
+            serde_json::Value::String(v.to_string())
+        };
+        map.insert(k.to_string(), val);
     }
-    serde_json::Value::Object(map)
+    Ok(serde_json::Value::Object(map))
 }
 
 fn build_request(cli: &Cli) -> Result<DaemonRequest> {
@@ -613,7 +619,7 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
             "run-script",
             json!({
                 "file_path": absolutize_path(file_path)?,
-                "script_args": parse_args(script_args),
+                "script_args": parse_args(script_args)?,
                 "output": absolutize(output)?,
                 "track_navigation": track_navigation
             }),
@@ -629,7 +635,7 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
             json!({
                 "file_path": absolutize_path(file_path)?,
                 "function_name": function_name,
-                "script_args": parse_args(script_args),
+                "script_args": parse_args(script_args)?,
                 "output": absolutize(output)?,
                 "track_navigation": track_navigation
             }),
@@ -1200,7 +1206,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 &mut client,
                 &session_id,
                 file_path,
-                &parse_args(script_args),
+                &parse_args(script_args)?,
                 cli.output_format(),
                 output.as_deref(),
                 *track_navigation,
@@ -1219,7 +1225,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 &session_id,
                 file_path,
                 function_name,
-                &parse_args(script_args),
+                &parse_args(script_args)?,
                 cli.output_format(),
                 output.as_deref(),
                 *track_navigation,
@@ -1249,15 +1255,22 @@ mod tests {
             "float_val=3.14".to_string(),
             "bool_true=true".to_string(),
             "bool_false=False".to_string(),
-            "no_equals".to_string(),
         ];
-        let parsed = parse_args(&args);
+        let parsed = parse_args(&args).unwrap();
         let obj = parsed.as_object().unwrap();
         assert_eq!(obj.get("str_val").unwrap().as_str().unwrap(), "hello");
         assert_eq!(obj.get("int_val").unwrap().as_i64().unwrap(), 42);
         assert_eq!(obj.get("float_val").unwrap().as_f64().unwrap(), 3.14);
         assert_eq!(obj.get("bool_true").unwrap().as_bool().unwrap(), true);
         assert_eq!(obj.get("bool_false").unwrap().as_bool().unwrap(), false);
-        assert!(obj.get("no_equals").is_none());
+    }
+
+    #[test]
+    fn test_parse_args_rejects_malformed() {
+        // Missing '=' is now a hard error instead of being silently dropped.
+        assert!(parse_args(&["no_equals".to_string()]).is_err());
+        // Empty keys are rejected.
+        assert!(parse_args(&["=value".to_string()]).is_err());
+        assert!(parse_args(&["   =value".to_string()]).is_err());
     }
 }
