@@ -370,6 +370,17 @@ pub async fn run_adapter(
                 None,
             )
             .await?;
+
+            let post_nav_url = client.current_url(session_id).await?;
+            let post_matched = domains.iter().any(|domain| url_matches_domain(&post_nav_url, domain));
+            if !post_matched {
+                anyhow::bail!(
+                    "Auto-navigation to '{}' resulted in URL '{}' which does not match adapter domains {:?}",
+                    target_url,
+                    post_nav_url,
+                    domains
+                );
+            }
         }
     }
 
