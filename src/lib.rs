@@ -328,6 +328,40 @@ pub enum Commands {
         extension_id: Option<String>,
     },
 
+    /// Run a local JavaScript file in the active page context
+    #[command(name = "run-script")]
+    RunScript {
+        /// Path to the JavaScript file
+        file_path: String,
+        /// Optional arguments to pass to the script as key=value pairs (can be repeated)
+        #[arg(long = "arg", short = 'a')]
+        script_args: Vec<String>,
+        /// Write output to a file instead of stdout
+        #[arg(long, short)]
+        output: Option<String>,
+        /// Track URL changes caused by this evaluation
+        #[arg(long)]
+        track_navigation: bool,
+    },
+
+    /// Run a structured custom site adapter JavaScript function
+    #[command(name = "adapter")]
+    Adapter {
+        /// Path to the JavaScript adapter file
+        file_path: String,
+        /// Name of the function in the adapter to run
+        function_name: String,
+        /// Optional arguments to pass to the function as key=value pairs (can be repeated)
+        #[arg(long = "arg", short = 'a')]
+        script_args: Vec<String>,
+        /// Write output to a file instead of stdout
+        #[arg(long, short)]
+        output: Option<String>,
+        /// Track URL changes caused by this evaluation
+        #[arg(long)]
+        track_navigation: bool,
+    },
+
     /// Stop the background daemon process
     #[command(name = "kill-daemon")]
     KillDaemon,
@@ -373,6 +407,8 @@ impl Cli {
             Commands::Console { .. } => "console",
             Commands::Network { .. } => "network",
             Commands::SwLogs { .. } => "sw-logs",
+            Commands::RunScript { .. } => "run-script",
+            Commands::Adapter { .. } => "adapter",
             Commands::KillDaemon => "kill-daemon",
         }
     }
@@ -394,6 +430,33 @@ fn absolutize_path(path: &str) -> Result<String> {
             .map_err(|e| anyhow::anyhow!("Failed to resolve CLI working directory to absolutize path '{path}': {e}"))?;
         Ok(cwd.join(p).to_string_lossy().to_string())
     }
+}
+
+fn parse_args(args: &[String]) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for arg in args {
+        if let Some((k, v)) = arg.split_once('=') {
+            let k = k.trim().to_string();
+            let v = v.trim();
+            let val = if v.eq_ignore_ascii_case("true") {
+                serde_json::Value::Bool(true)
+            } else if v.eq_ignore_ascii_case("false") {
+                serde_json::Value::Bool(false)
+            } else if let Ok(n) = v.parse::<i64>() {
+                serde_json::Value::Number(n.into())
+            } else if let Ok(f) = v.parse::<f64>() {
+                if let Some(num) = serde_json::Number::from_f64(f) {
+                    serde_json::Value::Number(num)
+                } else {
+                    serde_json::Value::String(v.to_string())
+                }
+            } else {
+                serde_json::Value::String(v.to_string())
+            };
+            map.insert(k, val);
+        }
+    }
+    serde_json::Value::Object(map)
 }
 
 fn build_request(cli: &Cli) -> Result<DaemonRequest> {
@@ -540,6 +603,36 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
         } => (
             "sw-logs",
             json!({"duration": duration, "extension_id": extension_id}),
+        ),
+        Commands::RunScript {
+            file_path,
+            script_args,
+            output,
+            track_navigation,
+        } => (
+            "run-script",
+            json!({
+                "file_path": absolutize_path(file_path)?,
+                "script_args": parse_args(script_args),
+                "output": absolutize(output)?,
+                "track_navigation": track_navigation
+            }),
+        ),
+        Commands::Adapter {
+            file_path,
+            function_name,
+            script_args,
+            output,
+            track_navigation,
+        } => (
+            "adapter",
+            json!({
+                "file_path": absolutize_path(file_path)?,
+                "function_name": function_name,
+                "script_args": parse_args(script_args),
+                "output": absolutize(output)?,
+                "track_navigation": track_navigation
+            }),
         ),
         Commands::KillDaemon => unreachable!("KillDaemon is handled before build_request"),
         Commands::InspectHeapSnapshotNode { .. } => {
@@ -1097,6 +1190,42 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             )
             .await
         }
+        Commands::RunScript {
+            file_path,
+            script_args,
+            output,
+            track_navigation,
+        } => {
+            commands::evaluate::run_script(
+                &mut client,
+                &session_id,
+                file_path,
+                &parse_args(script_args),
+                cli.output_format(),
+                output.as_deref(),
+                *track_navigation,
+            )
+            .await
+        }
+        Commands::Adapter {
+            file_path,
+            function_name,
+            script_args,
+            output,
+            track_navigation,
+        } => {
+            commands::evaluate::run_adapter(
+                &mut client,
+                &session_id,
+                file_path,
+                function_name,
+                &parse_args(script_args),
+                cli.output_format(),
+                output.as_deref(),
+                *track_navigation,
+            )
+            .await
+        }
         _ => unreachable!(),
     };
 
@@ -1106,4 +1235,29 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
         r.target_id = Some(name);
         r
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_args() {
+        let args = vec![
+            "str_val=hello".to_string(),
+            "int_val=42".to_string(),
+            "float_val=3.14".to_string(),
+            "bool_true=true".to_string(),
+            "bool_false=False".to_string(),
+            "no_equals".to_string(),
+        ];
+        let parsed = parse_args(&args);
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("str_val").unwrap().as_str().unwrap(), "hello");
+        assert_eq!(obj.get("int_val").unwrap().as_i64().unwrap(), 42);
+        assert_eq!(obj.get("float_val").unwrap().as_f64().unwrap(), 3.14);
+        assert_eq!(obj.get("bool_true").unwrap().as_bool().unwrap(), true);
+        assert_eq!(obj.get("bool_false").unwrap().as_bool().unwrap(), false);
+        assert!(obj.get("no_equals").is_none());
+    }
 }

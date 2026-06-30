@@ -72,6 +72,8 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "console" => &["duration", "type"],
         "network" => &["duration", "type"],
         "sw-logs" => &["duration", "extension_id"],
+        "run-script" => &["file_path", "script_args", "output", "track_navigation"],
+        "adapter" => &["file_path", "function_name", "script_args", "output", "track_navigation"],
         "kill-daemon" => &[],
         _ => &[],
     }
@@ -568,6 +570,61 @@ async fn inner_execute(
                 .unwrap_or_default();
             commands::network::collect_network(client, session_id, duration, types, req.format())
                 .await
+        }
+        "run-script" => {
+            let file_path = args
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("file_path required"))?;
+            let script_args = args
+                .get("script_args")
+                .ok_or_else(|| anyhow!("script_args required"))?;
+            let output = args.get("output").and_then(|v| v.as_str());
+            let track_navigation = args
+                .get("track_navigation")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            commands::evaluate::run_script(
+                client,
+                session_id,
+                file_path,
+                script_args,
+                req.format(),
+                output,
+                track_navigation,
+            )
+            .await
+        }
+        "adapter" => {
+            let file_path = args
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("file_path required"))?;
+            let function_name = args
+                .get("function_name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("function_name required"))?;
+            let script_args = args
+                .get("script_args")
+                .ok_or_else(|| anyhow!("script_args required"))?;
+            let output = args.get("output").and_then(|v| v.as_str());
+            let track_navigation = args
+                .get("track_navigation")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            commands::evaluate::run_adapter(
+                client,
+                session_id,
+                file_path,
+                function_name,
+                script_args,
+                req.format(),
+                output,
+                track_navigation,
+            )
+            .await
         }
         _ => bail!("Unknown command: {cmd}"),
     }
