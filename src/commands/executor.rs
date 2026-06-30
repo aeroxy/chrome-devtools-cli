@@ -576,9 +576,9 @@ async fn inner_execute(
                 .get("file_path")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("file_path required"))?;
-            let script_args = args
-                .get("script_args")
-                .ok_or_else(|| anyhow!("script_args required"))?;
+            // script_args is conceptually optional; default to an empty object so
+            // clients can omit it when a script takes no arguments.
+            let script_args = args.get("script_args").cloned().unwrap_or_else(|| json!({}));
             let output = args.get("output").and_then(|v| v.as_str());
             let track_navigation = args
                 .get("track_navigation")
@@ -589,7 +589,7 @@ async fn inner_execute(
                 client,
                 session_id,
                 file_path,
-                script_args,
+                &script_args,
                 req.format(),
                 output,
                 track_navigation,
@@ -605,9 +605,9 @@ async fn inner_execute(
                 .get("function_name")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("function_name required"))?;
-            let script_args = args
-                .get("script_args")
-                .ok_or_else(|| anyhow!("script_args required"))?;
+            // script_args is conceptually optional; default to an empty object so
+            // clients can omit it when an adapter takes no arguments.
+            let script_args = args.get("script_args").cloned().unwrap_or_else(|| json!({}));
             let output = args.get("output").and_then(|v| v.as_str());
             let track_navigation = args
                 .get("track_navigation")
@@ -619,7 +619,7 @@ async fn inner_execute(
                 session_id,
                 file_path,
                 function_name,
-                script_args,
+                &script_args,
                 req.format(),
                 output,
                 track_navigation,

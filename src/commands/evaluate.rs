@@ -128,7 +128,20 @@ fn build_ctx_object(args_str: &str) -> String {
                 fill: async (selector, value) => {{
                     const el = document.querySelector(selector);
                     if (!el) throw new Error("Element not found: " + selector);
-                    el.value = value;
+                    if (el.type === 'checkbox' || el.type === 'radio') {{
+                        // Checkboxes/radios toggle via `checked`, not `value`. A
+                        // boolean (or "true"/"false") sets the state directly; any
+                        // other value selects the input whose `value` it matches.
+                        if (value === true || value === false) {{
+                            el.checked = value;
+                        }} else if (value === 'true' || value === 'false') {{
+                            el.checked = value === 'true';
+                        }} else {{
+                            el.checked = String(value) === el.value;
+                        }}
+                    }} else {{
+                        el.value = value;
+                    }}
                     el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 }}
@@ -209,6 +222,16 @@ fn normalize_host(raw: &str) -> String {
     host.to_string()
 }
 
+/// Detect loopback / local-dev hosts that should default to plain HTTP during
+/// auto-navigation, since they typically don't serve HTTPS.
+fn is_local_host(domain: &str) -> bool {
+    let host = normalize_host(domain);
+    host == "localhost"
+        || host == "127.0.0.1"
+        || host == "0.0.0.0"
+        || host.ends_with(".localhost")
+}
+
 /// Check if a URL matches a domain pattern.
 ///
 /// Both sides are normalized to a bare hostname first, so an adapter `@domain`
@@ -224,25 +247,66 @@ fn url_matches_domain(url: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{}", domain))
 }
 
+/// True for characters allowed inside a JavaScript identifier (after the first).
+fn is_js_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Validate that `name` is a plain JavaScript identifier.
+///
+/// The adapter function name is interpolated directly into the injected IIFE, so
+/// rejecting anything that isn't an identifier prevents both syntax errors and
+/// code injection through a crafted `function_name`.
+fn is_valid_js_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        // A leading digit (or any non-identifier-start char) is invalid.
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    chars.all(is_js_ident_char)
+}
+
 /// Normalize ES-module `export` keywords out of adapter source.
 ///
 /// Adapters are injected as statements into an async IIFE, where a top-level
 /// `export` is a SyntaxError. The supported adapter format is plain function
 /// declarations; this strips a leading `export` / `export default` so the common
 /// authoring habit parses instead of failing before the function-existence check.
+///
+/// The prefix is only stripped when it directly precedes a declaration keyword.
+/// This avoids corrupting `export { ... }` re-export blocks or stray `export`
+/// text inside multi-line strings/comments.
 fn strip_export_keywords(content: &str) -> String {
+    const DECL_KEYWORDS: [&str; 6] = ["function", "async", "class", "const", "let", "var"];
+    let declaration_follows = |rest: &str| {
+        let rest = rest.trim_start();
+        DECL_KEYWORDS.iter().any(|kw| match rest.strip_prefix(kw) {
+            // The keyword must end at a non-identifier boundary so `constant`
+            // is not mistaken for `const`.
+            Some(after) => match after.chars().next() {
+                Some(c) => !is_js_ident_char(c),
+                None => true,
+            },
+            None => false,
+        })
+    };
+
     content
         .lines()
         .map(|line| {
             let trimmed = line.trim_start();
             let indent = &line[..line.len() - trimmed.len()];
             if let Some(rest) = trimmed.strip_prefix("export default ") {
-                format!("{indent}{rest}")
+                if declaration_follows(rest) {
+                    return format!("{indent}{rest}");
+                }
             } else if let Some(rest) = trimmed.strip_prefix("export ") {
-                format!("{indent}{rest}")
-            } else {
-                line.to_string()
+                if declaration_follows(rest) {
+                    return format!("{indent}{rest}");
+                }
             }
+            line.to_string()
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -259,6 +323,15 @@ pub async fn run_adapter(
     output: Option<&str>,
     track_navigation: bool,
 ) -> Result<CommandResult> {
+    // `function_name` is interpolated straight into the injected IIFE, so reject
+    // anything that isn't a plain identifier before touching Chrome or the disk.
+    if !is_valid_js_identifier(function_name) {
+        anyhow::bail!(
+            "Invalid adapter function name '{}': must be a valid JavaScript identifier",
+            function_name
+        );
+    }
+
     let script_content = std::fs::read_to_string(file_path)
         .map_err(|e| anyhow::anyhow!("Failed to read adapter file '{}': {}", file_path, e))?;
 
@@ -275,7 +348,12 @@ pub async fn run_adapter(
             // hosts and adapters that target an existing subdomain
             // (e.g. `creator.xiaohongshu.com`).
             let target_url = if target_domain.starts_with("http://") || target_domain.starts_with("https://") {
+                // An explicit scheme always wins, so authors can force http/https
+                // by writing it in `@domain` (e.g. `@domain http://localhost:3000`).
                 target_domain.clone()
+            } else if is_local_host(target_domain) {
+                // Local dev servers generally speak http, not https.
+                format!("http://{}", target_domain)
             } else {
                 format!("https://{}", target_domain)
             };
@@ -368,6 +446,42 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_export_keywords_preserves_non_declarations() {
+        // Re-export blocks, `export *`, and prose that merely starts with the
+        // word must be left untouched (only declarations are stripped).
+        let src = "export { ask, read };\nexport * from './x';\nexport const ok = 1;\nexport constants = 2;";
+        let out = strip_export_keywords(src);
+        assert_eq!(
+            out,
+            "export { ask, read };\nexport * from './x';\nconst ok = 1;\nexport constants = 2;"
+        );
+    }
+
+    #[test]
+    fn test_is_valid_js_identifier() {
+        assert!(is_valid_js_identifier("ask"));
+        assert!(is_valid_js_identifier("_private"));
+        assert!(is_valid_js_identifier("$dollar"));
+        assert!(is_valid_js_identifier("readWiki2"));
+        assert!(!is_valid_js_identifier(""));
+        assert!(!is_valid_js_identifier("2fast"));
+        assert!(!is_valid_js_identifier("foo.bar"));
+        assert!(!is_valid_js_identifier("foo(); evil"));
+        assert!(!is_valid_js_identifier("foo bar"));
+    }
+
+    #[test]
+    fn test_is_local_host() {
+        assert!(is_local_host("localhost"));
+        assert!(is_local_host("localhost:3000"));
+        assert!(is_local_host("127.0.0.1:8080"));
+        assert!(is_local_host("app.localhost"));
+        assert!(is_local_host("http://localhost:5173/path"));
+        assert!(!is_local_host("example.com"));
+        assert!(!is_local_host("notlocalhost.com"));
+    }
+
+    #[test]
     fn test_url_matches_domain() {
         assert!(url_matches_domain("https://www.xiaohongshu.com/explore", "xiaohongshu.com"));
         assert!(url_matches_domain("http://creator.xiaohongshu.com", "creator.xiaohongshu.com"));
@@ -392,5 +506,8 @@ mod tests {
         for helper in ["wait:", "waitForText:", "waitForSelector:", "click:", "fill:"] {
             assert!(ctx.contains(helper), "missing helper: {helper}");
         }
+        // fill must special-case checkable inputs instead of setting `value`.
+        assert!(ctx.contains("el.type === 'checkbox' || el.type === 'radio'"));
+        assert!(ctx.contains("el.checked ="));
     }
 }
