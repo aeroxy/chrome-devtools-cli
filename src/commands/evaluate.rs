@@ -93,24 +93,15 @@ pub async fn evaluate(
     }
 }
 
-/// Run a local JavaScript file inside the page context
-pub async fn run_script(
-    client: &mut CdpClient,
-    session_id: &str,
-    file_path: &str,
-    script_args: &serde_json::Value,
-    format: OutputFormat,
-    output: Option<&str>,
-    track_navigation: bool,
-) -> Result<CommandResult> {
-    let script_content = std::fs::read_to_string(file_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read script file '{}': {}", file_path, e))?;
-
-    let args_str = serde_json::to_string(script_args)?;
-
-    let iife = format!(
-        r#"(async () => {{
-            const ctx = {{
+/// Build the injected `ctx` automation-helper object shared by `run-script` and
+/// `adapter`.
+///
+/// The returned snippet declares `const ctx = {...}` and is meant to be embedded
+/// at the top of an async IIFE, before user code runs. Both call sites reuse it
+/// so the helper surface stays in lockstep.
+fn build_ctx_object(args_str: &str) -> String {
+    format!(
+        r#"const ctx = {{
                 args: {args_str},
                 wait: async (ms) => new Promise(r => setTimeout(r, ms)),
                 waitForText: async (text, timeout = 30000) => {{
@@ -141,7 +132,29 @@ pub async fn run_script(
                     el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 }}
-            }};
+            }};"#
+    )
+}
+
+/// Run a local JavaScript file inside the page context
+pub async fn run_script(
+    client: &mut CdpClient,
+    session_id: &str,
+    file_path: &str,
+    script_args: &serde_json::Value,
+    format: OutputFormat,
+    output: Option<&str>,
+    track_navigation: bool,
+) -> Result<CommandResult> {
+    let script_content = std::fs::read_to_string(file_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read script file '{}': {}", file_path, e))?;
+
+    let args_str = serde_json::to_string(script_args)?;
+    let ctx = build_ctx_object(&args_str);
+
+    let iife = format!(
+        r#"(async () => {{
+            {ctx}
 
             {script_content}
         }})()"#
@@ -150,35 +163,65 @@ pub async fn run_script(
     evaluate(client, session_id, &iife, format, output, track_navigation).await
 }
 
-/// Extract `@domain` JSDoc comments from a script
+/// Extract `@domain` JSDoc comments from a script.
+///
+/// Only genuine metadata comment lines (`// @domain ...` or the `* @domain ...`
+/// JSDoc continuation form) are honored. Matching a bare `@domain` substring
+/// would otherwise pick up the marker from string literals or prose elsewhere
+/// in the adapter source.
 fn parse_adapter_domains(content: &str) -> Vec<String> {
     let mut domains = Vec::new();
     for line in content.lines() {
-        if let Some(pos) = line.find("@domain") {
-            let rest = &line[pos + 7..];
-            let domain = rest.trim().split_whitespace().next().unwrap_or("");
-            if !domain.is_empty() {
-                domains.push(domain.to_string());
-            }
+        // Require the line to be a comment before looking for the marker.
+        let trimmed = line.trim_start();
+        let comment = match trimmed.strip_prefix("//").or_else(|| trimmed.strip_prefix('*')) {
+            Some(rest) => rest.trim_start(),
+            None => continue,
+        };
+
+        // The marker must lead the comment body and be followed by whitespace so
+        // tokens like `@domainname` or `foo@domain.com` do not match.
+        let Some(rest) = comment.strip_prefix("@domain") else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+
+        let domain = rest.split_whitespace().next().unwrap_or("");
+        if !domain.is_empty() {
+            domains.push(domain.to_string());
         }
     }
     domains
 }
 
-/// Check if a URL matches a domain pattern
-fn url_matches_domain(url: &str, domain: &str) -> bool {
-    let url_lower = url.to_lowercase();
-    let domain_lower = domain.to_lowercase();
-    
-    let s = url_lower
+/// Strip scheme, path, and port from a raw URL/host string, returning the bare
+/// lowercased hostname.
+fn normalize_host(raw: &str) -> String {
+    let lower = raw.trim().to_lowercase();
+    let without_scheme = lower
         .strip_prefix("https://")
-        .or_else(|| url_lower.strip_prefix("http://"))
-        .unwrap_or(&url_lower);
-        
-    let host = s.split('/').next().unwrap_or(s);
+        .or_else(|| lower.strip_prefix("http://"))
+        .unwrap_or(&lower);
+    let host = without_scheme.split('/').next().unwrap_or(without_scheme);
     let host = host.split(':').next().unwrap_or(host);
-    
-    host == domain_lower || host.ends_with(&format!(".{}", domain_lower))
+    host.to_string()
+}
+
+/// Check if a URL matches a domain pattern.
+///
+/// Both sides are normalized to a bare hostname first, so an adapter `@domain`
+/// written as `https://example.com` or `example.com/path` still matches the
+/// page host instead of forcing a spurious auto-navigation.
+fn url_matches_domain(url: &str, domain: &str) -> bool {
+    let host = normalize_host(url);
+    let domain = normalize_host(domain);
+    if domain.is_empty() {
+        return false;
+    }
+
+    host == domain || host.ends_with(&format!(".{}", domain))
 }
 
 /// Normalize ES-module `export` keywords out of adapter source.
@@ -258,41 +301,11 @@ pub async fn run_adapter(
     let script_content = strip_export_keywords(&script_content);
 
     let args_str = serde_json::to_string(script_args)?;
+    let ctx = build_ctx_object(&args_str);
 
     let iife = format!(
         r#"(async () => {{
-            const ctx = {{
-                args: {args_str},
-                wait: async (ms) => new Promise(r => setTimeout(r, ms)),
-                waitForText: async (text, timeout = 30000) => {{
-                    const start = Date.now();
-                    while (Date.now() - start < timeout) {{
-                        if (document.body && document.body.innerText.includes(text)) return;
-                        await new Promise(r => setTimeout(r, {POLL_INTERVAL_MS}));
-                    }}
-                    throw new Error("Timeout waiting for text: " + text);
-                }},
-                waitForSelector: async (selector, timeout = 30000) => {{
-                    const start = Date.now();
-                    while (Date.now() - start < timeout) {{
-                        if (document.querySelector(selector)) return;
-                        await new Promise(r => setTimeout(r, {POLL_INTERVAL_MS}));
-                    }}
-                    throw new Error("Timeout waiting for selector: " + selector);
-                }},
-                click: async (selector) => {{
-                    const el = document.querySelector(selector);
-                    if (!el) throw new Error("Element not found: " + selector);
-                    el.click();
-                }},
-                fill: async (selector, value) => {{
-                    const el = document.querySelector(selector);
-                    if (!el) throw new Error("Element not found: " + selector);
-                    el.value = value;
-                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                }}
-            }};
+            {ctx}
 
             {script_content}
 
@@ -324,6 +337,27 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_adapter_domains_jsdoc_block() {
+        // The `* @domain` JSDoc continuation form is also honored.
+        let content = "/**\n * @domain example.com\n */";
+        assert_eq!(parse_adapter_domains(content), vec!["example.com"]);
+    }
+
+    #[test]
+    fn test_parse_adapter_domains_ignores_non_metadata() {
+        // Only genuine comment metadata lines count: string literals, prose, and
+        // tokens like `@domainname` must not be picked up.
+        let content = r#"
+            // @domain real.com
+            const note = "send mail to user@domain.com";
+            // contact foo@domain.org for help
+            // @domainname not-a-real-marker.com
+            const x = "@domain inside-string.com";
+        "#;
+        assert_eq!(parse_adapter_domains(content), vec!["real.com"]);
+    }
+
+    #[test]
     fn test_strip_export_keywords() {
         let src = "export async function ask(ctx) {}\n  export function read() {}\nexport const helper = 1;\nexport default function main() {}\nconst x = \"export inside string\";";
         let out = strip_export_keywords(src);
@@ -339,5 +373,24 @@ mod tests {
         assert!(url_matches_domain("http://creator.xiaohongshu.com", "creator.xiaohongshu.com"));
         assert!(url_matches_domain("https://xiaohongshu.com:8080/path", "xiaohongshu.com"));
         assert!(!url_matches_domain("https://google.com", "xiaohongshu.com"));
+    }
+
+    #[test]
+    fn test_url_matches_domain_normalizes_domain() {
+        // `@domain` written with a scheme and/or path still matches the host.
+        assert!(url_matches_domain("https://www.example.com/page", "https://example.com"));
+        assert!(url_matches_domain("https://example.com/explore", "example.com/path"));
+        assert!(url_matches_domain("https://example.com", "http://example.com:443/"));
+        assert!(!url_matches_domain("https://example.com", ""));
+    }
+
+    #[test]
+    fn test_build_ctx_object_embeds_args_and_helpers() {
+        let ctx = build_ctx_object(r#"{"query":"hi"}"#);
+        assert!(ctx.starts_with("const ctx = {"));
+        assert!(ctx.contains(r#"args: {"query":"hi"}"#));
+        for helper in ["wait:", "waitForText:", "waitForSelector:", "click:", "fill:"] {
+            assert!(ctx.contains(helper), "missing helper: {helper}");
+        }
     }
 }
