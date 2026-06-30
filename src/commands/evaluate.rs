@@ -139,6 +139,8 @@ fn build_ctx_object(args_str: &str) -> String {
                         }} else {{
                             el.checked = String(value) === el.value;
                         }}
+                    }} else if (el.isContentEditable) {{
+                        el.innerText = value;
                     }} else {{
                         el.value = value;
                     }}
@@ -218,7 +220,17 @@ fn normalize_host(raw: &str) -> String {
         .or_else(|| lower.strip_prefix("http://"))
         .unwrap_or(&lower);
     let host = without_scheme.split('/').next().unwrap_or(without_scheme);
-    let host = host.split(':').next().unwrap_or(host);
+    let host = if host.starts_with('[') {
+        if let Some(idx) = host.rfind(']') {
+            &host[..=idx]
+        } else {
+            host
+        }
+    } else if host.matches(':').count() > 1 {
+        host
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
     host.to_string()
 }
 
@@ -229,6 +241,8 @@ fn is_local_host(domain: &str) -> bool {
     host == "localhost"
         || host == "127.0.0.1"
         || host == "0.0.0.0"
+        || host == "[::1]"
+        || host == "::1"
         || host.ends_with(".localhost")
 }
 
@@ -486,6 +500,9 @@ mod tests {
         assert!(is_local_host("localhost"));
         assert!(is_local_host("localhost:3000"));
         assert!(is_local_host("127.0.0.1:8080"));
+        assert!(is_local_host("[::1]"));
+        assert!(is_local_host("[::1]:8080"));
+        assert!(is_local_host("::1"));
         assert!(is_local_host("app.localhost"));
         assert!(is_local_host("http://localhost:5173/path"));
         assert!(!is_local_host("example.com"));
@@ -497,6 +514,7 @@ mod tests {
         assert!(url_matches_domain("https://www.xiaohongshu.com/explore", "xiaohongshu.com"));
         assert!(url_matches_domain("http://creator.xiaohongshu.com", "creator.xiaohongshu.com"));
         assert!(url_matches_domain("https://xiaohongshu.com:8080/path", "xiaohongshu.com"));
+        assert!(url_matches_domain("http://[::1]:3000", "[::1]"));
         assert!(!url_matches_domain("https://google.com", "xiaohongshu.com"));
     }
 
@@ -520,5 +538,8 @@ mod tests {
         // fill must special-case checkable inputs instead of setting `value`.
         assert!(ctx.contains("el.type === 'checkbox' || el.type === 'radio'"));
         assert!(ctx.contains("el.checked ="));
+        // fill must support contenteditable elements.
+        assert!(ctx.contains("el.isContentEditable"));
+        assert!(ctx.contains("el.innerText ="));
     }
 }
