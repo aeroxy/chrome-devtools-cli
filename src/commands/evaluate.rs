@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::cdp::CdpClient;
+use crate::constants::POLL_INTERVAL_MS;
 use crate::format::{format_structured, OutputFormat};
 use crate::result::CommandResult;
 
@@ -116,7 +117,7 @@ pub async fn run_script(
                     const start = Date.now();
                     while (Date.now() - start < timeout) {{
                         if (document.body && document.body.innerText.includes(text)) return;
-                        await new Promise(r => setTimeout(r, 100));
+                        await new Promise(r => setTimeout(r, {POLL_INTERVAL_MS}));
                     }}
                     throw new Error("Timeout waiting for text: " + text);
                 }},
@@ -124,7 +125,7 @@ pub async fn run_script(
                     const start = Date.now();
                     while (Date.now() - start < timeout) {{
                         if (document.querySelector(selector)) return;
-                        await new Promise(r => setTimeout(r, 100));
+                        await new Promise(r => setTimeout(r, {POLL_INTERVAL_MS}));
                     }}
                     throw new Error("Timeout waiting for selector: " + selector);
                 }},
@@ -267,7 +268,7 @@ pub async fn run_adapter(
                     const start = Date.now();
                     while (Date.now() - start < timeout) {{
                         if (document.body && document.body.innerText.includes(text)) return;
-                        await new Promise(r => setTimeout(r, 100));
+                        await new Promise(r => setTimeout(r, {POLL_INTERVAL_MS}));
                     }}
                     throw new Error("Timeout waiting for text: " + text);
                 }},
@@ -275,7 +276,7 @@ pub async fn run_adapter(
                     const start = Date.now();
                     while (Date.now() - start < timeout) {{
                         if (document.querySelector(selector)) return;
-                        await new Promise(r => setTimeout(r, 100));
+                        await new Promise(r => setTimeout(r, {POLL_INTERVAL_MS}));
                     }}
                     throw new Error("Timeout waiting for selector: " + selector);
                 }},
