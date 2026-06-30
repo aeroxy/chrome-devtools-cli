@@ -336,6 +336,9 @@ pub enum Commands {
         /// Optional arguments to pass to the script as key=value pairs (can be repeated)
         #[arg(long = "arg", short = 'a')]
         script_args: Vec<String>,
+        /// Extra trailing raw/positional arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        raw_args: Vec<String>,
         /// Write output to a file instead of stdout
         #[arg(long, short)]
         output: Option<String>,
@@ -354,6 +357,9 @@ pub enum Commands {
         /// Optional arguments to pass to the function as key=value pairs (can be repeated)
         #[arg(long = "arg", short = 'a')]
         script_args: Vec<String>,
+        /// Extra trailing raw/positional arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        raw_args: Vec<String>,
         /// Write output to a file instead of stdout
         #[arg(long, short)]
         output: Option<String>,
@@ -432,11 +438,33 @@ fn absolutize_path(path: &str) -> Result<String> {
     }
 }
 
-fn parse_args(args: &[String]) -> Result<serde_json::Value> {
+fn parse_json_value(v: &str) -> serde_json::Value {
+    if v.eq_ignore_ascii_case("true") {
+        serde_json::Value::Bool(true)
+    } else if v.eq_ignore_ascii_case("false") {
+        serde_json::Value::Bool(false)
+    } else if let Ok(n) = v.parse::<i64>() {
+        if n.to_string() == v {
+            serde_json::Value::Number(n.into())
+        } else {
+            serde_json::Value::String(v.to_string())
+        }
+    } else if let Ok(f) = v.parse::<f64>() {
+        if let Some(num) = serde_json::Number::from_f64(f) {
+            serde_json::Value::Number(num)
+        } else {
+            serde_json::Value::String(v.to_string())
+        }
+    } else {
+        serde_json::Value::String(v.to_string())
+    }
+}
+
+fn parse_args(named_args: &[String], raw_args: &[String]) -> Result<serde_json::Value> {
     let mut map = serde_json::Map::new();
-    for arg in args {
-        // Reject malformed tokens up front so bad `--arg` input surfaces a clear
-        // error here instead of failing later with a misleading message.
+
+    // Parse named_args (from -a/--arg) first
+    for arg in named_args {
         let (k, v) = arg
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("Invalid argument '{arg}': expected key=value"))?;
@@ -445,30 +473,34 @@ fn parse_args(args: &[String]) -> Result<serde_json::Value> {
             anyhow::bail!("Invalid argument '{arg}': key must not be empty");
         }
         let v = v.trim();
-        let val = if v.eq_ignore_ascii_case("true") {
-            serde_json::Value::Bool(true)
-        } else if v.eq_ignore_ascii_case("false") {
-            serde_json::Value::Bool(false)
-        } else if let Ok(n) = v.parse::<i64>() {
-            // Keep values like ZIP codes or phone numbers verbatim: if the parsed
-            // integer doesn't round-trip to the original token (leading zeros, a
-            // leading '+', etc.), it isn't canonical, so preserve it as a string.
-            if n.to_string() == v {
-                serde_json::Value::Number(n.into())
-            } else {
-                serde_json::Value::String(v.to_string())
-            }
-        } else if let Ok(f) = v.parse::<f64>() {
-            if let Some(num) = serde_json::Number::from_f64(f) {
-                serde_json::Value::Number(num)
-            } else {
-                serde_json::Value::String(v.to_string())
-            }
-        } else {
-            serde_json::Value::String(v.to_string())
-        };
-        map.insert(k.to_string(), val);
+        map.insert(k.to_string(), parse_json_value(v));
     }
+
+    // Parse raw_args (trailing positional arguments)
+    let mut positional_count = 0;
+    for arg in raw_args {
+        if let Some((k, v)) = arg.split_once('=') {
+            let k = k.trim();
+            if k.is_empty() {
+                anyhow::bail!("Invalid argument '{arg}': key must not be empty");
+            }
+            let v = v.trim();
+            map.insert(k.to_string(), parse_json_value(v));
+        } else {
+            // Positional argument without `=`
+            let val = parse_json_value(arg.trim());
+
+            // Populated as `_0`, `_1`, etc.
+            map.insert(format!("_{}", positional_count), val.clone());
+
+            // If it's the first positional argument, also map it to `"query"`
+            if positional_count == 0 {
+                map.insert("query".to_string(), val);
+            }
+            positional_count += 1;
+        }
+    }
+
     Ok(serde_json::Value::Object(map))
 }
 
@@ -620,13 +652,14 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
         Commands::RunScript {
             file_path,
             script_args,
+            raw_args,
             output,
             track_navigation,
         } => (
             "run-script",
             json!({
                 "file_path": absolutize_path(file_path)?,
-                "script_args": parse_args(script_args)?,
+                "script_args": parse_args(script_args, raw_args)?,
                 "output": absolutize(output)?,
                 "track_navigation": track_navigation
             }),
@@ -635,6 +668,7 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
             file_path,
             function_name,
             script_args,
+            raw_args,
             output,
             track_navigation,
         } => (
@@ -642,7 +676,7 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
             json!({
                 "file_path": absolutize_path(file_path)?,
                 "function_name": function_name,
-                "script_args": parse_args(script_args)?,
+                "script_args": parse_args(script_args, raw_args)?,
                 "output": absolutize(output)?,
                 "track_navigation": track_navigation
             }),
@@ -1206,6 +1240,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
         Commands::RunScript {
             file_path,
             script_args,
+            raw_args,
             output,
             track_navigation,
         } => {
@@ -1213,7 +1248,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 &mut client,
                 &session_id,
                 file_path,
-                &parse_args(script_args)?,
+                &parse_args(script_args, raw_args)?,
                 cli.output_format(),
                 output.as_deref(),
                 *track_navigation,
@@ -1224,6 +1259,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             file_path,
             function_name,
             script_args,
+            raw_args,
             output,
             track_navigation,
         } => {
@@ -1232,7 +1268,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 &session_id,
                 file_path,
                 function_name,
-                &parse_args(script_args)?,
+                &parse_args(script_args, raw_args)?,
                 cli.output_format(),
                 output.as_deref(),
                 *track_navigation,
@@ -1263,7 +1299,7 @@ mod tests {
             "bool_true=true".to_string(),
             "bool_false=False".to_string(),
         ];
-        let parsed = parse_args(&args).unwrap();
+        let parsed = parse_args(&args, &[]).unwrap();
         let obj = parsed.as_object().unwrap();
         assert_eq!(obj.get("str_val").unwrap().as_str().unwrap(), "hello");
         assert_eq!(obj.get("int_val").unwrap().as_i64().unwrap(), 42);
@@ -1283,7 +1319,7 @@ mod tests {
             "neg=-5".to_string(),
             "plain=42".to_string(),
         ];
-        let parsed = parse_args(&args).unwrap();
+        let parsed = parse_args(&args, &[]).unwrap();
         let obj = parsed.as_object().unwrap();
         assert_eq!(obj.get("zip").unwrap().as_str().unwrap(), "01234");
         assert_eq!(obj.get("phone").unwrap().as_str().unwrap(), "+12025550123");
@@ -1295,9 +1331,30 @@ mod tests {
     #[test]
     fn test_parse_args_rejects_malformed() {
         // Missing '=' is now a hard error instead of being silently dropped.
-        assert!(parse_args(&["no_equals".to_string()]).is_err());
+        assert!(parse_args(&["no_equals".to_string()], &[]).is_err());
         // Empty keys are rejected.
-        assert!(parse_args(&["=value".to_string()]).is_err());
-        assert!(parse_args(&["   =value".to_string()]).is_err());
+        assert!(parse_args(&["=value".to_string()], &[]).is_err());
+        assert!(parse_args(&["   =value".to_string()], &[]).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_with_raw_args() {
+        // Standard trailing argument gets mapped to "query" and "_0"
+        let parsed = parse_args(&[], &["what is a witch".to_string()]).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("query").unwrap().as_str().unwrap(), "what is a witch");
+        assert_eq!(obj.get("_0").unwrap().as_str().unwrap(), "what is a witch");
+
+        // Mixture of key=value trailing args and raw positional args
+        let parsed = parse_args(
+            &["user=admin".to_string()],
+            &["what is a witch".to_string(), "limit=10".to_string(), "second_arg".to_string()],
+        ).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("user").unwrap().as_str().unwrap(), "admin");
+        assert_eq!(obj.get("query").unwrap().as_str().unwrap(), "what is a witch");
+        assert_eq!(obj.get("_0").unwrap().as_str().unwrap(), "what is a witch");
+        assert_eq!(obj.get("limit").unwrap().as_i64().unwrap(), 10);
+        assert_eq!(obj.get("_1").unwrap().as_str().unwrap(), "second_arg");
     }
 }

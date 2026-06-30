@@ -313,20 +313,24 @@ chrome-devtools --target warm-squid read-page --json
 
 ### Pattern 13: Local JS Scripting (run-script)
 
-Evaluate a local JavaScript file inside the page context. Dynamic arguments passed via `-a/--arg` are automatically typed and injected into the execution context as `ctx.args`. Standard helper functions are also injected.
+Evaluate a local JavaScript file inside the page context. Dynamic arguments can be passed as raw positional values at the end of the command or via `-a/--arg` keys, and are automatically typed and injected into the execution context as `ctx.args`. Supports comment-based `@url` auto-navigation.
+
+See the dedicated [Custom Scripting Guide](./CUSTOM_SCRIPTING.md) for full documentation on script creation, argument parsing, and auto-navigation.
 
 ```bash
-# Run a script with dynamic arguments
-chrome-devtools --target warm-squid run-script skill/chrome-devtools/examples/search_deepwiki.js --arg query="aeroxy/ast-bro"
+# Run a script with trailing positional arguments (auto-navigates if @url is present)
+chrome-devtools --target warm-squid run-script skill/chrome-devtools/examples/search_hn.js "Rust"
 ```
 
 ### Pattern 14: Custom Domain-Aware Adapters (adapter)
 
 Run site-specific adapter actions. If the browser is not currently on a matching domain (as defined by `@domain` comments in the JSDoc header), the CLI auto-navigates to that domain first.
 
+See the dedicated [Custom Scripting Guide](./CUSTOM_SCRIPTING.md) for full documentation on custom adapters, domain protection, and argument parsing.
+
 ```bash
-# Run an adapter function with automatic domain protection and navigation
-chrome-devtools --target warm-squid adapter skill/chrome-devtools/examples/deepwiki_adapter.js ask --arg query="how to write adapter"
+# Run an adapter function with positional args (auto-navigates if target domain is mismatch)
+chrome-devtools --target warm-squid adapter skill/chrome-devtools/examples/hn_adapter.js search "Rust"
 ```
 
 ## Complete Command Reference

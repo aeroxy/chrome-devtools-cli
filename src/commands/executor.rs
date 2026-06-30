@@ -72,8 +72,8 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "console" => &["duration", "type"],
         "network" => &["duration", "type"],
         "sw-logs" => &["duration", "extension_id"],
-        "run-script" => &["file_path", "script_args", "output", "track_navigation"],
-        "adapter" => &["file_path", "function_name", "script_args", "output", "track_navigation"],
+        "run-script" => &["file_path", "script_args", "raw_args", "output", "track_navigation"],
+        "adapter" => &["file_path", "function_name", "script_args", "raw_args", "output", "track_navigation"],
         "kill-daemon" => &[],
         _ => &[],
     }

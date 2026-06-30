@@ -5,12 +5,34 @@ Run site-specific custom JavaScript adapter functions with built-in domain prote
 ## Synopsis
 
 ```bash
-chrome-devtools [--target <name>] adapter <file_path> <function_name> [--arg key=value] [--output <path>] [--track-navigation]
+chrome-devtools [--target <name>] adapter <file_path> <function_name> [--arg key=value] [raw_args...] [--output <path>] [--track-navigation]
 ```
 
 ## Description
 
 `adapter` reads a local custom JS adapter file, parses the target `@domain` markers, and ensures the browser is on a matching domain before invoking a specific named function exported or defined inside the script.
+
+### Flexible Argument Syntax
+
+Dynamic arguments passed to the adapter function can be specified in several clean and intuitive styles:
+
+1. **Pure Positional Style (Recommended for single queries):**
+   Simply append raw positional strings at the end of the command. If a single argument is passed, it is automatically mapped to `ctx.args.query` (as well as `ctx.args._0`):
+   ```bash
+   chrome-devtools adapter hn_adapter.js search "Rust"
+   ```
+2. **Hybrid Style (Positional + Named):**
+   For functions with multiple parameters, you can pass the main parameter positionally, and other options as explicit `key=value` pairs:
+   ```bash
+   chrome-devtools adapter hn_adapter.js search "Rust" limit=10 safeSearch=true
+   ```
+3. **Pure Named Style:**
+   Specify named options as explicit key-value pairs at the end of the command or via the `-a/--arg` flag:
+   ```bash
+   chrome-devtools adapter hn_adapter.js search query="Rust" limit=10
+   ```
+
+All values are automatically parsed into their appropriate JavaScript types (e.g. `10` to number, `true` to boolean, etc.) and made available inside `ctx.args`.
 
 ### Domain Protection and Auto-Navigation
 
@@ -19,7 +41,7 @@ By declaring standard `@domain` markers at the top of your adapter file, the CLI
 ```javascript
 // ==UserAdapter==
 // @name         My Custom Adapter
-// @domain       deepwiki.com
+// @domain       wikipedia.org
 // ==/UserAdapter==
 ```
 
@@ -34,51 +56,45 @@ Like `run-script`, your adapter function is passed a `ctx` context containing he
 *   `ctx.click(selector)`: DOM clicking helper.
 *   `ctx.fill(selector, value)`: DOM value input helper.
 
-## Real-World Example: DeepWiki AI Q&A Adapter
+## Real-World Example: Hacker News Search Adapter
 
-This adapter has a target domain of `deepwiki.com` and exposes an `ask` Q&A function and a `readWiki` document reader function.
+This adapter has a target domain of `hn.algolia.com` and exposes a `search` function.
 
-### Adapter file (`skill/chrome-devtools/examples/deepwiki_adapter.js`)
+### Adapter file (`skill/chrome-devtools/examples/hn_adapter.js`)
 ```javascript
 // ==UserAdapter==
-// @name         DeepWiki Adapter
-// @domain       deepwiki.com
+// @name         Hacker News Search Adapter
+// @domain       hn.algolia.com
 // ==/UserAdapter==
 
-async function ask(ctx) {
+// Run with: chrome-devtools adapter skill/chrome-devtools/examples/hn_adapter.js search -a query="Rust"
+
+async function search(ctx) {
   const query = ctx.args.query;
   if (!query) throw new Error("query argument is required");
 
-  // Fill search input and click ask/search
-  await ctx.fill("input.ask-input, input[placeholder*='Ask']", query);
-  await ctx.click("button.ask-btn, button[type='submit']");
+  // Fill search input (the SPA will fetch and render results dynamically)
+  await ctx.fill("input.SearchInput", query);
 
-  // Wait for AI response to finish streaming/loading
-  await ctx.waitForSelector(".answer-box, .ai-response", 15000);
-  await ctx.wait(2000); // Allow text to settle
+  // Wait for results to update/load
+  await ctx.waitForSelector("article.Story", 10000);
 
-  const answer = document.querySelector(".answer-box, .ai-response")?.innerText.trim() || "";
-  const sources = Array.from(document.querySelectorAll(".sources-list a, .citation-link")).map(el => ({
-    title: el.innerText.trim(),
-    url: el.href
-  }));
+  const results = Array.from(document.querySelectorAll("article.Story")).map(el => {
+    const titleEl = el.querySelector(".Story_title a");
+    const metaEl = el.querySelector(".Story_meta");
+    return {
+      title: titleEl?.innerText.trim() || "",
+      meta: metaEl?.innerText.trim() || "",
+      url: titleEl?.href || ""
+    };
+  });
 
-  return { query, answer, sources };
-}
-
-async function readWiki(ctx) {
-  // Navigation must happen before running this adapter (e.g. via the `navigate`
-  // command). Changing window.location here would tear down the Runtime.evaluate
-  // context mid-execution, so readWiki only scrapes the already-loaded page.
-  return {
-    title: document.querySelector("h1, .wiki-title")?.innerText.trim() || "",
-    content: document.querySelector("article, .wiki-content")?.innerText.trim() || ""
-  };
+  return results;
 }
 ```
 
 ### CLI Execution
 ```bash
-# Executing 'ask' on deepwiki.com (will auto-navigate there if not already open)
-chrome-devtools --target warm-squid adapter skill/chrome-devtools/examples/deepwiki_adapter.js ask --arg query="how to write adapter" --json
+# Executing 'search' on hn.algolia.com (will auto-navigate there if not already open)
+chrome-devtools --target warm-squid adapter skill/chrome-devtools/examples/hn_adapter.js search --arg query="Rust" --json
 ```

@@ -44,16 +44,14 @@ pub async fn evaluate(
         let desc = exception["exception"]["description"]
             .as_str()
             .unwrap_or(text);
-        anyhow::bail!(
-            "{desc}\n\n[HINT: To explore the page DOM, use the `snapshot` command instead of `evaluate`. To interact with elements, use `click` or `fill`.]"
-        );
+        anyhow::bail!("{desc}");
     }
 
     let value = &result["result"];
     let val_type = value["type"].as_str().unwrap_or("undefined");
 
     let output_hint = if format.is_text() {
-        let mut text = match val_type {
+        let text = match val_type {
             "undefined" => "undefined".to_string(),
             "string" => value["value"].as_str().unwrap_or("").to_string(),
             _ => {
@@ -65,13 +63,6 @@ pub async fn evaluate(
             }
         };
 
-        if expression.contains("querySelector")
-            || expression.contains("document.body")
-            || expression.contains("getElementById")
-            || expression.contains("getElementsBy")
-        {
-            text.push_str("\n\n[HINT: Avoid using `evaluate` for DOM traversal. Use the `snapshot` command to get a clean accessibility tree of the page, then use `click` or `fill`.]");
-        }
         text
     } else {
         let v = value.get("value").unwrap_or(value);
@@ -142,13 +133,37 @@ fn build_ctx_object(args_str: &str) -> String {
                     }} else if (el.isContentEditable) {{
                         el.innerText = value;
                     }} else {{
-                        el.value = value;
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+                            || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                        if (setter) {{
+                            setter.call(el, value);
+                        }} else {{
+                            el.value = value;
+                        }}
                     }}
                     el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 }}
             }};"#
     )
+}
+
+fn url_encode(input: &str) -> String {
+    let mut encoded = String::new();
+    for b in input.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(b as char);
+            }
+            b' ' => {
+                encoded.push('+');
+            }
+            _ => {
+                encoded.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    encoded
 }
 
 /// Run a local JavaScript file inside the page context
@@ -163,6 +178,63 @@ pub async fn run_script(
 ) -> Result<CommandResult> {
     let script_content = std::fs::read_to_string(file_path)
         .map_err(|e| anyhow::anyhow!("Failed to read script file '{}': {}", file_path, e))?;
+
+    // Perform auto-navigation if @url or @navigate comments exist at the top of the file
+    let mut target_url = None;
+    for line in script_content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(comment) = trimmed.strip_prefix("//").or_else(|| trimmed.strip_prefix('*')) {
+            let comment = comment.trim_start();
+            if let Some(rest) = comment.strip_prefix("@url") {
+                target_url = Some(rest.trim().to_string());
+                break;
+            } else if let Some(rest) = comment.strip_prefix("@navigate") {
+                target_url = Some(rest.trim().to_string());
+                break;
+            }
+        }
+    }
+
+    if let Some(ref url) = target_url {
+        // Interpolate {arg_name} placeholders from script_args
+        let mut interpolated_url = url.clone();
+        if let Some(obj) = script_args.as_object() {
+            for (key, val) in obj {
+                let placeholder = format!("{{{}}}", key);
+                let val_str = match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let encoded_val = url_encode(&val_str);
+                interpolated_url = interpolated_url.replace(&placeholder, &encoded_val);
+            }
+        }
+
+        let current_url = client.current_url(session_id).await?;
+        if !url_matches_domain(&current_url, &interpolated_url) {
+            eprintln!("[script] Current URL '{}' does not match target URL '{}'. Auto-navigating...", current_url, interpolated_url);
+            
+            let nav_url = if interpolated_url.starts_with("http://") || interpolated_url.starts_with("https://") {
+                interpolated_url.clone()
+            } else if is_local_host(&interpolated_url) {
+                format!("http://{}", interpolated_url)
+            } else {
+                format!("https://{}", interpolated_url)
+            };
+
+            crate::commands::navigate::navigate(
+                client,
+                session_id,
+                Some(&nav_url),
+                false,
+                false,
+                false,
+                None,
+                None,
+            )
+            .await?;
+        }
+    }
 
     let args_str = serde_json::to_string(script_args)?;
     let ctx = build_ctx_object(&args_str);
