@@ -210,17 +210,17 @@ pub async fn run_script(
             }
         }
 
+        let nav_url = if interpolated_url.starts_with("http://") || interpolated_url.starts_with("https://") {
+            interpolated_url.clone()
+        } else if is_local_host(&interpolated_url) {
+            format!("http://{}", interpolated_url)
+        } else {
+            format!("https://{}", interpolated_url)
+        };
+
         let current_url = client.current_url(session_id).await?;
-        if !url_matches_domain(&current_url, &interpolated_url) {
-            eprintln!("[script] Current URL '{}' does not match target URL '{}'. Auto-navigating...", current_url, interpolated_url);
-            
-            let nav_url = if interpolated_url.starts_with("http://") || interpolated_url.starts_with("https://") {
-                interpolated_url.clone()
-            } else if is_local_host(&interpolated_url) {
-                format!("http://{}", interpolated_url)
-            } else {
-                format!("https://{}", interpolated_url)
-            };
+        if current_url != nav_url {
+            eprintln!("[script] Current URL '{}' does not match target URL '{}'. Auto-navigating...", current_url, nav_url);
 
             crate::commands::navigate::navigate(
                 client,
@@ -233,6 +233,15 @@ pub async fn run_script(
                 None,
             )
             .await?;
+
+            let post_nav_url = client.current_url(session_id).await?;
+            if post_nav_url != nav_url {
+                anyhow::bail!(
+                    "Auto-navigation to '{}' resulted in URL '{}' which does not match target URL",
+                    nav_url,
+                    post_nav_url
+                );
+            }
         }
     }
 

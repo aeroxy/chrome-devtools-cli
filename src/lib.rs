@@ -336,8 +336,8 @@ pub enum Commands {
         /// Optional arguments to pass to the script as key=value pairs (can be repeated)
         #[arg(long = "arg", short = 'a')]
         script_args: Vec<String>,
-        /// Extra trailing raw/positional arguments
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Extra trailing raw/positional arguments (placed after '--')
+        #[arg(last = true)]
         raw_args: Vec<String>,
         /// Write output to a file instead of stdout
         #[arg(long, short)]
@@ -357,8 +357,8 @@ pub enum Commands {
         /// Optional arguments to pass to the function as key=value pairs (can be repeated)
         #[arg(long = "arg", short = 'a')]
         script_args: Vec<String>,
-        /// Extra trailing raw/positional arguments
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Extra trailing raw/positional arguments (placed after '--')
+        #[arg(last = true)]
         raw_args: Vec<String>,
         /// Write output to a file instead of stdout
         #[arg(long, short)]
@@ -451,7 +451,11 @@ fn parse_json_value(v: &str) -> serde_json::Value {
         }
     } else if let Ok(f) = v.parse::<f64>() {
         if let Some(num) = serde_json::Number::from_f64(f) {
-            serde_json::Value::Number(num)
+            if f.to_string() == v {
+                serde_json::Value::Number(num)
+            } else {
+                serde_json::Value::String(v.to_string())
+            }
         } else {
             serde_json::Value::String(v.to_string())
         }
@@ -1326,6 +1330,23 @@ mod tests {
         assert_eq!(obj.get("zero").unwrap().as_i64().unwrap(), 0);
         assert_eq!(obj.get("neg").unwrap().as_i64().unwrap(), -5);
         assert_eq!(obj.get("plain").unwrap().as_i64().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_parse_args_preserves_non_canonical_floats() {
+        // Non-canonical float representations must remain strings verbatim
+        let args = vec![
+            "val1=01.50".to_string(),
+            "val2=1e3".to_string(),
+            "val3=+3.5".to_string(),
+            "val4=3.5".to_string(), // Canonical should still parse as float number
+        ];
+        let parsed = parse_args(&args, &[]).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("val1").unwrap().as_str().unwrap(), "01.50");
+        assert_eq!(obj.get("val2").unwrap().as_str().unwrap(), "1e3");
+        assert_eq!(obj.get("val3").unwrap().as_str().unwrap(), "+3.5");
+        assert_eq!(obj.get("val4").unwrap().as_f64().unwrap(), 3.5);
     }
 
     #[test]
