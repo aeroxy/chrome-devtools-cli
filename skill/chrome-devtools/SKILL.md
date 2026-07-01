@@ -319,7 +319,7 @@ See the dedicated [Custom Scripting Guide](./CUSTOM_SCRIPTING.md) for full docum
 
 ```bash
 # Run a script with trailing positional arguments (auto-navigates if @url is present)
-chrome-devtools --target warm-squid run-script skill/chrome-devtools/examples/search_hn.js "Rust"
+chrome-devtools --target warm-squid run-script skill/chrome-devtools/examples/search_hn.js -- "Rust"
 ```
 
 ### Pattern 14: Custom Domain-Aware Adapters (adapter)
@@ -330,7 +330,7 @@ See the dedicated [Custom Scripting Guide](./CUSTOM_SCRIPTING.md) for full docum
 
 ```bash
 # Run an adapter function with positional args (auto-navigates if target domain is mismatch)
-chrome-devtools --target warm-squid adapter skill/chrome-devtools/examples/hn_adapter.js search "Rust"
+chrome-devtools --target warm-squid adapter skill/chrome-devtools/examples/hn_adapter.js search -- "Rust"
 ```
 
 ## Complete Command Reference

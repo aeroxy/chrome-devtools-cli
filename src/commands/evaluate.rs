@@ -133,9 +133,7 @@ fn build_ctx_object(args_str: &str) -> String {
                     }} else if (el.isContentEditable) {{
                         el.innerText = value;
                     }} else {{
-                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
-                            || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
-                            || Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value')?.set;
+                        const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')?.set;
                         if (setter) {{
                             setter.call(el, value);
                         }} else {{
@@ -164,6 +162,40 @@ fn url_encode(input: &str) -> String {
     encoded
 }
 
+/// Extract the `@url` / `@navigate` auto-navigation target from a script's
+/// leading comment block, if present.
+///
+/// Only lines at the very top of the file that are comments (`//`, `/*`, or a
+/// `*` JSDoc continuation line) are considered; scanning stops at the first
+/// blank-then-non-comment line. A trailing `*/` on single-line block comments
+/// (e.g. `/* @url https://example.com */`) is stripped so it isn't captured
+/// as part of the URL.
+fn parse_script_url_marker(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let comment = trimmed
+            .strip_prefix("//")
+            .or_else(|| trimmed.strip_prefix("/*"))
+            .or_else(|| trimmed.strip_prefix('*'))?;
+
+        let mut comment = comment.trim();
+        if let Some(stripped) = comment.strip_suffix("*/") {
+            comment = stripped.trim();
+        }
+
+        if let Some(rest) = comment.strip_prefix("@url") {
+            return Some(rest.trim().to_string());
+        }
+        if let Some(rest) = comment.strip_prefix("@navigate") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
 /// Run a local JavaScript file inside the page context
 pub async fn run_script(
     client: &mut CdpClient,
@@ -178,25 +210,7 @@ pub async fn run_script(
         .map_err(|e| anyhow::anyhow!("Failed to read script file '{}': {}", file_path, e))?;
 
     // Perform auto-navigation if @url or @navigate comments exist at the top of the file
-    let mut target_url = None;
-    for line in script_content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some(comment) = trimmed.strip_prefix("//").or_else(|| trimmed.strip_prefix("/*")).or_else(|| trimmed.strip_prefix('*')) {
-            let comment = comment.trim();
-            if let Some(rest) = comment.strip_prefix("@url") {
-                target_url = Some(rest.trim().to_string());
-                break;
-            } else if let Some(rest) = comment.strip_prefix("@navigate") {
-                target_url = Some(rest.trim().to_string());
-                break;
-            }
-        } else {
-            break;
-        }
-    }
+    let target_url = parse_script_url_marker(&script_content);
 
     if let Some(ref url) = target_url {
         // Interpolate {arg_name} placeholders from script_args
@@ -239,10 +253,13 @@ pub async fn run_script(
 
             let post_nav_url = client.current_url(session_id).await?;
             if post_nav_url.trim_end_matches('/') != nav_url.trim_end_matches('/') {
-                anyhow::bail!(
-                    "Auto-navigation to '{}' resulted in URL '{}' which does not match target URL",
-                    nav_url,
-                    post_nav_url
+                // Not a hard failure: sites commonly redirect (www., trailing
+                // slashes, locale/auth redirects, SPA router normalization),
+                // and `navigate()` already surfaces real navigation failures
+                // (CDP errors, load timeouts) before we get here.
+                eprintln!(
+                    "[script] Warning: auto-navigation to '{}' resulted in URL '{}'. Continuing anyway...",
+                    nav_url, post_nav_url
                 );
             }
         }
@@ -545,6 +562,67 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_script_url_marker_line_comment() {
+        let content = "// @url https://example.com\nconst x = 1;";
+        assert_eq!(
+            parse_script_url_marker(content),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_script_url_marker_navigate_alias() {
+        let content = "// @navigate https://example.com\nconst x = 1;";
+        assert_eq!(
+            parse_script_url_marker(content),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_script_url_marker_single_line_block_comment() {
+        // A single-line block comment's trailing `*/` must not be captured as
+        // part of the URL.
+        let content = "/* @url https://example.com */\nconst x = 1;";
+        assert_eq!(
+            parse_script_url_marker(content),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_script_url_marker_jsdoc_block() {
+        let content = "/**\n * @url https://example.com\n */\nconst x = 1;";
+        assert_eq!(
+            parse_script_url_marker(content),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_script_url_marker_skips_leading_blank_lines() {
+        let content = "\n\n   \n// @url https://example.com\nconst x = 1;";
+        assert_eq!(
+            parse_script_url_marker(content),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_script_url_marker_stops_at_first_non_comment_line() {
+        // The marker only counts if it's part of the leading comment block;
+        // once code starts, scanning stops even if a later comment has one.
+        let content = "const x = 1;\n// @url https://example.com";
+        assert_eq!(parse_script_url_marker(content), None);
+    }
+
+    #[test]
+    fn test_parse_script_url_marker_absent() {
+        let content = "// just a regular comment\nconst x = 1;";
+        assert_eq!(parse_script_url_marker(content), None);
+    }
+
+    #[test]
     fn test_strip_export_keywords() {
         let src = "export async function ask(ctx) {}\n  export function read() {}\nexport const helper = 1;\nexport default function main() {}\nconst x = \"export inside string\";";
         let out = strip_export_keywords(src);
@@ -632,7 +710,26 @@ mod tests {
         // fill must support contenteditable elements.
         assert!(ctx.contains("el.isContentEditable"));
         assert!(ctx.contains("el.innerText ="));
-        // fill must check HTMLSelectElement for state updates in frameworks.
-        assert!(ctx.contains("window.HTMLSelectElement.prototype"));
+        // fill must look up the native value setter from the element's own
+        // prototype (not a hardcoded HTMLInputElement/etc. chain, which would
+        // throw on <textarea>/<select> — see
+        // test_fill_uses_element_prototype_not_hardcoded_input_element for the
+        // receiver-check rationale) so React/Vue-style frameworks see the
+        // update.
+        assert!(ctx.contains("Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')"));
+    }
+
+    #[test]
+    fn test_fill_uses_element_prototype_not_hardcoded_input_element() {
+        // Regression test: a hardcoded `HTMLInputElement.prototype || HTMLTextAreaElement...`
+        // chain always resolves to the first (HTMLInputElement) setter, which
+        // throws `TypeError: Method set value called on incompatible receiver`
+        // when later `.call()`-ed on a <textarea> or <select>. The setter must
+        // be looked up from the element's actual prototype instead.
+        let ctx = build_ctx_object("{}");
+        assert!(!ctx.contains("HTMLInputElement"));
+        assert!(!ctx.contains("HTMLTextAreaElement"));
+        assert!(!ctx.contains("HTMLSelectElement"));
+        assert!(ctx.contains("Object.getPrototypeOf(el)"));
     }
 }

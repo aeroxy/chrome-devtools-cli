@@ -5,8 +5,11 @@ Evaluate a local JavaScript file inside the current page context with injected h
 ## Synopsis
 
 ```bash
-chrome-devtools [--target <name>] run-script <file_path> [--arg key=value] [raw_args...] [--output <path>] [--track-navigation]
+chrome-devtools [--target <name>] run-script <file_path> [--arg key=value] [--output <path>] [--track-navigation] [-- <raw_args>...]
 ```
+
+`raw_args` is a clap "last" positional: it only takes effect after a literal
+`--`, and `--output`/`--track-navigation` must be given *before* it.
 
 ## Description
 
@@ -17,19 +20,19 @@ chrome-devtools [--target <name>] run-script <file_path> [--arg key=value] [raw_
 Dynamic arguments passed to the script can be specified in several clean and intuitive styles:
 
 1. **Pure Positional Style (Recommended for single queries):**
-   Simply append raw positional strings at the end of the command. If a single argument is passed, it is automatically mapped to `ctx.args.query` (as well as `ctx.args._0`):
+   Simply append raw positional strings after a `--` separator at the end of the command. If a single argument is passed, it is automatically mapped to `ctx.args.query` (as well as `ctx.args._0`):
    ```bash
-   chrome-devtools run-script search_hn.js "Rust"
+   chrome-devtools run-script search_hn.js -- "Rust"
    ```
 2. **Hybrid Style (Positional + Named):**
-   For scripts with multiple parameters, you can pass the main parameter positionally, and other options as explicit `key=value` pairs:
+   For scripts with multiple parameters, you can pass the main parameter positionally, and other options as explicit `key=value` pairs, all after `--`:
    ```bash
-   chrome-devtools run-script search_hn.js "Rust" limit=10 safeSearch=true
+   chrome-devtools run-script search_hn.js -- "Rust" limit=10 safeSearch=true
    ```
 3. **Pure Named Style:**
-   Specify named options as explicit key-value pairs at the end of the command or via the `-a/--arg` flag:
+   Specify named options as explicit key-value pairs after `--`, or via the repeatable `-a/--arg` flag (which doesn't require `--`):
    ```bash
-   chrome-devtools run-script search_hn.js query="Rust" limit=10
+   chrome-devtools run-script search_hn.js -- query="Rust" limit=10
    ```
 
 All values are automatically parsed into their appropriate JavaScript types (e.g. `10` to number, `true` to boolean, etc.) and made available inside `ctx.args`.
