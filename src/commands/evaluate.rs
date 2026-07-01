@@ -133,7 +133,16 @@ fn build_ctx_object(args_str: &str) -> String {
                     }} else if (el.isContentEditable) {{
                         el.innerText = value;
                     }} else {{
-                        const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')?.set;
+                        let setter;
+                        let proto = Object.getPrototypeOf(el);
+                        while (proto) {{
+                            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                            if (desc) {{
+                                setter = desc.set;
+                                break;
+                            }}
+                            proto = Object.getPrototypeOf(proto);
+                        }}
                         if (setter) {{
                             setter.call(el, value);
                         }} else {{
@@ -321,6 +330,7 @@ fn normalize_host(raw: &str) -> String {
         .or_else(|| lower.strip_prefix("http://"))
         .unwrap_or(&lower);
     let host = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let host = host.split('@').last().unwrap_or(host);
     let host = if host.starts_with('[') {
         if let Some(idx) = host.rfind(']') {
             &host[..=idx]
@@ -658,6 +668,16 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_host() {
+        assert_eq!(normalize_host("http://user:pass@example.com/some/path"), "example.com");
+        assert_eq!(normalize_host("http://user:pass@[::1]:8080"), "[::1]");
+        assert_eq!(normalize_host("http://user:pass@127.0.0.1:8080"), "127.0.0.1");
+        assert_eq!(normalize_host("https://foo:bar@localhost"), "localhost");
+        assert_eq!(normalize_host("example.com"), "example.com");
+        assert_eq!(normalize_host("http://example.com:3000/"), "example.com");
+    }
+
+    #[test]
     fn test_is_local_host() {
         assert!(is_local_host("localhost"));
         assert!(is_local_host("localhost:3000"));
@@ -716,7 +736,8 @@ mod tests {
         // test_fill_uses_element_prototype_not_hardcoded_input_element for the
         // receiver-check rationale) so React/Vue-style frameworks see the
         // update.
-        assert!(ctx.contains("Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')"));
+        assert!(ctx.contains("Object.getPrototypeOf(el)"));
+        assert!(ctx.contains("Object.getOwnPropertyDescriptor(proto, 'value')"));
     }
 
     #[test]
