@@ -308,6 +308,38 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     })
 }
 
+/// Arguments shared by the `run-script` and `adapter` commands.
+struct ScriptExecArgs<'a> {
+    file_path: &'a str,
+    script_args: serde_json::Value,
+    output: Option<&'a str>,
+    track_navigation: bool,
+}
+
+/// Extract the arguments common to `run-script` and `adapter` from the raw
+/// command args. `script_args` is conceptually optional; it defaults to an
+/// empty object so clients can omit it when a script/adapter takes no
+/// arguments.
+fn script_exec_args(args: &serde_json::Value) -> Result<ScriptExecArgs<'_>> {
+    let file_path = args
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("file_path required"))?;
+    let script_args = args.get("script_args").cloned().unwrap_or_else(|| json!({}));
+    let output = args.get("output").and_then(|v| v.as_str());
+    let track_navigation = args
+        .get("track_navigation")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    Ok(ScriptExecArgs {
+        file_path,
+        script_args,
+        output,
+        track_navigation,
+    })
+}
+
 /// Execute a page-level command within an active session.
 async fn inner_execute(
     client: &mut CdpClient,
@@ -572,57 +604,34 @@ async fn inner_execute(
                 .await
         }
         "run-script" => {
-            let file_path = args
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("file_path required"))?;
-            // script_args is conceptually optional; default to an empty object so
-            // clients can omit it when a script takes no arguments.
-            let script_args = args.get("script_args").cloned().unwrap_or_else(|| json!({}));
-            let output = args.get("output").and_then(|v| v.as_str());
-            let track_navigation = args
-                .get("track_navigation")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
+            let a = script_exec_args(args)?;
             commands::evaluate::run_script(
                 client,
                 session_id,
-                file_path,
-                &script_args,
+                a.file_path,
+                &a.script_args,
                 req.format(),
-                output,
-                track_navigation,
+                a.output,
+                a.track_navigation,
             )
             .await
         }
         "adapter" => {
-            let file_path = args
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("file_path required"))?;
+            let a = script_exec_args(args)?;
             let function_name = args
                 .get("function_name")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("function_name required"))?;
-            // script_args is conceptually optional; default to an empty object so
-            // clients can omit it when an adapter takes no arguments.
-            let script_args = args.get("script_args").cloned().unwrap_or_else(|| json!({}));
-            let output = args.get("output").and_then(|v| v.as_str());
-            let track_navigation = args
-                .get("track_navigation")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
 
             commands::evaluate::run_adapter(
                 client,
                 session_id,
-                file_path,
+                a.file_path,
                 function_name,
-                &script_args,
+                &a.script_args,
                 req.format(),
-                output,
-                track_navigation,
+                a.output,
+                a.track_navigation,
             )
             .await
         }

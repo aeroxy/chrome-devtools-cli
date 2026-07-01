@@ -329,6 +329,12 @@ pub enum Commands {
     },
 
     /// Run a local JavaScript file in the active page context
+    ///
+    /// `raw_args` is a clap "last" positional: it only takes effect after a
+    /// literal `--`, and everything after that `--` is treated as a raw
+    /// argument rather than a flag. Put --output/--track-navigation *before*
+    /// the `--`, e.g.: `run-script foo.js --output out.json -- "query" limit=10`
+    /// (a bare `run-script foo.js "query"`, with no `--`, is rejected by clap).
     #[command(name = "run-script")]
     RunScript {
         /// Path to the JavaScript file
@@ -336,18 +342,25 @@ pub enum Commands {
         /// Optional arguments to pass to the script as key=value pairs (can be repeated)
         #[arg(long = "arg", short = 'a')]
         script_args: Vec<String>,
-        /// Extra trailing raw/positional arguments (placed after '--')
+        /// Extra trailing raw/positional arguments. Must be placed after a
+        /// literal '--'; put other options before it (see command help).
         #[arg(last = true)]
         raw_args: Vec<String>,
-        /// Write output to a file instead of stdout
+        /// Write output to a file instead of stdout (must precede '--')
         #[arg(long, short)]
         output: Option<String>,
-        /// Track URL changes caused by this evaluation
+        /// Track URL changes caused by this evaluation (must precede '--')
         #[arg(long)]
         track_navigation: bool,
     },
 
     /// Run a structured custom site adapter JavaScript function
+    ///
+    /// `raw_args` is a clap "last" positional: it only takes effect after a
+    /// literal `--`, and everything after that `--` is treated as a raw
+    /// argument rather than a flag. Put --output/--track-navigation *before*
+    /// the `--`, e.g.: `adapter foo.js myFn --output out.json -- "query"`
+    /// (a bare `adapter foo.js myFn "query"`, with no `--`, is rejected by clap).
     #[command(name = "adapter")]
     Adapter {
         /// Path to the JavaScript adapter file
@@ -357,13 +370,14 @@ pub enum Commands {
         /// Optional arguments to pass to the function as key=value pairs (can be repeated)
         #[arg(long = "arg", short = 'a')]
         script_args: Vec<String>,
-        /// Extra trailing raw/positional arguments (placed after '--')
+        /// Extra trailing raw/positional arguments. Must be placed after a
+        /// literal '--'; put other options before it (see command help).
         #[arg(last = true)]
         raw_args: Vec<String>,
-        /// Write output to a file instead of stdout
+        /// Write output to a file instead of stdout (must precede '--')
         #[arg(long, short)]
         output: Option<String>,
-        /// Track URL changes caused by this evaluation
+        /// Track URL changes caused by this evaluation (must precede '--')
         #[arg(long)]
         track_navigation: bool,
     },

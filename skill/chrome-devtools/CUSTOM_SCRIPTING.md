@@ -9,20 +9,21 @@ This guide details how to create and execute custom JavaScript scripts (`run-scr
 `run-script` reads a local JavaScript file, wraps it inside an Immediately Invoked Function Expression (IIFE), and evaluates it directly inside the target browser's page context.
 
 ### Flexible Argument Syntax
-Dynamic arguments passed to the script can be specified in several styles and are automatically parsed and made available inside `ctx.args`:
+Dynamic arguments passed to the script can be specified in several styles and are automatically parsed and made available inside `ctx.args`. Note that raw positional values (styles 1 & 2 below) must come after a literal `--`, and any options like `--output`/`--track-navigation` must be given *before* it:
 
-1. **Pure Positional Style (Recommended for single queries):**
-   Simply append raw positional strings at the end of the command. A single trailing positional argument is automatically mapped to `ctx.args.query` (as well as `ctx.args._0`):
+1. **Named Style via `-a`/`--arg` (Recommended):**
+   Pass one or more `key=value` pairs with the repeatable `-a`/`--arg` flag. This form doesn't need a `--` separator:
    ```bash
-   chrome-devtools run-script search_hn.js "Rust"
+   chrome-devtools run-script search_hn.js -a query="Rust"
    ```
-2. **Hybrid Style (Positional + Named):**
+2. **Pure Positional Style:**
+   Append raw positional strings after `--`. A single trailing positional argument is automatically mapped to `ctx.args.query` (as well as `ctx.args._0`):
    ```bash
-   chrome-devtools run-script search_hn.js "Rust" limit=10 safeSearch=true
+   chrome-devtools run-script search_hn.js -- "Rust"
    ```
-3. **Pure Named Style:**
+3. **Hybrid Style (Positional + Named, after `--`):**
    ```bash
-   chrome-devtools run-script search_hn.js query="Rust" limit=10
+   chrome-devtools run-script search_hn.js -- "Rust" limit=10 safeSearch=true
    ```
 
 ### Comment-based Auto-Navigation
@@ -73,11 +74,14 @@ These real-world examples work on `hn.algolia.com`.
 // @url https://hn.algolia.com/?query={query}
 
 // search_hn.js
-// Run with: chrome-devtools run-script skill/chrome-devtools/examples/search_hn.js "Rust"
+// Run with: chrome-devtools run-script skill/chrome-devtools/examples/search_hn.js -a query="Rust"
+//
+// run-script injects `ctx` and runs this file inside an async context.
+// Setting `@url` above tells the CLI to automatically navigate to the pre-rendered query URL first!
 
 const query = ctx.args.query;
 if (!query) {
-  throw new Error("Query argument is required.");
+  throw new Error("Query argument is required. Pass it with '-a query=...'");
 }
 
 // Wait for results to update/load
@@ -104,7 +108,7 @@ return results;
 // @domain       hn.algolia.com
 // ==/UserAdapter==
 
-// Run with: chrome-devtools adapter skill/chrome-devtools/examples/hn_adapter.js search "Rust"
+// Run with: chrome-devtools adapter skill/chrome-devtools/examples/hn_adapter.js search -a query="Rust"
 
 async function search(ctx) {
   const query = ctx.args.query;
