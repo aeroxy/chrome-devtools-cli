@@ -134,7 +134,8 @@ fn build_ctx_object(args_str: &str) -> String {
                         el.innerText = value;
                     }} else {{
                         const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
-                            || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                            || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
+                            || Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value')?.set;
                         if (setter) {{
                             setter.call(el, value);
                         }} else {{
@@ -154,9 +155,6 @@ fn url_encode(input: &str) -> String {
         match b {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 encoded.push(b as char);
-            }
-            b' ' => {
-                encoded.push('+');
             }
             _ => {
                 encoded.push_str(&format!("%{:02X}", b));
@@ -182,9 +180,12 @@ pub async fn run_script(
     // Perform auto-navigation if @url or @navigate comments exist at the top of the file
     let mut target_url = None;
     for line in script_content.lines() {
-        let trimmed = line.trim_start();
-        if let Some(comment) = trimmed.strip_prefix("//").or_else(|| trimmed.strip_prefix('*')) {
-            let comment = comment.trim_start();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(comment) = trimmed.strip_prefix("//").or_else(|| trimmed.strip_prefix("/*")).or_else(|| trimmed.strip_prefix('*')) {
+            let comment = comment.trim();
             if let Some(rest) = comment.strip_prefix("@url") {
                 target_url = Some(rest.trim().to_string());
                 break;
@@ -192,6 +193,8 @@ pub async fn run_script(
                 target_url = Some(rest.trim().to_string());
                 break;
             }
+        } else {
+            break;
         }
     }
 
@@ -219,7 +222,7 @@ pub async fn run_script(
         };
 
         let current_url = client.current_url(session_id).await?;
-        if current_url != nav_url {
+        if current_url.trim_end_matches('/') != nav_url.trim_end_matches('/') {
             eprintln!("[script] Current URL '{}' does not match target URL '{}'. Auto-navigating...", current_url, nav_url);
 
             crate::commands::navigate::navigate(
@@ -235,7 +238,7 @@ pub async fn run_script(
             .await?;
 
             let post_nav_url = client.current_url(session_id).await?;
-            if post_nav_url != nav_url {
+            if post_nav_url.trim_end_matches('/') != nav_url.trim_end_matches('/') {
                 anyhow::bail!(
                     "Auto-navigation to '{}' resulted in URL '{}' which does not match target URL",
                     nav_url,
@@ -609,6 +612,13 @@ mod tests {
     }
 
     #[test]
+    fn test_url_encode() {
+        assert_eq!(url_encode("hello world"), "hello%20world");
+        assert_eq!(url_encode("foo+bar"), "foo%2Bbar");
+        assert_eq!(url_encode("a-z_A-Z_0-9"), "a-z_A-Z_0-9");
+    }
+
+    #[test]
     fn test_build_ctx_object_embeds_args_and_helpers() {
         let ctx = build_ctx_object(r#"{"query":"hi"}"#);
         assert!(ctx.starts_with("const ctx = {"));
@@ -622,5 +632,7 @@ mod tests {
         // fill must support contenteditable elements.
         assert!(ctx.contains("el.isContentEditable"));
         assert!(ctx.contains("el.innerText ="));
+        // fill must check HTMLSelectElement for state updates in frameworks.
+        assert!(ctx.contains("window.HTMLSelectElement.prototype"));
     }
 }
