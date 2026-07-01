@@ -297,25 +297,31 @@ pub async fn run_script(
 fn parse_adapter_domains(content: &str) -> Vec<String> {
     let mut domains = Vec::new();
     for line in content.lines() {
-        // Require the line to be a comment before looking for the marker.
-        let trimmed = line.trim_start();
-        let comment = match trimmed.strip_prefix("//").or_else(|| trimmed.strip_prefix('*')) {
-            Some(rest) => rest.trim_start(),
-            None => continue,
-        };
-
-        // The marker must lead the comment body and be followed by whitespace so
-        // tokens like `@domainname` or `foo@domain.com` do not match.
-        let Some(rest) = comment.strip_prefix("@domain") else {
-            continue;
-        };
-        if !rest.starts_with(char::is_whitespace) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
+        let comment = match trimmed
+            .strip_prefix("//")
+            .or_else(|| trimmed.strip_prefix("/*"))
+            .or_else(|| trimmed.strip_prefix('*'))
+        {
+            Some(rest) => rest.trim_start(),
+            None => break,
+        };
 
-        let domain = rest.split_whitespace().next().unwrap_or("");
-        if !domain.is_empty() {
-            domains.push(domain.to_string());
+        let mut comment = comment;
+        if let Some(stripped) = comment.strip_suffix("*/") {
+            comment = stripped.trim();
+        }
+
+        if let Some(rest) = comment.strip_prefix("@domain") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                let domain = rest.split_whitespace().next().unwrap_or("");
+                if !domain.is_empty() {
+                    domains.push(domain.to_string());
+                }
+            }
         }
     }
     domains
@@ -569,6 +575,17 @@ mod tests {
             const x = "@domain inside-string.com";
         "#;
         assert_eq!(parse_adapter_domains(content), vec!["real.com"]);
+    }
+
+    #[test]
+    fn test_parse_adapter_domains_block_comments_and_early_break() {
+        // Block comment on a single line
+        let content = "/* @domain block-one.com */\nconst x = 1;\n// @domain ignored.com";
+        assert_eq!(parse_adapter_domains(content), vec!["block-one.com"]);
+
+        // Multi-line block comment with early break on code
+        let content = "/*\n * @domain block-two.com\n */\n\nconst y = 2;\n// @domain ignored2.com";
+        assert_eq!(parse_adapter_domains(content), vec!["block-two.com"]);
     }
 
     #[test]
