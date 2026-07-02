@@ -215,7 +215,8 @@ pub async fn run_script(
     output: Option<&str>,
     track_navigation: bool,
 ) -> Result<CommandResult> {
-    let script_content = std::fs::read_to_string(file_path)
+    let script_content = tokio::fs::read_to_string(file_path)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to read script file '{}': {}", file_path, e))?;
 
     // Perform auto-navigation if @url or @navigate comments exist at the top of the file
@@ -463,7 +464,8 @@ pub async fn run_adapter(
         );
     }
 
-    let script_content = std::fs::read_to_string(file_path)
+    let script_content = tokio::fs::read_to_string(file_path)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to read adapter file '{}': {}", file_path, e))?;
 
     // Perform domain protection
