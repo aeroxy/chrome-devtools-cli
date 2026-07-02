@@ -328,6 +328,60 @@ pub enum Commands {
         extension_id: Option<String>,
     },
 
+    /// Run a local JavaScript file in the active page context
+    ///
+    /// `raw_args` is a clap "last" positional: it only takes effect after a
+    /// literal `--`, and everything after that `--` is treated as a raw
+    /// argument rather than a flag. Put --output/--track-navigation *before*
+    /// the `--`, e.g.: `run-script foo.js --output out.json -- "query" limit=10`
+    /// (a bare `run-script foo.js "query"`, with no `--`, is rejected by clap).
+    #[command(name = "run-script")]
+    RunScript {
+        /// Path to the JavaScript file
+        file_path: String,
+        /// Optional arguments to pass to the script as key=value pairs (can be repeated)
+        #[arg(long = "arg", short = 'a')]
+        script_args: Vec<String>,
+        /// Extra trailing raw/positional arguments. Must be placed after a
+        /// literal '--'; put other options before it (see command help).
+        #[arg(last = true)]
+        raw_args: Vec<String>,
+        /// Write output to a file instead of stdout (must precede '--')
+        #[arg(long, short)]
+        output: Option<String>,
+        /// Track URL changes caused by this evaluation (must precede '--')
+        #[arg(long)]
+        track_navigation: bool,
+    },
+
+    /// Run a structured custom site adapter JavaScript function
+    ///
+    /// `raw_args` is a clap "last" positional: it only takes effect after a
+    /// literal `--`, and everything after that `--` is treated as a raw
+    /// argument rather than a flag. Put --output/--track-navigation *before*
+    /// the `--`, e.g.: `adapter foo.js myFn --output out.json -- "query"`
+    /// (a bare `adapter foo.js myFn "query"`, with no `--`, is rejected by clap).
+    #[command(name = "adapter")]
+    Adapter {
+        /// Path to the JavaScript adapter file
+        file_path: String,
+        /// Name of the function in the adapter to run
+        function_name: String,
+        /// Optional arguments to pass to the function as key=value pairs (can be repeated)
+        #[arg(long = "arg", short = 'a')]
+        script_args: Vec<String>,
+        /// Extra trailing raw/positional arguments. Must be placed after a
+        /// literal '--'; put other options before it (see command help).
+        #[arg(last = true)]
+        raw_args: Vec<String>,
+        /// Write output to a file instead of stdout (must precede '--')
+        #[arg(long, short)]
+        output: Option<String>,
+        /// Track URL changes caused by this evaluation (must precede '--')
+        #[arg(long)]
+        track_navigation: bool,
+    },
+
     /// Stop the background daemon process
     #[command(name = "kill-daemon")]
     KillDaemon,
@@ -373,6 +427,8 @@ impl Cli {
             Commands::Console { .. } => "console",
             Commands::Network { .. } => "network",
             Commands::SwLogs { .. } => "sw-logs",
+            Commands::RunScript { .. } => "run-script",
+            Commands::Adapter { .. } => "adapter",
             Commands::KillDaemon => "kill-daemon",
         }
     }
@@ -394,6 +450,76 @@ fn absolutize_path(path: &str) -> Result<String> {
             .map_err(|e| anyhow::anyhow!("Failed to resolve CLI working directory to absolutize path '{path}': {e}"))?;
         Ok(cwd.join(p).to_string_lossy().to_string())
     }
+}
+
+fn parse_json_value(v: &str) -> serde_json::Value {
+    if v.eq_ignore_ascii_case("true") {
+        serde_json::Value::Bool(true)
+    } else if v.eq_ignore_ascii_case("false") {
+        serde_json::Value::Bool(false)
+    } else if let Ok(n) = v.parse::<i64>() {
+        if n.to_string() == v {
+            serde_json::Value::Number(n.into())
+        } else {
+            serde_json::Value::String(v.to_string())
+        }
+    } else if let Ok(f) = v.parse::<f64>() {
+        if let Some(num) = serde_json::Number::from_f64(f) {
+            if f.to_string() == v {
+                serde_json::Value::Number(num)
+            } else {
+                serde_json::Value::String(v.to_string())
+            }
+        } else {
+            serde_json::Value::String(v.to_string())
+        }
+    } else {
+        serde_json::Value::String(v.to_string())
+    }
+}
+
+fn parse_args(named_args: &[String], raw_args: &[String]) -> Result<serde_json::Value> {
+    let mut map = serde_json::Map::new();
+
+    // Parse named_args (from -a/--arg) first
+    for arg in named_args {
+        let (k, v) = arg
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("Invalid argument '{arg}': expected key=value"))?;
+        let k = k.trim();
+        if k.is_empty() {
+            anyhow::bail!("Invalid argument '{arg}': key must not be empty");
+        }
+        let v = v.trim();
+        map.insert(k.to_string(), parse_json_value(v));
+    }
+
+    // Parse raw_args (trailing positional arguments)
+    let mut positional_count = 0;
+    for arg in raw_args {
+        if let Some((k, v)) = arg.split_once('=') {
+            let k = k.trim();
+            if k.is_empty() {
+                anyhow::bail!("Invalid argument '{arg}': key must not be empty");
+            }
+            let v = v.trim();
+            map.insert(k.to_string(), parse_json_value(v));
+        } else {
+            // Positional argument without `=`
+            let val = parse_json_value(arg.trim());
+
+            // Populated as `_0`, `_1`, etc.
+            map.insert(format!("_{}", positional_count), val.clone());
+
+            // If it's the first positional argument, also map it to `"query"`
+            if positional_count == 0 {
+                map.insert("query".to_string(), val);
+            }
+            positional_count += 1;
+        }
+    }
+
+    Ok(serde_json::Value::Object(map))
 }
 
 fn build_request(cli: &Cli) -> Result<DaemonRequest> {
@@ -540,6 +666,38 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
         } => (
             "sw-logs",
             json!({"duration": duration, "extension_id": extension_id}),
+        ),
+        Commands::RunScript {
+            file_path,
+            script_args,
+            raw_args,
+            output,
+            track_navigation,
+        } => (
+            "run-script",
+            json!({
+                "file_path": absolutize_path(file_path)?,
+                "script_args": parse_args(script_args, raw_args)?,
+                "output": absolutize(output)?,
+                "track_navigation": track_navigation
+            }),
+        ),
+        Commands::Adapter {
+            file_path,
+            function_name,
+            script_args,
+            raw_args,
+            output,
+            track_navigation,
+        } => (
+            "adapter",
+            json!({
+                "file_path": absolutize_path(file_path)?,
+                "function_name": function_name,
+                "script_args": parse_args(script_args, raw_args)?,
+                "output": absolutize(output)?,
+                "track_navigation": track_navigation
+            }),
         ),
         Commands::KillDaemon => unreachable!("KillDaemon is handled before build_request"),
         Commands::InspectHeapSnapshotNode { .. } => {
@@ -1097,6 +1255,44 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             )
             .await
         }
+        Commands::RunScript {
+            file_path,
+            script_args,
+            raw_args,
+            output,
+            track_navigation,
+        } => {
+            commands::evaluate::run_script(
+                &mut client,
+                &session_id,
+                file_path,
+                &parse_args(script_args, raw_args)?,
+                cli.output_format(),
+                output.as_deref(),
+                *track_navigation,
+            )
+            .await
+        }
+        Commands::Adapter {
+            file_path,
+            function_name,
+            script_args,
+            raw_args,
+            output,
+            track_navigation,
+        } => {
+            commands::evaluate::run_adapter(
+                &mut client,
+                &session_id,
+                file_path,
+                function_name,
+                &parse_args(script_args, raw_args)?,
+                cli.output_format(),
+                output.as_deref(),
+                *track_navigation,
+            )
+            .await
+        }
         _ => unreachable!(),
     };
 
@@ -1106,4 +1302,94 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
         r.target_id = Some(name);
         r
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_args() {
+        let args = vec![
+            "str_val=hello".to_string(),
+            "int_val=42".to_string(),
+            "float_val=3.14".to_string(),
+            "bool_true=true".to_string(),
+            "bool_false=False".to_string(),
+        ];
+        let parsed = parse_args(&args, &[]).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("str_val").unwrap().as_str().unwrap(), "hello");
+        assert_eq!(obj.get("int_val").unwrap().as_i64().unwrap(), 42);
+        assert_eq!(obj.get("float_val").unwrap().as_f64().unwrap(), 3.14);
+        assert_eq!(obj.get("bool_true").unwrap().as_bool().unwrap(), true);
+        assert_eq!(obj.get("bool_false").unwrap().as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn test_parse_args_preserves_leading_zeros() {
+        // ZIP codes, phone numbers, and signed tokens must not be rewritten as
+        // canonical integers (which would drop leading zeros or the '+').
+        let args = vec![
+            "zip=01234".to_string(),
+            "phone=+12025550123".to_string(),
+            "zero=0".to_string(),
+            "neg=-5".to_string(),
+            "plain=42".to_string(),
+        ];
+        let parsed = parse_args(&args, &[]).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("zip").unwrap().as_str().unwrap(), "01234");
+        assert_eq!(obj.get("phone").unwrap().as_str().unwrap(), "+12025550123");
+        assert_eq!(obj.get("zero").unwrap().as_i64().unwrap(), 0);
+        assert_eq!(obj.get("neg").unwrap().as_i64().unwrap(), -5);
+        assert_eq!(obj.get("plain").unwrap().as_i64().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_parse_args_preserves_non_canonical_floats() {
+        // Non-canonical float representations must remain strings verbatim
+        let args = vec![
+            "val1=01.50".to_string(),
+            "val2=1e3".to_string(),
+            "val3=+3.5".to_string(),
+            "val4=3.5".to_string(), // Canonical should still parse as float number
+        ];
+        let parsed = parse_args(&args, &[]).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("val1").unwrap().as_str().unwrap(), "01.50");
+        assert_eq!(obj.get("val2").unwrap().as_str().unwrap(), "1e3");
+        assert_eq!(obj.get("val3").unwrap().as_str().unwrap(), "+3.5");
+        assert_eq!(obj.get("val4").unwrap().as_f64().unwrap(), 3.5);
+    }
+
+    #[test]
+    fn test_parse_args_rejects_malformed() {
+        // Missing '=' is now a hard error instead of being silently dropped.
+        assert!(parse_args(&["no_equals".to_string()], &[]).is_err());
+        // Empty keys are rejected.
+        assert!(parse_args(&["=value".to_string()], &[]).is_err());
+        assert!(parse_args(&["   =value".to_string()], &[]).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_with_raw_args() {
+        // Standard trailing argument gets mapped to "query" and "_0"
+        let parsed = parse_args(&[], &["what is a witch".to_string()]).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("query").unwrap().as_str().unwrap(), "what is a witch");
+        assert_eq!(obj.get("_0").unwrap().as_str().unwrap(), "what is a witch");
+
+        // Mixture of key=value trailing args and raw positional args
+        let parsed = parse_args(
+            &["user=admin".to_string()],
+            &["what is a witch".to_string(), "limit=10".to_string(), "second_arg".to_string()],
+        ).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("user").unwrap().as_str().unwrap(), "admin");
+        assert_eq!(obj.get("query").unwrap().as_str().unwrap(), "what is a witch");
+        assert_eq!(obj.get("_0").unwrap().as_str().unwrap(), "what is a witch");
+        assert_eq!(obj.get("limit").unwrap().as_i64().unwrap(), 10);
+        assert_eq!(obj.get("_1").unwrap().as_str().unwrap(), "second_arg");
+    }
 }

@@ -56,7 +56,7 @@ chrome-devtools --page 0 navigate https://example.com
 
 - **Navigation**: `navigate`, `navigate --back`, `navigate --forward`, `navigate --reload`
 - **Page management**: `list-pages`, `new-page`, `close-page`, `select-page`
-- **Extraction**: `screenshot`, `snapshot` (accessibility tree), `evaluate` (JavaScript), `read-page` (page content as markdown)
+- **Extraction**: `screenshot`, `snapshot` (accessibility tree), `evaluate` (JavaScript), `read-page` (page content as markdown), `run-script` (run local JS file), `adapter` (run site adapter)
 - **Interaction**: `click`, `fill`, `type-text`, `press-key`, `hover`, `click-at`
 - **Emulation**: `emulate` (viewport, mobile, geolocation, URL blocking)
 - **Inspection**: `console` (logs), `network` (requests), `sw-logs` (extension service workers)
@@ -311,6 +311,28 @@ chrome-devtools --target warm-squid read-page --json
 - `read-page` — you want the page's textual content as readable markdown (articles, docs, wiki pages). Best for summarization, extraction, or feeding content to an LLM.
 - `snapshot` — you need the full accessibility tree with element IDs, roles, and interactive elements. Best for understanding page structure and finding elements to click/fill.
 
+### Pattern 13: Local JS Scripting (run-script)
+
+Evaluate a local JavaScript file inside the page context. Dynamic arguments can be passed as raw positional values at the end of the command or via `-a/--arg` keys, and are automatically typed and injected into the execution context as `ctx.args`. Supports comment-based `@url` auto-navigation.
+
+See the dedicated [Custom Scripting Guide](./CUSTOM_SCRIPTING.md) for full documentation on script creation, argument parsing, and auto-navigation.
+
+```bash
+# Run a script with trailing positional arguments (auto-navigates if @url is present)
+chrome-devtools --target warm-squid run-script skill/chrome-devtools/examples/search_hn.js -- "Rust"
+```
+
+### Pattern 14: Custom Domain-Aware Adapters (adapter)
+
+Run site-specific adapter actions. If the browser is not currently on a matching domain (as defined by `@domain` comments in the JSDoc header), the CLI auto-navigates to that domain first.
+
+See the dedicated [Custom Scripting Guide](./CUSTOM_SCRIPTING.md) for full documentation on custom adapters, domain protection, and argument parsing.
+
+```bash
+# Run an adapter function with positional args (auto-navigates if target domain is mismatch)
+chrome-devtools --target warm-squid adapter skill/chrome-devtools/examples/hn_adapter.js search -- "Rust"
+```
+
 ## Complete Command Reference
 
 ### Navigation
@@ -364,6 +386,12 @@ chrome-devtools --target <name> emulate --clear-all                      # clear
 ```bash
 chrome-devtools --target <name> list-3p-tools
 chrome-devtools --target <name> execute-3p-tool <name> '<json-params>'
+```
+
+### Custom Scripting & Adapters
+```bash
+chrome-devtools --target <name> run-script <file-path> [--arg key=value] [--output <path>] [--track-navigation]
+chrome-devtools --target <name> adapter <file-path> <function-name> [--arg key=value] [--output <path>] [--track-navigation]
 ```
 
 ### Daemon

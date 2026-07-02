@@ -72,6 +72,8 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "console" => &["duration", "type"],
         "network" => &["duration", "type"],
         "sw-logs" => &["duration", "extension_id"],
+        "run-script" => &["file_path", "script_args", "raw_args", "output", "track_navigation"],
+        "adapter" => &["file_path", "function_name", "script_args", "raw_args", "output", "track_navigation"],
         "kill-daemon" => &[],
         _ => &[],
     }
@@ -303,6 +305,38 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     result.map(|mut r| {
         r.target_id = Some(name);
         r
+    })
+}
+
+/// Arguments shared by the `run-script` and `adapter` commands.
+struct ScriptExecArgs<'a> {
+    file_path: &'a str,
+    script_args: serde_json::Value,
+    output: Option<&'a str>,
+    track_navigation: bool,
+}
+
+/// Extract the arguments common to `run-script` and `adapter` from the raw
+/// command args. `script_args` is conceptually optional; it defaults to an
+/// empty object so clients can omit it when a script/adapter takes no
+/// arguments.
+fn script_exec_args(args: &serde_json::Value) -> Result<ScriptExecArgs<'_>> {
+    let file_path = args
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("file_path required"))?;
+    let script_args = args.get("script_args").cloned().unwrap_or_else(|| json!({}));
+    let output = args.get("output").and_then(|v| v.as_str());
+    let track_navigation = args
+        .get("track_navigation")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    Ok(ScriptExecArgs {
+        file_path,
+        script_args,
+        output,
+        track_navigation,
     })
 }
 
@@ -568,6 +602,38 @@ async fn inner_execute(
                 .unwrap_or_default();
             commands::network::collect_network(client, session_id, duration, types, req.format())
                 .await
+        }
+        "run-script" => {
+            let a = script_exec_args(args)?;
+            commands::evaluate::run_script(
+                client,
+                session_id,
+                a.file_path,
+                &a.script_args,
+                req.format(),
+                a.output,
+                a.track_navigation,
+            )
+            .await
+        }
+        "adapter" => {
+            let a = script_exec_args(args)?;
+            let function_name = args
+                .get("function_name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("function_name required"))?;
+
+            commands::evaluate::run_adapter(
+                client,
+                session_id,
+                a.file_path,
+                function_name,
+                &a.script_args,
+                req.format(),
+                a.output,
+                a.track_navigation,
+            )
+            .await
         }
         _ => bail!("Unknown command: {cmd}"),
     }
