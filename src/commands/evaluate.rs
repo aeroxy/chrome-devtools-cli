@@ -97,16 +97,18 @@ fn build_ctx_object(args_str: &str) -> String {
                 wait: async (ms) => new Promise(r => setTimeout(r, ms)),
                 waitForText: async (text, timeout = 30000) => {{
                     const start = Date.now();
-                    while (Date.now() - start < timeout) {{
+                    while (true) {{
                         if (document.body && document.body.innerText.includes(text)) return;
+                        if (timeout > 0 && Date.now() - start >= timeout) break;
                         await new Promise(r => setTimeout(r, {POLL_INTERVAL_MS}));
                     }}
                     throw new Error("Timeout waiting for text: " + text);
                 }},
                 waitForSelector: async (selector, timeout = 30000) => {{
                     const start = Date.now();
-                    while (Date.now() - start < timeout) {{
+                    while (true) {{
                         if (document.querySelector(selector)) return;
+                        if (timeout > 0 && Date.now() - start >= timeout) break;
                         await new Promise(r => setTimeout(r, {POLL_INTERVAL_MS}));
                     }}
                     throw new Error("Timeout waiting for selector: " + selector);
@@ -817,6 +819,11 @@ mod tests {
         assert!(ctx.contains("setNativeProp(el, 'value'"));
         assert!(ctx.contains("Object.getPrototypeOf(element)"));
         assert!(ctx.contains("Object.getOwnPropertyDescriptor(proto, prop)"));
+        // waitForText/waitForSelector must check the condition before
+        // consulting the elapsed time, so `timeout = 0` performs at least one
+        // immediate check instead of throwing without ever looking at the DOM.
+        assert!(ctx.contains("while (true) {"));
+        assert!(ctx.contains("if (timeout > 0 && Date.now() - start >= timeout) break;"));
     }
 
     #[test]

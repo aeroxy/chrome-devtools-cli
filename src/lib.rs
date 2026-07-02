@@ -457,6 +457,8 @@ fn parse_json_value(v: &str) -> serde_json::Value {
         serde_json::Value::Bool(true)
     } else if v.eq_ignore_ascii_case("false") {
         serde_json::Value::Bool(false)
+    } else if v.eq_ignore_ascii_case("null") {
+        serde_json::Value::Null
     } else if let Ok(n) = v.parse::<i64>() {
         if n.to_string() == v {
             serde_json::Value::Number(n.into())
@@ -1331,6 +1333,7 @@ mod tests {
             "float_val=3.14".to_string(),
             "bool_true=true".to_string(),
             "bool_false=False".to_string(),
+            "null_val=null".to_string(),
         ];
         let parsed = parse_args(&args, &[]).unwrap();
         let obj = parsed.as_object().unwrap();
@@ -1338,6 +1341,7 @@ mod tests {
         assert_eq!(obj.get("int_val").unwrap().as_i64().unwrap(), 42);
         assert_eq!(obj.get("float_val").unwrap().as_f64().unwrap(), 3.14);
         assert_eq!(obj.get("bool_true").unwrap().as_bool().unwrap(), true);
+        assert!(obj.get("null_val").unwrap().is_null());
         assert_eq!(obj.get("bool_false").unwrap().as_bool().unwrap(), false);
     }
 
