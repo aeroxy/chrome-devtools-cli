@@ -465,7 +465,7 @@ fn parse_json_value(v: &str) -> serde_json::Value {
         }
     } else if let Ok(f) = v.parse::<f64>() {
         if let Some(num) = serde_json::Number::from_f64(f) {
-            if f.to_string() == v {
+            if num.to_string() == v {
                 serde_json::Value::Number(num)
             } else {
                 serde_json::Value::String(v.to_string())
@@ -478,6 +478,25 @@ fn parse_json_value(v: &str) -> serde_json::Value {
     }
 }
 
+/// True for strings that look like an intentional `key=value` key (e.g. `limit`,
+/// `safeSearch`, `second_arg`) rather than a positional value that merely
+/// contains a literal `=`, like a URL query string (`https://x.com?q=rust`).
+fn looks_like_arg_key(k: &str) -> bool {
+    let mut chars = k.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Split a `key=value` argument, trim both sides, and parse the value into
+/// JSON. Shared by the `named_args` and `raw_args` loops in [`parse_args`].
+fn parse_kv(key: &str, value: &str, arg: &str) -> Result<(String, serde_json::Value)> {
+    let key = key.trim();
+    if key.is_empty() {
+        anyhow::bail!("Invalid argument '{arg}': key must not be empty");
+    }
+    Ok((key.to_string(), parse_json_value(value.trim())))
+}
+
 fn parse_args(named_args: &[String], raw_args: &[String]) -> Result<serde_json::Value> {
     let mut map = serde_json::Map::new();
 
@@ -486,26 +505,22 @@ fn parse_args(named_args: &[String], raw_args: &[String]) -> Result<serde_json::
         let (k, v) = arg
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("Invalid argument '{arg}': expected key=value"))?;
-        let k = k.trim();
-        if k.is_empty() {
-            anyhow::bail!("Invalid argument '{arg}': key must not be empty");
-        }
-        let v = v.trim();
-        map.insert(k.to_string(), parse_json_value(v));
+        let (k, val) = parse_kv(k, v, arg)?;
+        map.insert(k, val);
     }
 
     // Parse raw_args (trailing positional arguments)
     let mut positional_count = 0;
     for arg in raw_args {
-        if let Some((k, v)) = arg.split_once('=') {
-            let k = k.trim();
-            if k.is_empty() {
-                anyhow::bail!("Invalid argument '{arg}': key must not be empty");
-            }
-            let v = v.trim();
-            map.insert(k.to_string(), parse_json_value(v));
+        // Only treat `=` as a key/value separator when the part before it looks
+        // like an intentional key. Otherwise a positional value containing a
+        // literal `=` (e.g. a URL query string) would be misparsed as key=value.
+        let kv = arg.split_once('=').filter(|(k, _)| looks_like_arg_key(k.trim()));
+        if let Some((k, v)) = kv {
+            let (k, val) = parse_kv(k, v, arg)?;
+            map.insert(k, val);
         } else {
-            // Positional argument without `=`
+            // Positional argument without a recognized `key=`
             let val = parse_json_value(arg.trim());
 
             // Populated as `_0`, `_1`, etc.
@@ -1354,6 +1369,7 @@ mod tests {
             "val2=1e3".to_string(),
             "val3=+3.5".to_string(),
             "val4=3.5".to_string(), // Canonical should still parse as float number
+            "val5=1.0".to_string(), // Canonical trailing ".0" should still parse as a number
         ];
         let parsed = parse_args(&args, &[]).unwrap();
         let obj = parsed.as_object().unwrap();
@@ -1361,6 +1377,7 @@ mod tests {
         assert_eq!(obj.get("val2").unwrap().as_str().unwrap(), "1e3");
         assert_eq!(obj.get("val3").unwrap().as_str().unwrap(), "+3.5");
         assert_eq!(obj.get("val4").unwrap().as_f64().unwrap(), 3.5);
+        assert_eq!(obj.get("val5").unwrap().as_f64().unwrap(), 1.0);
     }
 
     #[test]
@@ -1391,5 +1408,20 @@ mod tests {
         assert_eq!(obj.get("_0").unwrap().as_str().unwrap(), "what is a witch");
         assert_eq!(obj.get("limit").unwrap().as_i64().unwrap(), 10);
         assert_eq!(obj.get("_1").unwrap().as_str().unwrap(), "second_arg");
+    }
+
+    #[test]
+    fn test_parse_args_raw_args_preserves_urls_with_query_params() {
+        // A positional URL containing `=` (query params) must not be
+        // misparsed as a key=value pair.
+        let parsed = parse_args(
+            &[],
+            &["https://x.com/search?q=rust".to_string(), "limit=10".to_string()],
+        )
+        .unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("query").unwrap().as_str().unwrap(), "https://x.com/search?q=rust");
+        assert_eq!(obj.get("_0").unwrap().as_str().unwrap(), "https://x.com/search?q=rust");
+        assert_eq!(obj.get("limit").unwrap().as_i64().unwrap(), 10);
     }
 }

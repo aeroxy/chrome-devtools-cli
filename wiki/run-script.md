@@ -62,26 +62,25 @@ This script searches `hn.algolia.com` (Hacker News Search) for a query and extra
 
 `run-script` already runs your file inside an async context, so use the `ctx`
 helpers at the top level and `return` the result directly — no IIFE wrapper is
-needed. Because we have defined the `@url` metadata tag, the CLI will automatically
-navigate to `https://hn.algolia.com` if the browser is not already on that site.
+needed. Because we have defined the `@url` metadata tag with a `{query}`
+placeholder, the CLI will interpolate the `query` argument into the URL and
+automatically navigate to the pre-rendered search results page if the browser
+isn't already there.
 
 ### Script file (`skill/chrome-devtools/examples/search_hn.js`)
 ```javascript
-// @url https://hn.algolia.com
+// @url https://hn.algolia.com/?query={query}
 
 // search_hn.js
 // Run with: chrome-devtools run-script skill/chrome-devtools/examples/search_hn.js -a query="Rust"
 //
 // run-script injects `ctx` and runs this file inside an async context.
-// Setting `@url` above tells the CLI to automatically navigate to the target site first!
+// Setting `@url` above tells the CLI to automatically navigate to the pre-rendered query URL first!
 
 const query = ctx.args.query;
 if (!query) {
   throw new Error("Query argument is required. Pass it with '-a query=...'");
 }
-
-// Fill in search input (the SPA will fetch and render results dynamically)
-await ctx.fill("input.SearchInput", query);
 
 // Wait for results to update/load
 await ctx.waitForSelector("article.Story", 10000);
