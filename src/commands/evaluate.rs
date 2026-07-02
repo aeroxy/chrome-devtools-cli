@@ -119,24 +119,15 @@ fn build_ctx_object(args_str: &str) -> String {
                 fill: async (selector, value) => {{
                     const el = document.querySelector(selector);
                     if (!el) throw new Error("Element not found: " + selector);
-                    if (el.type === 'checkbox' || el.type === 'radio') {{
-                        // Checkboxes/radios toggle via `checked`, not `value`. A
-                        // boolean (or "true"/"false") sets the state directly; any
-                        // other value selects the input whose `value` it matches.
-                        if (value === true || value === false) {{
-                            el.checked = value;
-                        }} else if (value === 'true' || value === 'false') {{
-                            el.checked = value === 'true';
-                        }} else {{
-                            el.checked = String(value) === el.value;
-                        }}
-                    }} else if (el.isContentEditable) {{
-                        el.innerText = value;
-                    }} else {{
+                    // Look up the native property setter from the element's own
+                    // prototype chain (rather than assigning directly) so that
+                    // React/Vue-style frameworks, which override the setter to
+                    // track state, still observe the update.
+                    const setNativeProp = (element, prop, val) => {{
                         let setter;
-                        let proto = Object.getPrototypeOf(el);
+                        let proto = Object.getPrototypeOf(element);
                         while (proto) {{
-                            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                            const desc = Object.getOwnPropertyDescriptor(proto, prop);
                             if (desc) {{
                                 setter = desc.set;
                                 break;
@@ -144,10 +135,28 @@ fn build_ctx_object(args_str: &str) -> String {
                             proto = Object.getPrototypeOf(proto);
                         }}
                         if (setter) {{
-                            setter.call(el, value);
+                            setter.call(element, val);
                         }} else {{
-                            el.value = value;
+                            element[prop] = val;
                         }}
+                    }};
+                    if (el.type === 'checkbox' || el.type === 'radio') {{
+                        // Checkboxes/radios toggle via `checked`, not `value`. A
+                        // boolean (or "true"/"false") sets the state directly; any
+                        // other value selects the input whose `value` it matches.
+                        let checkedVal;
+                        if (value === true || value === false) {{
+                            checkedVal = value;
+                        }} else if (value === 'true' || value === 'false') {{
+                            checkedVal = value === 'true';
+                        }} else {{
+                            checkedVal = String(value) === el.value;
+                        }}
+                        setNativeProp(el, 'checked', checkedVal);
+                    }} else if (el.isContentEditable) {{
+                        el.innerText = value;
+                    }} else {{
+                        setNativeProp(el, 'value', value);
                     }}
                     el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
@@ -308,7 +317,19 @@ fn parse_adapter_domains(content: &str) -> Vec<String> {
             .or_else(|| trimmed.strip_prefix('*'))
         {
             Some(rest) => rest.trim_start(),
-            None => break,
+            None => {
+                // Leading ES module imports and "use strict" directives are
+                // common before the metadata comment block and shouldn't stop
+                // the scan; any other code still ends it (see
+                // test_parse_adapter_domains_block_comments_and_early_break).
+                if trimmed.starts_with("import ") || trimmed.starts_with("import(") {
+                    continue;
+                }
+                if matches!(trimmed, "\"use strict\";" | "'use strict';" | "\"use strict\"" | "'use strict'") {
+                    continue;
+                }
+                break;
+            }
         };
 
         let mut comment = comment;
@@ -407,8 +428,11 @@ fn is_valid_js_identifier(name: &str) -> bool {
 /// authoring habit parses instead of failing before the function-existence check.
 ///
 /// The prefix is only stripped when it directly precedes a declaration keyword.
-/// This avoids corrupting `export { ... }` re-export blocks or stray `export`
-/// text inside multi-line strings/comments.
+/// A bare same-line `export { ... };` list or `export default <identifier>;`
+/// re-exports an already-declared binding rather than declaring anything new,
+/// so the whole line is dropped instead. This avoids corrupting `export *` /
+/// `export { ... } from '...'` re-export blocks (which this tool can't resolve
+/// anyway) or stray `export` text inside multi-line strings/comments.
 fn strip_export_keywords(content: &str) -> String {
     const DECL_KEYWORDS: [&str; 6] = ["function", "async", "class", "const", "let", "var"];
     let declaration_follows = |rest: &str| {
@@ -424,11 +448,29 @@ fn strip_export_keywords(content: &str) -> String {
         })
     };
 
+    // A same-line `export { a, b as c };` list or `export default ident;`
+    // only re-exports bindings that are already declared elsewhere in the
+    // file, so it's safe to drop entirely rather than rewrite.
+    let is_bare_reexport = |trimmed: &str| -> bool {
+        if let Some(rest) = trimmed.strip_prefix("export {") {
+            let rest = rest.trim_end();
+            return rest.ends_with('}') || rest.ends_with("};");
+        }
+        if let Some(rest) = trimmed.strip_prefix("export default ") {
+            let ident = rest.trim_end().trim_end_matches(';').trim();
+            return is_valid_js_identifier(ident);
+        }
+        false
+    };
+
     content
         .lines()
         .map(|line| {
             let trimmed = line.trim_start();
             let indent = &line[..line.len() - trimmed.len()];
+            if is_bare_reexport(trimmed) {
+                return String::new();
+            }
             if let Some(rest) = trimmed.strip_prefix("export default ") {
                 if declaration_follows(rest) {
                     return format!("{indent}{rest}");
@@ -591,6 +633,14 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_adapter_domains_skips_leading_imports_and_use_strict() {
+        // Leading ES imports / "use strict" directives shouldn't stop the scan
+        // for the metadata comment block that follows them.
+        let content = "import { foo } from 'bar';\n\"use strict\";\n// @domain example.com\nconst x = 1;\n// @domain ignored.com";
+        assert_eq!(parse_adapter_domains(content), vec!["example.com"]);
+    }
+
+    #[test]
     fn test_parse_script_url_marker_line_comment() {
         let content = "// @url https://example.com\nconst x = 1;";
         assert_eq!(
@@ -663,14 +713,22 @@ mod tests {
 
     #[test]
     fn test_strip_export_keywords_preserves_non_declarations() {
-        // Re-export blocks, `export *`, and prose that merely starts with the
-        // word must be left untouched (only declarations are stripped).
-        let src = "export { ask, read };\nexport * from './x';\nexport const ok = 1;\nexport constants = 2;";
+        // `export * from` re-exports (which this tool can't resolve) and
+        // prose that merely starts with the word must be left untouched
+        // (only declarations and bare re-exports are handled).
+        let src = "export * from './x';\nexport const ok = 1;\nexport constants = 2;";
         let out = strip_export_keywords(src);
-        assert_eq!(
-            out,
-            "export { ask, read };\nexport * from './x';\nconst ok = 1;\nexport constants = 2;"
-        );
+        assert_eq!(out, "export * from './x';\nconst ok = 1;\nexport constants = 2;");
+    }
+
+    #[test]
+    fn test_strip_export_keywords_drops_bare_reexports() {
+        // `export { ... };` lists and `export default <identifier>;` only
+        // re-export an already-declared binding, so the whole line can be
+        // dropped rather than left behind as invalid top-level `export` syntax.
+        let src = "async function search(ctx) {}\nexport { search };\nexport default search;";
+        let out = strip_export_keywords(src);
+        assert_eq!(out, "async function search(ctx) {}\n\n");
     }
 
     #[test]
@@ -745,18 +803,20 @@ mod tests {
         }
         // fill must special-case checkable inputs instead of setting `value`.
         assert!(ctx.contains("el.type === 'checkbox' || el.type === 'radio'"));
-        assert!(ctx.contains("el.checked ="));
+        assert!(ctx.contains("setNativeProp(el, 'checked'"));
         // fill must support contenteditable elements.
         assert!(ctx.contains("el.isContentEditable"));
         assert!(ctx.contains("el.innerText ="));
-        // fill must look up the native value setter from the element's own
+        // fill must look up the native property setter from the element's own
         // prototype (not a hardcoded HTMLInputElement/etc. chain, which would
         // throw on <textarea>/<select> — see
         // test_fill_uses_element_prototype_not_hardcoded_input_element for the
         // receiver-check rationale) so React/Vue-style frameworks see the
-        // update.
-        assert!(ctx.contains("Object.getPrototypeOf(el)"));
-        assert!(ctx.contains("Object.getOwnPropertyDescriptor(proto, 'value')"));
+        // update. This applies to both `value` and `checked` so checkbox/radio
+        // state stays in sync with framework-tracked state too.
+        assert!(ctx.contains("setNativeProp(el, 'value'"));
+        assert!(ctx.contains("Object.getPrototypeOf(element)"));
+        assert!(ctx.contains("Object.getOwnPropertyDescriptor(proto, prop)"));
     }
 
     #[test]
@@ -770,6 +830,6 @@ mod tests {
         assert!(!ctx.contains("HTMLInputElement"));
         assert!(!ctx.contains("HTMLTextAreaElement"));
         assert!(!ctx.contains("HTMLSelectElement"));
-        assert!(ctx.contains("Object.getPrototypeOf(el)"));
+        assert!(ctx.contains("Object.getPrototypeOf(element)"));
     }
 }
