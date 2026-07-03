@@ -240,6 +240,27 @@ pub enum Commands {
         node_id: u64,
     },
 
+    /// Compare two .heapsnapshot files and report per-class added/deleted nodes.
+    /// Offline: parses local files, no Chrome connection required. Without
+    /// --class-index, prints a summary table sorted by size delta. With
+    /// --class-index N, prints the added/deleted node IDs for row N (use the
+    /// idx column from the summary). Node IDs in the detail output are
+    /// directly usable with `inspect-heapsnapshot-node --node-id`.
+    #[command(name = "compare-heapsnapshots")]
+    CompareHeapsnapshots {
+        /// Path to the base (earlier) .heapsnapshot file
+        #[arg(long, short = 'b')]
+        base: String,
+        /// Path to the current (later) .heapsnapshot file
+        #[arg(long, short = 'c')]
+        current: String,
+        /// Optional 0-based row index from the summary output. When omitted,
+        /// prints the summary table; when present, prints per-id detail for
+        /// that class.
+        #[arg(long)]
+        class_index: Option<usize>,
+    },
+
     /// Manage page emulation (viewport, geolocation, etc.)
     Emulate {
         /// Set viewport size as WxH (e.g. 1280x720)
@@ -420,6 +441,7 @@ impl Cli {
             Commands::ReadPage { .. } => "read-page",
             Commands::TakeHeapSnapshot { .. } => "take-heapsnapshot",
             Commands::InspectHeapSnapshotNode { .. } => "inspect-heapsnapshot-node",
+            Commands::CompareHeapsnapshots { .. } => "compare-heapsnapshots",
             Commands::Emulate { .. } => "emulate",
             Commands::WaitFor { .. } => "wait-for",
             Commands::List3pTools => "list-3p-tools",
@@ -720,6 +742,9 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
         Commands::InspectHeapSnapshotNode { .. } => {
             unreachable!("InspectHeapSnapshotNode is handled before build_request")
         }
+        Commands::CompareHeapsnapshots { .. } => {
+            unreachable!("CompareHeapsnapshots is handled before build_request")
+        }
     };
 
     Ok(DaemonRequest {
@@ -892,6 +917,20 @@ pub async fn run() -> Result<()> {
         let result = commands::memory::inspect_heapsnapshot_node_offline(
             file_path,
             *node_id,
+            cli.output_format(),
+        )
+        .await?;
+        print_result(&result);
+        return Ok(());
+    }
+
+    // Handle compare-heapsnapshots offline — parses two local .heapsnapshot
+    // files and diffs them. No Chrome connection or daemon required.
+    if let Commands::CompareHeapsnapshots { base, current, class_index } = &cli.command {
+        let result = commands::memory::compare_heapsnapshots_offline(
+            base,
+            current,
+            *class_index,
             cli.output_format(),
         )
         .await?;

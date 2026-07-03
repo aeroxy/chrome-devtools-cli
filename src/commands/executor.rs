@@ -55,6 +55,7 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "read-page" => &["output"],
         "take-heapsnapshot" => &["output"],
         "inspect-heapsnapshot-node" => &["file_path", "node_id"],
+        "compare-heapsnapshots" => &["base", "current", "class_index"],
         "emulate" => &[
             "viewport",
             "device_scale_factor",
