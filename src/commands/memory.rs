@@ -396,7 +396,10 @@ fn diff_snapshots(
         })
     }).collect();
 
-    diffs.sort_by(|a, b| b.size_delta.cmp(&a.size_delta));
+    diffs.sort_by(|a, b| {
+        b.size_delta.cmp(&a.size_delta)
+            .then_with(|| a.class_name.cmp(&b.class_name))
+    });
     diffs
 }
 

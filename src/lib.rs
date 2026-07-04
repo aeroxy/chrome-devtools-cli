@@ -249,10 +249,10 @@ pub enum Commands {
     #[command(name = "compare-heapsnapshots")]
     CompareHeapsnapshots {
         /// Path to the base (earlier) .heapsnapshot file
-        #[arg(long, short = 'b')]
+        #[arg(long, short)]
         base: String,
         /// Path to the current (later) .heapsnapshot file
-        #[arg(long, short = 'c')]
+        #[arg(long, short)]
         current: String,
         /// Optional 0-based row index from the summary output. When omitted,
         /// prints the summary table; when present, prints per-id detail for
