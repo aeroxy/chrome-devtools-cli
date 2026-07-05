@@ -468,8 +468,11 @@ fn absolutize_path(path: &str) -> Result<String> {
         // Fail loudly if the CWD can't be resolved: silently falling back to an
         // empty path would send a bogus relative path to the daemon, which would
         // resolve it against the daemon's (different) startup CWD.
-        let cwd = std::env::current_dir()
-            .map_err(|e| anyhow::anyhow!("Failed to resolve CLI working directory to absolutize path '{path}': {e}"))?;
+        let cwd = std::env::current_dir().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to resolve CLI working directory to absolutize path '{path}': {e}"
+            )
+        })?;
         Ok(cwd.join(p).to_string_lossy().to_string())
     }
 }
@@ -539,7 +542,9 @@ fn parse_args(named_args: &[String], raw_args: &[String]) -> Result<serde_json::
         // Only treat `=` as a key/value separator when the part before it looks
         // like an intentional key. Otherwise a positional value containing a
         // literal `=` (e.g. a URL query string) would be misparsed as key=value.
-        let kv = arg.split_once('=').filter(|(k, _)| looks_like_arg_key(k.trim()));
+        let kv = arg
+            .split_once('=')
+            .filter(|(k, _)| looks_like_arg_key(k.trim()));
         if let Some((k, v)) = kv {
             let (k, val) = parse_kv(k, v, arg)?;
             map.insert(k, val);
@@ -926,7 +931,12 @@ pub async fn run() -> Result<()> {
 
     // Handle compare-heapsnapshots offline — parses two local .heapsnapshot
     // files and diffs them. No Chrome connection or daemon required.
-    if let Commands::CompareHeapsnapshots { base, current, class_index } = &cli.command {
+    if let Commands::CompareHeapsnapshots {
+        base,
+        current,
+        class_index,
+    } = &cli.command
+    {
         let result = commands::memory::compare_heapsnapshots_offline(
             base,
             current,
@@ -1365,6 +1375,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_parse_args() {
         let args = vec![
             "str_val=hello".to_string(),
@@ -1379,9 +1390,9 @@ mod tests {
         assert_eq!(obj.get("str_val").unwrap().as_str().unwrap(), "hello");
         assert_eq!(obj.get("int_val").unwrap().as_i64().unwrap(), 42);
         assert_eq!(obj.get("float_val").unwrap().as_f64().unwrap(), 3.14);
-        assert_eq!(obj.get("bool_true").unwrap().as_bool().unwrap(), true);
+        assert!(obj.get("bool_true").unwrap().as_bool().unwrap());
         assert!(obj.get("null_val").unwrap().is_null());
-        assert_eq!(obj.get("bool_false").unwrap().as_bool().unwrap(), false);
+        assert!(!obj.get("bool_false").unwrap().as_bool().unwrap());
     }
 
     #[test]
@@ -1437,17 +1448,28 @@ mod tests {
         // Standard trailing argument gets mapped to "query" and "_0"
         let parsed = parse_args(&[], &["what is a witch".to_string()]).unwrap();
         let obj = parsed.as_object().unwrap();
-        assert_eq!(obj.get("query").unwrap().as_str().unwrap(), "what is a witch");
+        assert_eq!(
+            obj.get("query").unwrap().as_str().unwrap(),
+            "what is a witch"
+        );
         assert_eq!(obj.get("_0").unwrap().as_str().unwrap(), "what is a witch");
 
         // Mixture of key=value trailing args and raw positional args
         let parsed = parse_args(
             &["user=admin".to_string()],
-            &["what is a witch".to_string(), "limit=10".to_string(), "second_arg".to_string()],
-        ).unwrap();
+            &[
+                "what is a witch".to_string(),
+                "limit=10".to_string(),
+                "second_arg".to_string(),
+            ],
+        )
+        .unwrap();
         let obj = parsed.as_object().unwrap();
         assert_eq!(obj.get("user").unwrap().as_str().unwrap(), "admin");
-        assert_eq!(obj.get("query").unwrap().as_str().unwrap(), "what is a witch");
+        assert_eq!(
+            obj.get("query").unwrap().as_str().unwrap(),
+            "what is a witch"
+        );
         assert_eq!(obj.get("_0").unwrap().as_str().unwrap(), "what is a witch");
         assert_eq!(obj.get("limit").unwrap().as_i64().unwrap(), 10);
         assert_eq!(obj.get("_1").unwrap().as_str().unwrap(), "second_arg");
@@ -1459,12 +1481,21 @@ mod tests {
         // misparsed as a key=value pair.
         let parsed = parse_args(
             &[],
-            &["https://x.com/search?q=rust".to_string(), "limit=10".to_string()],
+            &[
+                "https://x.com/search?q=rust".to_string(),
+                "limit=10".to_string(),
+            ],
         )
         .unwrap();
         let obj = parsed.as_object().unwrap();
-        assert_eq!(obj.get("query").unwrap().as_str().unwrap(), "https://x.com/search?q=rust");
-        assert_eq!(obj.get("_0").unwrap().as_str().unwrap(), "https://x.com/search?q=rust");
+        assert_eq!(
+            obj.get("query").unwrap().as_str().unwrap(),
+            "https://x.com/search?q=rust"
+        );
+        assert_eq!(
+            obj.get("_0").unwrap().as_str().unwrap(),
+            "https://x.com/search?q=rust"
+        );
         assert_eq!(obj.get("limit").unwrap().as_i64().unwrap(), 10);
     }
 }

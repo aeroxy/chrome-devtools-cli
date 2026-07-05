@@ -73,8 +73,21 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "console" => &["duration", "type"],
         "network" => &["duration", "type"],
         "sw-logs" => &["duration", "extension_id"],
-        "run-script" => &["file_path", "script_args", "raw_args", "output", "track_navigation"],
-        "adapter" => &["file_path", "function_name", "script_args", "raw_args", "output", "track_navigation"],
+        "run-script" => &[
+            "file_path",
+            "script_args",
+            "raw_args",
+            "output",
+            "track_navigation",
+        ],
+        "adapter" => &[
+            "file_path",
+            "function_name",
+            "script_args",
+            "raw_args",
+            "output",
+            "track_navigation",
+        ],
         "kill-daemon" => &[],
         _ => &[],
     }
@@ -326,7 +339,10 @@ fn script_exec_args(args: &serde_json::Value) -> Result<ScriptExecArgs<'_>> {
         .get("file_path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("file_path required"))?;
-    let script_args = args.get("script_args").cloned().unwrap_or_else(|| json!({}));
+    let script_args = args
+        .get("script_args")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let output = args.get("output").and_then(|v| v.as_str());
     let track_navigation = args
         .get("track_navigation")
@@ -413,7 +429,10 @@ async fn inner_execute(
                 client,
                 session_id,
                 commands::screenshot::ScreenshotOptions {
-                    output: args.get("output").and_then(|v| v.as_str()).map(String::from),
+                    output: args
+                        .get("output")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
                     format: args
                         .get("format")
                         .and_then(|v| v.as_str())

@@ -329,7 +329,10 @@ mod tests {
 
     #[test]
     fn extract_title_missing() {
-        assert_eq!(extract_title_from_html("<html><body>Hello</body></html>"), None);
+        assert_eq!(
+            extract_title_from_html("<html><body>Hello</body></html>"),
+            None
+        );
     }
 
     #[test]
@@ -352,10 +355,7 @@ mod tests {
     #[test]
     fn extract_title_decodes_html_entities() {
         let html = "<html><head><title>Foo &amp; Bar</title></head></html>";
-        assert_eq!(
-            extract_title_from_html(html),
-            Some("Foo & Bar".to_string())
-        );
+        assert_eq!(extract_title_from_html(html), Some("Foo & Bar".to_string()));
     }
 
     #[test]
@@ -456,10 +456,7 @@ mod tests {
 
     #[test]
     fn unwrap_iframes_empty() {
-        assert_eq!(
-            unwrap_iframes("<iframe src=\"x\"></iframe>"),
-            ""
-        );
+        assert_eq!(unwrap_iframes("<iframe src=\"x\"></iframe>"), "");
     }
 
     #[test]
@@ -506,7 +503,8 @@ mod tests {
 
     #[test]
     fn extract_content_passes_url_for_relative_link_resolution() {
-        let html = "<html><head><title>Test</title></head><body><a href='/page'>link</a></body></html>";
+        let html =
+            "<html><head><title>Test</title></head><body><a href='/page'>link</a></body></html>";
         let url = "https://example.com/article";
         let (_, _) = extract_content(html, Some(url));
         // Smoke test: URL is accepted without panic. Readability may or may not
@@ -613,13 +611,8 @@ mod tests {
             excerpt: None,
             site_name: None,
         };
-        let result = format_output(
-            html,
-            &meta,
-            Some("https://example.com"),
-            OutputFormat::Json,
-        )
-        .unwrap();
+        let result =
+            format_output(html, &meta, Some("https://example.com"), OutputFormat::Json).unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["url"], "https://example.com");
     }

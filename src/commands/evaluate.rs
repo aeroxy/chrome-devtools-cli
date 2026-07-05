@@ -248,7 +248,9 @@ pub async fn run_script(
             }
         }
 
-        let nav_url = if interpolated_url.starts_with("http://") || interpolated_url.starts_with("https://") {
+        let nav_url = if interpolated_url.starts_with("http://")
+            || interpolated_url.starts_with("https://")
+        {
             interpolated_url.clone()
         } else if is_local_host(&interpolated_url) {
             format!("http://{}", interpolated_url)
@@ -258,7 +260,10 @@ pub async fn run_script(
 
         let current_url = client.current_url(session_id).await?;
         if current_url.trim_end_matches('/') != nav_url.trim_end_matches('/') {
-            eprintln!("[script] Current URL '{}' does not match target URL '{}'. Auto-navigating...", current_url, nav_url);
+            eprintln!(
+                "[script] Current URL '{}' does not match target URL '{}'. Auto-navigating...",
+                current_url, nav_url
+            );
 
             crate::commands::navigate::navigate(
                 client,
@@ -327,7 +332,10 @@ fn parse_adapter_domains(content: &str) -> Vec<String> {
                 if trimmed.starts_with("import ") || trimmed.starts_with("import(") {
                     continue;
                 }
-                if matches!(trimmed, "\"use strict\";" | "'use strict';" | "\"use strict\"" | "'use strict'") {
+                if matches!(
+                    trimmed,
+                    "\"use strict\";" | "'use strict';" | "\"use strict\"" | "'use strict'"
+                ) {
                     continue;
                 }
                 break;
@@ -516,7 +524,9 @@ pub async fn run_adapter(
     let domains = parse_adapter_domains(&script_content);
     if !domains.is_empty() {
         let current_url = client.current_url(session_id).await?;
-        let matched = domains.iter().any(|domain| url_matches_domain(&current_url, domain));
+        let matched = domains
+            .iter()
+            .any(|domain| url_matches_domain(&current_url, domain));
 
         if !matched {
             let target_domain = &domains[0];
@@ -524,18 +534,19 @@ pub async fn run_adapter(
             // scheme when one is missing. Forcing a `www.` subdomain breaks apex
             // hosts and adapters that target an existing subdomain
             // (e.g. `creator.xiaohongshu.com`).
-            let target_url = if target_domain.starts_with("http://") || target_domain.starts_with("https://") {
-                // An explicit scheme always wins, so authors can force http/https
-                // by writing it in `@domain` (e.g. `@domain http://localhost:3000`).
-                target_domain.clone()
-            } else if is_local_host(target_domain) {
-                // Local dev servers generally speak http, not https.
-                format!("http://{}", target_domain)
-            } else {
-                format!("https://{}", target_domain)
-            };
+            let target_url =
+                if target_domain.starts_with("http://") || target_domain.starts_with("https://") {
+                    // An explicit scheme always wins, so authors can force http/https
+                    // by writing it in `@domain` (e.g. `@domain http://localhost:3000`).
+                    target_domain.clone()
+                } else if is_local_host(target_domain) {
+                    // Local dev servers generally speak http, not https.
+                    format!("http://{}", target_domain)
+                } else {
+                    format!("https://{}", target_domain)
+                };
             eprintln!("[adapter] Current URL '{}' does not match adapter domains {:?}. Auto-navigating to '{}'...", current_url, domains, target_url);
-            
+
             crate::commands::navigate::navigate(
                 client,
                 session_id,
@@ -549,7 +560,9 @@ pub async fn run_adapter(
             .await?;
 
             let post_nav_url = client.current_url(session_id).await?;
-            let post_matched = domains.iter().any(|domain| url_matches_domain(&post_nav_url, domain));
+            let post_matched = domains
+                .iter()
+                .any(|domain| url_matches_domain(&post_nav_url, domain));
             if !post_matched {
                 anyhow::bail!(
                     "Auto-navigation to '{}' resulted in URL '{}' which does not match adapter domains {:?}",
@@ -720,7 +733,10 @@ mod tests {
         // (only declarations and bare re-exports are handled).
         let src = "export * from './x';\nexport const ok = 1;\nexport constants = 2;";
         let out = strip_export_keywords(src);
-        assert_eq!(out, "export * from './x';\nconst ok = 1;\nexport constants = 2;");
+        assert_eq!(
+            out,
+            "export * from './x';\nconst ok = 1;\nexport constants = 2;"
+        );
     }
 
     #[test]
@@ -748,9 +764,15 @@ mod tests {
 
     #[test]
     fn test_normalize_host() {
-        assert_eq!(normalize_host("http://user:pass@example.com/some/path"), "example.com");
+        assert_eq!(
+            normalize_host("http://user:pass@example.com/some/path"),
+            "example.com"
+        );
         assert_eq!(normalize_host("http://user:pass@[::1]:8080"), "[::1]");
-        assert_eq!(normalize_host("http://user:pass@127.0.0.1:8080"), "127.0.0.1");
+        assert_eq!(
+            normalize_host("http://user:pass@127.0.0.1:8080"),
+            "127.0.0.1"
+        );
         assert_eq!(normalize_host("https://foo:bar@localhost"), "localhost");
         assert_eq!(normalize_host("example.com"), "example.com");
         assert_eq!(normalize_host("http://example.com:3000/"), "example.com");
@@ -772,9 +794,18 @@ mod tests {
 
     #[test]
     fn test_url_matches_domain() {
-        assert!(url_matches_domain("https://www.xiaohongshu.com/explore", "xiaohongshu.com"));
-        assert!(url_matches_domain("http://creator.xiaohongshu.com", "creator.xiaohongshu.com"));
-        assert!(url_matches_domain("https://xiaohongshu.com:8080/path", "xiaohongshu.com"));
+        assert!(url_matches_domain(
+            "https://www.xiaohongshu.com/explore",
+            "xiaohongshu.com"
+        ));
+        assert!(url_matches_domain(
+            "http://creator.xiaohongshu.com",
+            "creator.xiaohongshu.com"
+        ));
+        assert!(url_matches_domain(
+            "https://xiaohongshu.com:8080/path",
+            "xiaohongshu.com"
+        ));
         assert!(url_matches_domain("http://[::1]:3000", "[::1]"));
         assert!(!url_matches_domain("https://google.com", "xiaohongshu.com"));
     }
@@ -782,9 +813,18 @@ mod tests {
     #[test]
     fn test_url_matches_domain_normalizes_domain() {
         // `@domain` written with a scheme and/or path still matches the host.
-        assert!(url_matches_domain("https://www.example.com/page", "https://example.com"));
-        assert!(url_matches_domain("https://example.com/explore", "example.com/path"));
-        assert!(url_matches_domain("https://example.com", "http://example.com:443/"));
+        assert!(url_matches_domain(
+            "https://www.example.com/page",
+            "https://example.com"
+        ));
+        assert!(url_matches_domain(
+            "https://example.com/explore",
+            "example.com/path"
+        ));
+        assert!(url_matches_domain(
+            "https://example.com",
+            "http://example.com:443/"
+        ));
         assert!(!url_matches_domain("https://example.com", ""));
     }
 
@@ -800,7 +840,13 @@ mod tests {
         let ctx = build_ctx_object(r#"{"query":"hi"}"#);
         assert!(ctx.starts_with("const ctx = {"));
         assert!(ctx.contains(r#"args: {"query":"hi"}"#));
-        for helper in ["wait:", "waitForText:", "waitForSelector:", "click:", "fill:"] {
+        for helper in [
+            "wait:",
+            "waitForText:",
+            "waitForSelector:",
+            "click:",
+            "fill:",
+        ] {
             assert!(ctx.contains(helper), "missing helper: {helper}");
         }
         // fill must special-case checkable inputs instead of setting `value`.

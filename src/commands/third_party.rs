@@ -143,9 +143,7 @@ pub async fn list_3p_tools(
                                 let parts: Vec<String> = ann
                                     .as_object()
                                     .map(|obj| {
-                                        obj.iter()
-                                            .map(|(k, v)| format!("{}={}", k, v))
-                                            .collect()
+                                        obj.iter().map(|(k, v)| format!("{}={}", k, v)).collect()
                                     })
                                     .unwrap_or_default();
                                 if !parts.is_empty() {

@@ -22,7 +22,10 @@ pub async fn take_heapsnapshot(
     // can't collide, and rename is atomic (same filesystem).
     let temp_path = output_path.with_file_name(format!(
         ".{}.{}.tmp",
-        output_path.file_name().unwrap_or_default().to_string_lossy(),
+        output_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
         std::process::id(),
     ));
     // Drop guard ensures the temp file is removed under all termination paths
@@ -43,13 +46,17 @@ pub async fn take_heapsnapshot(
     // Heap snapshots can be tens or hundreds of MB; buffer the writes to avoid a
     // syscall per streamed chunk.
     let mut file = tokio::io::BufWriter::new(
-        tokio::fs::File::create(&temp_path)
-            .await
-            .with_context(|| format!("Failed to create heap snapshot temp file: {}", temp_path.display()))?,
+        tokio::fs::File::create(&temp_path).await.with_context(|| {
+            format!(
+                "Failed to create heap snapshot temp file: {}",
+                temp_path.display()
+            )
+        })?,
     );
-    
+
     // First, let's enable the HeapProfiler.
-    client.send_to_target(session_id, "HeapProfiler.enable", json!({}))
+    client
+        .send_to_target(session_id, "HeapProfiler.enable", json!({}))
         .await
         .context("Failed to enable HeapProfiler via CDP")?;
 
@@ -70,7 +77,7 @@ pub async fn take_heapsnapshot(
                 .context("Failed to read WebSocket stream message during heap snapshot chunk collection")?;
             let event: serde_json::Value = serde_json::from_str(&text)
                 .context("Failed to parse WebSocket text frame into JSON event")?;
-            
+
             // Check if this is the completion response for our takeHeapSnapshot command
             if event.get("id").and_then(|v| v.as_u64()) == Some(msg_id) {
                 if let Some(error) = event.get("error") {
@@ -105,7 +112,9 @@ pub async fn take_heapsnapshot(
     }
     .await;
 
-    let _ = client.send_to_target(session_id, "HeapProfiler.disable", json!({})).await;
+    let _ = client
+        .send_to_target(session_id, "HeapProfiler.disable", json!({}))
+        .await;
 
     if let Err(e) = snapshot_result {
         return Err(e);
@@ -132,7 +141,9 @@ pub async fn take_heapsnapshot(
             "output": output,
             "message": format!("Heap snapshot successfully saved to {}", output)
         });
-        Ok(CommandResult::output(crate::format::format_structured(&details, format)?))
+        Ok(CommandResult::output(crate::format::format_structured(
+            &details, format,
+        )?))
     }
 }
 
@@ -155,10 +166,7 @@ struct HeapSnapshot {
 
 /// Parse the JSON heap snapshot and locate details for the given node ID.
 /// Returns a tuple of (node_name, self_size).
-pub fn parse_node_from_snapshot(
-    file_path: &str,
-    node_id: u64,
-) -> Result<(String, u64)> {
+pub fn parse_node_from_snapshot(file_path: &str, node_id: u64) -> Result<(String, u64)> {
     let val = parse_snapshot_file(file_path)?;
     find_node_in_snapshot(&val, node_id)
 }
@@ -171,11 +179,17 @@ fn find_node_in_snapshot(val: &HeapSnapshot, node_id: u64) -> Result<(String, u6
     let node_fields = &val.snapshot.meta.node_fields;
 
     // Find fields offsets within the flat nodes array
-    let id_offset = node_fields.iter().position(|f| f == "id")
+    let id_offset = node_fields
+        .iter()
+        .position(|f| f == "id")
         .context("Invalid snapshot schema: 'id' node field meta is missing")?;
-    let name_offset = node_fields.iter().position(|f| f == "name")
+    let name_offset = node_fields
+        .iter()
+        .position(|f| f == "name")
         .context("Invalid snapshot schema: 'name' node field meta is missing")?;
-    let self_size_offset = node_fields.iter().position(|f| f == "self_size")
+    let self_size_offset = node_fields
+        .iter()
+        .position(|f| f == "self_size")
         .context("Invalid snapshot schema: 'self_size' node field meta is missing")?;
     let node_size = node_fields.len();
     if node_size == 0 {
@@ -206,8 +220,13 @@ fn find_node_in_snapshot(val: &HeapSnapshot, node_id: u64) -> Result<(String, u6
     let name_str_idx = usize::try_from(nodes[target_node_index + name_offset])
         .ok()
         .context("Corrupt snapshot: string index overflow on 32-bit architecture")?;
-    let name = val.strings.get(name_str_idx).cloned()
-        .ok_or_else(|| anyhow!("Corrupt snapshot: string index {} out of bounds (strings len {})", name_str_idx, val.strings.len()))?;
+    let name = val.strings.get(name_str_idx).cloned().ok_or_else(|| {
+        anyhow!(
+            "Corrupt snapshot: string index {} out of bounds (strings len {})",
+            name_str_idx,
+            val.strings.len()
+        )
+    })?;
     let self_size = nodes[target_node_index + self_size_offset];
 
     Ok((name, self_size))
@@ -223,15 +242,8 @@ pub fn format_node_details(
     if format.is_text() {
         let mut out = String::new();
         out.push_str("nodeId,nodeName,selfSize\n");
-        let escaped_name = if name.contains(',') || name.contains('"') || name.contains('\n') || name.contains('\r') {
-            format!("\"{}\"", name.replace('"', "\"\""))
-        } else {
-            name.to_string()
-        };
-        out.push_str(&format!(
-            "{},{},{}\n",
-            node_id, escaped_name, self_size
-        ));
+        let escaped_name = csv_escape(name);
+        out.push_str(&format!("{},{},{}\n", node_id, escaped_name, self_size));
         Ok(out)
     } else {
         let details = json!({
@@ -252,11 +264,10 @@ pub async fn inspect_heapsnapshot_node_offline(
     format: crate::format::OutputFormat,
 ) -> Result<CommandResult> {
     let file_path_owned = file_path.to_string();
-    let (name, self_size) = tokio::task::spawn_blocking(move || {
-        parse_node_from_snapshot(&file_path_owned, node_id)
-    })
-    .await
-    .map_err(|e| anyhow!("Failed to execute blocking snapshot parser: {e}"))??;
+    let (name, self_size) =
+        tokio::task::spawn_blocking(move || parse_node_from_snapshot(&file_path_owned, node_id))
+            .await
+            .map_err(|e| anyhow!("Failed to execute blocking snapshot parser: {e}"))??;
 
     let out = format_node_details(node_id, &name, self_size, format)?;
     Ok(CommandResult::output(out))
@@ -270,41 +281,62 @@ struct ClassAggregate {
 
 impl ClassAggregate {
     fn new() -> Self {
-        Self { nodes: std::collections::HashMap::new() }
+        Self {
+            nodes: std::collections::HashMap::new(),
+        }
     }
 }
 
 /// Walk every node in the snapshot and group by class name (the `name`
 /// field's string). Pure (no I/O) so it can be unit-tested alongside
 /// `find_node_in_snapshot`.
-fn build_class_aggregates(val: &HeapSnapshot) -> Result<std::collections::HashMap<String, ClassAggregate>> {
+fn build_class_aggregates(
+    val: &HeapSnapshot,
+) -> Result<std::collections::HashMap<String, ClassAggregate>> {
     use anyhow::Context;
     let nodes = &val.nodes;
     let node_fields = &val.snapshot.meta.node_fields;
-    let id_offset = node_fields.iter().position(|f| f == "id")
+    let id_offset = node_fields
+        .iter()
+        .position(|f| f == "id")
         .context("Invalid snapshot schema: 'id' node field meta is missing")?;
-    let name_offset = node_fields.iter().position(|f| f == "name")
+    let name_offset = node_fields
+        .iter()
+        .position(|f| f == "name")
         .context("Invalid snapshot schema: 'name' node field meta is missing")?;
-    let self_size_offset = node_fields.iter().position(|f| f == "self_size")
+    let self_size_offset = node_fields
+        .iter()
+        .position(|f| f == "self_size")
         .context("Invalid snapshot schema: 'self_size' node field meta is missing")?;
     let node_size = node_fields.len();
     if node_size == 0 {
         bail!("Invalid snapshot: node_fields schema is empty");
     }
 
-    let mut aggregates: std::collections::HashMap<String, ClassAggregate> = std::collections::HashMap::new();
+    let mut aggregates: std::collections::HashMap<String, ClassAggregate> =
+        std::collections::HashMap::new();
     let mut current_idx = 0;
     while current_idx + node_size <= nodes.len() {
         let id = nodes[current_idx + id_offset];
         let name_str_idx = usize::try_from(nodes[current_idx + name_offset])
             .ok()
             .context("Corrupt snapshot: string index overflow on 32-bit architecture")?;
-        let name = val.strings.get(name_str_idx).cloned()
-            .ok_or_else(|| anyhow!("Corrupt snapshot: string index {} out of bounds (strings len {})", name_str_idx, val.strings.len()))?;
+        let name_ref = val.strings.get(name_str_idx).ok_or_else(|| {
+            anyhow!(
+                "Corrupt snapshot: string index {} out of bounds (strings len {})",
+                name_str_idx,
+                val.strings.len()
+            )
+        })?;
         let self_size = nodes[current_idx + self_size_offset];
 
-        aggregates.entry(name).or_insert_with(ClassAggregate::new)
-            .nodes.insert(id, self_size);
+        if let Some(agg) = aggregates.get_mut(name_ref) {
+            agg.nodes.insert(id, self_size);
+        } else {
+            let mut agg = ClassAggregate::new();
+            agg.nodes.insert(id, self_size);
+            aggregates.insert(name_ref.clone(), agg);
+        }
 
         current_idx += node_size;
     }
@@ -337,13 +369,11 @@ fn diff_snapshots(
     base: &std::collections::HashMap<String, ClassAggregate>,
     current: &std::collections::HashMap<String, ClassAggregate>,
 ) -> Vec<HeapSnapshotClassDiff> {
-    let mut all_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    all_names.extend(base.keys().map(String::as_str));
-    all_names.extend(current.keys().map(String::as_str));
+    let mut diffs: Vec<HeapSnapshotClassDiff> = Vec::new();
 
-    let mut diffs: Vec<HeapSnapshotClassDiff> = all_names.into_iter().filter_map(|name| {
+    // 1. Process all classes in `current` (covers retained and added classes)
+    for (name, cur_agg) in current {
         let base_agg = base.get(name);
-        let cur_agg = current.get(name);
 
         let mut added_ids: Vec<u64> = Vec::new();
         let mut added_self_sizes: Vec<u64> = Vec::new();
@@ -352,52 +382,118 @@ fn diff_snapshots(
         let mut added_size: u64 = 0;
         let mut removed_size: u64 = 0;
 
-        if let Some(cur) = cur_agg {
-            for (id, size) in &cur.nodes {
-                let in_base = base_agg.map_or(false, |b| b.nodes.contains_key(id));
-                if !in_base {
+        if let Some(b) = base_agg {
+            for (id, size) in &cur_agg.nodes {
+                if !b.nodes.contains_key(id) {
                     added_ids.push(*id);
                     added_self_sizes.push(*size);
                     added_size += size;
                 }
             }
-        }
-        if let Some(base_a) = base_agg {
-            for (id, size) in &base_a.nodes {
-                let in_cur = cur_agg.map_or(false, |c| c.nodes.contains_key(id));
-                if !in_cur {
+            for (id, size) in &b.nodes {
+                if !cur_agg.nodes.contains_key(id) {
                     deleted_ids.push(*id);
                     deleted_self_sizes.push(*size);
                     removed_size += size;
                 }
             }
+        } else {
+            for (id, size) in &cur_agg.nodes {
+                added_ids.push(*id);
+                added_self_sizes.push(*size);
+                added_size += size;
+            }
         }
 
         let added_count = added_ids.len();
         let removed_count = deleted_ids.len();
-        if added_count == 0 && removed_count == 0 {
-            return None;
-        }
-        let count_delta = added_count as i64 - removed_count as i64;
-        let size_delta = added_size as i64 - removed_size as i64;
+        if added_count > 0 || removed_count > 0 {
+            // Ensure added_ids and added_self_sizes are sorted deterministically
+            if added_count > 1 {
+                let mut zipped: Vec<(u64, u64)> =
+                    added_ids.into_iter().zip(added_self_sizes).collect();
+                zipped.sort_unstable_by_key(|&(id, _)| id);
+                let (ids, sizes): (Vec<u64>, Vec<u64>) = zipped.into_iter().unzip();
+                added_ids = ids;
+                added_self_sizes = sizes;
+            }
 
-        Some(HeapSnapshotClassDiff {
-            class_name: name.to_string(),
-            added_count,
-            removed_count,
-            count_delta,
-            added_size,
-            removed_size,
-            size_delta,
-            added_ids,
-            added_self_sizes,
-            deleted_ids,
-            deleted_self_sizes,
-        })
-    }).collect();
+            // Ensure deleted_ids and deleted_self_sizes are sorted deterministically
+            if removed_count > 1 {
+                let mut zipped: Vec<(u64, u64)> =
+                    deleted_ids.into_iter().zip(deleted_self_sizes).collect();
+                zipped.sort_unstable_by_key(|&(id, _)| id);
+                let (ids, sizes): (Vec<u64>, Vec<u64>) = zipped.into_iter().unzip();
+                deleted_ids = ids;
+                deleted_self_sizes = sizes;
+            }
+
+            let count_delta = added_count as i64 - removed_count as i64;
+            let size_delta = added_size as i64 - removed_size as i64;
+
+            diffs.push(HeapSnapshotClassDiff {
+                class_name: name.clone(),
+                added_count,
+                removed_count,
+                count_delta,
+                added_size,
+                removed_size,
+                size_delta,
+                added_ids,
+                added_self_sizes,
+                deleted_ids,
+                deleted_self_sizes,
+            });
+        }
+    }
+
+    // 2. Process classes only in `base` (covers entirely deleted classes)
+    for (name, base_agg) in base {
+        if !current.contains_key(name) {
+            let mut deleted_ids: Vec<u64> = Vec::with_capacity(base_agg.nodes.len());
+            let mut deleted_self_sizes: Vec<u64> = Vec::with_capacity(base_agg.nodes.len());
+            let mut removed_size: u64 = 0;
+
+            for (id, size) in &base_agg.nodes {
+                deleted_ids.push(*id);
+                deleted_self_sizes.push(*size);
+                removed_size += size;
+            }
+
+            let removed_count = deleted_ids.len();
+
+            // Ensure deleted_ids and deleted_self_sizes are sorted deterministically
+            if removed_count > 1 {
+                let mut zipped: Vec<(u64, u64)> =
+                    deleted_ids.into_iter().zip(deleted_self_sizes).collect();
+                zipped.sort_unstable_by_key(|&(id, _)| id);
+                let (ids, sizes): (Vec<u64>, Vec<u64>) = zipped.into_iter().unzip();
+                deleted_ids = ids;
+                deleted_self_sizes = sizes;
+            }
+
+            let count_delta = -(removed_count as i64);
+            let size_delta = -(removed_size as i64);
+
+            diffs.push(HeapSnapshotClassDiff {
+                class_name: name.clone(),
+                added_count: 0,
+                removed_count,
+                count_delta,
+                added_size: 0,
+                removed_size,
+                size_delta,
+                added_ids: Vec::new(),
+                added_self_sizes: Vec::new(),
+                deleted_ids,
+                deleted_self_sizes,
+            });
+        }
+    }
 
     diffs.sort_by(|a, b| {
-        b.size_delta.cmp(&a.size_delta)
+        b.size_delta
+            .cmp(&a.size_delta)
             .then_with(|| a.class_name.cmp(&b.class_name))
     });
     diffs
@@ -421,7 +517,9 @@ pub fn format_class_diff_summary(
 ) -> Result<String> {
     if format.is_text() {
         let mut out = String::new();
-        out.push_str("idx,className,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta\n");
+        out.push_str(
+            "idx,className,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta\n",
+        );
         for (i, d) in diffs.iter().enumerate() {
             out.push_str(&format!(
                 "{},{},{},{},{},{},{},{}\n",
@@ -437,19 +535,26 @@ pub fn format_class_diff_summary(
         }
         Ok(out)
     } else {
-        let rows: Vec<serde_json::Value> = diffs.iter().enumerate().map(|(i, d)| {
-            json!({
-                "idx": i,
-                "className": d.class_name,
-                "addedCount": d.added_count,
-                "removedCount": d.removed_count,
-                "countDelta": d.count_delta,
-                "addedSize": d.added_size,
-                "removedSize": d.removed_size,
-                "sizeDelta": d.size_delta,
+        let rows: Vec<serde_json::Value> = diffs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                json!({
+                    "idx": i,
+                    "className": d.class_name,
+                    "addedCount": d.added_count,
+                    "removedCount": d.removed_count,
+                    "countDelta": d.count_delta,
+                    "addedSize": d.added_size,
+                    "removedSize": d.removed_size,
+                    "sizeDelta": d.size_delta,
+                })
             })
-        }).collect();
-        Ok(crate::format::format_structured(&json!({ "diffs": rows }), format)?)
+            .collect();
+        Ok(crate::format::format_structured(
+            &json!({ "diffs": rows }),
+            format,
+        )?)
     }
 }
 
@@ -482,10 +587,16 @@ pub fn format_class_diff_detail(
         }
         Ok(out)
     } else {
-        let added: Vec<serde_json::Value> = diff.added_ids.iter().zip(diff.added_self_sizes.iter())
+        let added: Vec<serde_json::Value> = diff
+            .added_ids
+            .iter()
+            .zip(diff.added_self_sizes.iter())
             .map(|(id, size)| json!({ "op": "+", "nodeId": id, "selfSize": size }))
             .collect();
-        let deleted: Vec<serde_json::Value> = diff.deleted_ids.iter().zip(diff.deleted_self_sizes.iter())
+        let deleted: Vec<serde_json::Value> = diff
+            .deleted_ids
+            .iter()
+            .zip(diff.deleted_self_sizes.iter())
             .map(|(id, size)| json!({ "op": "-", "nodeId": id, "selfSize": size }))
             .collect();
         let mut nodes: Vec<serde_json::Value> = added;
@@ -528,10 +639,13 @@ pub async fn compare_heapsnapshots_offline(
     let out = match class_index {
         None => format_class_diff_summary(&diffs, format)?,
         Some(idx) => {
-            let diff = diffs.get(idx).ok_or_else(|| anyhow!(
-                "Invalid classIndex: {}. Total classes with changes: {}",
-                idx, diffs.len()
-            ))?;
+            let diff = diffs.get(idx).ok_or_else(|| {
+                anyhow!(
+                    "Invalid classIndex: {}. Total classes with changes: {}",
+                    idx,
+                    diffs.len()
+                )
+            })?;
             format_class_diff_detail(idx, diff, format)?
         }
     };
@@ -635,11 +749,17 @@ mod tests {
 
         // Name with comma
         let out_comma = format_node_details(123, "My,Class", 100, OutputFormat::Text).unwrap();
-        assert_eq!(out_comma, "nodeId,nodeName,selfSize\n123,\"My,Class\",100\n");
+        assert_eq!(
+            out_comma,
+            "nodeId,nodeName,selfSize\n123,\"My,Class\",100\n"
+        );
 
         // Name with quotes
         let out_quotes = format_node_details(123, "My\"Class", 100, OutputFormat::Text).unwrap();
-        assert_eq!(out_quotes, "nodeId,nodeName,selfSize\n123,\"My\"\"Class\",100\n");
+        assert_eq!(
+            out_quotes,
+            "nodeId,nodeName,selfSize\n123,\"My\"\"Class\",100\n"
+        );
 
         // Name with newline
         let out_nl = format_node_details(123, "My\nClass", 100, OutputFormat::Text).unwrap();
@@ -706,11 +826,17 @@ mod tests {
         // Base: Map{1@100, 2@100}, String{3@50}
         // Current: Map{1@100 (retained), 4@150 (new)}, Window{5@500 (new class)}
         let base = build_class_aggregates(&make_snapshot(&[
-            (1, "Map", 100), (2, "Map", 100), (3, "String", 50),
-        ])).unwrap();
+            (1, "Map", 100),
+            (2, "Map", 100),
+            (3, "String", 50),
+        ]))
+        .unwrap();
         let current = build_class_aggregates(&make_snapshot(&[
-            (1, "Map", 100), (4, "Map", 150), (5, "Window", 500),
-        ])).unwrap();
+            (1, "Map", 100),
+            (4, "Map", 150),
+            (5, "Window", 500),
+        ]))
+        .unwrap();
 
         let diffs = diff_snapshots(&base, &current);
 
@@ -753,9 +879,8 @@ mod tests {
 
     #[test]
     fn test_diff_class_gone_entirely_from_current() {
-        let base = build_class_aggregates(&make_snapshot(&[
-            (1, "Old", 80), (2, "Old", 40),
-        ])).unwrap();
+        let base =
+            build_class_aggregates(&make_snapshot(&[(1, "Old", 80), (2, "Old", 40)])).unwrap();
         let current = build_class_aggregates(&make_snapshot(&[])).unwrap();
         let diffs = diff_snapshots(&base, &current);
         assert_eq!(diffs.len(), 1);
@@ -768,21 +893,22 @@ mod tests {
 
     #[test]
     fn test_format_summary_and_detail_share_indices() {
-        let base = build_class_aggregates(&make_snapshot(&[
-            (1, "Map", 100), (2, "String", 50),
-        ])).unwrap();
-        let current = build_class_aggregates(&make_snapshot(&[
-            (3, "Window", 500), (4, "Map", 150),
-        ])).unwrap();
+        let base =
+            build_class_aggregates(&make_snapshot(&[(1, "Map", 100), (2, "String", 50)])).unwrap();
+        let current =
+            build_class_aggregates(&make_snapshot(&[(3, "Window", 500), (4, "Map", 150)])).unwrap();
         let diffs = diff_snapshots(&base, &current);
 
         let summary = format_class_diff_summary(&diffs, crate::format::OutputFormat::Text).unwrap();
         // First data row (idx 0) should be the largest sizeDelta — Window.
-        assert!(summary.starts_with("idx,className,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta\n"));
+        assert!(summary.starts_with(
+            "idx,className,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta\n"
+        ));
         assert!(summary.contains("0,Window,1,0,1,500,0,500\n"));
 
         // Detail for idx 0 must reference the same class.
-        let detail = format_class_diff_detail(0, &diffs[0], crate::format::OutputFormat::Text).unwrap();
+        let detail =
+            format_class_diff_detail(0, &diffs[0], crate::format::OutputFormat::Text).unwrap();
         assert!(detail.contains("className:Window"));
         assert!(detail.contains("+,3,500"));
         // Map's id 4 should NOT appear here — it's a different class.
@@ -812,23 +938,27 @@ mod tests {
         write!(cur_file, "{}", cur_json).unwrap();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let summary = rt.block_on(compare_heapsnapshots_offline(
-            base_file.path().to_str().unwrap(),
-            cur_file.path().to_str().unwrap(),
-            None,
-            OutputFormat::Text,
-        )).unwrap();
+        let summary = rt
+            .block_on(compare_heapsnapshots_offline(
+                base_file.path().to_str().unwrap(),
+                cur_file.path().to_str().unwrap(),
+                None,
+                OutputFormat::Text,
+            ))
+            .unwrap();
         let summary_out = summary.output;
         assert!(summary_out.contains("0,Window"));
         assert!(summary_out.contains("1,Map"));
 
         // Detail for idx 0 should print Window's node 3.
-        let detail = rt.block_on(compare_heapsnapshots_offline(
-            base_file.path().to_str().unwrap(),
-            cur_file.path().to_str().unwrap(),
-            Some(0),
-            OutputFormat::Text,
-        )).unwrap();
+        let detail = rt
+            .block_on(compare_heapsnapshots_offline(
+                base_file.path().to_str().unwrap(),
+                cur_file.path().to_str().unwrap(),
+                Some(0),
+                OutputFormat::Text,
+            ))
+            .unwrap();
         assert!(detail.output.contains("className:Window"));
         assert!(detail.output.contains("+,3,500"));
 

@@ -78,15 +78,27 @@ pub async fn take_screenshot(
             if let Some(size) = metrics.get("cssContentSize") {
                 // Filter non-positive values (empty/unrendered pages, certain
                 // document types) — they'd produce an invalid CDP clip.
-                src_w = size["width"].as_f64().filter(|&v| v > 0.0).unwrap_or(1920.0);
-                src_h = size["height"].as_f64().filter(|&v| v > 0.0).unwrap_or(1080.0);
+                src_w = size["width"]
+                    .as_f64()
+                    .filter(|&v| v > 0.0)
+                    .unwrap_or(1920.0);
+                src_h = size["height"]
+                    .as_f64()
+                    .filter(|&v| v > 0.0)
+                    .unwrap_or(1080.0);
             }
         } else {
             // cssLayoutViewport.clientWidth/Height is the visible viewport in
             // CSS pixels; pageX/pageY are its document-origin scroll offsets.
             if let Some(viewport) = metrics.get("cssLayoutViewport") {
-                src_w = viewport["clientWidth"].as_f64().filter(|&v| v > 0.0).unwrap_or(1920.0);
-                src_h = viewport["clientHeight"].as_f64().filter(|&v| v > 0.0).unwrap_or(1080.0);
+                src_w = viewport["clientWidth"]
+                    .as_f64()
+                    .filter(|&v| v > 0.0)
+                    .unwrap_or(1920.0);
+                src_h = viewport["clientHeight"]
+                    .as_f64()
+                    .filter(|&v| v > 0.0)
+                    .unwrap_or(1080.0);
                 scroll_x = viewport["pageX"].as_f64().unwrap_or(0.0);
                 scroll_y = viewport["pageY"].as_f64().unwrap_or(0.0);
             }
@@ -138,7 +150,12 @@ pub async fn take_screenshot(
 /// Returns the smaller of the width and height scale ratios, clamped to <= 1.0
 /// (never upscales). A `None` dimension, or a non-positive max/src value, yields
 /// 1.0 for that axis (no scaling). Returns 1.0 when neither dimension is set.
-fn clip_scale_factor(src_w: f64, src_h: f64, max_width: Option<f64>, max_height: Option<f64>) -> f64 {
+fn clip_scale_factor(
+    src_w: f64,
+    src_h: f64,
+    max_width: Option<f64>,
+    max_height: Option<f64>,
+) -> f64 {
     let width_scale = match max_width {
         Some(max_w) if max_w > 0.0 && src_w > 0.0 => (max_w / src_w).min(1.0),
         _ => 1.0,
@@ -166,7 +183,10 @@ mod tests {
 
     #[test]
     fn negative_max_is_treated_as_no_scaling() {
-        assert_eq!(clip_scale_factor(1920.0, 1080.0, Some(-100.0), Some(-50.0)), 1.0);
+        assert_eq!(
+            clip_scale_factor(1920.0, 1080.0, Some(-100.0), Some(-50.0)),
+            1.0
+        );
     }
 
     #[test]
@@ -189,12 +209,18 @@ mod tests {
     #[test]
     fn both_dimensions_uses_the_smaller_ratio() {
         // src 2000x1000, max 1000x250 → width_scale 0.5, height_scale 0.25 → 0.25
-        assert_eq!(clip_scale_factor(2000.0, 1000.0, Some(1000.0), Some(250.0)), 0.25);
+        assert_eq!(
+            clip_scale_factor(2000.0, 1000.0, Some(1000.0), Some(250.0)),
+            0.25
+        );
     }
 
     #[test]
     fn never_upscales_when_max_exceeds_source() {
         // src 800x600, max 1600x1200 → both ratios > 1.0, clamped to 1.0
-        assert_eq!(clip_scale_factor(800.0, 600.0, Some(1600.0), Some(1200.0)), 1.0);
+        assert_eq!(
+            clip_scale_factor(800.0, 600.0, Some(1600.0), Some(1200.0)),
+            1.0
+        );
     }
 }
