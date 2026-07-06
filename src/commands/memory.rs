@@ -375,10 +375,13 @@ fn diff_snapshots(
     for (name, cur_agg) in current {
         let base_agg = base.get(name);
 
-        let mut added_ids: Vec<u64> = Vec::new();
-        let mut added_self_sizes: Vec<u64> = Vec::new();
-        let mut deleted_ids: Vec<u64> = Vec::new();
-        let mut deleted_self_sizes: Vec<u64> = Vec::new();
+        // Upper-bounds: every current node could be new, every base node
+        // could be gone. Avoids reallocation churn on large classes.
+        let mut added_ids: Vec<u64> = Vec::with_capacity(cur_agg.nodes.len());
+        let mut added_self_sizes: Vec<u64> = Vec::with_capacity(cur_agg.nodes.len());
+        let base_len = base_agg.map(|b| b.nodes.len()).unwrap_or(0);
+        let mut deleted_ids: Vec<u64> = Vec::with_capacity(base_len);
+        let mut deleted_self_sizes: Vec<u64> = Vec::with_capacity(base_len);
         let mut added_size: u64 = 0;
         let mut removed_size: u64 = 0;
 
@@ -627,10 +630,17 @@ pub async fn compare_heapsnapshots_offline(
     let base_owned = base_path.to_string();
     let current_owned = current_path.to_string();
     let diffs = tokio::task::spawn_blocking(move || -> Result<Vec<HeapSnapshotClassDiff>> {
-        let base_val = parse_snapshot_file(&base_owned)?;
-        let current_val = parse_snapshot_file(&current_owned)?;
-        let base_agg = build_class_aggregates(&base_val)?;
-        let current_agg = build_class_aggregates(&current_val)?;
+        // Each raw HeapSnapshot (nodes + strings) can be very large; scope the
+        // parse so it's dropped as soon as its aggregate is built instead of
+        // holding both raw snapshots in memory for the duration of the diff.
+        let base_agg = {
+            let base_val = parse_snapshot_file(&base_owned)?;
+            build_class_aggregates(&base_val)?
+        };
+        let current_agg = {
+            let current_val = parse_snapshot_file(&current_owned)?;
+            build_class_aggregates(&current_val)?
+        };
         Ok(diff_snapshots(&base_agg, &current_agg))
     })
     .await
