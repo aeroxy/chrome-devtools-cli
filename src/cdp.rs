@@ -180,7 +180,8 @@ impl CdpClient {
     /// which (via the daemon) makes every command appear to hang forever
     /// with no diagnostic.
     pub async fn connect(ws_url: &str) -> Result<Self> {
-        let (ws, _) = tokio::time::timeout(connect_timeout(), connect_async(ws_url))
+        let timeout_dur = connect_timeout();
+        let (ws, _) = tokio::time::timeout(timeout_dur, connect_async(ws_url))
             .await
             .map_err(|_| {
                 anyhow!(
@@ -189,7 +190,7 @@ impl CdpClient {
                      If you are an automated agent: do not retry in a loop and do not run \
                      kill-daemon (it will not fix this and will require a fresh approval) — \
                      stop and ask the human to check Chrome, then retry once.",
-                    connect_timeout().as_secs()
+                    timeout_dur.as_secs()
                 )
             })?
             .map_err(|e| anyhow!("Failed to connect to Chrome at {ws_url}: {e}"))?;
