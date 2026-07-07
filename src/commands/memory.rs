@@ -376,24 +376,27 @@ pub struct HeapSnapshotClassDiff {
 /// sizeDelta descending — matching DevTools' `#getSortedRawClassDiffs` so the
 /// summary list and the `--class-index` detail view share stable indices.
 fn diff_snapshots(
-    base: &std::collections::HashMap<String, ClassAggregate>,
-    current: &std::collections::HashMap<String, ClassAggregate>,
+    mut base: std::collections::HashMap<String, ClassAggregate>,
+    current: std::collections::HashMap<String, ClassAggregate>,
 ) -> Vec<HeapSnapshotClassDiff> {
     let mut diffs: Vec<HeapSnapshotClassDiff> = Vec::new();
 
-    // 1. Process all classes in `current` (covers retained and added classes)
+    // 1. Process all classes in `current` (covers retained and added classes).
+    // Removing matched classes from `base` as we go means whatever remains in
+    // `base` after this loop is exactly the set of classes deleted entirely
+    // from `current` — no second `contains_key` pass needed.
     for (name, cur_agg) in current {
-        let base_agg = base.get(name);
+        let base_agg = base.remove(&name);
 
         // Upper-bounds: every current node could be new, every base node
         // could be gone. Avoids reallocation churn on large classes.
         let mut added_nodes: Vec<(u64, u64)> = Vec::with_capacity(cur_agg.nodes.len());
-        let base_len = base_agg.map(|b| b.nodes.len()).unwrap_or(0);
+        let base_len = base_agg.as_ref().map(|b| b.nodes.len()).unwrap_or(0);
         let mut deleted_nodes: Vec<(u64, u64)> = Vec::with_capacity(base_len);
         let mut added_size: u64 = 0;
         let mut removed_size: u64 = 0;
 
-        if let Some(b) = base_agg {
+        if let Some(b) = &base_agg {
             for (id, size) in &cur_agg.nodes {
                 if !b.nodes.contains_key(id) {
                     added_nodes.push((*id, *size));
@@ -429,7 +432,7 @@ fn diff_snapshots(
             let size_delta = added_size as i64 - removed_size as i64;
 
             diffs.push(HeapSnapshotClassDiff {
-                class_name: name.clone(),
+                class_name: name,
                 added_count,
                 removed_count,
                 count_delta,
@@ -442,39 +445,38 @@ fn diff_snapshots(
         }
     }
 
-    // 2. Process classes only in `base` (covers entirely deleted classes)
+    // 2. Whatever remains in `base` was never matched in `current` — these
+    // are classes deleted entirely.
     for (name, base_agg) in base {
-        if !current.contains_key(name) {
-            let mut deleted_nodes: Vec<(u64, u64)> = Vec::with_capacity(base_agg.nodes.len());
-            let mut removed_size: u64 = 0;
+        let mut deleted_nodes: Vec<(u64, u64)> = Vec::with_capacity(base_agg.nodes.len());
+        let mut removed_size: u64 = 0;
 
-            for (id, size) in &base_agg.nodes {
-                deleted_nodes.push((*id, *size));
-                removed_size += size;
-            }
-
-            let removed_count = deleted_nodes.len();
-
-            // Sort deterministically by node id.
-            if removed_count > 1 {
-                deleted_nodes.sort_unstable_by_key(|(id, _)| *id);
-            }
-
-            let count_delta = -(removed_count as i64);
-            let size_delta = -(removed_size as i64);
-
-            diffs.push(HeapSnapshotClassDiff {
-                class_name: name.clone(),
-                added_count: 0,
-                removed_count,
-                count_delta,
-                added_size: 0,
-                removed_size,
-                size_delta,
-                added_nodes: Vec::new(),
-                deleted_nodes,
-            });
+        for (id, size) in &base_agg.nodes {
+            deleted_nodes.push((*id, *size));
+            removed_size += size;
         }
+
+        let removed_count = deleted_nodes.len();
+
+        // Sort deterministically by node id.
+        if removed_count > 1 {
+            deleted_nodes.sort_unstable_by_key(|(id, _)| *id);
+        }
+
+        let count_delta = -(removed_count as i64);
+        let size_delta = -(removed_size as i64);
+
+        diffs.push(HeapSnapshotClassDiff {
+            class_name: name,
+            added_count: 0,
+            removed_count,
+            count_delta,
+            added_size: 0,
+            removed_size,
+            size_delta,
+            added_nodes: Vec::new(),
+            deleted_nodes,
+        });
     }
 
     diffs.sort_by(|a, b| {
@@ -622,7 +624,7 @@ pub async fn compare_heapsnapshots_offline(
             let current_val = parse_snapshot_file(&current_owned)?;
             build_class_aggregates(&current_val)?
         };
-        Ok(diff_snapshots(&base_agg, &current_agg))
+        Ok(diff_snapshots(base_agg, current_agg))
     })
     .await
     .map_err(|e| anyhow!("Failed to execute blocking snapshot diff: {e}"))??;
@@ -856,7 +858,7 @@ mod tests {
         ]))
         .unwrap();
 
-        let diffs = diff_snapshots(&base, &current);
+        let diffs = diff_snapshots(base, current);
 
         // Sorted by sizeDelta desc: Window(500) > Map(50) > String(-50)
         assert_eq!(diffs.len(), 3);
@@ -891,7 +893,7 @@ mod tests {
         // Map appears in both with identical nodes → no diff row at all.
         let base = build_class_aggregates(&make_snapshot(&[(1, "Map", 100)])).unwrap();
         let current = build_class_aggregates(&make_snapshot(&[(1, "Map", 100)])).unwrap();
-        let diffs = diff_snapshots(&base, &current);
+        let diffs = diff_snapshots(base, current);
         assert!(diffs.is_empty());
     }
 
@@ -900,7 +902,7 @@ mod tests {
         let base =
             build_class_aggregates(&make_snapshot(&[(1, "Old", 80), (2, "Old", 40)])).unwrap();
         let current = build_class_aggregates(&make_snapshot(&[])).unwrap();
-        let diffs = diff_snapshots(&base, &current);
+        let diffs = diff_snapshots(base, current);
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].class_name, "Old");
         assert_eq!(diffs[0].removed_count, 2);
@@ -915,7 +917,7 @@ mod tests {
             build_class_aggregates(&make_snapshot(&[(1, "Map", 100), (2, "String", 50)])).unwrap();
         let current =
             build_class_aggregates(&make_snapshot(&[(3, "Window", 500), (4, "Map", 150)])).unwrap();
-        let diffs = diff_snapshots(&base, &current);
+        let diffs = diff_snapshots(base, current);
 
         let summary = format_class_diff_summary(&diffs, crate::format::OutputFormat::Text).unwrap();
         // First data row (idx 0) should be the largest sizeDelta — Window.
