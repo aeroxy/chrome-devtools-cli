@@ -340,13 +340,11 @@ fn build_class_aggregates(
         })?;
         let self_size = nodes[current_idx + self_size_offset];
 
-        if let Some(agg) = aggregates.get_mut(name_ref) {
-            agg.nodes.insert(id, self_size);
-        } else {
-            let mut agg = ClassAggregate::new();
-            agg.nodes.insert(id, self_size);
-            aggregates.insert(name_ref.clone(), agg);
-        }
+        aggregates
+            .entry(name_ref.clone())
+            .or_insert_with(ClassAggregate::new)
+            .nodes
+            .insert(id, self_size);
 
         current_idx += node_size;
     }
@@ -365,10 +363,10 @@ pub struct HeapSnapshotClassDiff {
     pub removed_size: u64,
     pub size_delta: i64,
     // Per-id detail. Exposed only via the `--class-index` path.
-    pub added_ids: Vec<u64>,
-    pub added_self_sizes: Vec<u64>,
-    pub deleted_ids: Vec<u64>,
-    pub deleted_self_sizes: Vec<u64>,
+    // Each tuple is (node_id, self_size) — kept together so sorting and
+    // formatting never have to zip/unzip parallel vectors.
+    pub added_nodes: Vec<(u64, u64)>,
+    pub deleted_nodes: Vec<(u64, u64)>,
 }
 
 /// Compute the per-class diff between two snapshots. Returns rows filtered to
@@ -387,58 +385,42 @@ fn diff_snapshots(
 
         // Upper-bounds: every current node could be new, every base node
         // could be gone. Avoids reallocation churn on large classes.
-        let mut added_ids: Vec<u64> = Vec::with_capacity(cur_agg.nodes.len());
-        let mut added_self_sizes: Vec<u64> = Vec::with_capacity(cur_agg.nodes.len());
+        let mut added_nodes: Vec<(u64, u64)> = Vec::with_capacity(cur_agg.nodes.len());
         let base_len = base_agg.map(|b| b.nodes.len()).unwrap_or(0);
-        let mut deleted_ids: Vec<u64> = Vec::with_capacity(base_len);
-        let mut deleted_self_sizes: Vec<u64> = Vec::with_capacity(base_len);
+        let mut deleted_nodes: Vec<(u64, u64)> = Vec::with_capacity(base_len);
         let mut added_size: u64 = 0;
         let mut removed_size: u64 = 0;
 
         if let Some(b) = base_agg {
             for (id, size) in &cur_agg.nodes {
                 if !b.nodes.contains_key(id) {
-                    added_ids.push(*id);
-                    added_self_sizes.push(*size);
+                    added_nodes.push((*id, *size));
                     added_size += size;
                 }
             }
             for (id, size) in &b.nodes {
                 if !cur_agg.nodes.contains_key(id) {
-                    deleted_ids.push(*id);
-                    deleted_self_sizes.push(*size);
+                    deleted_nodes.push((*id, *size));
                     removed_size += size;
                 }
             }
         } else {
             for (id, size) in &cur_agg.nodes {
-                added_ids.push(*id);
-                added_self_sizes.push(*size);
+                added_nodes.push((*id, *size));
                 added_size += size;
             }
         }
 
-        let added_count = added_ids.len();
-        let removed_count = deleted_ids.len();
+        let added_count = added_nodes.len();
+        let removed_count = deleted_nodes.len();
         if added_count > 0 || removed_count > 0 {
-            // Ensure added_ids and added_self_sizes are sorted deterministically
+            // Sort deterministically by node id so summary/detail indices
+            // stay stable across runs.
             if added_count > 1 {
-                let mut zipped: Vec<(u64, u64)> =
-                    added_ids.into_iter().zip(added_self_sizes).collect();
-                zipped.sort_unstable_by_key(|&(id, _)| id);
-                let (ids, sizes): (Vec<u64>, Vec<u64>) = zipped.into_iter().unzip();
-                added_ids = ids;
-                added_self_sizes = sizes;
+                added_nodes.sort_unstable_by_key(|(id, _)| *id);
             }
-
-            // Ensure deleted_ids and deleted_self_sizes are sorted deterministically
             if removed_count > 1 {
-                let mut zipped: Vec<(u64, u64)> =
-                    deleted_ids.into_iter().zip(deleted_self_sizes).collect();
-                zipped.sort_unstable_by_key(|&(id, _)| id);
-                let (ids, sizes): (Vec<u64>, Vec<u64>) = zipped.into_iter().unzip();
-                deleted_ids = ids;
-                deleted_self_sizes = sizes;
+                deleted_nodes.sort_unstable_by_key(|(id, _)| *id);
             }
 
             let count_delta = added_count as i64 - removed_count as i64;
@@ -452,10 +434,8 @@ fn diff_snapshots(
                 added_size,
                 removed_size,
                 size_delta,
-                added_ids,
-                added_self_sizes,
-                deleted_ids,
-                deleted_self_sizes,
+                added_nodes,
+                deleted_nodes,
             });
         }
     }
@@ -463,26 +443,19 @@ fn diff_snapshots(
     // 2. Process classes only in `base` (covers entirely deleted classes)
     for (name, base_agg) in base {
         if !current.contains_key(name) {
-            let mut deleted_ids: Vec<u64> = Vec::with_capacity(base_agg.nodes.len());
-            let mut deleted_self_sizes: Vec<u64> = Vec::with_capacity(base_agg.nodes.len());
+            let mut deleted_nodes: Vec<(u64, u64)> = Vec::with_capacity(base_agg.nodes.len());
             let mut removed_size: u64 = 0;
 
             for (id, size) in &base_agg.nodes {
-                deleted_ids.push(*id);
-                deleted_self_sizes.push(*size);
+                deleted_nodes.push((*id, *size));
                 removed_size += size;
             }
 
-            let removed_count = deleted_ids.len();
+            let removed_count = deleted_nodes.len();
 
-            // Ensure deleted_ids and deleted_self_sizes are sorted deterministically
+            // Sort deterministically by node id.
             if removed_count > 1 {
-                let mut zipped: Vec<(u64, u64)> =
-                    deleted_ids.into_iter().zip(deleted_self_sizes).collect();
-                zipped.sort_unstable_by_key(|&(id, _)| id);
-                let (ids, sizes): (Vec<u64>, Vec<u64>) = zipped.into_iter().unzip();
-                deleted_ids = ids;
-                deleted_self_sizes = sizes;
+                deleted_nodes.sort_unstable_by_key(|(id, _)| *id);
             }
 
             let count_delta = -(removed_count as i64);
@@ -496,10 +469,8 @@ fn diff_snapshots(
                 added_size: 0,
                 removed_size,
                 size_delta,
-                added_ids: Vec::new(),
-                added_self_sizes: Vec::new(),
-                deleted_ids,
-                deleted_self_sizes,
+                added_nodes: Vec::new(),
+                deleted_nodes,
             });
         }
     }
@@ -592,24 +563,22 @@ pub fn format_class_diff_detail(
             diff.size_delta,
         ));
         out.push_str("\nop,nodeId,selfSize\n");
-        for (id, size) in diff.added_ids.iter().zip(diff.added_self_sizes.iter()) {
+        for (id, size) in &diff.added_nodes {
             out.push_str(&format!("+,{},{}\n", id, size));
         }
-        for (id, size) in diff.deleted_ids.iter().zip(diff.deleted_self_sizes.iter()) {
+        for (id, size) in &diff.deleted_nodes {
             out.push_str(&format!("-,{},{}\n", id, size));
         }
         Ok(out)
     } else {
         let added: Vec<serde_json::Value> = diff
-            .added_ids
+            .added_nodes
             .iter()
-            .zip(diff.added_self_sizes.iter())
             .map(|(id, size)| json!({ "op": "+", "nodeId": id, "selfSize": size }))
             .collect();
         let deleted: Vec<serde_json::Value> = diff
-            .deleted_ids
+            .deleted_nodes
             .iter()
-            .zip(diff.deleted_self_sizes.iter())
             .map(|(id, size)| json!({ "op": "-", "nodeId": id, "selfSize": size }))
             .collect();
         let mut nodes: Vec<serde_json::Value> = added;
@@ -895,7 +864,7 @@ mod tests {
         assert_eq!(diffs[0].added_size, 500);
         assert_eq!(diffs[0].removed_size, 0);
         assert_eq!(diffs[0].size_delta, 500);
-        assert_eq!(diffs[0].added_ids, vec![5]);
+        assert_eq!(diffs[0].added_nodes, vec![(5, 500)]);
 
         assert_eq!(diffs[1].class_name, "Map");
         assert_eq!(diffs[1].added_count, 1);
@@ -904,15 +873,15 @@ mod tests {
         assert_eq!(diffs[1].added_size, 150);
         assert_eq!(diffs[1].removed_size, 100);
         assert_eq!(diffs[1].size_delta, 50);
-        assert_eq!(diffs[1].added_ids, vec![4]);
-        assert_eq!(diffs[1].deleted_ids, vec![2]);
+        assert_eq!(diffs[1].added_nodes, vec![(4, 150)]);
+        assert_eq!(diffs[1].deleted_nodes, vec![(2, 100)]);
 
         assert_eq!(diffs[2].class_name, "String");
         assert_eq!(diffs[2].added_count, 0);
         assert_eq!(diffs[2].removed_count, 1);
         assert_eq!(diffs[2].count_delta, -1);
         assert_eq!(diffs[2].size_delta, -50);
-        assert_eq!(diffs[2].deleted_ids, vec![3]);
+        assert_eq!(diffs[2].deleted_nodes, vec![(3, 50)]);
     }
 
     #[test]
@@ -935,7 +904,7 @@ mod tests {
         assert_eq!(diffs[0].removed_count, 2);
         assert_eq!(diffs[0].removed_size, 120);
         assert_eq!(diffs[0].size_delta, -120);
-        assert_eq!(diffs[0].deleted_ids.len(), 2);
+        assert_eq!(diffs[0].deleted_nodes.len(), 2);
     }
 
     #[test]
