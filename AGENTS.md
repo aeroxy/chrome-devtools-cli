@@ -46,6 +46,18 @@ Detailed documentation for individual commands:
 
 - [read-page](wiki/read-page.md) — page content extraction as markdown
 
+## Agent Skill
+
+`skill/chrome-devtools/SKILL.md` is the **source of truth** for the agent-facing
+skill/documentation — it's what teaches an agent (e.g. Claude Code, opencode) how
+to use this CLI (targeting, standard patterns, gotchas, failure handling, etc.).
+It gets installed/copied into an agent's skills directory (e.g.
+`~/.config/opencode/skills/chrome-devtools/SKILL.md`); that installed copy is a
+**deployed artifact**, not the source — always edit `skill/chrome-devtools/SKILL.md`
+in this repo, then re-sync/reinstall it, rather than editing the installed copy
+directly. `skill/chrome-devtools/CUSTOM_SCRIPTING.md` documents `run-script` and
+`adapter` in more depth.
+
 ## Key Concepts
 
 ### Daemon Architecture
@@ -53,6 +65,17 @@ Detailed documentation for individual commands:
 A background daemon (`/tmp/chrome-devtools-daemon.sock`) keeps a persistent CDP
 WebSocket connection. First CLI invocation spawns it; subsequent commands reuse
 it. 5-minute idle timeout.
+
+`CdpClient::connect` (`cdp.rs`) bounds the WebSocket handshake with a timeout
+(`CHROME_CONNECT_TIMEOUT_SECS`, default 10s). Without it, a pending Chrome
+remote-debugging consent dialog would hang the handshake indefinitely — and
+since the daemon binds its socket *before* connecting to Chrome (see comments
+in `daemon.rs`), the CLI's `wait_for_daemon()` would succeed immediately while
+the actual request silently hung forever waiting on the daemon's response, with
+no error and no way for a caller (especially an unattended agent) to tell what
+was wrong. The timeout error message is written to be agent-actionable: retry
+at most once, then stop and ask a human rather than looping or calling
+`kill-daemon`.
 
 ### Page Targeting
 
@@ -76,6 +99,12 @@ LLM-friendly) produce structured output. Mutually exclusive.
 `inspect-heapsnapshot-node` and `kill-daemon` are intercepted early in `run()`
 before any Chrome connection or daemon spawn. `inspect-heapsnapshot-node` parses
 a local `.heapsnapshot` file purely offline.
+
+`kill-daemon` drops the daemon's already-approved Chrome connection, so it's
+guarded (`kill_daemon_decision` in `lib.rs`): interactive (TTY) callers get a
+`[y/N]` confirmation prompt; non-interactive callers (agents, scripts) are
+refused outright unless `--force` is passed. It must never be used as a
+"retry" step for connection failures — see the timeout note above.
 
 ### Path Resolution
 

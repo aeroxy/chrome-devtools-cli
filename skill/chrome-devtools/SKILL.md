@@ -396,8 +396,33 @@ chrome-devtools --target <name> adapter <file-path> <function-name> [--arg key=v
 
 ### Daemon
 ```bash
-chrome-devtools kill-daemon        # stop the background daemon process
+chrome-devtools kill-daemon            # refuses when run non-interactively (agents) unless --force
+chrome-devtools kill-daemon --force    # kills unconditionally
 ```
+
+## Failure Handling: "Failed to connect to Chrome" / a command hangs
+
+Chrome's remote-debugging connection requires a one-time **human approval dialog**
+in Chrome. If a command hangs or fails with a connection/timeout error, the most
+likely cause is that this dialog is open and waiting for the human — not a bug
+you can fix by retrying.
+
+**If a command hangs for a long time or errors with "Failed to connect to Chrome"
+or "Timed out ... connecting to Chrome":**
+1. Retry **at most once** (the human may have already approved it just now).
+2. If it fails again, **STOP.** Do not keep retrying — the human is very likely
+   away from the keyboard and no amount of retrying will approve the dialog for
+   them.
+3. Tell the user directly that Chrome is waiting for them to approve the
+   remote-debugging connection dialog, and wait for their response.
+
+**Never run `kill-daemon` as a way to "fix" a connection problem.** It does not
+help — it destroys the daemon's already-approved connection (if one exists) and
+guarantees the *next* attempt needs a fresh human approval, making things worse.
+For this reason, `kill-daemon` refuses to run non-interactively without
+`--force`. As an agent, only pass `--force` if the user has explicitly asked you
+to kill the daemon for some other reason (e.g. it's stuck on unrelated JS
+execution) — never as a reaction to a connection failure.
 
 ## Critical Gotchas
 
@@ -458,6 +483,20 @@ chrome-devtools --target warm-squid console
 
 ### ✓ CORRECT: Each drain is a fresh window
 Run `console` / `network` right after the action that produces events, OR use `--duration` to collect for a window of time.
+
+### ✗ WRONG: Retrying in a loop or running `kill-daemon` on connection failure
+```bash
+chrome-devtools list-pages   # hangs / fails: "Failed to connect to Chrome"
+chrome-devtools kill-daemon --force   # ❌ WRONG: destroys the approved connection, makes it worse
+chrome-devtools list-pages   # retry again, and again...  ❌ WRONG: human is likely away
+```
+
+### ✓ CORRECT: Retry once, then stop and ask the human
+```bash
+chrome-devtools list-pages   # hangs / fails: "Failed to connect to Chrome"
+chrome-devtools list-pages   # ✓ one retry, in case the human just approved it
+# still failing → STOP retrying, tell the user Chrome needs approval, and wait
+```
 
 ## Output Format Summary
 

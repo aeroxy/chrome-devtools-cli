@@ -162,11 +162,36 @@ fn stash_tab_emulation(
     }
 }
 
+/// Read the Chrome WebSocket connect timeout from `CHROME_CONNECT_TIMEOUT_SECS`,
+/// defaulting to 10.
+fn connect_timeout() -> std::time::Duration {
+    std::env::var("CHROME_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(10))
+}
+
 impl CdpClient {
     /// Connect to Chrome via WebSocket and return a CDP client.
+    ///
+    /// Bounded by a timeout: without it, a pending Chrome remote-debugging
+    /// consent dialog leaves the WebSocket handshake hanging indefinitely,
+    /// which (via the daemon) makes every command appear to hang forever
+    /// with no diagnostic.
     pub async fn connect(ws_url: &str) -> Result<Self> {
-        let (ws, _) = connect_async(ws_url)
+        let (ws, _) = tokio::time::timeout(connect_timeout(), connect_async(ws_url))
             .await
+            .map_err(|_| {
+                anyhow!(
+                    "Timed out after {}s connecting to Chrome at {ws_url}. Chrome may be \
+                     waiting for a human to approve the remote-debugging connection dialog. \
+                     If you are an automated agent: do not retry in a loop and do not run \
+                     kill-daemon (it will not fix this and will require a fresh approval) — \
+                     stop and ask the human to check Chrome, then retry once.",
+                    connect_timeout().as_secs()
+                )
+            })?
             .map_err(|e| anyhow!("Failed to connect to Chrome at {ws_url}: {e}"))?;
         let (write, read) = ws.split();
         Ok(Self {

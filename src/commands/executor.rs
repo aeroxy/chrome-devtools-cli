@@ -88,7 +88,7 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
             "output",
             "track_navigation",
         ],
-        "kill-daemon" => &[],
+        "kill-daemon" => &["force"],
         _ => &[],
     }
 }

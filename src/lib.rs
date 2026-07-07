@@ -405,7 +405,16 @@ pub enum Commands {
 
     /// Stop the background daemon process
     #[command(name = "kill-daemon")]
-    KillDaemon,
+    KillDaemon {
+        /// Skip the confirmation/refusal guard and kill unconditionally.
+        ///
+        /// Killing the daemon drops any already-approved Chrome remote-debugging
+        /// connection; reconnecting requires the human to re-approve Chrome's
+        /// consent dialog. This does NOT fix "Failed to connect to Chrome"
+        /// errors — do not use it as a retry step.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 impl Cli {
@@ -451,8 +460,33 @@ impl Cli {
             Commands::SwLogs { .. } => "sw-logs",
             Commands::RunScript { .. } => "run-script",
             Commands::Adapter { .. } => "adapter",
-            Commands::KillDaemon => "kill-daemon",
+            Commands::KillDaemon { .. } => "kill-daemon",
         }
+    }
+}
+
+/// What to do when `kill-daemon` is invoked, given `--force` and whether
+/// stdin is a TTY. Kept pure so the policy is unit-testable without
+/// mocking stdin I/O.
+#[derive(Debug, PartialEq, Eq)]
+enum KillDaemonDecision {
+    /// Kill immediately, no confirmation needed.
+    Proceed,
+    /// Interactive session — ask the human to confirm.
+    PromptUser,
+    /// Non-interactive (e.g. an agent) without `--force` — refuse outright.
+    /// Killing the daemon drops the approved Chrome connection and forces
+    /// the human to re-approve it, so an agent must never do this silently.
+    RefuseNonInteractive,
+}
+
+fn kill_daemon_decision(force: bool, is_tty: bool) -> KillDaemonDecision {
+    if force {
+        KillDaemonDecision::Proceed
+    } else if is_tty {
+        KillDaemonDecision::PromptUser
+    } else {
+        KillDaemonDecision::RefuseNonInteractive
     }
 }
 
@@ -743,7 +777,7 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
                 "track_navigation": track_navigation
             }),
         ),
-        Commands::KillDaemon => unreachable!("KillDaemon is handled before build_request"),
+        Commands::KillDaemon { .. } => unreachable!("KillDaemon is handled before build_request"),
         Commands::InspectHeapSnapshotNode { .. } => {
             unreachable!("InspectHeapSnapshotNode is handled before build_request")
         }
@@ -837,7 +871,36 @@ pub async fn run() -> Result<()> {
     };
 
     // Handle kill-daemon without connecting to Chrome
-    if matches!(cli.command, Commands::KillDaemon) {
+    if let Commands::KillDaemon { force } = cli.command {
+        use std::io::IsTerminal;
+        match kill_daemon_decision(force, std::io::stdin().is_terminal()) {
+            KillDaemonDecision::RefuseNonInteractive => {
+                return Err(error::CliError::new(
+                    error::ErrorCode::InvalidInput,
+                    "Refusing to kill the daemon: this will NOT fix \"Failed to connect to \
+                     Chrome\" errors and will force the human to re-approve Chrome's \
+                     remote-debugging connection. If you are certain this is what you want, \
+                     re-run with --force.",
+                )
+                .into());
+            }
+            KillDaemonDecision::PromptUser => {
+                use std::io::Write;
+                eprint!(
+                    "Kill the daemon? This drops the approved Chrome connection and will \
+                     require re-approval in Chrome. [y/N] "
+                );
+                std::io::stderr().flush().ok();
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer).ok();
+                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+            KillDaemonDecision::Proceed => {}
+        }
+
         let pid_path = protocol::pid_path();
         #[cfg(unix)]
         let sock_path = protocol::socket_path();
@@ -1393,6 +1456,30 @@ mod tests {
         assert!(obj.get("bool_true").unwrap().as_bool().unwrap());
         assert!(obj.get("null_val").unwrap().is_null());
         assert!(!obj.get("bool_false").unwrap().as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_kill_daemon_decision_force_always_proceeds() {
+        assert_eq!(kill_daemon_decision(true, true), KillDaemonDecision::Proceed);
+        assert_eq!(kill_daemon_decision(true, false), KillDaemonDecision::Proceed);
+    }
+
+    #[test]
+    fn test_kill_daemon_decision_tty_prompts() {
+        assert_eq!(
+            kill_daemon_decision(false, true),
+            KillDaemonDecision::PromptUser
+        );
+    }
+
+    #[test]
+    fn test_kill_daemon_decision_non_tty_refuses() {
+        // This is the agent/non-interactive case: refuse rather than silently
+        // kill a daemon holding an already-approved Chrome connection.
+        assert_eq!(
+            kill_daemon_decision(false, false),
+            KillDaemonDecision::RefuseNonInteractive
+        );
     }
 
     #[test]
