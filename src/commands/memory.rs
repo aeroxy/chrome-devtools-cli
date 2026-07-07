@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::BufReader;
 
 use crate::cdp::CdpClient;
+use crate::error::{CliError, ErrorCode};
 use crate::result::CommandResult;
 
 /// Take a heap snapshot of the page and save it to a file.
@@ -54,7 +55,8 @@ pub async fn take_heapsnapshot(
         })?,
     );
 
-    // First, let's enable the HeapProfiler.
+    // HeapProfiler must be enabled before takeHeapSnapshot — Chrome rejects
+    // the command otherwise.
     client
         .send_to_target(session_id, "HeapProfiler.enable", json!({}))
         .await
@@ -311,6 +313,14 @@ fn build_class_aggregates(
     let node_size = node_fields.len();
     if node_size == 0 {
         bail!("Invalid snapshot: node_fields schema is empty");
+    }
+    if !nodes.len().is_multiple_of(node_size) {
+        bail!(
+            "Corrupt snapshot: nodes array length ({}) is not a multiple of node_size ({}); \
+             the file is truncated or malformed",
+            nodes.len(),
+            node_size
+        );
     }
 
     let mut aggregates: std::collections::HashMap<String, ClassAggregate> =
@@ -650,10 +660,13 @@ pub async fn compare_heapsnapshots_offline(
         None => format_class_diff_summary(&diffs, format)?,
         Some(idx) => {
             let diff = diffs.get(idx).ok_or_else(|| {
-                anyhow!(
-                    "Invalid classIndex: {}. Total classes with changes: {}",
-                    idx,
-                    diffs.len()
+                CliError::new(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "Invalid classIndex: {}. Total classes with changes: {}",
+                        idx,
+                        diffs.len()
+                    ),
                 )
             })?;
             format_class_diff_detail(idx, diff, format)?
@@ -832,6 +845,30 @@ mod tests {
     }
 
     #[test]
+    fn test_build_class_aggregates_rejects_truncated_nodes() {
+        // node_fields describes 3-field records, but nodes has 4 entries — a
+        // truncated/malformed flat array that isn't a multiple of node_size.
+        // Must error instead of silently dropping the trailing partial record.
+        let snap = HeapSnapshot {
+            snapshot: SnapshotMeta {
+                meta: MetaDetails {
+                    node_fields: vec!["id".into(), "name".into(), "self_size".into()],
+                },
+            },
+            nodes: vec![1, 0, 100, 2],
+            strings: vec!["Map".into()],
+        };
+        let err = match build_class_aggregates(&snap) {
+            Ok(_) => panic!("expected error for truncated nodes array"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("not a multiple of node_size"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn test_diff_added_removed_and_retained() {
         // Base: Map{1@100, 2@100}, String{3@50}
         // Current: Map{1@100 (retained), 4@150 (new)}, Window{5@500 (new class)}
@@ -979,11 +1016,18 @@ mod tests {
             Some(99),
             OutputFormat::Text,
         ));
-        let msg = match err {
+        let err = match err {
             Ok(_) => panic!("expected error for out-of-range class_index"),
-            Err(e) => e.to_string(),
+            Err(e) => e,
         };
+        let msg = err.to_string();
         assert!(msg.contains("Invalid classIndex"), "got: {msg}");
         assert!(msg.contains("99"));
+        // Must surface as a typed InvalidInput error so callers (e.g. main's
+        // exit-code mapping) get a stable, non-Unspecified error code.
+        let cli_err = err
+            .downcast_ref::<crate::error::CliError>()
+            .expect("expected a CliError");
+        assert_eq!(cli_err.code(), crate::error::ErrorCode::InvalidInput);
     }
 }
