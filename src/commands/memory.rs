@@ -340,11 +340,16 @@ fn build_class_aggregates(
         })?;
         let self_size = nodes[current_idx + self_size_offset];
 
-        aggregates
-            .entry(name_ref.clone())
-            .or_insert_with(ClassAggregate::new)
-            .nodes
-            .insert(id, self_size);
+        // Only clone the name on the cold insert path. `entry()` would force a
+        // clone per node (millions of allocations on large snapshots); the
+        // get_mut/insert split keeps the hot lookup path allocation-free.
+        if let Some(agg) = aggregates.get_mut(name_ref) {
+            agg.nodes.insert(id, self_size);
+        } else {
+            let mut agg = ClassAggregate::new();
+            agg.nodes.insert(id, self_size);
+            aggregates.insert(name_ref.clone(), agg);
+        }
 
         current_idx += node_size;
     }
