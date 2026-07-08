@@ -314,7 +314,7 @@ fn build_class_aggregates(
     if node_size == 0 {
         bail!("Invalid snapshot: node_fields schema is empty");
     }
-    if !nodes.len().is_multiple_of(node_size) {
+    if nodes.len() % node_size != 0 {
         bail!(
             "Corrupt snapshot: nodes array length ({}) is not a multiple of node_size ({}); \
              the file is truncated or malformed",
@@ -340,13 +340,11 @@ fn build_class_aggregates(
         })?;
         let self_size = nodes[current_idx + self_size_offset];
 
-        if let Some(agg) = aggregates.get_mut(name_ref) {
-            agg.nodes.insert(id, self_size);
-        } else {
-            let mut agg = ClassAggregate::new();
-            agg.nodes.insert(id, self_size);
-            aggregates.insert(name_ref.clone(), agg);
-        }
+        aggregates
+            .entry(name_ref.clone())
+            .or_insert_with(ClassAggregate::new)
+            .nodes
+            .insert(id, self_size);
 
         current_idx += node_size;
     }
@@ -490,11 +488,11 @@ fn diff_snapshots(
 /// CSV-escape a class name the same way `format_node_details` escapes node
 /// names — names like `(closure)` are safe, but `(string, joined)` would break
 /// naive CSV parsing.
-fn csv_escape(s: &str) -> String {
+fn csv_escape(s: &str) -> std::borrow::Cow<'_, str> {
     if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-        format!("\"{}\"", s.replace('"', "\"\""))
+        std::borrow::Cow::Owned(format!("\"{}\"", s.replace('"', "\"\"")))
     } else {
-        s.to_string()
+        std::borrow::Cow::Borrowed(s)
     }
 }
 
@@ -504,12 +502,14 @@ pub fn format_class_diff_summary(
     format: crate::format::OutputFormat,
 ) -> Result<String> {
     if format.is_text() {
+        use std::fmt::Write;
         let mut out = String::new();
         out.push_str(
             "idx,className,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta\n",
         );
         for (i, d) in diffs.iter().enumerate() {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "{},{},{},{},{},{},{},{}\n",
                 i,
                 csv_escape(&d.class_name),
@@ -519,7 +519,7 @@ pub fn format_class_diff_summary(
                 d.added_size,
                 d.removed_size,
                 d.size_delta,
-            ));
+            );
         }
         Ok(out)
     } else {
@@ -554,8 +554,10 @@ pub fn format_class_diff_detail(
     format: crate::format::OutputFormat,
 ) -> Result<String> {
     if format.is_text() {
+        use std::fmt::Write;
         let mut out = String::new();
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "idx:{},className:{},addedCount:{},removedCount:{},countDelta:{},addedSize:{},removedSize:{},sizeDelta:{}\n",
             idx,
             csv_escape(&diff.class_name),
@@ -565,13 +567,13 @@ pub fn format_class_diff_detail(
             diff.added_size,
             diff.removed_size,
             diff.size_delta,
-        ));
+        );
         out.push_str("\nop,nodeId,selfSize\n");
         for (id, size) in &diff.added_nodes {
-            out.push_str(&format!("+,{},{}\n", id, size));
+            let _ = write!(out, "+,{},{}\n", id, size);
         }
         for (id, size) in &diff.deleted_nodes {
-            out.push_str(&format!("-,{},{}\n", id, size));
+            let _ = write!(out, "-,{},{}\n", id, size);
         }
         Ok(out)
     } else {
