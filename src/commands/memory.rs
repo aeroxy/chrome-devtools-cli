@@ -149,9 +149,11 @@ pub async fn take_heapsnapshot(
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct MetaDetails {
     node_fields: Vec<String>,
+    #[serde(default)]
+    node_types: Vec<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -173,6 +175,7 @@ struct NodeFieldOffsets {
     name_offset: usize,
     self_size_offset: usize,
     node_size: usize,
+    type_offset: Option<usize>,
 }
 
 /// Parse the snapshot meta's `node_fields` schema once and return the
@@ -197,11 +200,13 @@ fn resolve_node_field_offsets(
     if node_size == 0 {
         bail!("Invalid snapshot: node_fields schema is empty");
     }
+    let type_offset = node_fields.iter().position(|f| f == "type");
     Ok(NodeFieldOffsets {
         id_offset,
         name_offset,
         self_size_offset,
         node_size,
+        type_offset,
     })
 }
 
@@ -223,6 +228,7 @@ fn find_node_in_snapshot(val: &HeapSnapshot, node_id: u64) -> Result<(String, u6
         name_offset,
         self_size_offset,
         node_size,
+        ..
     } = offs;
 
     // Iterate over nodes using chunk sizes defined by the schema meta
@@ -316,8 +322,13 @@ impl ClassAggregate {
     }
 }
 
-/// Walk every node in the snapshot and group by class name (the `name`
-/// field's string). Pure (no I/O) so it can be unit-tested alongside
+/// Walk every node in the snapshot and group by class name. For nodes whose
+/// `name` field is a constructor/class label (object, native, closure types),
+/// the name is used as the group key — matching Chrome DevTools' `className`.
+/// For other types (string, array, code, regexp, …) the `name` field holds
+/// per-instance content (e.g. the actual string value), so the type name
+/// itself is used as the group key instead, preventing one diff row per
+/// string value. Pure (no I/O) so it can be unit-tested alongside
 /// `find_node_in_snapshot`.
 fn build_class_aggregates(
     val: &HeapSnapshot,
@@ -330,6 +341,7 @@ fn build_class_aggregates(
         name_offset,
         self_size_offset,
         node_size,
+        type_offset,
     } = offs;
     if nodes.len() % node_size != 0 {
         bail!(
@@ -339,6 +351,23 @@ fn build_class_aggregates(
             node_size
         );
     }
+
+    // Resolve the type-names enum from node_types meta so non-object nodes
+    // can be grouped by their type name. node_types[type_offset] is itself an
+    // array of strings (the type enum); other entries are plain field-type
+    // descriptors ("string", "number", …).
+    let type_names: Option<Vec<String>> = type_offset.and_then(|to| {
+        val.snapshot
+            .meta
+            .node_types
+            .get(to)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|t| t.as_str().unwrap_or("unknown").to_string())
+                    .collect()
+            })
+    });
 
     let mut aggregates: std::collections::HashMap<String, ClassAggregate> =
         std::collections::HashMap::new();
@@ -357,15 +386,31 @@ fn build_class_aggregates(
         })?;
         let self_size = nodes[current_idx + self_size_offset];
 
+        // Determine the class key: for object/native/closure types the name
+        // field holds the constructor/class name. For other types (string,
+        // array, code, …) the name field holds per-instance content, so use
+        // the type name instead — matching Chrome DevTools' className logic.
+        let class_key: &str = match (&type_names, type_offset) {
+            (Some(names), Some(to)) => {
+                let type_idx = nodes[current_idx + to] as usize;
+                let type_name = names.get(type_idx).map(|s| s.as_str()).unwrap_or("unknown");
+                match type_name {
+                    "object" | "native" | "closure" => name_ref,
+                    _ => type_name,
+                }
+            }
+            _ => name_ref,
+        };
+
         // Only clone the name on the cold insert path. `entry()` would force a
         // clone per node (millions of allocations on large snapshots); the
         // get_mut/insert split keeps the hot lookup path allocation-free.
-        if let Some(agg) = aggregates.get_mut(name_ref) {
+        if let Some(agg) = aggregates.get_mut(class_key) {
             agg.nodes.insert(id, self_size);
         } else {
             let mut agg = ClassAggregate::new();
             agg.nodes.insert(id, self_size);
-            aggregates.insert(name_ref.clone(), agg);
+            aggregates.insert(class_key.to_string(), agg);
         }
 
         current_idx += node_size;
@@ -716,6 +761,7 @@ mod tests {
             snapshot: SnapshotMeta {
                 meta: MetaDetails {
                     node_fields: vec!["id".into(), "name".into(), "self_size".into()],
+                    ..Default::default()
                 },
             },
             nodes: vec![10, 0, 100, 20, 1, 200],
@@ -733,6 +779,7 @@ mod tests {
             snapshot: SnapshotMeta {
                 meta: MetaDetails {
                     node_fields: vec!["id".into(), "name".into(), "self_size".into()],
+                    ..Default::default()
                 },
             },
             nodes: vec![10, 0, 100],
@@ -749,6 +796,7 @@ mod tests {
             snapshot: SnapshotMeta {
                 meta: MetaDetails {
                     node_fields: vec!["id".into(), "name".into(), "self_size".into()],
+                    ..Default::default()
                 },
             },
             nodes: vec![10, 5, 100],
@@ -822,6 +870,7 @@ mod tests {
             snapshot: SnapshotMeta {
                 meta: MetaDetails {
                     node_fields: vec!["id".into(), "name".into(), "self_size".into()],
+                    ..Default::default()
                 },
             },
             nodes: flat,
@@ -841,6 +890,121 @@ mod tests {
         assert_eq!(s.nodes.get(&3), Some(&50));
     }
 
+    /// Like `make_snapshot` but includes a `type` field (first column) and
+    /// `node_types` meta so the type-based class-grouping logic can be tested.
+    /// Each tuple is (type_idx, name, id, self_size).
+    fn make_typed_snapshot(nodes: &[(u64, &str, u64, u64)]) -> HeapSnapshot {
+        let type_names = [
+            "hidden",
+            "array",
+            "string",
+            "object",
+            "code",
+            "closure",
+            "regexp",
+            "number",
+            "native",
+            "synthetic",
+            "concatenated string",
+            "sliced string",
+            "bigint",
+        ];
+        let type_enum: Vec<serde_json::Value> = type_names
+            .iter()
+            .map(|t| serde_json::Value::String(t.to_string()))
+            .collect();
+
+        let mut flat: Vec<u64> = Vec::with_capacity(nodes.len() * 4);
+        let mut strings: Vec<String> = Vec::new();
+        let mut string_idx: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        for (type_idx, name, id, size) in nodes {
+            let &mut idx = string_idx.entry(name).or_insert_with(|| {
+                let i = strings.len() as u64;
+                strings.push(name.to_string());
+                i
+            });
+            flat.extend_from_slice(&[*type_idx, idx, *id, *size]);
+        }
+        HeapSnapshot {
+            snapshot: SnapshotMeta {
+                meta: MetaDetails {
+                    node_fields: vec![
+                        "type".into(),
+                        "name".into(),
+                        "id".into(),
+                        "self_size".into(),
+                    ],
+                    node_types: vec![
+                        serde_json::Value::Array(type_enum),
+                        serde_json::Value::String("string".into()),
+                        serde_json::Value::String("number".into()),
+                        serde_json::Value::String("number".into()),
+                    ],
+                },
+            },
+            nodes: flat,
+            strings,
+        }
+    }
+
+    #[test]
+    fn test_build_class_aggregates_groups_by_type() {
+        // Two strings with different values should collapse into one "string"
+        // class. Object nodes use their name as the class key. An array node
+        // groups under "array" regardless of its name field.
+        let snap = make_typed_snapshot(&[
+            (2, "hello", 1, 50),  // string
+            (2, "world", 2, 60),  // string — different value, same type
+            (3, "Map", 3, 100),   // object
+            (3, "Window", 4, 200), // object
+            (1, "(array)", 5, 80), // array
+        ]);
+        let aggs = build_class_aggregates(&snap).unwrap();
+
+        // Both string nodes are in one "string" bucket
+        let s = aggs.get("string").unwrap();
+        assert_eq!(s.nodes.len(), 2);
+        assert_eq!(s.nodes.get(&1), Some(&50));
+        assert_eq!(s.nodes.get(&2), Some(&60));
+
+        // Object nodes use their name as the class key
+        let m = aggs.get("Map").unwrap();
+        assert_eq!(m.nodes.get(&3), Some(&100));
+        let w = aggs.get("Window").unwrap();
+        assert_eq!(w.nodes.get(&4), Some(&200));
+
+        // Array node groups under "array", not its name field value
+        let a = aggs.get("array").unwrap();
+        assert_eq!(a.nodes.get(&5), Some(&80));
+        assert!(!aggs.contains_key("(array)"));
+    }
+
+    #[test]
+    fn test_diff_groups_strings_by_type() {
+        // Without type-based grouping, removing "world" and adding "foo" would
+        // produce two separate diff rows. With the fix they collapse into a
+        // single "string" row with one add and one remove.
+        let base = build_class_aggregates(&make_typed_snapshot(&[
+            (2, "hello", 1, 50),
+            (2, "world", 2, 60),
+        ]))
+        .unwrap();
+        let current = build_class_aggregates(&make_typed_snapshot(&[
+            (2, "hello", 1, 50),
+            (2, "foo", 3, 70),
+        ]))
+        .unwrap();
+
+        let diffs = diff_snapshots(base, current);
+
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].class_name, "string");
+        assert_eq!(diffs[0].added_count, 1);
+        assert_eq!(diffs[0].removed_count, 1);
+        assert_eq!(diffs[0].added_nodes, vec![(3, 70)]);
+        assert_eq!(diffs[0].deleted_nodes, vec![(2, 60)]);
+    }
+
     #[test]
     fn test_build_class_aggregates_rejects_truncated_nodes() {
         // node_fields describes 3-field records, but nodes has 4 entries — a
@@ -850,6 +1014,7 @@ mod tests {
             snapshot: SnapshotMeta {
                 meta: MetaDetails {
                     node_fields: vec!["id".into(), "name".into(), "self_size".into()],
+                    ..Default::default()
                 },
             },
             nodes: vec![1, 0, 100, 2],
