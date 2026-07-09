@@ -166,21 +166,21 @@ struct HeapSnapshot {
     strings: Vec<String>,
 }
 
-/// Parse the JSON heap snapshot and locate details for the given node ID.
-/// Returns a tuple of (node_name, self_size).
-pub fn parse_node_from_snapshot(file_path: &str, node_id: u64) -> Result<(String, u64)> {
-    let val = parse_snapshot_file(file_path)?;
-    find_node_in_snapshot(&val, node_id)
+/// Resolved offsets into the flat `nodes` array for the fields both
+/// `find_node_in_snapshot` and `build_class_aggregates` need.
+struct NodeFieldOffsets {
+    id_offset: usize,
+    name_offset: usize,
+    self_size_offset: usize,
+    node_size: usize,
 }
 
-/// Pure schema-validation + node-lookup logic, separated from I/O so it can be
-/// unit-tested without writing a temp file.
-fn find_node_in_snapshot(val: &HeapSnapshot, node_id: u64) -> Result<(String, u64)> {
+/// Parse the snapshot meta's `node_fields` schema once and return the
+/// offsets (and record stride) used to walk the flat `nodes` array.
+fn resolve_node_field_offsets(
+    node_fields: &[String],
+) -> Result<NodeFieldOffsets> {
     use anyhow::Context;
-    let nodes = &val.nodes;
-    let node_fields = &val.snapshot.meta.node_fields;
-
-    // Find fields offsets within the flat nodes array
     let id_offset = node_fields
         .iter()
         .position(|f| f == "id")
@@ -197,6 +197,33 @@ fn find_node_in_snapshot(val: &HeapSnapshot, node_id: u64) -> Result<(String, u6
     if node_size == 0 {
         bail!("Invalid snapshot: node_fields schema is empty");
     }
+    Ok(NodeFieldOffsets {
+        id_offset,
+        name_offset,
+        self_size_offset,
+        node_size,
+    })
+}
+
+/// Parse the JSON heap snapshot and locate details for the given node ID.
+/// Returns a tuple of (node_name, self_size).
+pub fn parse_node_from_snapshot(file_path: &str, node_id: u64) -> Result<(String, u64)> {
+    let val = parse_snapshot_file(file_path)?;
+    find_node_in_snapshot(&val, node_id)
+}
+
+/// Pure schema-validation + node-lookup logic, separated from I/O so it can be
+/// unit-tested without writing a temp file.
+fn find_node_in_snapshot(val: &HeapSnapshot, node_id: u64) -> Result<(String, u64)> {
+    use anyhow::Context;
+    let nodes = &val.nodes;
+    let offs = resolve_node_field_offsets(&val.snapshot.meta.node_fields)?;
+    let NodeFieldOffsets {
+        id_offset,
+        name_offset,
+        self_size_offset,
+        node_size,
+    } = offs;
 
     // Iterate over nodes using chunk sizes defined by the schema meta
     let mut target_index = None;
@@ -297,23 +324,13 @@ fn build_class_aggregates(
 ) -> Result<std::collections::HashMap<String, ClassAggregate>> {
     use anyhow::Context;
     let nodes = &val.nodes;
-    let node_fields = &val.snapshot.meta.node_fields;
-    let id_offset = node_fields
-        .iter()
-        .position(|f| f == "id")
-        .context("Invalid snapshot schema: 'id' node field meta is missing")?;
-    let name_offset = node_fields
-        .iter()
-        .position(|f| f == "name")
-        .context("Invalid snapshot schema: 'name' node field meta is missing")?;
-    let self_size_offset = node_fields
-        .iter()
-        .position(|f| f == "self_size")
-        .context("Invalid snapshot schema: 'self_size' node field meta is missing")?;
-    let node_size = node_fields.len();
-    if node_size == 0 {
-        bail!("Invalid snapshot: node_fields schema is empty");
-    }
+    let offs = resolve_node_field_offsets(&val.snapshot.meta.node_fields)?;
+    let NodeFieldOffsets {
+        id_offset,
+        name_offset,
+        self_size_offset,
+        node_size,
+    } = offs;
     if nodes.len() % node_size != 0 {
         bail!(
             "Corrupt snapshot: nodes array length ({}) is not a multiple of node_size ({}); \
