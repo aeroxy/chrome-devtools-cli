@@ -536,19 +536,35 @@ fn compute_class_node_detail(
     let mut added_nodes: Vec<(u64, u64)> = Vec::new();
     let mut deleted_nodes: Vec<(u64, u64)> = Vec::new();
 
-    if let Some(c) = cur_agg {
-        for (id, size) in &c.nodes {
-            if !base_agg.is_some_and(|b| b.nodes.contains_key(id)) {
+    // Unwrap the Options once so the inner loops do a direct HashMap lookup
+    // per node instead of re-evaluating the Option on every iteration. The
+    // all-added / all-deleted branches are the class-new and class-gone cases.
+    match (cur_agg, base_agg) {
+        (Some(c), Some(b)) => {
+            for (id, size) in &c.nodes {
+                if !b.nodes.contains_key(id) {
+                    added_nodes.push((*id, *size));
+                }
+            }
+            for (id, size) in &b.nodes {
+                if !c.nodes.contains_key(id) {
+                    deleted_nodes.push((*id, *size));
+                }
+            }
+        }
+        (Some(c), None) => {
+            // Class is brand-new in current: every node is added.
+            for (id, size) in &c.nodes {
                 added_nodes.push((*id, *size));
             }
         }
-    }
-    if let Some(b) = base_agg {
-        for (id, size) in &b.nodes {
-            if !cur_agg.is_some_and(|c| c.nodes.contains_key(id)) {
+        (None, Some(b)) => {
+            // Class is gone from current: every base node is deleted.
+            for (id, size) in &b.nodes {
                 deleted_nodes.push((*id, *size));
             }
         }
+        (None, None) => {}
     }
 
     added_nodes.sort_unstable_by_key(|(id, _)| *id);
@@ -693,10 +709,10 @@ fn snapshots_share_no_node_ids(
     }
     // Overlap check is intentionally class-agnostic: an object can change
     // class name across snapshots, but its ID cannot.
-    let base_ids: std::collections::HashSet<u64> = base
-        .values()
-        .flat_map(|a| a.nodes.keys().copied())
-        .collect();
+    let base_nodes_count: usize = base.values().map(|a| a.nodes.len()).sum();
+    let mut base_ids: std::collections::HashSet<u64> =
+        std::collections::HashSet::with_capacity(base_nodes_count);
+    base_ids.extend(base.values().flat_map(|a| a.nodes.keys().copied()));
     !current
         .values()
         .flat_map(|a| a.nodes.keys())
