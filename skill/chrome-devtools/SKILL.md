@@ -333,6 +333,40 @@ See the dedicated [Custom Scripting Guide](./CUSTOM_SCRIPTING.md) for full docum
 chrome-devtools --target warm-squid adapter skill/chrome-devtools/examples/hn_adapter.js search -- "Rust"
 ```
 
+### Pattern 15: Memory Leak Debugging (Heap Snapshots)
+
+Take two heap snapshots around a suspected leak, diff them per class, then
+drill into individual node IDs. `compare-heapsnapshots` and
+`inspect-heapsnapshot-node` are fully offline (they parse local files — no
+Chrome connection needed).
+
+```bash
+# 1. Take a baseline snapshot
+chrome-devtools --target warm-squid take-heapsnapshot --output /tmp/base.heapsnapshot
+
+# 2. Perform the leaky action in the page (click, navigate, etc.), then take a second snapshot
+chrome-devtools --target warm-squid take-heapsnapshot --output /tmp/current.heapsnapshot
+
+# 3. Diff: one row per class with added/removed counts and sizes, sorted by size delta
+chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /tmp/current.heapsnapshot
+# idx,className,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta
+# 0,Detached HTMLDivElement,120,0,120,46080,0,46080
+# ...
+
+# 4. Detail for one summary row (use the idx column): per-node-id adds/removes
+chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /tmp/current.heapsnapshot --class-index 0
+
+# 5. Inspect a specific node ID from the detail output
+chrome-devtools inspect-heapsnapshot-node --file-path /tmp/current.heapsnapshot --node-id 12345
+```
+
+**⚠️ Both snapshots must come from the same Chrome session.** The diff matches
+nodes by V8 heap object ID, which is only stable within a single browser
+session. Comparing snapshots taken across a Chrome restart (or from different
+profiles/machines) produces a meaningless result where nearly everything is
+reported as both added and removed — the CLI prints a warning on stderr when
+it detects this.
+
 ## Complete Command Reference
 
 ### Navigation
@@ -357,6 +391,13 @@ chrome-devtools --target <name> evaluate "<js-expression>" [--dialog-action acce
 chrome-devtools --target <name> network [--duration <ms>] [--type <resource>]
 chrome-devtools --target <name> console [--duration <ms>] [--type <level>]
 chrome-devtools sw-logs [--duration <ms>] [--extension-id <id>]
+```
+
+### Memory (heap snapshots)
+```bash
+chrome-devtools --target <name> take-heapsnapshot --output <path.heapsnapshot>
+chrome-devtools compare-heapsnapshots --base <path> --current <path> [--class-index N]   # offline
+chrome-devtools inspect-heapsnapshot-node --file-path <path> --node-id <id>              # offline
 ```
 
 ### Interaction

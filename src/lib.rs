@@ -246,6 +246,11 @@ pub enum Commands {
     /// --class-index N, prints the added/deleted node IDs for row N (use the
     /// idx column from the summary). Node IDs in the detail output are
     /// directly usable with `inspect-heapsnapshot-node --node-id`.
+    ///
+    /// IMPORTANT: both snapshots must come from the same Chrome session —
+    /// nodes are matched by V8 heap object ID, which is only stable within a
+    /// single session. Snapshots taken across a browser restart diff as
+    /// "everything added + everything removed", which is meaningless.
     #[command(name = "compare-heapsnapshots")]
     CompareHeapsnapshots {
         /// Path to the base (earlier) .heapsnapshot file
@@ -870,10 +875,14 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    // Handle kill-daemon without connecting to Chrome
-    if let Commands::KillDaemon { force } = cli.command {
+    // Handle kill-daemon without connecting to Chrome. Match by reference
+    // like the other `cli.command` intercepts below: binding only the Copy
+    // `force` field happens to avoid a partial move today, but a by-ref match
+    // keeps that from silently breaking if the variant ever gains a non-Copy
+    // field.
+    if let Commands::KillDaemon { force } = &cli.command {
         use std::io::IsTerminal;
-        match kill_daemon_decision(force, std::io::stdin().is_terminal()) {
+        match kill_daemon_decision(*force, std::io::stdin().is_terminal()) {
             KillDaemonDecision::RefuseNonInteractive => {
                 return Err(error::CliError::new(
                     error::ErrorCode::InvalidInput,
@@ -1460,8 +1469,14 @@ mod tests {
 
     #[test]
     fn test_kill_daemon_decision_force_always_proceeds() {
-        assert_eq!(kill_daemon_decision(true, true), KillDaemonDecision::Proceed);
-        assert_eq!(kill_daemon_decision(true, false), KillDaemonDecision::Proceed);
+        assert_eq!(
+            kill_daemon_decision(true, true),
+            KillDaemonDecision::Proceed
+        );
+        assert_eq!(
+            kill_daemon_decision(true, false),
+            KillDaemonDecision::Proceed
+        );
     }
 
     #[test]

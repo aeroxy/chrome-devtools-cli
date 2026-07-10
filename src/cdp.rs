@@ -163,13 +163,32 @@ fn stash_tab_emulation(
 }
 
 /// Read the Chrome WebSocket connect timeout from `CHROME_CONNECT_TIMEOUT_SECS`,
-/// defaulting to 10.
+/// defaulting to 10. Kept pure (value passed in) so the parsing policy is
+/// unit-testable without mutating process-global env vars.
+fn parse_connect_timeout(raw: Option<&str>) -> std::time::Duration {
+    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
+    match raw {
+        None => DEFAULT,
+        Some(v) => match v.parse::<u64>() {
+            // 0 would make every connect fail instantly with the misleading
+            // "Chrome may be waiting for approval" message; treat it as
+            // invalid rather than honoring it.
+            Ok(secs) if secs > 0 => std::time::Duration::from_secs(secs),
+            _ => {
+                eprintln!(
+                    "[warning] Ignoring invalid CHROME_CONNECT_TIMEOUT_SECS value '{v}' \
+                     (expected a positive integer); using default of {}s",
+                    DEFAULT.as_secs()
+                );
+                DEFAULT
+            }
+        },
+    }
+}
+
 fn connect_timeout() -> std::time::Duration {
-    std::env::var("CHROME_CONNECT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or(std::time::Duration::from_secs(10))
+    let raw = std::env::var("CHROME_CONNECT_TIMEOUT_SECS").ok();
+    parse_connect_timeout(raw.as_deref())
 }
 
 impl CdpClient {
@@ -909,6 +928,48 @@ pub fn join_console_args(args: &[Value]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_parse_connect_timeout_default_when_unset() {
+        assert_eq!(
+            parse_connect_timeout(None),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn test_parse_connect_timeout_valid_value() {
+        assert_eq!(
+            parse_connect_timeout(Some("3")),
+            std::time::Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn test_parse_connect_timeout_rejects_zero() {
+        // 0 would make every connect fail instantly with a misleading
+        // "waiting for approval" error — must fall back to the default.
+        assert_eq!(
+            parse_connect_timeout(Some("0")),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn test_parse_connect_timeout_rejects_garbage() {
+        assert_eq!(
+            parse_connect_timeout(Some("fast")),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            parse_connect_timeout(Some("-5")),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            parse_connect_timeout(Some("")),
+            std::time::Duration::from_secs(10)
+        );
+    }
 
     #[test]
     fn test_event_buffer_capping() {

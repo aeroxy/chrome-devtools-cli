@@ -30,7 +30,7 @@ src/
     ├── screenshot.rs
     ├── snapshot.rs
     ├── read_page.rs  # read-page (Readability + HTML→Markdown)
-    ├── memory.rs     # take-heapsnapshot (CDP streaming) + inspect-heapsnapshot-node (offline)
+    ├── memory.rs     # take-heapsnapshot (CDP streaming) + inspect-heapsnapshot-node / compare-heapsnapshots (offline)
     ├── evaluate.rs
     ├── input.rs      # click/fill/type/press/hover
     ├── emulation.rs  # emulate (viewport/geolocation/blocklist)
@@ -96,9 +96,12 @@ LLM-friendly) produce structured output. Mutually exclusive.
 
 ### Offline Commands
 
-`inspect-heapsnapshot-node` and `kill-daemon` are intercepted early in `run()`
-before any Chrome connection or daemon spawn. `inspect-heapsnapshot-node` parses
-a local `.heapsnapshot` file purely offline.
+`inspect-heapsnapshot-node`, `compare-heapsnapshots`, and `kill-daemon` are
+intercepted early in `run()` before any Chrome connection or daemon spawn.
+`inspect-heapsnapshot-node` and `compare-heapsnapshots` parse local
+`.heapsnapshot` files purely offline. Note that snapshot diffing matches nodes
+by V8 heap object ID, which is only stable within a single Chrome session —
+both snapshots must come from the same session to produce a meaningful diff.
 
 `kill-daemon` drops the daemon's already-approved Chrome connection, so it's
 guarded (`kill_daemon_decision` in `lib.rs`): interactive (TTY) callers get a
