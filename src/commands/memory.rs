@@ -118,9 +118,7 @@ pub async fn take_heapsnapshot(
         .send_to_target(session_id, "HeapProfiler.disable", json!({}))
         .await;
 
-    if let Err(e) = snapshot_result {
-        return Err(e);
-    }
+    snapshot_result?;
 
     // Drop the writer (and its underlying file handle) before the rename: on
     // Windows an open handle blocks the move, and even on Unix releasing it
