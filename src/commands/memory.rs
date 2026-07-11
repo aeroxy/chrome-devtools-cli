@@ -706,15 +706,28 @@ fn snapshots_share_no_node_ids(
         return false;
     }
     // Overlap check is intentionally class-agnostic: an object can change
-    // class name across snapshots, but its ID cannot.
-    let base_nodes_count: usize = base.values().map(|a| a.nodes.len()).sum();
-    let mut base_ids: std::collections::HashSet<u64> =
-        std::collections::HashSet::with_capacity(base_nodes_count);
-    base_ids.extend(base.values().flat_map(|a| a.nodes.keys().copied()));
-    !current
-        .values()
-        .flat_map(|a| a.nodes.keys())
-        .any(|id| base_ids.contains(id))
+    // class name across snapshots, but its ID cannot. Build the HashSet from
+    // whichever side has fewer IDs, then scan the other — this bounds the
+    // peak allocation to the smaller set for large snapshots.
+    let base_count: usize = base.values().map(|a| a.nodes.len()).sum();
+    let current_count: usize = current.values().map(|a| a.nodes.len()).sum();
+    if base_count <= current_count {
+        let mut ids: std::collections::HashSet<u64> =
+            std::collections::HashSet::with_capacity(base_count);
+        ids.extend(base.values().flat_map(|a| a.nodes.keys().copied()));
+        !current
+            .values()
+            .flat_map(|a| a.nodes.keys())
+            .any(|id| ids.contains(id))
+    } else {
+        let mut ids: std::collections::HashSet<u64> =
+            std::collections::HashSet::with_capacity(current_count);
+        ids.extend(current.values().flat_map(|a| a.nodes.keys().copied()));
+        !base
+            .values()
+            .flat_map(|a| a.nodes.keys())
+            .any(|id| ids.contains(id))
+    }
 }
 
 /// Offline implementation of `compare-heapsnapshots`. Parses both files,

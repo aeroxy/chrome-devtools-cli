@@ -485,10 +485,10 @@ enum KillDaemonDecision {
     RefuseNonInteractive,
 }
 
-fn kill_daemon_decision(force: bool, is_tty: bool) -> KillDaemonDecision {
+fn kill_daemon_decision(force: bool, can_prompt: bool) -> KillDaemonDecision {
     if force {
         KillDaemonDecision::Proceed
-    } else if is_tty {
+    } else if can_prompt {
         KillDaemonDecision::PromptUser
     } else {
         KillDaemonDecision::RefuseNonInteractive
@@ -882,7 +882,11 @@ pub async fn run() -> Result<()> {
     // field.
     if let Commands::KillDaemon { force } = &cli.command {
         use std::io::IsTerminal;
-        match kill_daemon_decision(*force, std::io::stdin().is_terminal()) {
+        // A prompt is only useful if the user can both type (stdin) and see it
+        // (stderr). If stderr is not a TTY (e.g. `2>file`) while stdin still is,
+        // prompting would block silently — treat that as non-interactive.
+        let can_prompt = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+        match kill_daemon_decision(*force, can_prompt) {
             KillDaemonDecision::RefuseNonInteractive => {
                 return Err(error::CliError::new(
                     error::ErrorCode::InvalidInput,
@@ -1480,7 +1484,8 @@ mod tests {
     }
 
     #[test]
-    fn test_kill_daemon_decision_tty_prompts() {
+    fn test_kill_daemon_decision_can_prompt_prompts() {
+        // Both stdin and stderr are terminals: ask the human.
         assert_eq!(
             kill_daemon_decision(false, true),
             KillDaemonDecision::PromptUser
