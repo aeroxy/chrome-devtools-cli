@@ -29,31 +29,105 @@ enum ConnectionOutcome {
     Fatal,
 }
 
-macro_rules! run_accept_loop_body {
-    ($accept:expr, $client:expr, $ws_url:expr) => {
-        loop {
-            let accept = tokio::time::timeout(idle_timeout(), $accept).await;
+/// Best-effort removal of the daemon's socket/address and PID files.
+///
+/// Only cleans up when the PID file still names this process: the paths are
+/// shared, so a stale-but-alive old daemon exiting must not delete the files
+/// of a newer daemon that has since rebound them.
+fn cleanup() {
+    let owns_files = std::fs::read_to_string(pid_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        == Some(std::process::id());
+    if !owns_files {
+        return;
+    }
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(socket_path());
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(addr_path());
+    let _ = std::fs::remove_file(pid_path());
+}
 
-            match accept {
-                Ok(Ok((stream, _))) => match handle_connection(stream, $client, $ws_url).await {
-                    ConnectionOutcome::Continue => {}
-                    ConnectionOutcome::Fatal => break,
-                },
-                Ok(Err(e)) => {
-                    eprintln!("daemon: accept error: {e}");
-                }
-                Err(_) => {
-                    // Idle timeout — exit
+/// Removes the daemon's on-disk files when `run_daemon`'s frame is left for
+/// any reason: normal return, early `?` error, or an unwinding panic.
+/// (SIGKILL and other non-catchable terminations are inherently not covered.)
+struct CleanupGuard;
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        cleanup();
+    }
+}
+
+macro_rules! run_accept_loop_body {
+    ($accept:expr, $client:expr, $ws_url:expr, $shutdown:expr) => {
+        loop {
+            tokio::select! {
+                _ = &mut $shutdown => {
+                    // SIGTERM/SIGINT (or Ctrl-C on Windows) — exit cleanly.
+                    // Only observed between requests: an in-flight command
+                    // finishes and its response is written before shutdown.
                     break;
+                }
+                accept = tokio::time::timeout(idle_timeout(), $accept) => match accept {
+                    Ok(Ok((stream, _))) => match handle_connection(stream, $client, $ws_url).await {
+                        ConnectionOutcome::Continue => {}
+                        ConnectionOutcome::Fatal => break,
+                    },
+                    Ok(Err(e)) => {
+                        eprintln!("daemon: accept error: {e}");
+                    }
+                    Err(_) => {
+                        // Idle timeout — exit
+                        break;
+                    }
                 }
             }
         }
     };
 }
 
+/// Resolves when the daemon should shut down due to a signal.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    // If a signal stream can't be registered, fall back to never resolving —
+    // the daemon then behaves as before this handler existed (default
+    // disposition still terminates the process; only file cleanup is lost).
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(_) => return std::future::pending().await,
+    };
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(_) => return std::future::pending().await,
+    };
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
+    }
+}
+
+/// Best-effort on Windows: the daemon is spawned with CREATE_NO_WINDOW (no
+/// console), so SetConsoleCtrlHandler-based Ctrl-C delivery typically never
+/// fires for a backgrounded daemon. It does work when `__daemon__` is run
+/// manually in a foreground console for debugging.
+#[cfg(windows)]
+async fn shutdown_signal() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 pub async fn run_daemon(ws_url: &str) -> Result<()> {
     // Write PID
     std::fs::write(pid_path(), std::process::id().to_string())?;
+
+    // From here on, socket/addr/pid files are removed whenever this frame is
+    // left — including early `?` returns (e.g. a failed bind below) and
+    // unwinding panics, which previously leaked them.
+    let _guard = CleanupGuard;
 
     #[cfg(unix)]
     let listener = {
@@ -85,16 +159,13 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
     // while the daemon handles the potentially slow macOS/Chrome network permission prompt.
     let mut client: Option<CdpClient> = None;
 
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
     // Signal readiness by socket/address existence (it's already bound)
-    run_accept_loop_body!(listener.accept(), &mut client, ws_url);
+    run_accept_loop_body!(listener.accept(), &mut client, ws_url, shutdown);
 
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(socket_path());
-
-    #[cfg(windows)]
-    let _ = std::fs::remove_file(addr_path());
-
-    let _ = std::fs::remove_file(pid_path());
+    // File cleanup is handled by `_guard` (also covers signal/panic exits).
 
     // Shut down telemetry before exiting so the background thread
     // flushes pending entries and exits cleanly.
