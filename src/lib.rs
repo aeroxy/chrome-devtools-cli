@@ -989,6 +989,43 @@ pub async fn run() -> Result<()> {
                 ));
             }
         }
+
+        // Best-effort sweep of the pre-uid-suffix file names: a daemon
+        // started by an older binary is invisible to the paths above, so
+        // without this it could only be stopped by waiting out its idle
+        // timeout. Silent when no legacy files exist (the common case).
+        #[cfg(unix)]
+        {
+            let legacy_pid_path = protocol::legacy_pid_path();
+            if let Ok(pid_str) = std::fs::read_to_string(&legacy_pid_path) {
+                // Same corrupted-PID-file guards as above: never signal pid 0
+                // (whole process group) or a value that wraps negative.
+                let legacy_pid = pid_str
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|&p| p != 0)
+                    .and_then(|p| i32::try_from(p).ok());
+                if let Some(pid) = legacy_pid {
+                    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                    let gone = ret == 0
+                        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                    if gone {
+                        // Old binaries have no SIGTERM handler and exit
+                        // without cleanup, so remove their files here.
+                        let _ = std::fs::remove_file(protocol::legacy_socket_path());
+                        let _ = std::fs::remove_file(&legacy_pid_path);
+                        if ret == 0 {
+                            println!("Also stopped legacy daemon (PID {pid}).");
+                        }
+                    }
+                } else {
+                    // Unusable PID content — the files are junk; remove them.
+                    let _ = std::fs::remove_file(protocol::legacy_socket_path());
+                    let _ = std::fs::remove_file(&legacy_pid_path);
+                }
+            }
+        }
         return Ok(());
     }
 

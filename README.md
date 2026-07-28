@@ -41,7 +41,7 @@ This is a lightweight Rust binary that talks directly to Chrome's DevTools Proto
 ```
 chrome-devtools navigate https://example.com
         │
-        ├─ Try daemon (Unix socket /tmp/chrome-devtools-daemon.sock)
+        ├─ Try daemon (Unix socket $TMPDIR/chrome-devtools-daemon-<uid>.sock)
         │   └─ If running → send command → get result
         │
         ├─ If no daemon → spawn one (background process)
@@ -215,9 +215,10 @@ Global `--block-url` and `--unblock-url` update the **active tab's** block list 
 
 ## Daemon details
 
-- **Socket**: `/tmp/chrome-devtools-daemon.sock`
-- **PID file**: `/tmp/chrome-devtools-daemon.pid`
+- **Socket**: `$TMPDIR/chrome-devtools-daemon-<uid>.sock` (uid-suffixed so users on a shared machine don't collide)
+- **PID file**: `$TMPDIR/chrome-devtools-daemon-<uid>.pid`
 - **Idle timeout**: 5 minutes (auto-exits, cleans up socket)
+- **Cleanup**: socket + PID files are also removed on SIGTERM/SIGINT and panics, not just normal exit
 - **Protocol**: Length-prefixed JSON over Unix socket
 - **Spawned by**: First CLI invocation (transparent to user)
 - **Kill**: `chrome-devtools kill-daemon` (or delete the socket + PID file)
