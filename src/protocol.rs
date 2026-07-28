@@ -48,21 +48,34 @@ pub struct DaemonResponse {
     pub error_code: Option<u32>,
 }
 
+/// Per-user filename suffix. `temp_dir()` is per-user on macOS ($TMPDIR) and
+/// Windows (%TEMP%), but shared /tmp on Linux — a fixed name there lets users
+/// collide on (or squat) each other's daemon files.
+#[cfg(unix)]
+fn user_suffix() -> String {
+    format!("-{}", unsafe { libc::getuid() })
+}
+
+#[cfg(windows)]
+fn user_suffix() -> String {
+    String::new()
+}
+
 /// Path to the Unix domain socket for daemon communication.
 #[cfg(unix)]
 pub fn socket_path() -> PathBuf {
-    std::env::temp_dir().join("chrome-devtools-daemon.sock")
+    std::env::temp_dir().join(format!("chrome-devtools-daemon{}.sock", user_suffix()))
 }
 
 /// Path to the named-pipe address file for daemon communication (Windows).
 #[cfg(windows)]
 pub fn addr_path() -> PathBuf {
-    std::env::temp_dir().join("chrome-devtools-daemon.addr")
+    std::env::temp_dir().join(format!("chrome-devtools-daemon{}.addr", user_suffix()))
 }
 
 /// Path to the daemon PID file.
 pub fn pid_path() -> PathBuf {
-    std::env::temp_dir().join("chrome-devtools-daemon.pid")
+    std::env::temp_dir().join(format!("chrome-devtools-daemon{}.pid", user_suffix()))
 }
 
 /// Write a length-prefixed message to a stream.
