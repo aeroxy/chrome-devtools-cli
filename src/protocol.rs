@@ -78,6 +78,27 @@ pub fn pid_path() -> PathBuf {
     std::env::temp_dir().join(format!("chrome-devtools-daemon{}.pid", user_suffix()))
 }
 
+/// Path to the lock file serializing daemon startup and cleanup.
+///
+/// The lock file is never removed once created: deleting it while another
+/// process may be about to lock it would reintroduce the race it prevents.
+pub fn lock_path() -> PathBuf {
+    std::env::temp_dir().join(format!("chrome-devtools-daemon{}.lock", user_suffix()))
+}
+
+/// Pre-uid-suffix PID file name, so `kill-daemon` can still stop a daemon
+/// left running by an older binary after an upgrade.
+#[cfg(unix)]
+pub fn legacy_pid_path() -> PathBuf {
+    std::env::temp_dir().join("chrome-devtools-daemon.pid")
+}
+
+/// Pre-uid-suffix socket name (see [`legacy_pid_path`]).
+#[cfg(unix)]
+pub fn legacy_socket_path() -> PathBuf {
+    std::env::temp_dir().join("chrome-devtools-daemon.sock")
+}
+
 /// Write a length-prefixed message to a stream.
 pub async fn write_msg<W: AsyncWriteExt + Unpin>(w: &mut W, data: &[u8]) -> anyhow::Result<()> {
     let len = (data.len() as u32).to_be_bytes();

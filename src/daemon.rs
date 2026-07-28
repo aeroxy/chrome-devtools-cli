@@ -29,12 +29,50 @@ enum ConnectionOutcome {
     Fatal,
 }
 
+/// Acquire the cross-process lock serializing the daemon-file critical
+/// sections: startup's pid-write/rebind and cleanup's check-then-remove.
+/// Blocks until the lock is free; the OS releases it when the handle drops.
+/// `None` means the lock file couldn't be created/locked — callers proceed
+/// unlocked (degrading to pre-lock behavior) rather than refusing to run.
+fn lock_daemon_files() -> Option<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path())
+        .ok()?;
+    f.lock().ok()?;
+    Some(f)
+}
+
+/// Non-blocking variant for `cleanup()`: if the lock is held, another daemon
+/// is inside its own critical section — exactly when deleting the shared
+/// files is guaranteed wrong — so contention means "don't touch anything".
+fn try_lock_daemon_files() -> Option<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path())
+        .ok()?;
+    f.try_lock().ok()?;
+    Some(f)
+}
+
 /// Best-effort removal of the daemon's socket/address and PID files.
 ///
 /// Only cleans up when the PID file still names this process: the paths are
 /// shared, so a stale-but-alive old daemon exiting must not delete the files
-/// of a newer daemon that has since rebound them.
+/// of a newer daemon that has since rebound them. The ownership check and the
+/// removals happen under the daemon-file lock so a replacement can't write
+/// its pid and rebind in between (it would keep running but be unreachable,
+/// and every later CLI call would spawn yet another daemon).
 fn cleanup() {
+    let Some(_lock) = try_lock_daemon_files() else {
+        // Contended: a replacement is mid-startup. Its rebind supersedes our
+        // files, and any leftovers self-heal on the next daemon start.
+        return;
+    };
     let owns_files = std::fs::read_to_string(pid_path())
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
@@ -88,7 +126,11 @@ macro_rules! run_accept_loop_body {
     };
 }
 
-/// Resolves when the daemon should shut down due to a signal.
+/// SIGTERM/SIGINT must be turned into a normal accept-loop exit: their
+/// default disposition kills the process without unwinding, so `CleanupGuard`
+/// would never run and the socket/PID files would go stale. SIGHUP is
+/// deliberately left unhandled — convention reserves it for config reload,
+/// not shutdown.
 #[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
@@ -122,12 +164,20 @@ async fn shutdown_signal() {
 
 pub async fn run_daemon(ws_url: &str) -> Result<()> {
     // Write PID
-    std::fs::write(pid_path(), std::process::id().to_string())?;
-
-    // From here on, socket/addr/pid files are removed whenever this frame is
-    // left — including early `?` returns (e.g. a failed bind below) and
-    // unwinding panics, which previously leaked them.
+    // Armed before anything is written: cleanup() verifies pid-file ownership
+    // first, so firing "too early" is a no-op, and this declaration order
+    // means the startup lock below is released (locals drop in reverse order)
+    // before the guard's cleanup() tries to take it — no self-deadlock on an
+    // early `?` return or panic. Covers every way this frame is left,
+    // including unwinding panics, which previously leaked the files.
     let _guard = CleanupGuard;
+
+    // Startup critical section: the pid write and endpoint (re)bind must not
+    // interleave with a predecessor's cleanup() check-then-remove, or the
+    // predecessor can delete files this daemon just claimed.
+    let startup_lock = lock_daemon_files();
+
+    std::fs::write(pid_path(), std::process::id().to_string())?;
 
     #[cfg(unix)]
     let listener = {
@@ -153,6 +203,8 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
         std::fs::write(addr_path(), listener.local_addr()?.to_string())?;
         listener
     };
+
+    drop(startup_lock);
 
     // We don't connect immediately. We wait for the first connection from the CLI.
     // This ensures the CLI wait_for_daemon() succeeds, and the CLI blocks on read_msg()

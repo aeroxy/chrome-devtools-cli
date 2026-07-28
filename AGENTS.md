@@ -62,9 +62,10 @@ directly. `skill/chrome-devtools/CUSTOM_SCRIPTING.md` documents `run-script` and
 
 ### Daemon Architecture
 
-A background daemon (`/tmp/chrome-devtools-daemon.sock`) keeps a persistent CDP
-WebSocket connection. First CLI invocation spawns it; subsequent commands reuse
-it. 5-minute idle timeout.
+A background daemon (`$TMPDIR/chrome-devtools-daemon-<uid>.sock` — uid-suffixed
+to isolate users sharing /tmp) keeps a persistent CDP WebSocket connection.
+First CLI invocation spawns it; subsequent commands reuse it. 5-minute idle
+timeout; socket/PID files are cleaned up on signals and panics too.
 
 `CdpClient::connect` (`cdp.rs`) bounds the WebSocket handshake with a timeout
 (`CHROME_CONNECT_TIMEOUT_SECS`, default 10s). Without it, a pending Chrome
