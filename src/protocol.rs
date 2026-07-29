@@ -53,6 +53,8 @@ pub struct DaemonResponse {
 /// collide on (or squat) each other's daemon files.
 #[cfg(unix)]
 fn user_suffix() -> String {
+    // SAFETY: getuid() is a pure kernel query with no preconditions; it is
+    // thread-safe and cannot fail.
     format!("-{}", unsafe { libc::getuid() })
 }
 
