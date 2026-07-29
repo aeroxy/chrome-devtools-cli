@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(windows)]
@@ -29,34 +29,27 @@ enum ConnectionOutcome {
     Fatal,
 }
 
+fn open_lock_file() -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path())
+}
+
 /// Acquire the cross-process lock serializing the daemon-file critical
 /// sections: startup's pid-write/rebind and cleanup's check-then-remove.
 /// Blocks until the lock is free; the OS releases it when the handle drops.
-/// `None` means the lock file couldn't be created/locked — callers proceed
-/// unlocked (degrading to pre-lock behavior) rather than refusing to run.
-fn lock_daemon_files() -> Option<std::fs::File> {
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path())
-        .ok()?;
-    f.lock().ok()?;
-    Some(f)
-}
-
-/// Non-blocking variant for `cleanup()`: if the lock is held, another daemon
-/// is inside its own critical section — exactly when deleting the shared
-/// files is guaranteed wrong — so contention means "don't touch anything".
-fn try_lock_daemon_files() -> Option<std::fs::File> {
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path())
-        .ok()?;
-    f.try_lock().ok()?;
-    Some(f)
+///
+/// Errors instead of degrading: the lock is what makes ownership handoff
+/// correct, and a daemon that can't create a file in temp_dir couldn't write
+/// its PID file either — failing here just surfaces the cause sooner.
+fn lock_daemon_files() -> Result<std::fs::File> {
+    let f = open_lock_file()
+        .with_context(|| format!("Failed to open daemon lock file {}", lock_path().display()))?;
+    f.lock()
+        .with_context(|| format!("Failed to lock daemon lock file {}", lock_path().display()))?;
+    Ok(f)
 }
 
 /// Best-effort removal of the daemon's socket/address and PID files.
@@ -68,11 +61,35 @@ fn try_lock_daemon_files() -> Option<std::fs::File> {
 /// its pid and rebind in between (it would keep running but be unreachable,
 /// and every later CLI call would spawn yet another daemon).
 fn cleanup() {
-    let Some(_lock) = try_lock_daemon_files() else {
-        // Contended: a replacement is mid-startup. Its rebind supersedes our
-        // files, and any leftovers self-heal on the next daemon start.
-        return;
+    let lock_file = match open_lock_file() {
+        Ok(f) => f,
+        Err(e) => {
+            // Without the lock, removal could race a replacement's startup —
+            // leaving the files is the safe side (they self-heal on the next
+            // daemon start), but say why so the cause isn't swallowed.
+            eprintln!(
+                "daemon: leaving socket/PID files in place: cannot open lock file {}: {e}",
+                lock_path().display()
+            );
+            return;
+        }
     };
+    match lock_file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            // Contended: a replacement is mid-startup. Its rebind supersedes
+            // our files, and any leftovers self-heal on the next start.
+            return;
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            eprintln!(
+                "daemon: leaving socket/PID files in place: cannot lock {}: {e}",
+                lock_path().display()
+            );
+            return;
+        }
+    }
+    let _lock = lock_file;
     let owns_files = std::fs::read_to_string(pid_path())
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
@@ -175,7 +192,7 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
     // Startup critical section: the pid write and endpoint (re)bind must not
     // interleave with a predecessor's cleanup() check-then-remove, or the
     // predecessor can delete files this daemon just claimed.
-    let startup_lock = lock_daemon_files();
+    let startup_lock = lock_daemon_files()?;
 
     std::fs::write(pid_path(), std::process::id().to_string())?;
 

@@ -485,6 +485,46 @@ enum KillDaemonDecision {
     RefuseNonInteractive,
 }
 
+/// Parse PID-file contents into a value safe to pass to `libc::kill`.
+///
+/// Rejects pid 0 — `kill(0, sig)` signals the caller's whole process group —
+/// and values that don't fit `libc::pid_t`, where the `as` cast would wrap
+/// negative and `kill` would signal process group `-pid` instead.
+#[cfg(unix)]
+fn parse_pid_file_contents(s: &str) -> Option<i32> {
+    s.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|&p| p != 0)
+        .and_then(|p| i32::try_from(p).ok())
+}
+
+/// Confirm a live daemon is listening on the legacy (pre-uid-suffix) socket
+/// before trusting the legacy PID file. The OS recycles PIDs, so a stale
+/// file alone is not evidence the process it names is still our daemon — but
+/// something answering length-prefixed JSON on the daemon's socket is. The
+/// probe payload is deliberately not a valid `DaemonRequest`: old daemons
+/// answer "Invalid request" without ever dialing Chrome.
+#[cfg(unix)]
+async fn probe_legacy_daemon() -> bool {
+    let Ok(mut stream) =
+        tokio::net::UnixStream::connect(protocol::legacy_socket_path()).await
+    else {
+        return false;
+    };
+    if protocol::write_msg(&mut stream, b"\"probe\"").await.is_err() {
+        return false;
+    }
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            protocol::read_msg(&mut stream)
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 fn kill_daemon_decision(force: bool, can_prompt: bool) -> KillDaemonDecision {
     if force {
         KillDaemonDecision::Proceed
@@ -998,31 +1038,38 @@ pub async fn run() -> Result<()> {
         {
             let legacy_pid_path = protocol::legacy_pid_path();
             if let Ok(pid_str) = std::fs::read_to_string(&legacy_pid_path) {
-                // Same corrupted-PID-file guards as above: never signal pid 0
-                // (whole process group) or a value that wraps negative.
-                let legacy_pid = pid_str
-                    .trim()
-                    .parse::<u32>()
-                    .ok()
-                    .filter(|&p| p != 0)
-                    .and_then(|p| i32::try_from(p).ok());
-                if let Some(pid) = legacy_pid {
-                    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-                    let gone = ret == 0
-                        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-                    if gone {
-                        // Old binaries have no SIGTERM handler and exit
-                        // without cleanup, so remove their files here.
-                        let _ = std::fs::remove_file(protocol::legacy_socket_path());
-                        let _ = std::fs::remove_file(&legacy_pid_path);
-                        if ret == 0 {
-                            println!("Also stopped legacy daemon (PID {pid}).");
+                match (parse_pid_file_contents(&pid_str), probe_legacy_daemon().await) {
+                    (Some(pid), true) => {
+                        // A daemon answered on the legacy socket, so the PID
+                        // file is live — not a recycled PID from a dead run.
+                        let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                        if ret == 0 || std::io::Error::last_os_error().raw_os_error()
+                            == Some(libc::ESRCH)
+                        {
+                            // Old binaries have no SIGTERM handler and exit
+                            // without cleanup, so remove their files here.
+                            let _ = std::fs::remove_file(protocol::legacy_socket_path());
+                            let _ = std::fs::remove_file(&legacy_pid_path);
+                            if ret == 0 {
+                                println!("Also stopped legacy daemon (PID {pid}).");
+                            }
                         }
                     }
-                } else {
-                    // Unusable PID content — the files are junk; remove them.
-                    let _ = std::fs::remove_file(protocol::legacy_socket_path());
-                    let _ = std::fs::remove_file(&legacy_pid_path);
+                    (_, false) => {
+                        // Nothing answering on the legacy socket: the files
+                        // are leftovers. Never signal the PID — the OS may
+                        // have recycled it for an unrelated process.
+                        let _ = std::fs::remove_file(protocol::legacy_socket_path());
+                        let _ = std::fs::remove_file(&legacy_pid_path);
+                    }
+                    (None, true) => {
+                        // Live daemon but unusable PID contents: can't signal
+                        // it safely. Leave its files; it idles out on its own.
+                        println!(
+                            "Note: a legacy daemon is listening on {} but its PID file is unreadable; it will exit after its idle timeout.",
+                            protocol::legacy_socket_path().display()
+                        );
+                    }
                 }
             }
         }
