@@ -389,7 +389,9 @@ chrome-devtools kill-daemon --force
   about:blank &
 CHROME_PID=$!
 
-# 3. Wait for Chrome to publish its debug port
+# 3. DevToolsActivePort is written only after the DevTools server is
+#    actually listening, so the file's existence — not the process being
+#    alive — is the readiness signal; connecting earlier races startup
 while [ ! -f "$PROFILE/DevToolsActivePort" ]; do sleep 0.5; done
 
 # 4. Every command needs --user-data-dir pointing at the headless profile;
