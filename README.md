@@ -219,12 +219,12 @@ Global `--block-url` and `--unblock-url` update the **active tab's** block list 
 - **Endpoint (Unix)**: socket at `$TMPDIR/chrome-devtools-daemon-<uid>.sock` (uid-suffixed so users on a shared machine don't collide)
 - **Endpoint (Windows)**: loopback TCP listener; its address is written to `%TEMP%\chrome-devtools-daemon.addr` (`%TEMP%` is already per-user, so no suffix)
 - **PID file**: `$TMPDIR/chrome-devtools-daemon-<uid>.pid` (Windows: `%TEMP%\chrome-devtools-daemon.pid`)
-- **Lock file**: `$TMPDIR/chrome-devtools-daemon-<uid>.lock` (Windows: `%TEMP%\chrome-devtools-daemon.lock`) — serializes daemon startup/cleanup; intentionally never removed automatically (deleting a lock file another process may be about to take reintroduces the race it prevents). Safe to delete manually when no daemon is running.
+- **Lock file**: `$TMPDIR/chrome-devtools-daemon-<uid>.lock` (Windows: `%TEMP%\chrome-devtools-daemon.lock`) — serializes daemon startup/cleanup; intentionally never removed automatically. Locks bind to the inode, not the name: deleting the file while any daemon process is still starting, running, or shutting down lets a new process lock a fresh replacement inode and bypass the serialization entirely. Only delete it once no daemon process exists at all — and there's rarely a reason to, since a leftover lock file is harmless.
 - **Idle timeout**: 5 minutes (auto-exits, cleans up its files)
 - **Cleanup**: endpoint + PID files are also removed on panics, and on Unix on SIGTERM/SIGINT; Windows Ctrl-C cleanup is best-effort only (a background daemon has no console to receive it)
 - **Protocol**: Length-prefixed JSON over the Unix socket / loopback TCP
 - **Spawned by**: First CLI invocation (transparent to user)
-- **Kill**: `chrome-devtools kill-daemon` (or delete the socket + PID file; the lock file may also be deleted)
+- **Kill**: `chrome-devtools kill-daemon` (or delete the socket + PID file; leave the lock file — see above)
 
 The daemon keeps a persistent CDP session on the current page to:
 - Continuously collect `Network.*` and `Runtime.consoleAPICalled`/`exceptionThrown` events for `console` and `network` drains.
