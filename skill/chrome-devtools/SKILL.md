@@ -367,6 +367,53 @@ profiles/machines) produces a meaningless result where nearly everything is
 reported as both added and removed — the CLI prints a warning on stderr when
 it detects this.
 
+### Pattern 16: Headless Chrome (No Login, No Human Approval)
+
+When the flow under test doesn't need the user's cookies/credentials, spawn a
+throwaway headless Chrome instead of attaching to the user's browser. Because
+the instance is launched with remote debugging already enabled, **no consent
+prompt ever appears** — the whole flow runs unattended.
+
+```bash
+PROFILE=$(mktemp -d)
+
+# 1. If a daemon is already attached to the user's real Chrome, stop it first
+#    (the daemon is per-user and sticks to whichever Chrome it first connected to)
+chrome-devtools kill-daemon --force
+
+# 2. Spawn headless Chrome with an isolated profile; port 0 = pick a free port
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --headless=new --remote-debugging-port=0 \
+  --user-data-dir="$PROFILE" \
+  --no-first-run --no-default-browser-check \
+  about:blank &
+CHROME_PID=$!
+
+# 3. Wait for Chrome to publish its debug port
+while [ ! -f "$PROFILE/DevToolsActivePort" ]; do sleep 0.5; done
+
+# 4. Every command needs --user-data-dir pointing at the headless profile;
+#    the CLI auto-connects by reading its DevToolsActivePort
+chrome-devtools --user-data-dir "$PROFILE" navigate https://example.com
+chrome-devtools --user-data-dir "$PROFILE" evaluate 'document.title'
+chrome-devtools --user-data-dir "$PROFILE" screenshot --output /tmp/shot.png
+
+# 5. Cleanup — REQUIRED: the daemon is now bound to the headless instance and
+#    would otherwise hijack later commands aimed at the user's real Chrome
+chrome-devtools kill-daemon --force
+kill $CHROME_PID
+rm -rf "$PROFILE"
+```
+
+Linux path: `google-chrome` or `chromium` on `$PATH` replaces the macOS
+`.app` binary path.
+
+**⚠️ One daemon per user, bound to one Chrome.** The daemon connects to
+whichever Chrome the first command resolved, and later commands reuse it even
+if their flags point elsewhere. Always `kill-daemon --force` when switching
+between the user's Chrome and a headless instance — in both directions
+(steps 1 and 5 above).
+
 ## Complete Command Reference
 
 ### Navigation
