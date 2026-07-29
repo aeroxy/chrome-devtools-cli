@@ -980,28 +980,15 @@ pub async fn run() -> Result<()> {
         let sock_path = protocol::socket_path();
         match std::fs::read_to_string(&pid_path) {
             Ok(pid_str) => {
-                let pid: u32 = pid_str
-                    .trim()
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("Invalid PID in {}", pid_path.display()))?;
                 #[cfg(unix)]
                 {
-                    // Refuse PID 0: kill(0, ...) signals every process in the
-                    // caller's process group — it would take down this CLI and
-                    // its siblings. A corrupted/truncated PID file could read "0".
-                    if pid == 0 {
-                        anyhow::bail!("PID in {} is 0; refusing to signal", pid_path.display());
-                    }
-                    // Guard against a PID that doesn't fit in libc::pid_t (a
-                    // signed 32-bit integer on POSIX). The OS never produces such
-                    // PIDs, but a corrupted PID file could, and the cast below
-                    // would silently wrap to a negative number — which kill()
-                    // interprets as "signal all processes in process group -pid",
-                    // potentially killing unrelated processes.
-                    let pid_i32: i32 = i32::try_from(pid).map_err(|_| {
+                    // parse_pid_file_contents enforces the safety rules for
+                    // what may be passed to kill() (no pid 0, no pid_t
+                    // overflow — see its doc comment).
+                    let pid = parse_pid_file_contents(&pid_str).ok_or_else(|| {
                         anyhow::anyhow!(
-                            "PID {} in {} exceeds libc::pid_t; refusing to signal",
-                            pid,
+                            "PID {:?} in {} is not a positive integer that fits libc::pid_t; refusing to signal",
+                            pid_str.trim(),
                             pid_path.display()
                         )
                     })?;
@@ -1009,7 +996,7 @@ pub async fn run() -> Result<()> {
                     // to /usr/bin/kill. A return of 0 means the signal was
                     // delivered; -1 with errno ESRCH means the process is gone
                     // (and the PID file was stale).
-                    let ret = unsafe { libc::kill(pid_i32 as libc::pid_t, libc::SIGTERM) };
+                    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
                     if ret == 0 {
                         // Signal delivered — daemon is shutting down; clean up.
                         let _ = std::fs::remove_file(&sock_path);
@@ -1033,7 +1020,7 @@ pub async fn run() -> Result<()> {
                 }
                 #[cfg(not(unix))]
                 {
-                    let _ = pid;
+                    let _ = pid_str;
                     println!("kill-daemon is only supported on Unix systems.");
                 }
             }
@@ -1064,9 +1051,8 @@ pub async fn run() -> Result<()> {
                         // A daemon answered on the legacy socket, so the PID
                         // file is live — not a recycled PID from a dead run.
                         let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-                        if ret == 0 || std::io::Error::last_os_error().raw_os_error()
-                            == Some(libc::ESRCH)
-                        {
+                        let err = std::io::Error::last_os_error();
+                        if ret == 0 || err.raw_os_error() == Some(libc::ESRCH) {
                             // Old binaries have no SIGTERM handler and exit
                             // without cleanup, so remove their files here.
                             let _ = std::fs::remove_file(protocol::legacy_socket_path());
@@ -1074,6 +1060,12 @@ pub async fn run() -> Result<()> {
                             if ret == 0 {
                                 println!("Also stopped legacy daemon (PID {pid}).");
                             }
+                        } else {
+                            // e.g. EPERM: it answered the probe, so it's
+                            // alive — say so instead of silently leaving it.
+                            println!(
+                                "Warning: could not signal legacy daemon (PID {pid}): {err}. It may still be running; its files were left in place."
+                            );
                         }
                     }
                     (_, Ok(false)) => {
@@ -1564,6 +1556,41 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_pid_file_contents_valid_with_whitespace() {
+        assert_eq!(parse_pid_file_contents("12345"), Some(12345));
+        assert_eq!(parse_pid_file_contents("  12345\n"), Some(12345));
+        assert_eq!(parse_pid_file_contents("1"), Some(1));
+        assert_eq!(parse_pid_file_contents(&i32::MAX.to_string()), Some(i32::MAX));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_pid_file_contents_rejects_zero() {
+        assert_eq!(parse_pid_file_contents("0"), None);
+        assert_eq!(parse_pid_file_contents(" 0 "), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_pid_file_contents_rejects_pid_t_overflow() {
+        // Would wrap negative through `as libc::pid_t` and signal group -pid.
+        assert_eq!(parse_pid_file_contents(&(i32::MAX as u32 + 1).to_string()), None);
+        assert_eq!(parse_pid_file_contents(&u32::MAX.to_string()), None);
+        assert_eq!(parse_pid_file_contents(&u64::MAX.to_string()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_pid_file_contents_rejects_non_numeric() {
+        assert_eq!(parse_pid_file_contents("-5"), None);
+        assert_eq!(parse_pid_file_contents("abc"), None);
+        assert_eq!(parse_pid_file_contents("12 34"), None);
+        assert_eq!(parse_pid_file_contents(""), None);
+        assert_eq!(parse_pid_file_contents("   \n"), None);
+    }
 
     #[test]
     #[allow(clippy::approx_constant)]
