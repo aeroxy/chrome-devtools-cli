@@ -34,7 +34,8 @@ enum ConnectionOutcome {
 /// planted symlink (O_NOFOLLOW) and only lock something that is a regular
 /// file owned by this uid. macOS $TMPDIR and Windows %TEMP% are per-user, so
 /// there the checks are inert.
-fn open_lock_file() -> std::io::Result<std::fs::File> {
+fn open_lock_file() -> Result<std::fs::File> {
+    let path = lock_path();
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).write(true).truncate(false);
     #[cfg(unix)]
@@ -43,16 +44,20 @@ fn open_lock_file() -> std::io::Result<std::fs::File> {
         opts.custom_flags(libc::O_NOFOLLOW);
         opts.mode(0o600);
     }
-    let f = opts.open(lock_path())?;
+    let f = opts
+        .open(&path)
+        .with_context(|| format!("Failed to open daemon lock file {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let md = f.metadata()?;
+        let md = f.metadata().with_context(|| {
+            format!("Failed to read metadata of daemon lock file {}", path.display())
+        })?;
         if !md.is_file() || md.uid() != unsafe { libc::getuid() } {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "lock path is not a regular file owned by the current user",
-            ));
+            anyhow::bail!(
+                "Daemon lock path {} is not a regular file owned by the current user; refusing to lock it",
+                path.display()
+            );
         }
     }
     Ok(f)
@@ -73,8 +78,7 @@ const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// wait is bounded because an indefinite `lock()` would let any process that
 /// pre-acquired the predictable lock path park daemon startup forever.
 fn lock_daemon_files() -> Result<std::fs::File> {
-    let f = open_lock_file()
-        .with_context(|| format!("Failed to open daemon lock file {}", lock_path().display()))?;
+    let f = open_lock_file()?;
     let deadline = std::time::Instant::now() + LOCK_WAIT_TIMEOUT;
     loop {
         match f.try_lock() {
@@ -112,10 +116,8 @@ fn cleanup() {
             // Without the lock, removal could race a replacement's startup —
             // leaving the files is the safe side (they self-heal on the next
             // daemon start), but say why so the cause isn't swallowed.
-            eprintln!(
-                "daemon: leaving socket/PID files in place: cannot open lock file {}: {e}",
-                lock_path().display()
-            );
+            // open_lock_file's error already names the operation and path.
+            eprintln!("daemon: leaving socket/PID files in place: {e:#}");
             return;
         }
     };

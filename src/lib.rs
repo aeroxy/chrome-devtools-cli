@@ -1068,12 +1068,28 @@ pub async fn run() -> Result<()> {
                             );
                         }
                     }
-                    (_, Ok(false)) => {
-                        // Nothing answering on the legacy socket: the files
-                        // are leftovers. Never signal the PID — the OS may
-                        // have recycled it for an unrelated process.
-                        let _ = std::fs::remove_file(protocol::legacy_socket_path());
-                        let _ = std::fs::remove_file(&legacy_pid_path);
+                    (pid, Ok(false)) => {
+                        // Nothing answering on the legacy socket. That alone
+                        // doesn't prove staleness: old binaries write their
+                        // PID before binding, and they don't take the new
+                        // startup lock, so this may be a daemon mid-startup.
+                        // Only remove when the named process is verifiably
+                        // gone (or the PID is junk). Never signal here — the
+                        // OS may have recycled the PID.
+                        let alive = pid.is_some_and(|p| {
+                            (unsafe { libc::kill(p as libc::pid_t, 0) }) == 0
+                                || std::io::Error::last_os_error().raw_os_error()
+                                    == Some(libc::EPERM)
+                        });
+                        if alive {
+                            println!(
+                                "Note: legacy PID file {} names a live process but nothing answered on the legacy socket; leaving its files in place (it may be mid-startup, and it exits after its idle timeout anyway).",
+                                legacy_pid_path.display()
+                            );
+                        } else {
+                            let _ = std::fs::remove_file(protocol::legacy_socket_path());
+                            let _ = std::fs::remove_file(&legacy_pid_path);
+                        }
                     }
                     (None, Ok(true)) => {
                         // Live daemon but unusable PID contents: can't signal
