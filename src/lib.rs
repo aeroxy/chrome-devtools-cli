@@ -503,6 +503,39 @@ fn parse_pid_file_contents(s: &str) -> Option<i32> {
         .and_then(|p| i32::try_from(p).ok())
 }
 
+/// Read a PID file without trusting the path it lives at. PID-file names are
+/// predictable and, on Linux, live in shared /tmp — the same threat model as
+/// the daemon lock file — so refuse to follow a planted symlink (O_NOFOLLOW)
+/// and only accept a regular file owned by this uid. O_NONBLOCK stops a
+/// planted FIFO from wedging the open() itself (it has no effect on regular
+/// files); the `is_file` check then rejects the FIFO. The read is capped
+/// because a PID is at most a few bytes — a large file at this path is
+/// hostile by definition and must not be slurped into memory.
+#[cfg(unix)]
+fn read_pid_file_checked(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let md = f.metadata()?;
+    // SAFETY: getuid() is a pure kernel query with no preconditions; it is
+    // thread-safe and cannot fail.
+    if !md.is_file() || md.uid() != unsafe { libc::getuid() } {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} is not a regular file owned by the current user; refusing to trust it",
+                path.display()
+            ),
+        ));
+    }
+    let mut s = String::new();
+    f.take(64).read_to_string(&mut s)?;
+    Ok(s)
+}
+
 /// Confirm a live daemon is listening on the legacy (pre-uid-suffix) socket
 /// before trusting the legacy PID file. The OS recycles PIDs, so a stale
 /// file alone is not evidence the process it names is still our daemon — but
@@ -536,10 +569,26 @@ async fn probe_legacy_daemon() -> Result<bool> {
                 return Ok(false);
             }
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("Failed to connect to {}", sock.display()));
+                return Err(e).with_context(|| format!("Failed to connect to {}", sock.display()));
             }
         };
+        // The socket path is predictable, so before treating the listener as
+        // our daemon, check who is actually on the other end: a legacy daemon
+        // was started by this user, so a peer running as any other uid is a
+        // squatter. Err (not Ok(false)) so the caller lands in the
+        // leave-everything-alone branch rather than the provably-stale one.
+        let cred = stream
+            .peer_cred()
+            .with_context(|| format!("Failed to read peer credentials of {}", sock.display()))?;
+        // SAFETY: getuid() is a pure kernel query with no preconditions; it
+        // is thread-safe and cannot fail.
+        if cred.uid() != unsafe { libc::getuid() } {
+            anyhow::bail!(
+                "Listener on {} runs as uid {}, not the current user; refusing to treat it as the legacy daemon",
+                sock.display(),
+                cred.uid()
+            );
+        }
         protocol::write_msg(&mut stream, b"\"probe\"")
             .await
             .with_context(|| format!("Failed to write probe to {}", sock.display()))?;
@@ -985,7 +1034,13 @@ pub async fn run() -> Result<()> {
         let pid_path = protocol::pid_path();
         #[cfg(unix)]
         let sock_path = protocol::socket_path();
-        match std::fs::read_to_string(&pid_path) {
+        // Ownership-checked read: the path is predictable in shared /tmp, so
+        // never act on a PID file that was planted there by another user.
+        #[cfg(unix)]
+        let read_result = read_pid_file_checked(&pid_path);
+        #[cfg(not(unix))]
+        let read_result = std::fs::read_to_string(&pid_path);
+        match read_result {
             Ok(pid_str) => {
                 #[cfg(unix)]
                 {
@@ -1055,8 +1110,26 @@ pub async fn run() -> Result<()> {
         #[cfg(unix)]
         {
             let legacy_pid_path = protocol::legacy_pid_path();
-            if let Ok(pid_str) = std::fs::read_to_string(&legacy_pid_path) {
-                match (parse_pid_file_contents(&pid_str), probe_legacy_daemon().await) {
+            // Ownership-checked read (same threat model as the current pid
+            // path above, but worse: the legacy name has no uid suffix, so on
+            // shared /tmp any user could have planted it).
+            let pid_str = match read_pid_file_checked(&legacy_pid_path) {
+                Ok(s) => Some(s),
+                // No legacy files — the common case; stay silent.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    println!(
+                        "Note: skipping legacy daemon sweep: cannot trust {}: {e}",
+                        legacy_pid_path.display()
+                    );
+                    None
+                }
+            };
+            if let Some(pid_str) = pid_str {
+                match (
+                    parse_pid_file_contents(&pid_str),
+                    probe_legacy_daemon().await,
+                ) {
                     (Some(pid), Ok(true)) => {
                         // A daemon answered on the legacy socket, so the PID
                         // file is live — not a recycled PID from a dead run.
@@ -1595,7 +1668,10 @@ mod tests {
         assert_eq!(parse_pid_file_contents("12345"), Some(12345));
         assert_eq!(parse_pid_file_contents("  12345\n"), Some(12345));
         assert_eq!(parse_pid_file_contents("1"), Some(1));
-        assert_eq!(parse_pid_file_contents(&i32::MAX.to_string()), Some(i32::MAX));
+        assert_eq!(
+            parse_pid_file_contents(&i32::MAX.to_string()),
+            Some(i32::MAX)
+        );
     }
 
     #[cfg(unix)]
@@ -1609,7 +1685,10 @@ mod tests {
     #[test]
     fn test_parse_pid_file_contents_rejects_pid_t_overflow() {
         // Would wrap negative through `as libc::pid_t` and signal group -pid.
-        assert_eq!(parse_pid_file_contents(&(i32::MAX as u32 + 1).to_string()), None);
+        assert_eq!(
+            parse_pid_file_contents(&(i32::MAX as u32 + 1).to_string()),
+            None
+        );
         assert_eq!(parse_pid_file_contents(&u32::MAX.to_string()), None);
         assert_eq!(parse_pid_file_contents(&u64::MAX.to_string()), None);
     }
