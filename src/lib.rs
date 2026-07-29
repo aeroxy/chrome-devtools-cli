@@ -505,24 +505,45 @@ fn parse_pid_file_contents(s: &str) -> Option<i32> {
 /// something answering length-prefixed JSON on the daemon's socket is. The
 /// probe payload is deliberately not a valid `DaemonRequest`: old daemons
 /// answer "Invalid request" without ever dialing Chrome.
+///
+/// `Ok(false)` = nothing listening (missing socket / connection refused), so
+/// the files are provably stale. `Err` = something accepted the connection
+/// but the handshake didn't complete — the caller must treat the daemon's
+/// liveness as unknown and leave its files alone. The timeout spans the whole
+/// connect/write/read sequence: the socket name is predictable on shared
+/// /tmp, so a hostile listener must not be able to stall `kill-daemon` at
+/// any step.
 #[cfg(unix)]
-async fn probe_legacy_daemon() -> bool {
-    let Ok(mut stream) =
-        tokio::net::UnixStream::connect(protocol::legacy_socket_path()).await
-    else {
-        return false;
+async fn probe_legacy_daemon() -> Result<bool> {
+    use anyhow::Context as _;
+    let sock = protocol::legacy_socket_path();
+    let sequence = async {
+        let mut stream = match tokio::net::UnixStream::connect(&sock).await {
+            Ok(s) => s,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to connect to {}", sock.display()));
+            }
+        };
+        protocol::write_msg(&mut stream, b"\"probe\"")
+            .await
+            .with_context(|| format!("Failed to write probe to {}", sock.display()))?;
+        protocol::read_msg(&mut stream)
+            .await
+            .with_context(|| format!("Failed to read probe response from {}", sock.display()))?;
+        Ok(true)
     };
-    if protocol::write_msg(&mut stream, b"\"probe\"").await.is_err() {
-        return false;
-    }
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            protocol::read_msg(&mut stream)
-        )
-        .await,
-        Ok(Ok(_))
-    )
+    tokio::time::timeout(std::time::Duration::from_secs(2), sequence)
+        .await
+        .with_context(|| format!("Probe of legacy daemon socket {} timed out", sock.display()))?
 }
 
 fn kill_daemon_decision(force: bool, can_prompt: bool) -> KillDaemonDecision {
@@ -1039,7 +1060,7 @@ pub async fn run() -> Result<()> {
             let legacy_pid_path = protocol::legacy_pid_path();
             if let Ok(pid_str) = std::fs::read_to_string(&legacy_pid_path) {
                 match (parse_pid_file_contents(&pid_str), probe_legacy_daemon().await) {
-                    (Some(pid), true) => {
+                    (Some(pid), Ok(true)) => {
                         // A daemon answered on the legacy socket, so the PID
                         // file is live — not a recycled PID from a dead run.
                         let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
@@ -1055,18 +1076,28 @@ pub async fn run() -> Result<()> {
                             }
                         }
                     }
-                    (_, false) => {
+                    (_, Ok(false)) => {
                         // Nothing answering on the legacy socket: the files
                         // are leftovers. Never signal the PID — the OS may
                         // have recycled it for an unrelated process.
                         let _ = std::fs::remove_file(protocol::legacy_socket_path());
                         let _ = std::fs::remove_file(&legacy_pid_path);
                     }
-                    (None, true) => {
+                    (None, Ok(true)) => {
                         // Live daemon but unusable PID contents: can't signal
                         // it safely. Leave its files; it idles out on its own.
                         println!(
                             "Note: a legacy daemon is listening on {} but its PID file is unreadable; it will exit after its idle timeout.",
+                            protocol::legacy_socket_path().display()
+                        );
+                    }
+                    (_, Err(e)) => {
+                        // Something accepted the connection but the probe
+                        // couldn't confirm it's our daemon — signaling or
+                        // deleting on a guess is worse than leaving the files
+                        // for manual inspection.
+                        println!(
+                            "Warning: could not verify the legacy daemon on {}: {e:#}. Leaving its files in place.",
                             protocol::legacy_socket_path().display()
                         );
                     }

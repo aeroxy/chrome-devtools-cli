@@ -29,27 +29,72 @@ enum ConnectionOutcome {
     Fatal,
 }
 
+/// The lock path has a predictable name and, on Linux, lives in shared /tmp,
+/// so treat a pre-existing file as potentially hostile: refuse to follow a
+/// planted symlink (O_NOFOLLOW) and only lock something that is a regular
+/// file owned by this uid. macOS $TMPDIR and Windows %TEMP% are per-user, so
+/// there the checks are inert.
 fn open_lock_file() -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path())
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.mode(0o600);
+    }
+    let f = opts.open(lock_path())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md = f.metadata()?;
+        if !md.is_file() || md.uid() != unsafe { libc::getuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "lock path is not a regular file owned by the current user",
+            ));
+        }
+    }
+    Ok(f)
 }
+
+/// How long startup will wait for the daemon-file lock. Legitimate holders
+/// (a predecessor's cleanup, another daemon's startup) finish in
+/// milliseconds; anything longer means the lock is wedged or squatted.
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Acquire the cross-process lock serializing the daemon-file critical
 /// sections: startup's pid-write/rebind and cleanup's check-then-remove.
-/// Blocks until the lock is free; the OS releases it when the handle drops.
+/// The OS releases the lock when the handle drops.
 ///
 /// Errors instead of degrading: the lock is what makes ownership handoff
 /// correct, and a daemon that can't create a file in temp_dir couldn't write
-/// its PID file either — failing here just surfaces the cause sooner.
+/// its PID file either — failing here just surfaces the cause sooner. The
+/// wait is bounded because an indefinite `lock()` would let any process that
+/// pre-acquired the predictable lock path park daemon startup forever.
 fn lock_daemon_files() -> Result<std::fs::File> {
     let f = open_lock_file()
         .with_context(|| format!("Failed to open daemon lock file {}", lock_path().display()))?;
-    f.lock()
-        .with_context(|| format!("Failed to lock daemon lock file {}", lock_path().display()))?;
-    Ok(f)
+    let deadline = std::time::Instant::now() + LOCK_WAIT_TIMEOUT;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "Timed out after {LOCK_WAIT_TIMEOUT:?} waiting for daemon lock file {} (held by another process)",
+                        lock_path().display()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to lock daemon lock file {}", lock_path().display())
+                });
+            }
+        }
+    }
 }
 
 /// Best-effort removal of the daemon's socket/address and PID files.
