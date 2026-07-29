@@ -53,6 +53,8 @@ fn open_lock_file() -> Result<std::fs::File> {
         let md = f.metadata().with_context(|| {
             format!("Failed to read metadata of daemon lock file {}", path.display())
         })?;
+        // SAFETY: getuid() is a pure kernel query with no preconditions; it
+        // is thread-safe and cannot fail.
         if !md.is_file() || md.uid() != unsafe { libc::getuid() } {
             anyhow::bail!(
                 "Daemon lock path {} is not a regular file owned by the current user; refusing to lock it",
@@ -77,20 +79,22 @@ const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// its PID file either — failing here just surfaces the cause sooner. The
 /// wait is bounded because an indefinite `lock()` would let any process that
 /// pre-acquired the predictable lock path park daemon startup forever.
-fn lock_daemon_files() -> Result<std::fs::File> {
+/// Async (poll + `tokio::time::sleep`) so a contended lock never blocks the
+/// runtime's worker thread.
+async fn lock_daemon_files() -> Result<std::fs::File> {
     let f = open_lock_file()?;
-    let deadline = std::time::Instant::now() + LOCK_WAIT_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + LOCK_WAIT_TIMEOUT;
     loop {
         match f.try_lock() {
             Ok(()) => return Ok(f),
             Err(std::fs::TryLockError::WouldBlock) => {
-                if std::time::Instant::now() >= deadline {
+                if tokio::time::Instant::now() >= deadline {
                     anyhow::bail!(
                         "Timed out after {LOCK_WAIT_TIMEOUT:?} waiting for daemon lock file {} (held by another process)",
                         lock_path().display()
                     );
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(std::fs::TryLockError::Error(e)) => {
                 return Err(e).with_context(|| {
@@ -109,6 +113,12 @@ fn lock_daemon_files() -> Result<std::fs::File> {
 /// removals happen under the daemon-file lock so a replacement can't write
 /// its pid and rebind in between (it would keep running but be unreachable,
 /// and every later CLI call would spawn yet another daemon).
+///
+/// The `eprintln!` diagnostics here are only visible when `__daemon__` is run
+/// in a foreground terminal: `spawn_daemon` detaches with stderr to null.
+/// That's acceptable — every branch below fails safe (files are left in
+/// place and self-heal on the next daemon start), so the messages exist for
+/// interactive debugging, not operational monitoring.
 fn cleanup() {
     let lock_file = match open_lock_file() {
         Ok(f) => f,
@@ -162,6 +172,13 @@ impl Drop for CleanupGuard {
     }
 }
 
+/// A macro (not a generic fn) because the Unix `UnixListener` and Windows
+/// `TcpListener` have no common accept trait; the cfg-gated call site passes
+/// whichever exists. Contract for callers:
+/// - `$accept` is re-evaluated every iteration (pass `listener.accept()`,
+///   which creates a fresh accept future each time around the loop).
+/// - `$shutdown` is polled by `&mut` reference, so the caller must pin it
+///   first (`tokio::pin!`); passing an unpinned future fails to compile.
 macro_rules! run_accept_loop_body {
     ($accept:expr, $client:expr, $ws_url:expr, $shutdown:expr) => {
         loop {
@@ -239,7 +256,7 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
     // Startup critical section: the pid write and endpoint (re)bind must not
     // interleave with a predecessor's cleanup() check-then-remove, or the
     // predecessor can delete files this daemon just claimed.
-    let startup_lock = lock_daemon_files()?;
+    let startup_lock = lock_daemon_files().await?;
 
     std::fs::write(pid_path(), std::process::id().to_string())?;
 

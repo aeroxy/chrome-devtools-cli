@@ -490,6 +490,10 @@ enum KillDaemonDecision {
 /// Rejects pid 0 — `kill(0, sig)` signals the caller's whole process group —
 /// and values that don't fit `libc::pid_t`, where the `as` cast would wrap
 /// negative and `kill` would signal process group `-pid` instead.
+///
+/// Used only by `kill-daemon`'s PID-file handling (current and legacy
+/// paths); the daemon itself never parses a PID — it writes its own via
+/// `std::process::id()`.
 #[cfg(unix)]
 fn parse_pid_file_contents(s: &str) -> Option<i32> {
     s.trim()
@@ -504,7 +508,10 @@ fn parse_pid_file_contents(s: &str) -> Option<i32> {
 /// file alone is not evidence the process it names is still our daemon — but
 /// something answering length-prefixed JSON on the daemon's socket is. The
 /// probe payload is deliberately not a valid `DaemonRequest`: old daemons
-/// answer "Invalid request" without ever dialing Chrome.
+/// answer "Invalid request" without ever dialing Chrome. This assumes legacy
+/// daemons reply to malformed requests rather than dropping them; if that
+/// ever stops holding, the probe times out and lands in the `Err` branch —
+/// the safe outcome (files left in place, nothing signaled).
 ///
 /// `Ok(false)` = nothing listening (missing socket / connection refused), so
 /// the files are provably stale. `Err` = something accepted the connection
@@ -996,6 +1003,9 @@ pub async fn run() -> Result<()> {
                     // to /usr/bin/kill. A return of 0 means the signal was
                     // delivered; -1 with errno ESRCH means the process is gone
                     // (and the PID file was stale).
+                    // SAFETY: kill() has no memory-safety preconditions; the
+                    // pid was validated positive and in pid_t range above, so
+                    // it cannot alias a process group.
                     let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
                     if ret == 0 {
                         // Signal delivered — daemon is shutting down; clean up.
@@ -1050,6 +1060,9 @@ pub async fn run() -> Result<()> {
                     (Some(pid), Ok(true)) => {
                         // A daemon answered on the legacy socket, so the PID
                         // file is live — not a recycled PID from a dead run.
+                        // SAFETY: kill() has no memory-safety preconditions;
+                        // parse_pid_file_contents guarantees a positive,
+                        // pid_t-range pid (no process-group aliasing).
                         let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
                         let err = std::io::Error::last_os_error();
                         if ret == 0 || err.raw_os_error() == Some(libc::ESRCH) {
@@ -1077,6 +1090,9 @@ pub async fn run() -> Result<()> {
                         // gone (or the PID is junk). Never signal here — the
                         // OS may have recycled the PID.
                         let alive = pid.is_some_and(|p| {
+                            // SAFETY: signal 0 performs only an existence
+                            // check — no signal is sent; the pid was
+                            // validated by parse_pid_file_contents.
                             (unsafe { libc::kill(p as libc::pid_t, 0) }) == 0
                                 || std::io::Error::last_os_error().raw_os_error()
                                     == Some(libc::EPERM)
