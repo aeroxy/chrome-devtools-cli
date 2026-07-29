@@ -32,26 +32,37 @@ enum ConnectionOutcome {
 /// The lock path has a predictable name and, on Linux, lives in shared /tmp,
 /// so treat a pre-existing file as potentially hostile: refuse to follow a
 /// planted symlink (O_NOFOLLOW) and only lock something that is a regular
-/// file owned by this uid. macOS $TMPDIR and Windows %TEMP% are per-user, so
-/// there the checks are inert.
+/// file owned by this uid. O_NONBLOCK keeps a planted FIFO from wedging the
+/// open() itself (it has no effect on regular files); the `is_file` check
+/// then rejects it. macOS $TMPDIR and Windows %TEMP% are per-user, so there
+/// the checks are inert.
 fn open_lock_file() -> Result<std::fs::File> {
-    let path = lock_path();
+    open_lock_file_at(&lock_path())
+}
+
+/// Path-parameterized body of [`open_lock_file`], so tests can exercise the
+/// hostile-path checks against a scratch directory instead of the real
+/// `temp_dir()`.
+fn open_lock_file_at(path: &std::path::Path) -> Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).write(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         opts.mode(0o600);
     }
     let f = opts
-        .open(&path)
+        .open(path)
         .with_context(|| format!("Failed to open daemon lock file {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         let md = f.metadata().with_context(|| {
-            format!("Failed to read metadata of daemon lock file {}", path.display())
+            format!(
+                "Failed to read metadata of daemon lock file {}",
+                path.display()
+            )
         })?;
         // SAFETY: getuid() is a pure kernel query with no preconditions; it
         // is thread-safe and cannot fail.
@@ -68,7 +79,11 @@ fn open_lock_file() -> Result<std::fs::File> {
 /// How long startup will wait for the daemon-file lock. Legitimate holders
 /// (a predecessor's cleanup, another daemon's startup) finish in
 /// milliseconds; anything longer means the lock is wedged or squatted.
-const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Must stay well below the CLI's `DAEMON_WAIT_TIMEOUT_SECS` (default 5s,
+/// `client.rs`): if the two were equal, a daemon that spent its whole budget
+/// waiting here would bind at the exact moment `wait_for_daemon` gives up,
+/// and the CLI would fall back to direct execution despite a usable daemon.
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Acquire the cross-process lock serializing the daemon-file critical
 /// sections: startup's pid-write/rebind and cleanup's check-then-remove.
@@ -120,13 +135,26 @@ async fn lock_daemon_files() -> Result<std::fs::File> {
 /// place and self-heal on the next daemon start), so the messages exist for
 /// interactive debugging, not operational monitoring.
 fn cleanup() {
-    let lock_file = match open_lock_file() {
+    #[cfg(unix)]
+    let endpoint = socket_path();
+    #[cfg(windows)]
+    let endpoint = addr_path();
+    cleanup_at(&lock_path(), &pid_path(), &endpoint);
+}
+
+/// Path-parameterized body of [`cleanup`] (see its doc for the locking and
+/// ownership rules), so tests can drive it against a scratch directory
+/// instead of the real `temp_dir()` files.
+fn cleanup_at(lock: &std::path::Path, pid: &std::path::Path, endpoint: &std::path::Path) {
+    // `lock_file` holds the OS lock until it drops at the end of this scope,
+    // covering the ownership check and removals below.
+    let lock_file = match open_lock_file_at(lock) {
         Ok(f) => f,
         Err(e) => {
             // Without the lock, removal could race a replacement's startup —
             // leaving the files is the safe side (they self-heal on the next
             // daemon start), but say why so the cause isn't swallowed.
-            // open_lock_file's error already names the operation and path.
+            // open_lock_file_at's error already names the operation and path.
             eprintln!("daemon: leaving socket/PID files in place: {e:#}");
             return;
         }
@@ -141,24 +169,20 @@ fn cleanup() {
         Err(std::fs::TryLockError::Error(e)) => {
             eprintln!(
                 "daemon: leaving socket/PID files in place: cannot lock {}: {e}",
-                lock_path().display()
+                lock.display()
             );
             return;
         }
     }
-    let _lock = lock_file;
-    let owns_files = std::fs::read_to_string(pid_path())
+    let owns_files = std::fs::read_to_string(pid)
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
         == Some(std::process::id());
     if !owns_files {
         return;
     }
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(socket_path());
-    #[cfg(windows)]
-    let _ = std::fs::remove_file(addr_path());
-    let _ = std::fs::remove_file(pid_path());
+    let _ = std::fs::remove_file(endpoint);
+    let _ = std::fs::remove_file(pid);
 }
 
 /// Removes the daemon's on-disk files when `run_daemon`'s frame is left for
@@ -213,22 +237,36 @@ macro_rules! run_accept_loop_body {
 /// deliberately left unhandled — convention reserves it for config reload,
 /// not shutdown.
 #[cfg(unix)]
-async fn shutdown_signal() {
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{signal, SignalKind};
-    // If a signal stream can't be registered, fall back to never resolving —
-    // the daemon then behaves as before this handler existed (default
-    // disposition still terminates the process; only file cleanup is lost).
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => return std::future::pending().await,
-    };
-    let mut sigint = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(_) => return std::future::pending().await,
-    };
-    tokio::select! {
-        _ = sigterm.recv() => {}
-        _ = sigint.recv() => {}
+    // A plain fn returning a future (not an async fn) so the signal streams
+    // are registered right here, when the caller sets up shutdown handling —
+    // an async fn would defer registration to the first poll, leaving a
+    // window during startup where a signal still hits the default
+    // disposition and skips CleanupGuard.
+    let sigterm = signal(SignalKind::terminate()).ok();
+    let sigint = signal(SignalKind::interrupt()).ok();
+    async move {
+        // A stream that failed to register keeps its default disposition
+        // (terminate without cleanup — as before this handler existed). One
+        // that registered MUST still be drained here: registration replaces
+        // the default handler, so ignoring it would make that signal a no-op
+        // and the daemon unkillable by it.
+        match (sigterm, sigint) {
+            (Some(mut term), Some(mut int)) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+            }
+            (Some(mut term), None) => {
+                term.recv().await;
+            }
+            (None, Some(mut int)) => {
+                int.recv().await;
+            }
+            (None, None) => std::future::pending().await,
+        }
     }
 }
 
@@ -237,14 +275,20 @@ async fn shutdown_signal() {
 /// fires for a backgrounded daemon. It does work when `__daemon__` is run
 /// manually in a foreground console for debugging.
 #[cfg(windows)]
-async fn shutdown_signal() {
-    if tokio::signal::ctrl_c().await.is_err() {
-        std::future::pending::<()>().await;
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    // Registered eagerly for the same reason as the Unix version.
+    let ctrl_c = tokio::signal::windows::ctrl_c().ok();
+    async move {
+        match ctrl_c {
+            Some(mut c) => {
+                c.recv().await;
+            }
+            None => std::future::pending().await,
+        }
     }
 }
 
 pub async fn run_daemon(ws_url: &str) -> Result<()> {
-    // Write PID
     // Armed before anything is written: cleanup() verifies pid-file ownership
     // first, so firing "too early" is a no-op, and this declaration order
     // means the startup lock below is released (locals drop in reverse order)
@@ -252,6 +296,12 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
     // early `?` return or panic. Covers every way this frame is left,
     // including unwinding panics, which previously leaked the files.
     let _guard = CleanupGuard;
+
+    // Signal streams are registered here — before the lock wait and bind —
+    // so a SIGTERM during startup is buffered for the accept loop instead of
+    // killing the process without cleanup.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     // Startup critical section: the pid write and endpoint (re)bind must not
     // interleave with a predecessor's cleanup() check-then-remove, or the
@@ -291,9 +341,6 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
     // This ensures the CLI wait_for_daemon() succeeds, and the CLI blocks on read_msg()
     // while the daemon handles the potentially slow macOS/Chrome network permission prompt.
     let mut client: Option<CdpClient> = None;
-
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
 
     // Signal readiness by socket/address existence (it's already bound)
     run_accept_loop_body!(listener.accept(), &mut client, ws_url, shutdown);
@@ -419,5 +466,101 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> DaemonRe
                 error_code,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_lock_file_at_rejects_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "").unwrap();
+        let link = dir.path().join("daemon.lock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // O_NOFOLLOW must refuse a planted symlink even though its target is
+        // a perfectly ordinary file owned by us.
+        assert!(open_lock_file_at(&link).is_err());
+        // And the symlink must not have been replaced or followed-through.
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_lock_file_at_rejects_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("daemon.lock");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: mkfifo only reads the NUL-terminated path we just built.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // O_NONBLOCK makes the write-only open of a reader-less FIFO fail
+        // with ENXIO instead of blocking forever.
+        assert!(open_lock_file_at(&fifo).is_err());
+    }
+
+    #[test]
+    fn test_open_lock_file_at_accepts_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("daemon.lock");
+        assert!(open_lock_file_at(&lock).is_ok(), "creates when absent");
+        assert!(open_lock_file_at(&lock).is_ok(), "reopens when present");
+    }
+
+    /// The invariant the whole ownership handoff rests on: a daemon whose PID
+    /// file has been rebound to another process must not remove the files.
+    #[test]
+    fn test_cleanup_at_leaves_files_of_foreign_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("daemon.lock");
+        let pid = dir.path().join("daemon.pid");
+        let endpoint = dir.path().join("daemon.sock");
+        std::fs::write(&pid, std::process::id().wrapping_add(1).to_string()).unwrap();
+        std::fs::write(&endpoint, "").unwrap();
+        cleanup_at(&lock, &pid, &endpoint);
+        assert!(pid.exists(), "foreign PID file must survive cleanup");
+        assert!(
+            endpoint.exists(),
+            "foreign endpoint file must survive cleanup"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_at_removes_own_files_but_never_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("daemon.lock");
+        let pid = dir.path().join("daemon.pid");
+        let endpoint = dir.path().join("daemon.sock");
+        std::fs::write(&pid, std::process::id().to_string()).unwrap();
+        std::fs::write(&endpoint, "").unwrap();
+        cleanup_at(&lock, &pid, &endpoint);
+        assert!(!pid.exists());
+        assert!(!endpoint.exists());
+        assert!(
+            lock.exists(),
+            "the lock file is intentionally never removed"
+        );
+    }
+
+    /// flock is per open-file-description, so a second handle in this same
+    /// process contends like another process would.
+    #[test]
+    fn test_cleanup_at_backs_off_when_lock_contended() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("daemon.lock");
+        let pid = dir.path().join("daemon.pid");
+        let endpoint = dir.path().join("daemon.sock");
+        std::fs::write(&pid, std::process::id().to_string()).unwrap();
+        std::fs::write(&endpoint, "").unwrap();
+        let holder = open_lock_file_at(&lock).unwrap();
+        holder.try_lock().unwrap();
+        // A replacement holds the lock (mid-startup): even our own files must
+        // be left alone, since the replacement may be about to rebind them.
+        cleanup_at(&lock, &pid, &endpoint);
+        assert!(pid.exists());
+        assert!(endpoint.exists());
     }
 }

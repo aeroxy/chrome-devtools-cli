@@ -52,15 +52,15 @@ pub struct DaemonResponse {
 /// Windows (%TEMP%), but shared /tmp on Linux — a fixed name there lets users
 /// collide on (or squat) each other's daemon files.
 #[cfg(unix)]
-fn user_suffix() -> String {
+fn user_suffix() -> std::borrow::Cow<'static, str> {
     // SAFETY: getuid() is a pure kernel query with no preconditions; it is
     // thread-safe and cannot fail.
-    format!("-{}", unsafe { libc::getuid() })
+    std::borrow::Cow::Owned(format!("-{}", unsafe { libc::getuid() }))
 }
 
 #[cfg(windows)]
-fn user_suffix() -> String {
-    String::new()
+fn user_suffix() -> std::borrow::Cow<'static, str> {
+    std::borrow::Cow::Borrowed("")
 }
 
 /// Path to the Unix domain socket for daemon communication.

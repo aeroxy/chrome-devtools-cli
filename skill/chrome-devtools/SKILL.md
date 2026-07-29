@@ -389,22 +389,33 @@ chrome-devtools kill-daemon --force
   about:blank &
 CHROME_PID=$!
 
-# 3. DevToolsActivePort is written only after the DevTools server is
-#    actually listening, so the file's existence — not the process being
-#    alive — is the readiness signal; connecting earlier races startup
-while [ ! -f "$PROFILE/DevToolsActivePort" ]; do sleep 0.5; done
+# 3. Cleanup — REQUIRED even if a later step fails: the daemon is bound to the
+#    headless instance and would otherwise hijack later commands aimed at the
+#    user's real Chrome. A trap runs it on every exit path, not just success.
+cleanup() {
+  chrome-devtools kill-daemon --force
+  kill "$CHROME_PID" 2>/dev/null
+  rm -rf "$PROFILE"
+}
+trap cleanup EXIT
 
-# 4. Every command needs --user-data-dir pointing at the headless profile;
+# 4. DevToolsActivePort is written only after the DevTools server is
+#    actually listening, so the file's existence — not the process being
+#    alive — is the readiness signal; connecting earlier races startup.
+#    Bounded (30s) and watching the PID so a Chrome that crashes or never
+#    starts fails the script instead of hanging it forever.
+for _ in $(seq 1 60); do
+  [ -f "$PROFILE/DevToolsActivePort" ] && break
+  kill -0 "$CHROME_PID" 2>/dev/null || { echo "Chrome exited during startup" >&2; exit 1; }
+  sleep 0.5
+done
+[ -f "$PROFILE/DevToolsActivePort" ] || { echo "Chrome not ready after 30s" >&2; exit 1; }
+
+# 5. Every command needs --user-data-dir pointing at the headless profile;
 #    the CLI auto-connects by reading its DevToolsActivePort
 chrome-devtools --user-data-dir "$PROFILE" navigate https://example.com
 chrome-devtools --user-data-dir "$PROFILE" evaluate 'document.title'
 chrome-devtools --user-data-dir "$PROFILE" screenshot --output /tmp/shot.png
-
-# 5. Cleanup — REQUIRED: the daemon is now bound to the headless instance and
-#    would otherwise hijack later commands aimed at the user's real Chrome
-chrome-devtools kill-daemon --force
-kill $CHROME_PID
-rm -rf "$PROFILE"
 ```
 
 Linux path: `google-chrome` or `chromium` on `$PATH` replaces the macOS
@@ -414,7 +425,7 @@ Linux path: `google-chrome` or `chromium` on `$PATH` replaces the macOS
 whichever Chrome the first command resolved, and later commands reuse it even
 if their flags point elsewhere. Always `kill-daemon --force` when switching
 between the user's Chrome and a headless instance — in both directions
-(steps 1 and 5 above).
+(step 1 and the EXIT trap above).
 
 ## Complete Command Reference
 
