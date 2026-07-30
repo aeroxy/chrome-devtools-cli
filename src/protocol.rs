@@ -51,11 +51,18 @@ pub struct DaemonResponse {
 /// Per-user filename suffix. `temp_dir()` is per-user on macOS ($TMPDIR) and
 /// Windows (%TEMP%), but shared /tmp on Linux — a fixed name there lets users
 /// collide on (or squat) each other's daemon files.
+///
+/// Effective uid, not real: the kernel stamps a new file with the creating
+/// process's *effective* uid, and that is what the daemon's ownership checks
+/// compare against. Keying the name to the real uid instead would make the two
+/// disagree wherever they differ (a setuid binary, a credential-transitioning
+/// launcher): the daemon would create its files at a path derived from one
+/// identity and then refuse them as belonging to another user.
 #[cfg(unix)]
 fn user_suffix() -> std::borrow::Cow<'static, str> {
-    // SAFETY: getuid() is a pure kernel query with no preconditions; it is
+    // SAFETY: geteuid() is a pure kernel query with no preconditions; it is
     // thread-safe and cannot fail.
-    std::borrow::Cow::Owned(format!("-{}", unsafe { libc::getuid() }))
+    std::borrow::Cow::Owned(format!("-{}", unsafe { libc::geteuid() }))
 }
 
 #[cfg(windows)]
