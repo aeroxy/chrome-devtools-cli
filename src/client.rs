@@ -20,8 +20,11 @@ async fn connect_daemon() -> Result<TcpStream> {
     Ok(TcpStream::connect(addr.trim()).await?)
 }
 
-/// Read the daemon wait timeout from `DAEMON_WAIT_TIMEOUT_SECS`, defaulting to 5.
-fn daemon_wait_timeout() -> Duration {
+/// Read the daemon wait timeout from `DAEMON_WAIT_TIMEOUT_SECS`, defaulting to
+/// 5. This is the whole budget a spawned daemon has to become reachable, so the
+/// daemon derives its own startup lock wait from it (`daemon::lock_wait_timeout`)
+/// — the spawned process inherits this environment.
+pub(crate) fn daemon_wait_timeout() -> Duration {
     std::env::var("DAEMON_WAIT_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

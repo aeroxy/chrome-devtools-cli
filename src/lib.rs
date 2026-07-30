@@ -503,36 +503,69 @@ fn parse_pid_file_contents(s: &str) -> Option<i32> {
         .and_then(|p| i32::try_from(p).ok())
 }
 
+/// Largest PID file we will trust. A PID is at most a few bytes plus
+/// surrounding whitespace, so anything bigger is hostile by definition.
+#[cfg(unix)]
+const MAX_PID_FILE_LEN: u64 = 64;
+
+/// Whether a PID-file read failed only because the file isn't there. That's
+/// the ordinary "no daemon running" signal, which callers handle rather than
+/// report, so it has to stay distinguishable from every other failure — the
+/// reader adds `anyhow` context, so recover the kind from the error chain.
+fn pid_file_missing(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Read a PID file without trusting the path it lives at. PID-file names are
 /// predictable and, on Linux, live in shared /tmp — the same threat model as
 /// the daemon lock file — so refuse to follow a planted symlink (O_NOFOLLOW)
 /// and only accept a regular file owned by this uid. O_NONBLOCK stops a
 /// planted FIFO from wedging the open() itself (it has no effect on regular
-/// files); the `is_file` check then rejects the FIFO. The read is capped
-/// because a PID is at most a few bytes — a large file at this path is
-/// hostile by definition and must not be slurped into memory.
+/// files); the `is_file` check then rejects the FIFO. Oversized files are
+/// rejected outright rather than truncated: the parsed PID goes to `kill`, so
+/// a hostile file must not be able to smuggle one through in a valid-looking
+/// prefix.
+///
+/// Callers distinguish "no such file" — the common, silent case — with
+/// [`pid_file_missing`]; every other error carries path context and is worth
+/// reporting.
 #[cfg(unix)]
-fn read_pid_file_checked(path: &std::path::Path) -> std::io::Result<String> {
+fn read_pid_file_checked(path: &std::path::Path) -> Result<String> {
+    use anyhow::Context as _;
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let md = f.metadata()?;
+        .open(path)
+        .with_context(|| format!("Failed to open PID file {}", path.display()))?;
+    let md = f
+        .metadata()
+        .with_context(|| format!("Failed to read metadata of PID file {}", path.display()))?;
     // SAFETY: getuid() is a pure kernel query with no preconditions; it is
     // thread-safe and cannot fail.
     if !md.is_file() || md.uid() != unsafe { libc::getuid() } {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "{} is not a regular file owned by the current user; refusing to trust it",
-                path.display()
-            ),
-        ));
+        anyhow::bail!(
+            "{} is not a regular file owned by the current user; refusing to trust it",
+            path.display()
+        );
     }
     let mut s = String::new();
-    f.take(64).read_to_string(&mut s)?;
+    // Read one byte past the cap: stopping *at* the cap can't tell a file that
+    // fits from one that was truncated, and a truncated prefix ("123\n" plus
+    // 60 spaces, then megabytes of anything) still parses as a usable PID.
+    // Seeing the extra byte is what makes rejection possible. The cap is also
+    // what keeps a large file at this path out of memory.
+    f.take(MAX_PID_FILE_LEN + 1)
+        .read_to_string(&mut s)
+        .with_context(|| format!("Failed to read PID file {}", path.display()))?;
+    if s.len() as u64 > MAX_PID_FILE_LEN {
+        anyhow::bail!(
+            "PID file {} is larger than {MAX_PID_FILE_LEN} bytes; refusing to trust it",
+            path.display()
+        );
+    }
     Ok(s)
 }
 
@@ -1039,7 +1072,11 @@ pub async fn run() -> Result<()> {
         #[cfg(unix)]
         let read_result = read_pid_file_checked(&pid_path);
         #[cfg(not(unix))]
-        let read_result = std::fs::read_to_string(&pid_path);
+        let read_result = {
+            use anyhow::Context as _;
+            std::fs::read_to_string(&pid_path)
+                .with_context(|| format!("Failed to read PID file {}", pid_path.display()))
+        };
         match read_result {
             Ok(pid_str) => {
                 #[cfg(unix)]
@@ -1089,17 +1126,15 @@ pub async fn run() -> Result<()> {
                     println!("kill-daemon is only supported on Unix systems.");
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if pid_file_missing(&e) => {
                 println!("No daemon running (PID file not found).");
             }
             Err(e) => {
                 // Surface via the standard error path (uniform formatting,
                 // telemetry flush, typed exit code) — matching the EPERM
-                // signal-failure case above rather than exiting directly.
-                return Err(anyhow::anyhow!(
-                    "Failed to read PID file {}: {e}",
-                    pid_path.display()
-                ));
+                // signal-failure case above rather than exiting directly. The
+                // error already names the failing operation and the path.
+                return Err(e);
             }
         }
 
@@ -1116,12 +1151,10 @@ pub async fn run() -> Result<()> {
             let pid_str = match read_pid_file_checked(&legacy_pid_path) {
                 Ok(s) => Some(s),
                 // No legacy files — the common case; stay silent.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) if pid_file_missing(&e) => None,
                 Err(e) => {
-                    println!(
-                        "Note: skipping legacy daemon sweep: cannot trust {}: {e}",
-                        legacy_pid_path.display()
-                    );
+                    // The error chain already names the operation and the path.
+                    println!("Note: skipping legacy daemon sweep: {e:#}");
                     None
                 }
             };
@@ -1701,6 +1734,52 @@ mod tests {
         assert_eq!(parse_pid_file_contents("12 34"), None);
         assert_eq!(parse_pid_file_contents(""), None);
         assert_eq!(parse_pid_file_contents("   \n"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_pid_file_checked_rejects_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.pid");
+        // A parseable PID padded with whitespace to fill the first 64 bytes,
+        // then more content. Truncating at the cap would yield "12345" plus
+        // whitespace — a PID that parses cleanly and would reach kill().
+        let mut contents = "12345".to_string();
+        contents.push_str(&" ".repeat(MAX_PID_FILE_LEN as usize - contents.len()));
+        assert_eq!(contents.len() as u64, MAX_PID_FILE_LEN);
+        assert_eq!(parse_pid_file_contents(&contents), Some(12345));
+        contents.push_str("99999\n");
+        std::fs::write(&path, &contents).unwrap();
+
+        let err = read_pid_file_checked(&path).unwrap_err();
+        assert!(!pid_file_missing(&err));
+        assert!(
+            format!("{err:#}").contains("larger than"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_pid_file_checked_accepts_file_at_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("padded.pid");
+        // Exactly at the cap must still be accepted — the extra byte the
+        // reader requests is only there to detect overflow.
+        let contents = format!("12345{}", " ".repeat(MAX_PID_FILE_LEN as usize - 5));
+        std::fs::write(&path, &contents).unwrap();
+
+        let read = read_pid_file_checked(&path).unwrap();
+        assert_eq!(read, contents);
+        assert_eq!(parse_pid_file_contents(&read), Some(12345));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_pid_file_checked_missing_file_is_distinguishable() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_pid_file_checked(&dir.path().join("absent.pid")).unwrap_err();
+        assert!(pid_file_missing(&err), "unexpected error: {err:#}");
     }
 
     #[test]
