@@ -28,6 +28,14 @@ cargo build --release
 # Binary: ./target/release/chrome-devtools
 ```
 
+### Rust version
+
+Building from source — including `cargo install` — requires **Rust 1.89 or
+newer**. The daemon serializes its startup and cleanup with
+`std::fs::File::{lock, try_lock}`, stabilized in 1.89; `rust-version` in
+`Cargo.toml` makes Cargo say so instead of failing with a type error. The
+Homebrew bottle is prebuilt and carries no toolchain requirement.
+
 ## Why this exists
 
 Inspired by [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp) — the official MCP server for Chrome DevTools. It works well, but MCP-based browser tools consume a lot of token context: every interaction sends and receives large protocol payloads through the MCP layer.

@@ -622,6 +622,10 @@ async fn probe_legacy_daemon() -> Result<bool> {
                 cred.uid()
             );
         }
+        // Deliberately not a valid `DaemonRequest`, so no legacy daemon dials
+        // Chrome to answer it. If a future legacy binary ever drops malformed
+        // requests instead of replying, this read times out and degrades to
+        // the safe branch (Err — files left in place, nothing signaled).
         protocol::write_msg(&mut stream, b"\"probe\"")
             .await
             .with_context(|| format!("Failed to write probe to {}", sock.display()))?;
