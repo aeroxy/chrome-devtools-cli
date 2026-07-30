@@ -531,7 +531,7 @@ fn pid_file_missing(e: &anyhow::Error) -> bool {
 /// [`pid_file_missing`]; every other error carries path context and is worth
 /// reporting.
 #[cfg(unix)]
-fn read_pid_file_checked(path: &std::path::Path) -> Result<String> {
+pub(crate) fn read_pid_file_checked(path: &std::path::Path) -> Result<String> {
     use anyhow::Context as _;
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
