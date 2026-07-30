@@ -395,6 +395,18 @@ CHROME_PID=$!
 cleanup() {
   chrome-devtools kill-daemon --force
   kill "$CHROME_PID" 2>/dev/null
+  # Chrome shuts down asynchronously, so deleting the profile right after
+  # SIGTERM races its teardown and can leave it running against a directory
+  # that no longer exists. Wait for the process to actually go — but bounded
+  # (5s), then SIGKILL, so a Chrome that ignores SIGTERM can't hang the trap.
+  for _ in $(seq 1 20); do
+    kill -0 "$CHROME_PID" 2>/dev/null || break
+    sleep 0.25
+  done
+  if kill -0 "$CHROME_PID" 2>/dev/null; then
+    kill -9 "$CHROME_PID" 2>/dev/null
+  fi
+  wait "$CHROME_PID" 2>/dev/null
   rm -rf "$PROFILE"
 }
 trap cleanup EXIT

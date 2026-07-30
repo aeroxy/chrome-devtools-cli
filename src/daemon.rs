@@ -76,14 +76,32 @@ fn open_lock_file_at(path: &std::path::Path) -> Result<std::fs::File> {
     Ok(f)
 }
 
-/// How long startup will wait for the daemon-file lock. Legitimate holders
-/// (a predecessor's cleanup, another daemon's startup) finish in
-/// milliseconds; anything longer means the lock is wedged or squatted.
-/// Must stay well below the CLI's `DAEMON_WAIT_TIMEOUT_SECS` (default 5s,
-/// `client.rs`): if the two were equal, a daemon that spent its whole budget
-/// waiting here would bind at the exact moment `wait_for_daemon` gives up,
-/// and the CLI would fall back to direct execution despite a usable daemon.
-const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Ceiling on the lock wait. Legitimate holders (a predecessor's cleanup,
+/// another daemon's startup) finish in milliseconds; anything longer means the
+/// lock is wedged or squatted, so there is no reason to wait past this even
+/// when the client is willing to.
+const LOCK_WAIT_CEILING: Duration = Duration::from_secs(2);
+
+/// How long startup will wait for the daemon-file lock, given the CLI's own
+/// wait budget. Half the budget, capped at [`LOCK_WAIT_CEILING`]: the lock
+/// wait must stay strictly shorter than the client's deadline, or a daemon
+/// that spent the whole budget waiting here would bind at the exact moment
+/// `wait_for_daemon` gives up, and the CLI would fall back to direct execution
+/// despite a usable daemon. Halving (rather than subtracting a fixed margin)
+/// keeps that true for every value `DAEMON_WAIT_TIMEOUT_SECS` accepts, and
+/// leaves the other half for the pid write and bind that follow.
+///
+/// Kept pure so the relationship is unit-testable without setting env vars.
+fn derive_lock_wait_timeout(client_timeout: Duration) -> Duration {
+    (client_timeout / 2).min(LOCK_WAIT_CEILING)
+}
+
+/// The lock wait for this process. The daemon is spawned by the CLI and
+/// inherits its environment, so both sides read the same
+/// `DAEMON_WAIT_TIMEOUT_SECS` (default 5s, see `client.rs`).
+fn lock_wait_timeout() -> Duration {
+    derive_lock_wait_timeout(crate::client::daemon_wait_timeout())
+}
 
 /// Acquire the cross-process lock serializing the daemon-file critical
 /// sections: startup's pid-write/rebind and cleanup's check-then-remove.
@@ -98,14 +116,15 @@ const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// runtime's worker thread.
 async fn lock_daemon_files() -> Result<std::fs::File> {
     let f = open_lock_file()?;
-    let deadline = tokio::time::Instant::now() + LOCK_WAIT_TIMEOUT;
+    let timeout = lock_wait_timeout();
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match f.try_lock() {
             Ok(()) => return Ok(f),
             Err(std::fs::TryLockError::WouldBlock) => {
                 if tokio::time::Instant::now() >= deadline {
                     anyhow::bail!(
-                        "Timed out after {LOCK_WAIT_TIMEOUT:?} waiting for daemon lock file {} (held by another process)",
+                        "Timed out after {timeout:?} waiting for daemon lock file {} (held by another process)",
                         lock_path().display()
                     );
                 }
@@ -472,6 +491,23 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> DaemonRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_lock_wait_stays_shorter_than_every_client_deadline() {
+        // Any value DAEMON_WAIT_TIMEOUT_SECS accepts, not just the default:
+        // an equal deadline lets the daemon bind exactly as the CLI gives up.
+        for secs in [1_u64, 2, 3, 5, 10, 60, 3600] {
+            let client = Duration::from_secs(secs);
+            let lock = derive_lock_wait_timeout(client);
+            assert!(
+                lock < client,
+                "lock wait {lock:?} must be shorter than client deadline {client:?}"
+            );
+            assert!(lock <= LOCK_WAIT_CEILING);
+        }
+        // A zero budget can't be beaten, only matched: one try_lock, no wait.
+        assert_eq!(derive_lock_wait_timeout(Duration::ZERO), Duration::ZERO);
+    }
 
     #[cfg(unix)]
     #[test]
