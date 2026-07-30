@@ -229,10 +229,11 @@ Global `--block-url` and `--unblock-url` update the **active tab's** block list 
 - **PID file**: `$TMPDIR/chrome-devtools-daemon-<uid>.pid` (Windows: `%TEMP%\chrome-devtools-daemon.pid`)
 - **Lock file**: `$TMPDIR/chrome-devtools-daemon-<uid>.lock` (Windows: `%TEMP%\chrome-devtools-daemon.lock`) — serializes daemon startup/cleanup; intentionally never removed automatically. Locks bind to the inode, not the name: deleting the file while any daemon process is still starting, running, or shutting down lets a new process lock a fresh replacement inode and bypass the serialization entirely. Only delete it once no daemon process exists at all — and there's rarely a reason to, since a leftover lock file is harmless.
 - **Idle timeout**: 5 minutes (auto-exits, cleans up its files)
-- **Cleanup**: endpoint + PID files are also removed on panics, and on Unix on SIGTERM/SIGINT; Windows Ctrl-C cleanup is best-effort only (a background daemon has no console to receive it)
+- **Cleanup**: endpoint + PID files are also removed on panics, and on Unix on SIGTERM/SIGINT; Windows Ctrl-C cleanup is best-effort only (a background daemon has no console to receive it). SIGQUIT, SIGHUP and SIGKILL skip cleanup by design — the leftover files are harmless and are reclaimed by the next daemon start.
 - **Protocol**: Length-prefixed JSON over the Unix socket / loopback TCP
 - **Spawned by**: First CLI invocation (transparent to user)
-- **Kill**: `chrome-devtools kill-daemon` (or delete the socket + PID file; leave the lock file — see above)
+- **Kill**: `chrome-devtools kill-daemon` (or delete the socket + PID file; leave the lock file — see above). It sends SIGTERM and returns once the signal is delivered, not once the process is gone: the daemon exits *between* requests, so one that is mid-command finishes it and answers that client first. Expect up to one command's latency, and note that a daemon wedged inside a CDP call outlives the command that stopped it.
+- **Kill (Windows)**: not supported — `kill-daemon` says so and exits, and a backgrounded daemon has no console for Ctrl-C. Use `taskkill /PID <pid>` with the PID from `%TEMP%\chrome-devtools-daemon.pid`, or wait out the idle timeout.
 
 The daemon keeps a persistent CDP session on the current page to:
 - Continuously collect `Network.*` and `Runtime.consoleAPICalled`/`exceptionThrown` events for `console` and `network` drains.

@@ -76,6 +76,65 @@ fn open_lock_file_at(path: &std::path::Path) -> Result<std::fs::File> {
     Ok(f)
 }
 
+/// Write this process's PID to `path`, without trusting the path it lives at.
+///
+/// `std::fs::write` opens with `O_CREAT | O_TRUNC` and **follows symlinks**,
+/// which is the one hostile-path hole the read side doesn't cover: on Linux's
+/// shared /tmp, another user can pre-create
+/// `chrome-devtools-daemon-<victim-uid>.pid` as a symlink to any file the
+/// victim can write, and the first `chrome-devtools` invocation would then
+/// truncate that file and write a PID into it. The startup lock is no defense
+/// — the squatter never takes it, and it guards a different path.
+///
+/// So this mirrors [`open_lock_file_at`]: O_NOFOLLOW refuses the symlink,
+/// O_NONBLOCK keeps a planted FIFO from wedging the open (the `is_file` check
+/// then rejects it), and mode 0o600 creates it unreadable by others. The
+/// truncation is deliberately deferred until after the checks pass, and the
+/// checks run against the already-open fd rather than the path, so there is no
+/// window to swap the file in between. A hardlink to someone else's file would
+/// pass the uid check, but planting one requires owning the target under
+/// Linux's default `protected_hardlinks`.
+#[cfg(unix)]
+fn write_pid_file_checked(path: &std::path::Path) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        // Not O_TRUNC: truncating is destructive, so it waits for the checks.
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("Failed to open daemon PID file {}", path.display()))?;
+    let md = f.metadata().with_context(|| {
+        format!(
+            "Failed to read metadata of daemon PID file {}",
+            path.display()
+        )
+    })?;
+    // SAFETY: getuid() is a pure kernel query with no preconditions; it is
+    // thread-safe and cannot fail.
+    if !md.is_file() || md.uid() != unsafe { libc::getuid() } {
+        anyhow::bail!(
+            "Daemon PID path {} is not a regular file owned by the current user; refusing to write it",
+            path.display()
+        );
+    }
+    f.set_len(0)
+        .with_context(|| format!("Failed to truncate daemon PID file {}", path.display()))?;
+    f.write_all(std::process::id().to_string().as_bytes())
+        .with_context(|| format!("Failed to write daemon PID file {}", path.display()))
+}
+
+/// Windows has no O_NOFOLLOW, and `%TEMP%` is already per-user, so the
+/// shared-/tmp squatting the Unix version defends against doesn't apply.
+#[cfg(not(unix))]
+fn write_pid_file_checked(path: &std::path::Path) -> Result<()> {
+    std::fs::write(path, std::process::id().to_string())
+        .with_context(|| format!("Failed to write daemon PID file {}", path.display()))
+}
+
 /// Ceiling on the lock wait. Legitimate holders (a predecessor's cleanup,
 /// another daemon's startup) finish in milliseconds; anything longer means the
 /// lock is wedged or squatted, so there is no reason to wait past this even
@@ -193,10 +252,16 @@ fn cleanup_at(lock: &std::path::Path, pid: &std::path::Path, endpoint: &std::pat
             return;
         }
     }
-    let owns_files = std::fs::read_to_string(pid)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        == Some(std::process::id());
+    // Same trust rule as `kill-daemon`'s read, in one place: a PID file is
+    // only believable if it's a regular file we own and small enough to be a
+    // PID. Any failure means "not provably ours", which leaves the files in
+    // place — the safe side, and where an unreadable file already landed.
+    #[cfg(unix)]
+    let contents = crate::read_pid_file_checked(pid).ok();
+    #[cfg(not(unix))]
+    let contents = std::fs::read_to_string(pid).ok();
+    let owns_files =
+        contents.and_then(|s| s.trim().parse::<u32>().ok()) == Some(std::process::id());
     if !owns_files {
         return;
     }
@@ -226,10 +291,16 @@ macro_rules! run_accept_loop_body {
     ($accept:expr, $client:expr, $ws_url:expr, $shutdown:expr) => {
         loop {
             tokio::select! {
+                // Shutdown first, and `biased` so a ready signal always wins
+                // over a ready accept instead of being picked at random —
+                // otherwise a steady stream of requests can defer the exit by
+                // an iteration at a time.
+                biased;
                 _ = &mut $shutdown => {
                     // SIGTERM/SIGINT (or Ctrl-C on Windows) — exit cleanly.
                     // Only observed between requests: an in-flight command
-                    // finishes and its response is written before shutdown.
+                    // finishes and its response is written before shutdown, so
+                    // a daemon busy with a slow CDP call exits late, not now.
                     break;
                 }
                 accept = tokio::time::timeout(idle_timeout(), $accept) => match accept {
@@ -254,7 +325,10 @@ macro_rules! run_accept_loop_body {
 /// default disposition kills the process without unwinding, so `CleanupGuard`
 /// would never run and the socket/PID files would go stale. SIGHUP is
 /// deliberately left unhandled — convention reserves it for config reload,
-/// not shutdown.
+/// not shutdown. SIGQUIT is left unhandled too, for the opposite reason: it
+/// means "stop now and dump core", so honoring it as a graceful exit would
+/// defeat its purpose. Both therefore skip cleanup, as does SIGKILL; the
+/// leftover files are harmless and self-heal on the next daemon start.
 #[cfg(unix)]
 fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{signal, SignalKind};
@@ -327,7 +401,7 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
     // predecessor can delete files this daemon just claimed.
     let startup_lock = lock_daemon_files().await?;
 
-    std::fs::write(pid_path(), std::process::id().to_string())?;
+    write_pid_file_checked(&pid_path())?;
 
     #[cfg(unix)]
     let listener = {
@@ -522,6 +596,49 @@ mod tests {
         assert!(open_lock_file_at(&link).is_err());
         // And the symlink must not have been replaced or followed-through.
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_pid_file_checked_refuses_symlink_without_touching_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("bashrc");
+        std::fs::write(&victim, "precious\n").unwrap();
+        let planted = dir.path().join("daemon.pid");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        // The squatting attack: writing through the symlink would truncate the
+        // victim's file and leave a PID in it.
+        assert!(write_pid_file_checked(&planted).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+        assert!(planted.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_pid_file_checked_replaces_longer_stale_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        // A stale file from a previous daemon, longer than the new PID: the
+        // deferred truncation has to clear it rather than leave a tail.
+        std::fs::write(&path, "4294967295 stale trailing bytes\n").unwrap();
+
+        write_pid_file_checked(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            std::process::id().to_string()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_pid_file_checked_creates_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        write_pid_file_checked(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "unexpected mode {:o}", mode & 0o777);
     }
 
     #[cfg(unix)]
