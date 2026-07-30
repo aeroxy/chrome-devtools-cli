@@ -64,9 +64,9 @@ fn open_lock_file_at(path: &std::path::Path) -> Result<std::fs::File> {
                 path.display()
             )
         })?;
-        // SAFETY: getuid() is a pure kernel query with no preconditions; it
+        // SAFETY: geteuid() is a pure kernel query with no preconditions; it
         // is thread-safe and cannot fail.
-        if !md.is_file() || md.uid() != unsafe { libc::getuid() } {
+        if !md.is_file() || md.uid() != unsafe { libc::geteuid() } {
             anyhow::bail!(
                 "Daemon lock path {} is not a regular file owned by the current user; refusing to lock it",
                 path.display()
@@ -113,9 +113,9 @@ fn write_pid_file_checked(path: &std::path::Path) -> Result<()> {
             path.display()
         )
     })?;
-    // SAFETY: getuid() is a pure kernel query with no preconditions; it is
+    // SAFETY: geteuid() is a pure kernel query with no preconditions; it is
     // thread-safe and cannot fail.
-    if !md.is_file() || md.uid() != unsafe { libc::getuid() } {
+    if !md.is_file() || md.uid() != unsafe { libc::geteuid() } {
         anyhow::bail!(
             "Daemon PID path {} is not a regular file owned by the current user; refusing to write it",
             path.display()

@@ -543,9 +543,9 @@ pub(crate) fn read_pid_file_checked(path: &std::path::Path) -> Result<String> {
     let md = f
         .metadata()
         .with_context(|| format!("Failed to read metadata of PID file {}", path.display()))?;
-    // SAFETY: getuid() is a pure kernel query with no preconditions; it is
+    // SAFETY: geteuid() is a pure kernel query with no preconditions; it is
     // thread-safe and cannot fail.
-    if !md.is_file() || md.uid() != unsafe { libc::getuid() } {
+    if !md.is_file() || md.uid() != unsafe { libc::geteuid() } {
         anyhow::bail!(
             "{} is not a regular file owned by the current user; refusing to trust it",
             path.display()
@@ -610,12 +610,14 @@ async fn probe_legacy_daemon() -> Result<bool> {
         // was started by this user, so a peer running as any other uid is a
         // squatter. Err (not Ok(false)) so the caller lands in the
         // leave-everything-alone branch rather than the provably-stale one.
+        // Both sides of the comparison are effective uids — `peer_cred` reports
+        // the peer's euid — matching the identity the file checks use.
         let cred = stream
             .peer_cred()
             .with_context(|| format!("Failed to read peer credentials of {}", sock.display()))?;
-        // SAFETY: getuid() is a pure kernel query with no preconditions; it
+        // SAFETY: geteuid() is a pure kernel query with no preconditions; it
         // is thread-safe and cannot fail.
-        if cred.uid() != unsafe { libc::getuid() } {
+        if cred.uid() != unsafe { libc::geteuid() } {
             anyhow::bail!(
                 "Listener on {} runs as uid {}, not the current user; refusing to treat it as the legacy daemon",
                 sock.display(),
