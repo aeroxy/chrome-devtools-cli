@@ -72,6 +72,14 @@ Chrome must have remote debugging enabled:
 
 ## Auto-connect
 
+Enable remote debugging once per browser at `chrome://inspect/#remote-debugging`
+(Edge: `edge://inspect/#remote-debugging`). It applies to the running process
+immediately and persists across restarts — it is stored in the profile's
+`Local State` as `devtools.remote_debugging.user-enabled`, so no launch flag is
+needed. The toggle is per-browser: enabling it in Chrome does not enable it in
+Edge. The `--remote-debugging-port` flag is the alternative, and is meant for a
+throwaway instance rather than your everyday browser.
+
 By default, the CLI reads `DevToolsActivePort` from Chrome's user data directory:
 
 | OS | Default path |
@@ -80,13 +88,28 @@ By default, the CLI reads `DevToolsActivePort` from Chrome's user data directory
 | Linux | `~/.config/google-chrome/` |
 | Windows | `%LOCALAPPDATA%\Google\Chrome\User Data\` |
 
-Override with `--user-data-dir`, `--channel` (beta/canary/dev), or `--ws-endpoint`. All three also read from environment variables:
+Override with `--user-data-dir`, `--browser` (chrome/edge), `--channel` (beta/canary/dev), or `--ws-endpoint`. All four also read from environment variables:
 
 | Environment Variable | Corresponding Flag |
 |----------------------|--------------------|
 | `CHROME_WS_ENDPOINT` | `--ws-endpoint` |
 | `CHROME_USER_DATA_DIR` | `--user-data-dir` |
+| `CHROME_BROWSER` | `--browser` |
 | `CHROME_CHANNEL` | `--channel` |
+
+### Microsoft Edge
+
+Edge is Chromium and speaks the same DevTools Protocol, so every command works against it. Pass `--browser edge` to auto-connect to Edge's profile instead of Chrome's:
+
+| OS | Default path |
+|----|-------------|
+| macOS | `~/Library/Application Support/Microsoft Edge/` |
+| Linux | `~/.config/microsoft-edge/` |
+| Windows | `%LOCALAPPDATA%\Microsoft\Edge\User Data\` |
+
+`--channel` composes with it (`--browser edge --channel beta`). Edge Canary is not distributed for Linux, and that combination is rejected rather than pointed at a directory that cannot exist. An explicit `--ws-endpoint` or `--user-data-dir` needs no `--browser` — it only selects the default profile location.
+
+Enterprise-managed Edge can have remote debugging disabled by policy; `DevToolsActivePort` then never appears and auto-connect fails with the message above. That is the same failure mode as Chrome under the equivalent policy, just more common on managed fleets.
 
 ## Page targeting
 
@@ -204,7 +227,7 @@ A drain without a `--duration` returns instantly. Adding `--duration N` switches
 |---------|-------------|
 | `kill-daemon` | Stop the background daemon cleanly |
 
-`kill-daemon` signals the running daemon with `SIGTERM`, removes the socket and PID file, and exits. It's a no-op if no daemon is running. Prefer this over `pkill -f __daemon__` — the process name is shared by legitimate Chrome children processes.
+`kill-daemon` signals the targeted daemon with `SIGTERM`, removes its socket, info and PID files, and exits. It's a no-op if no daemon is running. Prefer this over `pkill -f __daemon__` — the process name is shared by legitimate Chrome children processes.
 
 ## Global options
 
@@ -217,22 +240,28 @@ A drain without a `--duration` returns instantly. Adding `--duration N` switches
 | `--block-url <pattern>` | Add a URL pattern to the active tab's block list (repeatable; persists until un-blocked or cleared) |
 | `--unblock-url <pattern>` | Remove a URL pattern from the active tab's block list (repeatable) |
 | `--ws-endpoint <url>` | Explicit WebSocket URL |
-| `--user-data-dir <path>` | Custom Chrome profile directory |
-| `--channel <ch>` | Chrome channel (stable/beta/canary/dev) |
+| `--user-data-dir <path>` | Custom browser profile directory |
+| `--browser <name>` | Browser to auto-connect to (chrome/edge) |
+| `--channel <ch>` | Browser release channel (stable/beta/canary/dev) |
+
+Commands: `list-daemons` shows every running daemon; `kill-daemon [--all]` stops one or all.
 
 Global `--block-url` and `--unblock-url` update the **active tab's** block list and apply via `Network.setBlockedURLs`; the daemon re-applies each tab's list when that tab is in use, so blocking is isolated per tab. **Note:** Chrome only blocks *subresources* (images, scripts, fetch/XHR, stylesheets, CDN, trackers, fonts). The top-level navigation document itself is never blocked — e.g. `--block-url "*example.com*"` then `navigate https://example.com` still loads the page, but any `*.png`, `*.woff2`, etc. subresources on it are blocked.
 
 ## Daemon details
 
-- **Endpoint (Unix)**: socket at `$TMPDIR/chrome-devtools-daemon-<uid>.sock` (uid-suffixed so users on a shared machine don't collide)
+- **Instance identity**: one daemon per browser endpoint. The socket/PID/info filenames carry a 16-hex-digit key derived from the resolved `ws://` URL, so Chrome, Edge, every channel and every headless instance get a daemon of their own, and a command aimed at one browser can never be served by a daemon attached to another. The URL's browser GUID changes on every browser launch, so a restarted browser gets a fresh daemon instead of inheriting a dead connection; the orphan exits on its idle timeout.
+- **Endpoint (Unix)**: socket at `$TMPDIR/chrome-devtools-daemon-<uid>-<key>.sock` (uid-suffixed so users on a shared machine don't collide)
 - **Endpoint (Windows)**: loopback TCP listener; its address is written to `%TEMP%\chrome-devtools-daemon.addr` (`%TEMP%` is already per-user, so no suffix)
-- **PID file**: `$TMPDIR/chrome-devtools-daemon-<uid>.pid` (Windows: `%TEMP%\chrome-devtools-daemon.pid`)
-- **Lock file**: `$TMPDIR/chrome-devtools-daemon-<uid>.lock` (Windows: `%TEMP%\chrome-devtools-daemon.lock`) — serializes daemon startup/cleanup; intentionally never removed automatically. Locks bind to the inode, not the name: deleting the file while any daemon process is still starting, running, or shutting down lets a new process lock a fresh replacement inode and bypass the serialization entirely. Only delete it once no daemon process exists at all — and there's rarely a reason to, since a leftover lock file is harmless.
+- **PID file**: `$TMPDIR/chrome-devtools-daemon-<uid>-<key>.pid` (Windows: `%TEMP%\chrome-devtools-daemon-<key>.pid`)
+- **Info file**: `$TMPDIR/chrome-devtools-daemon-<uid>-<key>.info` — JSON naming the browser, endpoint, PID and start time, so `list-daemons` can label rows. Best-effort: a daemon with no info file still lists, with `?` columns.
+- **Lock file**: `$TMPDIR/chrome-devtools-daemon-<uid>.lock` (Windows: `%TEMP%\chrome-devtools-daemon.lock`) — **not** keyed per instance: one lock covers all of them, because it only serializes the brief write-pid-then-bind window, while a per-instance lock would accumulate a never-removed file per browser session. Serializes daemon startup/cleanup; intentionally never removed automatically. Locks bind to the inode, not the name: deleting the file while any daemon process is still starting, running, or shutting down lets a new process lock a fresh replacement inode and bypass the serialization entirely. Only delete it once no daemon process exists at all — and there's rarely a reason to, since a leftover lock file is harmless.
 - **Idle timeout**: 5 minutes (auto-exits, cleans up its files)
 - **Cleanup**: endpoint + PID files are also removed on panics, and on Unix on SIGTERM/SIGINT; Windows Ctrl-C cleanup is best-effort only (a background daemon has no console to receive it). SIGQUIT, SIGHUP and SIGKILL skip cleanup by design — the leftover files are harmless and are reclaimed by the next daemon start.
 - **Protocol**: Length-prefixed JSON over the Unix socket / loopback TCP
-- **Spawned by**: First CLI invocation (transparent to user)
-- **Kill**: `chrome-devtools kill-daemon` (or delete the socket + PID file; leave the lock file — see above). It sends SIGTERM and returns once the signal is delivered, not once the process is gone: the daemon exits *between* requests, so one that is mid-command finishes it and answers that client first. Expect up to one command's latency, and note that a daemon wedged inside a CDP call outlives the command that stopped it.
+- **Spawned by**: First CLI invocation for a given endpoint (transparent to user)
+- **List**: `chrome-devtools list-daemons` — PID, browser, endpoint, uptime and state for every daemon this user owns. `--json` for machine-readable output. Reads only on-disk state, so it works when every browser has exited; rows whose PID no longer exists are marked `stale`.
+- **Kill**: `chrome-devtools kill-daemon` stops only the daemon for the endpoint its flags resolve to, so `--browser edge kill-daemon` cannot stop your Chrome daemon. Add `--all` to stop every daemon for this user — which is also the only way to clear one whose browser has already exited, since a scoped kill has no endpoint left to resolve (it fails and says so). `--all` also sweeps the pre-key `chrome-devtools-daemon-<uid>.pid` name left by older versions. (Or delete the socket + PID file by hand; leave the lock file — see above.) It sends SIGTERM and returns once the signal is delivered, not once the process is gone: the daemon exits *between* requests, so one that is mid-command finishes it and answers that client first. Expect up to one command's latency, and note that a daemon wedged inside a CDP call outlives the command that stopped it.
 - **Kill (Windows)**: not supported — `kill-daemon` says so and exits, and a backgrounded daemon has no console for Ctrl-C. Use `taskkill /PID <pid>` with the PID from `%TEMP%\chrome-devtools-daemon.pid`, or wait out the idle timeout.
 
 The daemon keeps a persistent CDP session on the current page to:

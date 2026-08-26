@@ -95,7 +95,7 @@ fn open_lock_file_at(path: &std::path::Path) -> Result<std::fs::File> {
 /// pass the uid check, but planting one requires owning the target under
 /// Linux's default `protected_hardlinks`.
 #[cfg(unix)]
-fn write_pid_file_checked(path: &std::path::Path) -> Result<()> {
+fn write_private_file_checked(path: &std::path::Path, contents: &[u8], what: &str) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut f = std::fs::OpenOptions::new()
@@ -106,10 +106,10 @@ fn write_pid_file_checked(path: &std::path::Path) -> Result<()> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .mode(0o600)
         .open(path)
-        .with_context(|| format!("Failed to open daemon PID file {}", path.display()))?;
+        .with_context(|| format!("Failed to open daemon {what} file {}", path.display()))?;
     let md = f.metadata().with_context(|| {
         format!(
-            "Failed to read metadata of daemon PID file {}",
+            "Failed to read metadata of daemon {what} file {}",
             path.display()
         )
     })?;
@@ -117,22 +117,53 @@ fn write_pid_file_checked(path: &std::path::Path) -> Result<()> {
     // thread-safe and cannot fail.
     if !md.is_file() || md.uid() != unsafe { libc::geteuid() } {
         anyhow::bail!(
-            "Daemon PID path {} is not a regular file owned by the current user; refusing to write it",
+            "Daemon {what} path {} is not a regular file owned by the current user; refusing to write it",
             path.display()
         );
     }
     f.set_len(0)
-        .with_context(|| format!("Failed to truncate daemon PID file {}", path.display()))?;
-    f.write_all(std::process::id().to_string().as_bytes())
-        .with_context(|| format!("Failed to write daemon PID file {}", path.display()))
+        .with_context(|| format!("Failed to truncate daemon {what} file {}", path.display()))?;
+    f.write_all(contents)
+        .with_context(|| format!("Failed to write daemon {what} file {}", path.display()))
 }
 
 /// Windows has no O_NOFOLLOW, and `%TEMP%` is already per-user, so the
 /// shared-/tmp squatting the Unix version defends against doesn't apply.
 #[cfg(not(unix))]
+fn write_private_file_checked(path: &std::path::Path, contents: &[u8], what: &str) -> Result<()> {
+    std::fs::write(path, contents)
+        .with_context(|| format!("Failed to write daemon {what} file {}", path.display()))
+}
+
+/// Write this process's PID to `path` (see [`write_private_file_checked`]).
 fn write_pid_file_checked(path: &std::path::Path) -> Result<()> {
-    std::fs::write(path, std::process::id().to_string())
-        .with_context(|| format!("Failed to write daemon PID file {}", path.display()))
+    write_private_file_checked(path, std::process::id().to_string().as_bytes(), "PID")
+}
+
+/// Publish the daemon's metadata sidecar, so `list-daemons` can name the
+/// browser without inspecting process arguments.
+///
+/// Best-effort by design: readers tolerate a missing info file, so a failure
+/// here is reported to the daemon's (usually null) stderr rather than failing
+/// startup — losing a display column must not cost a working daemon.
+fn write_info_file(key: &str, browser: &str, ws_url: &str) {
+    let info = crate::protocol::DaemonInfo {
+        browser: browser.to_string(),
+        ws_url: ws_url.to_string(),
+        pid: std::process::id(),
+        started_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    };
+    let path = crate::protocol::info_path(key);
+    match serde_json::to_vec(&info) {
+        Ok(bytes) => {
+            if let Err(e) = write_private_file_checked(&path, &bytes, "info") {
+                eprintln!("daemon: could not write info file: {e:#}");
+            }
+        }
+        Err(e) => eprintln!("daemon: could not serialize info file: {e}"),
+    }
 }
 
 /// Ceiling on the lock wait. Legitimate holders (a predecessor's cleanup,
@@ -213,17 +244,32 @@ async fn lock_daemon_files() -> Result<std::fs::File> {
 /// place and self-heal on the next daemon start), so the messages exist for
 /// interactive debugging, not operational monitoring.
 fn cleanup() {
+    // Published by run_daemon before the guard is armed. Unset means nothing
+    // has been written yet, so there is nothing to remove.
+    let Some(key) = INSTANCE_KEY.get() else {
+        return;
+    };
     #[cfg(unix)]
-    let endpoint = socket_path();
+    let endpoint = socket_path(key);
     #[cfg(windows)]
-    let endpoint = addr_path();
-    cleanup_at(&lock_path(), &pid_path(), &endpoint);
+    let endpoint = addr_path(key);
+    cleanup_at(&lock_path(), &pid_path(key), &endpoint, &info_path(key));
 }
+
+/// This daemon's instance key, so [`cleanup`] can derive its paths when it
+/// runs from a `Drop` guard, a signal handler or the panic hook — none of
+/// which can be passed an argument.
+static INSTANCE_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Path-parameterized body of [`cleanup`] (see its doc for the locking and
 /// ownership rules), so tests can drive it against a scratch directory
 /// instead of the real `temp_dir()` files.
-fn cleanup_at(lock: &std::path::Path, pid: &std::path::Path, endpoint: &std::path::Path) {
+fn cleanup_at(
+    lock: &std::path::Path,
+    pid: &std::path::Path,
+    endpoint: &std::path::Path,
+    info: &std::path::Path,
+) {
     // `lock_file` holds the OS lock until it drops at the end of this scope,
     // covering the ownership check and removals below.
     let lock_file = match open_lock_file_at(lock) {
@@ -266,6 +312,7 @@ fn cleanup_at(lock: &std::path::Path, pid: &std::path::Path, endpoint: &std::pat
         return;
     }
     let _ = std::fs::remove_file(endpoint);
+    let _ = std::fs::remove_file(info);
     let _ = std::fs::remove_file(pid);
 }
 
@@ -381,7 +428,12 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     }
 }
 
-pub async fn run_daemon(ws_url: &str) -> Result<()> {
+pub async fn run_daemon(ws_url: &str, browser: &str) -> Result<()> {
+    // Published before the guard is armed: this only sets an in-memory cell —
+    // nothing on disk yet — and cleanup() needs it to find the files at all.
+    let key = crate::protocol::instance_key(ws_url);
+    let key = INSTANCE_KEY.get_or_init(|| key).clone();
+
     // Armed before anything is written: cleanup() verifies pid-file ownership
     // first, so firing "too early" is a no-op, and this declaration order
     // means the startup lock below is released (locals drop in reverse order)
@@ -401,12 +453,13 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
     // predecessor can delete files this daemon just claimed.
     let startup_lock = lock_daemon_files().await?;
 
-    write_pid_file_checked(&pid_path())?;
+    write_pid_file_checked(&pid_path(&key))?;
+    write_info_file(&key, browser, ws_url);
 
     #[cfg(unix)]
     let listener = {
         // Clean up stale socket
-        let sock = socket_path();
+        let sock = socket_path(&key);
         let _ = std::fs::remove_file(&sock);
 
         // Bind socket FIRST so the CLI knows the daemon is alive and can connect.
@@ -418,13 +471,13 @@ pub async fn run_daemon(ws_url: &str) -> Result<()> {
     #[cfg(windows)]
     let listener = {
         // Clean up stale address file
-        let _ = std::fs::remove_file(addr_path());
+        let _ = std::fs::remove_file(addr_path(&key));
 
         // Bind listener FIRST so the CLI knows the daemon is alive and can connect.
         // If we wait for CdpClient::connect first, a Chrome/network permission prompt
         // can block the daemon and cause the CLI's 5-second wait_for_daemon timeout to expire.
         let listener = TcpListener::bind("127.0.0.1:0").await?;
-        std::fs::write(addr_path(), listener.local_addr()?.to_string())?;
+        std::fs::write(addr_path(&key), listener.local_addr()?.to_string())?;
         listener
     };
 
@@ -671,14 +724,17 @@ mod tests {
         let lock = dir.path().join("daemon.lock");
         let pid = dir.path().join("daemon.pid");
         let endpoint = dir.path().join("daemon.sock");
+        let info = dir.path().join("daemon.info");
         std::fs::write(&pid, std::process::id().wrapping_add(1).to_string()).unwrap();
         std::fs::write(&endpoint, "").unwrap();
-        cleanup_at(&lock, &pid, &endpoint);
+        std::fs::write(&info, "{}").unwrap();
+        cleanup_at(&lock, &pid, &endpoint, &info);
         assert!(pid.exists(), "foreign PID file must survive cleanup");
         assert!(
             endpoint.exists(),
             "foreign endpoint file must survive cleanup"
         );
+        assert!(info.exists(), "foreign info file must survive cleanup");
     }
 
     #[test]
@@ -687,11 +743,14 @@ mod tests {
         let lock = dir.path().join("daemon.lock");
         let pid = dir.path().join("daemon.pid");
         let endpoint = dir.path().join("daemon.sock");
+        let info = dir.path().join("daemon.info");
         std::fs::write(&pid, std::process::id().to_string()).unwrap();
         std::fs::write(&endpoint, "").unwrap();
-        cleanup_at(&lock, &pid, &endpoint);
+        std::fs::write(&info, "{}").unwrap();
+        cleanup_at(&lock, &pid, &endpoint, &info);
         assert!(!pid.exists());
         assert!(!endpoint.exists());
+        assert!(!info.exists(), "own info file must be removed");
         assert!(
             lock.exists(),
             "the lock file is intentionally never removed"
@@ -706,14 +765,17 @@ mod tests {
         let lock = dir.path().join("daemon.lock");
         let pid = dir.path().join("daemon.pid");
         let endpoint = dir.path().join("daemon.sock");
+        let info = dir.path().join("daemon.info");
         std::fs::write(&pid, std::process::id().to_string()).unwrap();
         std::fs::write(&endpoint, "").unwrap();
+        std::fs::write(&info, "{}").unwrap();
         let holder = open_lock_file_at(&lock).unwrap();
         holder.try_lock().unwrap();
         // A replacement holds the lock (mid-startup): even our own files must
         // be left alone, since the replacement may be about to rebind them.
-        cleanup_at(&lock, &pid, &endpoint);
+        cleanup_at(&lock, &pid, &endpoint, &info);
         assert!(pid.exists());
         assert!(endpoint.exists());
+        assert!(info.exists());
     }
 }

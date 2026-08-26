@@ -28,11 +28,15 @@ pub struct Cli {
     #[arg(long, global = true, env = "CHROME_WS_ENDPOINT")]
     pub ws_endpoint: Option<String>,
 
-    /// Chrome user data directory (for auto-connect)
+    /// Browser user data directory (for auto-connect)
     #[arg(long, global = true, env = "CHROME_USER_DATA_DIR")]
     pub user_data_dir: Option<String>,
 
-    /// Chrome channel: stable, beta, canary, dev
+    /// Browser to auto-connect to: chrome, edge
+    #[arg(long, global = true, default_value = "chrome", env = "CHROME_BROWSER")]
+    pub browser: String,
+
+    /// Browser release channel: stable, beta, canary, dev
     #[arg(long, global = true, default_value = "stable", env = "CHROME_CHANNEL")]
     pub channel: String,
 
@@ -408,6 +412,10 @@ pub enum Commands {
         track_navigation: bool,
     },
 
+    /// List the running daemons and the browser each is attached to
+    #[command(name = "list-daemons")]
+    ListDaemons,
+
     /// Stop the background daemon process
     #[command(name = "kill-daemon")]
     KillDaemon {
@@ -419,6 +427,14 @@ pub enum Commands {
         /// errors — do not use it as a retry step.
         #[arg(long)]
         force: bool,
+
+        /// Stop every daemon for this user, whatever browser each is attached
+        /// to, instead of only the one for the resolved target.
+        ///
+        /// Needs no reachable browser, so this is the way to clear daemons
+        /// orphaned by a browser that has already exited.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -466,8 +482,259 @@ impl Cli {
             Commands::RunScript { .. } => "run-script",
             Commands::Adapter { .. } => "adapter",
             Commands::KillDaemon { .. } => "kill-daemon",
+            Commands::ListDaemons => "list-daemons",
         }
     }
+}
+
+/// Whether a PID names a live process.
+///
+/// `kill(pid, 0)` delivers no signal but performs the same existence and
+/// permission checks: `EPERM` means the process exists and is someone else's,
+/// which for a daemon list is still "running".
+#[cfg(unix)]
+fn daemon_pid_alive(pid: i32) -> bool {
+    // SAFETY: kill() has no memory-safety preconditions, and signal 0 is the
+    // no-op existence probe. The pid is validated positive by the caller, so
+    // it cannot address a process group.
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Human-readable uptime, coarsened to the largest two units that matter.
+fn format_uptime(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m{}s", s / 60, s % 60),
+        s => format!("{}h{}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// Endpoint as `host:port`, dropping the browser-GUID path that makes the full
+/// URL too wide to tabulate.
+fn short_endpoint(ws_url: &str) -> String {
+    ws_url
+        .strip_prefix("ws://")
+        .unwrap_or(ws_url)
+        .split('/')
+        .next()
+        .unwrap_or(ws_url)
+        .to_string()
+}
+
+/// Print one row per daemon: which browser it is attached to, where, and for
+/// how long.
+///
+/// Reads only on-disk daemon state, so it works when every browser is gone.
+/// A daemon whose info sidecar is missing still lists — with `?` columns —
+/// because knowing a daemon holds a connection matters more than labeling it.
+fn print_daemon_list(format: format::OutputFormat) {
+    #[derive(serde::Serialize)]
+    struct Row {
+        pid: Option<u32>,
+        browser: String,
+        endpoint: String,
+        uptime_secs: Option<u64>,
+        running: Option<bool>,
+        key: String,
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    let mut rows = Vec::new();
+    for key in protocol::enumerate_instance_keys() {
+        let info: Option<protocol::DaemonInfo> = std::fs::read(protocol::info_path(&key))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+
+        #[cfg(unix)]
+        let pid_str = read_pid_file_checked(&protocol::pid_path(&key)).ok();
+        #[cfg(not(unix))]
+        let pid_str = std::fs::read_to_string(protocol::pid_path(&key)).ok();
+        let pid = pid_str.and_then(|s| s.trim().parse::<u32>().ok());
+
+        #[cfg(unix)]
+        let running = pid
+            .and_then(|p| i32::try_from(p).ok())
+            .map(daemon_pid_alive);
+        #[cfg(not(unix))]
+        let running: Option<bool> = None;
+
+        rows.push(Row {
+            pid,
+            browser: info
+                .as_ref()
+                .map_or_else(|| "?".to_string(), |i| i.browser.clone()),
+            endpoint: info
+                .as_ref()
+                .map_or_else(|| "?".to_string(), |i| short_endpoint(&i.ws_url)),
+            uptime_secs: info
+                .as_ref()
+                .filter(|i| i.started_unix > 0 && now >= i.started_unix)
+                .map(|i| now - i.started_unix),
+            running,
+            key,
+        });
+    }
+
+    if matches!(format, format::OutputFormat::Json) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string())
+        );
+        return;
+    }
+
+    if rows.is_empty() {
+        println!("No daemons running.");
+        return;
+    }
+
+    println!("PID     BROWSER  ENDPOINT              UPTIME    STATE");
+    println!("{}", "-".repeat(58));
+    for r in &rows {
+        let pid = r.pid.map_or_else(|| "?".to_string(), |p| p.to_string());
+        let uptime = r.uptime_secs.map_or_else(|| "?".to_string(), format_uptime);
+        let state = match r.running {
+            Some(true) => "running",
+            Some(false) => "stale",
+            None => "?",
+        };
+        println!(
+            "{:<7} {:<8} {:<21} {:<9} {}",
+            pid, r.browser, r.endpoint, uptime, state
+        );
+    }
+    if rows.iter().any(|r| r.running == Some(false)) {
+        println!("\nstale = PID file with no live process; `kill-daemon --all` clears them.");
+    }
+}
+
+/// Stop the daemon instance identified by `key`, removing its socket, info and
+/// PID files.
+///
+/// Split out of `kill-daemon` so the same ownership-checked, signal-once logic
+/// serves both the target-scoped kill and the `--all` sweep. Prints what it did
+/// (or that there was nothing to do) and returns an error only when the daemon
+/// may still be running — the caller decides whether one failure aborts a
+/// whole sweep.
+fn stop_daemon_instance(key: &str) -> Result<()> {
+    stop_daemon_at(
+        &protocol::pid_path(key),
+        &protocol::info_path(key),
+        #[cfg(unix)]
+        &protocol::socket_path(key),
+    )
+}
+
+/// Stop the pre-instance-key daemon (`chrome-devtools-daemon-<uid>.pid`) left
+/// by a version that ran one daemon per user.
+///
+/// Swept by `--all` only: it is attached to some browser we can no longer
+/// identify, so no scoped target can claim it, and after an upgrade nothing
+/// else will ever reach it. Silent when the files don't exist, which is the
+/// common case.
+fn stop_legacy_unkeyed_daemon() -> Result<()> {
+    let pid_path = protocol::legacy_unkeyed_pid_path();
+    if !pid_path.exists() {
+        return Ok(());
+    }
+    // No info sidecar existed in that layout; point at a path that is
+    // guaranteed absent so the removal is a no-op.
+    let info_path = pid_path.with_extension("info");
+    stop_daemon_at(
+        &pid_path,
+        &info_path,
+        #[cfg(unix)]
+        &protocol::legacy_unkeyed_socket_path(),
+    )
+}
+
+/// Signal one daemon and remove its files, given their paths.
+///
+/// The ownership-checked read and single SIGTERM live here so the keyed and
+/// legacy layouts cannot drift apart in how carefully they treat a predictable
+/// path in shared `/tmp`.
+fn stop_daemon_at(
+    pid_path: &std::path::Path,
+    info_path: &std::path::Path,
+    #[cfg(unix)] sock_path: &std::path::Path,
+) -> Result<()> {
+    // Ownership-checked read: the path is predictable in shared /tmp, so
+    // never act on a PID file that was planted there by another user.
+    #[cfg(unix)]
+    let read_result = read_pid_file_checked(pid_path);
+    #[cfg(not(unix))]
+    let read_result = {
+        use anyhow::Context as _;
+        std::fs::read_to_string(pid_path)
+            .with_context(|| format!("Failed to read PID file {}", pid_path.display()))
+    };
+    match read_result {
+        Ok(pid_str) => {
+            #[cfg(unix)]
+            {
+                // parse_pid_file_contents enforces the safety rules for
+                // what may be passed to kill() (no pid 0, no pid_t
+                // overflow — see its doc comment).
+                let pid = parse_pid_file_contents(&pid_str).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "PID {:?} in {} is not a positive integer that fits libc::pid_t; refusing to signal",
+                        pid_str.trim(),
+                        pid_path.display()
+                    )
+                })?;
+                // Signal the process directly via libc to avoid shelling out
+                // to /usr/bin/kill. A return of 0 means the signal was
+                // delivered; -1 with errno ESRCH means the process is gone
+                // (and the PID file was stale).
+                // SAFETY: kill() has no memory-safety preconditions; the
+                // pid was validated positive and in pid_t range above, so
+                // it cannot alias a process group.
+                let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                if ret == 0 {
+                    // Signal delivered — daemon is shutting down; clean up.
+                    let _ = std::fs::remove_file(sock_path);
+                    let _ = std::fs::remove_file(info_path);
+                    let _ = std::fs::remove_file(pid_path);
+                    println!("Daemon (PID {pid}) stopped.");
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::ESRCH) {
+                        // Process is gone — the PID file was stale; clean up.
+                        let _ = std::fs::remove_file(sock_path);
+                        let _ = std::fs::remove_file(info_path);
+                        let _ = std::fs::remove_file(pid_path);
+                        println!("Daemon (PID {pid}) was not running. Cleaned up stale files.");
+                    } else {
+                        // e.g. EPERM: the daemon may still be running. Leave the
+                        // socket/PID files so it stays reachable.
+                        return Err(anyhow::anyhow!(
+                            "Failed to signal daemon (PID {pid}): {err}. Left socket/PID files in place."
+                        ));
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = pid_str;
+                println!("kill-daemon is only supported on Unix systems.");
+            }
+        }
+        Err(e) if pid_file_missing(&e) => {
+            println!("No daemon running (PID file not found).");
+        }
+        Err(e) => {
+            // Surface via the standard error path (uniform formatting,
+            // telemetry flush, typed exit code) — matching the EPERM
+            // signal-failure case above rather than exiting directly. The
+            // error already names the failing operation and the path.
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 /// What to do when `kill-daemon` is invoked, given `--force` and whether
@@ -939,6 +1206,9 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
             }),
         ),
         Commands::KillDaemon { .. } => unreachable!("KillDaemon is handled before build_request"),
+        Commands::ListDaemons => {
+            unreachable!("ListDaemons is handled before build_request")
+        }
         Commands::InspectHeapSnapshotNode { .. } => {
             unreachable!("InspectHeapSnapshotNode is handled before build_request")
         }
@@ -1031,12 +1301,21 @@ pub async fn run() -> Result<()> {
         }
     };
 
+    // Pure local state: reads daemon files and never connects to a browser, so
+    // it must run before endpoint resolution — which would fail in exactly the
+    // situation where you most want the list (a browser that has exited,
+    // leaving a daemon behind).
+    if matches!(cli.command, Commands::ListDaemons) {
+        print_daemon_list(cli.output_format());
+        return Ok(());
+    }
+
     // Handle kill-daemon without connecting to Chrome. Match by reference
     // like the other `cli.command` intercepts below: binding only the Copy
     // `force` field happens to avoid a partial move today, but a by-ref match
     // keeps that from silently breaking if the variant ever gains a non-Copy
     // field.
-    if let Commands::KillDaemon { force } = &cli.command {
+    if let Commands::KillDaemon { force, all } = &cli.command {
         use std::io::IsTerminal;
         // A prompt is only useful if the user can both type (stdin) and see it
         // (stderr). If stderr is not a TTY (e.g. `2>file`) while stdin still is,
@@ -1070,78 +1349,51 @@ pub async fn run() -> Result<()> {
             KillDaemonDecision::Proceed => {}
         }
 
-        let pid_path = protocol::pid_path();
-        #[cfg(unix)]
-        let sock_path = protocol::socket_path();
-        // Ownership-checked read: the path is predictable in shared /tmp, so
-        // never act on a PID file that was planted there by another user.
-        #[cfg(unix)]
-        let read_result = read_pid_file_checked(&pid_path);
-        #[cfg(not(unix))]
-        let read_result = {
-            use anyhow::Context as _;
-            std::fs::read_to_string(&pid_path)
-                .with_context(|| format!("Failed to read PID file {}", pid_path.display()))
-        };
-        match read_result {
-            Ok(pid_str) => {
-                #[cfg(unix)]
-                {
-                    // parse_pid_file_contents enforces the safety rules for
-                    // what may be passed to kill() (no pid 0, no pid_t
-                    // overflow — see its doc comment).
-                    let pid = parse_pid_file_contents(&pid_str).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "PID {:?} in {} is not a positive integer that fits libc::pid_t; refusing to signal",
-                            pid_str.trim(),
-                            pid_path.display()
-                        )
-                    })?;
-                    // Signal the process directly via libc to avoid shelling out
-                    // to /usr/bin/kill. A return of 0 means the signal was
-                    // delivered; -1 with errno ESRCH means the process is gone
-                    // (and the PID file was stale).
-                    // SAFETY: kill() has no memory-safety preconditions; the
-                    // pid was validated positive and in pid_t range above, so
-                    // it cannot alias a process group.
-                    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-                    if ret == 0 {
-                        // Signal delivered — daemon is shutting down; clean up.
-                        let _ = std::fs::remove_file(&sock_path);
-                        let _ = std::fs::remove_file(&pid_path);
-                        println!("Daemon (PID {pid}) stopped.");
-                    } else {
-                        let err = std::io::Error::last_os_error();
-                        if err.raw_os_error() == Some(libc::ESRCH) {
-                            // Process is gone — the PID file was stale; clean up.
-                            let _ = std::fs::remove_file(&sock_path);
-                            let _ = std::fs::remove_file(&pid_path);
-                            println!("Daemon (PID {pid}) was not running. Cleaned up stale files.");
-                        } else {
-                            // e.g. EPERM: the daemon may still be running. Leave the
-                            // socket/PID files so it stays reachable.
-                            return Err(anyhow::anyhow!(
-                                "Failed to signal daemon (PID {pid}): {err}. Left socket/PID files in place."
-                            ));
-                        }
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = pid_str;
-                    println!("kill-daemon is only supported on Unix systems.");
+        if *all {
+            // Clean slate: every daemon this user owns, whatever browser it is
+            // attached to. Keep going after a failure so one unkillable daemon
+            // cannot strand the rest.
+            let keys = protocol::enumerate_instance_keys();
+            if keys.is_empty() {
+                println!("No daemons running.");
+            }
+            let mut failures = 0usize;
+            for key in &keys {
+                if let Err(e) = stop_daemon_instance(key) {
+                    failures += 1;
+                    eprintln!("{e:#}");
                 }
             }
-            Err(e) if pid_file_missing(&e) => {
-                println!("No daemon running (PID file not found).");
+            if let Err(e) = stop_legacy_unkeyed_daemon() {
+                failures += 1;
+                eprintln!("{e:#}");
             }
-            Err(e) => {
-                // Surface via the standard error path (uniform formatting,
-                // telemetry flush, typed exit code) — matching the EPERM
-                // signal-failure case above rather than exiting directly. The
-                // error already names the failing operation and the path.
-                return Err(e);
+            if failures > 0 {
+                return Err(anyhow::anyhow!(
+                    "{failures} daemon(s) could not be stopped (of {} found)",
+                    keys.len()
+                ));
             }
+        } else {
+            // Target-scoped: resolve the same endpoint a real command would,
+            // so `--browser edge kill-daemon` can only ever stop the Edge
+            // daemon. Resolution needs the browser to be reachable, which a
+            // dead browser with an orphaned daemon is not — hence the pointer
+            // to --all, which needs no endpoint.
+            let ws_url = browser::resolve_ws_url(
+                cli.ws_endpoint.as_deref(),
+                cli.user_data_dir.as_deref(),
+                &cli.browser,
+                &cli.channel,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{e:#}\n\nkill-daemon targets the daemon for a specific browser, so it \
+                     needs to resolve that browser's endpoint. If the browser is already gone \
+                     and you just want to stop leftover daemons, use --all."
+                )
+            })?;
+            stop_daemon_instance(&protocol::instance_key(&ws_url))?;
         }
 
         // Best-effort sweep of the pre-uid-suffix file names: a daemon
@@ -1278,25 +1530,31 @@ pub async fn run() -> Result<()> {
     let ws_url = browser::resolve_ws_url(
         cli.ws_endpoint.as_deref(),
         cli.user_data_dir.as_deref(),
+        &cli.browser,
         &cli.channel,
     )?;
 
     let request = build_request(&cli)?;
 
+    // One daemon per endpoint: a daemon serves only the browser session it was
+    // spawned for, so this command can never be answered by a daemon attached
+    // to a different browser.
+    let key = protocol::instance_key(&ws_url);
+
     // Try daemon first
-    if let Ok(resp) = client::send_to_daemon(&request).await {
+    if let Ok(resp) = client::send_to_daemon(&key, &request).await {
         print_response(&resp);
         return Ok(());
     }
 
     // Daemon not running — spawn it
-    client::spawn_daemon(&ws_url)?;
-    if let Err(e) = client::wait_for_daemon().await {
+    client::spawn_daemon(&ws_url, &cli.browser)?;
+    if let Err(e) = client::wait_for_daemon(&key).await {
         return run_direct_fallback(&cli, &ws_url, &e).await;
     }
 
     // Retry via daemon
-    match client::send_to_daemon(&request).await {
+    match client::send_to_daemon(&key, &request).await {
         Ok(resp) => {
             print_response(&resp);
             Ok(())
@@ -1807,6 +2065,40 @@ mod tests {
         assert!(obj.get("bool_true").unwrap().as_bool().unwrap());
         assert!(obj.get("null_val").unwrap().is_null());
         assert!(!obj.get("bool_false").unwrap().as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_format_uptime_units() {
+        assert_eq!(format_uptime(0), "0s");
+        assert_eq!(format_uptime(8), "8s");
+        assert_eq!(format_uptime(72), "1m12s");
+        assert_eq!(format_uptime(3600), "1h0m");
+        assert_eq!(format_uptime(7500), "2h5m");
+    }
+
+    #[test]
+    fn test_short_endpoint_drops_guid_path() {
+        assert_eq!(
+            short_endpoint("ws://127.0.0.1:56912/devtools/browser/1fff9d85"),
+            "127.0.0.1:56912"
+        );
+        // Degrades to the input rather than empty when the shape is unexpected.
+        assert_eq!(short_endpoint("127.0.0.1:9222"), "127.0.0.1:9222");
+        assert_eq!(short_endpoint(""), "");
+    }
+
+    /// A live process must read as running; PID 0 is never probed because
+    /// `kill(0, …)` addresses the caller's own process group.
+    #[cfg(unix)]
+    #[test]
+    fn test_daemon_pid_alive_detects_self_and_absence() {
+        let me = i32::try_from(std::process::id()).unwrap();
+        assert!(daemon_pid_alive(me), "this process is alive");
+        // PID 1 exists on every Unix; a very high PID almost certainly does not.
+        assert!(
+            !daemon_pid_alive(0x7FFF_FFFE),
+            "implausible PID is not alive"
+        );
     }
 
     #[test]

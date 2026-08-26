@@ -13,7 +13,10 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("__daemon__") {
         let ws_url = args.get(2).expect("daemon requires ws_url argument");
-        let result = daemon::run_daemon(ws_url).await;
+        // Descriptive only, for `list-daemons`. Older spawners passed no
+        // browser argument, so default rather than panic.
+        let browser = args.get(3).map(String::as_str).unwrap_or("chrome");
+        let result = daemon::run_daemon(ws_url, browser).await;
         telemetry::shutdown_logger();
         if let Err(e) = result {
             eprintln!("daemon error: {e:#}");
