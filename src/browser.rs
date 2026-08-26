@@ -69,6 +69,16 @@ fn read_devtools_active_port(user_data_dir: &Path, browser: Browser) -> Result<S
     Ok(format!("ws://127.0.0.1:{port}{path}"))
 }
 
+/// Canonical spelling of a browser name, for recording and display — so a
+/// daemon spawned by `--browser EDGE` or `--browser msedge` is still labelled
+/// `edge` in `list-daemons`.
+///
+/// Falls back to the input for names we don't know: endpoint resolution has
+/// already rejected those, so this is only reached for display.
+pub fn canonical_name(name: &str) -> String {
+    Browser::parse(name).map_or_else(|_| name.to_string(), |b| b.flag_name().to_string())
+}
+
 /// A Chromium-based browser the CLI knows how to auto-connect to.
 ///
 /// Both speak the same DevTools Protocol; they differ only in where the
@@ -80,8 +90,10 @@ enum Browser {
 }
 
 impl Browser {
+    /// Case- and whitespace-insensitive, so `--browser Edge` and
+    /// `CHROME_BROWSER=EDGE` work. The error quotes the name as typed.
     fn parse(name: &str) -> Result<Self> {
-        match name {
+        match name.trim().to_ascii_lowercase().as_str() {
             "chrome" => Ok(Self::Chrome),
             "edge" | "msedge" => Ok(Self::Edge),
             _ => bail!("Unknown browser: {name} (expected 'chrome' or 'edge')"),
@@ -96,6 +108,16 @@ impl Browser {
         }
     }
 
+    /// Canonical `--browser` spelling, for anything that records or displays
+    /// the choice. Kept separate from [`Browser::scheme`] so the two can
+    /// diverge if a browser ever needs different values.
+    fn flag_name(self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome",
+            Self::Edge => "edge",
+        }
+    }
+
     /// URL scheme for the `<scheme>://inspect` hint.
     fn scheme(self) -> &'static str {
         match self {
@@ -106,12 +128,17 @@ impl Browser {
 
     /// Default user data directory for the given release channel.
     fn default_user_data_dir(self, channel: &str) -> Result<PathBuf> {
+        // Matched case-insensitively for the same reason as `parse`; the error
+        // arms still report the channel as the user typed it.
+        let normalized = channel.trim().to_ascii_lowercase();
+        let channel_key = normalized.as_str();
+
         #[cfg(target_os = "macos")]
         {
             let home =
                 dirs::home_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
             let base = home.join("Library/Application Support");
-            let dir = match (self, channel) {
+            let dir = match (self, channel_key) {
                 (Self::Chrome, "stable" | "chrome") => base.join("Google/Chrome"),
                 (Self::Chrome, "beta") => base.join("Google/Chrome Beta"),
                 (Self::Chrome, "canary") => base.join("Google/Chrome Canary"),
@@ -129,7 +156,7 @@ impl Browser {
         {
             let home =
                 dirs::home_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
-            let dir = match (self, channel) {
+            let dir = match (self, channel_key) {
                 (Self::Chrome, "stable" | "chrome") => home.join(".config/google-chrome"),
                 (Self::Chrome, "beta") => home.join(".config/google-chrome-beta"),
                 // Chrome ships no Canary for Linux; unstable is the dev channel.
@@ -150,7 +177,7 @@ impl Browser {
             let local_app_data =
                 std::env::var("LOCALAPPDATA").map_err(|_| anyhow!("LOCALAPPDATA not set"))?;
             let base = PathBuf::from(local_app_data);
-            let dir = match (self, channel) {
+            let dir = match (self, channel_key) {
                 (Self::Chrome, "stable" | "chrome") => base.join("Google/Chrome/User Data"),
                 (Self::Chrome, "beta") => base.join("Google/Chrome Beta/User Data"),
                 (Self::Chrome, "canary") => base.join("Google/Chrome SxS/User Data"),
@@ -175,6 +202,49 @@ mod tests {
         assert_eq!(Browser::parse("chrome").unwrap(), Browser::Chrome);
         assert_eq!(Browser::parse("edge").unwrap(), Browser::Edge);
         assert_eq!(Browser::parse("msedge").unwrap(), Browser::Edge);
+    }
+
+    #[test]
+    fn parses_browsers_case_insensitively() {
+        for name in ["Chrome", "CHROME", " chrome "] {
+            assert_eq!(Browser::parse(name).unwrap(), Browser::Chrome, "{name}");
+        }
+        for name in ["Edge", "EDGE", "MSEdge", " edge "] {
+            assert_eq!(Browser::parse(name).unwrap(), Browser::Edge, "{name}");
+        }
+    }
+
+    #[test]
+    fn channels_are_matched_case_insensitively() {
+        for browser in [Browser::Chrome, Browser::Edge] {
+            assert_eq!(
+                browser.default_user_data_dir("stable").unwrap(),
+                browser.default_user_data_dir("STABLE").unwrap()
+            );
+            assert_eq!(
+                browser.default_user_data_dir("beta").unwrap(),
+                browser.default_user_data_dir(" Beta ").unwrap()
+            );
+        }
+    }
+
+    /// The error must quote what the user typed, not the normalized form.
+    #[test]
+    fn unknown_browser_error_quotes_the_original_spelling() {
+        let err = Browser::parse("FireFox").unwrap_err().to_string();
+        assert!(err.contains("FireFox"), "{err}");
+    }
+
+    #[test]
+    fn canonical_name_normalizes_spelling_and_aliases() {
+        for name in ["edge", "Edge", "EDGE", "msedge", "MSEdge"] {
+            assert_eq!(canonical_name(name), "edge", "{name}");
+        }
+        for name in ["chrome", "Chrome", "CHROME"] {
+            assert_eq!(canonical_name(name), "chrome", "{name}");
+        }
+        // Unknown names pass through rather than being silently relabelled.
+        assert_eq!(canonical_name("firefox"), "firefox");
     }
 
     #[test]
