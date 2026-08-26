@@ -10,13 +10,13 @@ use tokio::net::UnixStream;
 use crate::protocol::*;
 
 #[cfg(unix)]
-async fn connect_daemon() -> Result<UnixStream> {
-    Ok(UnixStream::connect(socket_path()).await?)
+async fn connect_daemon(key: &str) -> Result<UnixStream> {
+    Ok(UnixStream::connect(socket_path(key)).await?)
 }
 
 #[cfg(windows)]
-async fn connect_daemon() -> Result<TcpStream> {
-    let addr = std::fs::read_to_string(addr_path())?;
+async fn connect_daemon(key: &str) -> Result<TcpStream> {
+    let addr = std::fs::read_to_string(addr_path(key))?;
     Ok(TcpStream::connect(addr.trim()).await?)
 }
 
@@ -32,9 +32,10 @@ pub(crate) fn daemon_wait_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(5))
 }
 
-/// Try to send a request to the daemon. Returns error if daemon is not running.
-pub async fn send_to_daemon(request: &DaemonRequest) -> Result<DaemonResponse> {
-    let mut stream = connect_daemon().await?;
+/// Try to send a request to the daemon for `key`. Returns an error if no
+/// daemon is attached to that endpoint.
+pub async fn send_to_daemon(key: &str, request: &DaemonRequest) -> Result<DaemonResponse> {
+    let mut stream = connect_daemon(key).await?;
 
     let req_bytes = serde_json::to_vec(request)?;
     write_msg(&mut stream, &req_bytes).await?;
@@ -45,10 +46,14 @@ pub async fn send_to_daemon(request: &DaemonRequest) -> Result<DaemonResponse> {
 }
 
 /// Spawn the daemon process in the background.
-pub fn spawn_daemon(ws_url: &str) -> Result<()> {
+///
+/// `browser` is descriptive only — it is recorded in the daemon's info file so
+/// `list-daemons` can name the browser. The daemon's identity comes from
+/// `ws_url` alone.
+pub fn spawn_daemon(ws_url: &str, browser: &str) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(["__daemon__", ws_url])
+    cmd.args(["__daemon__", ws_url, browser])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -60,8 +65,9 @@ pub fn spawn_daemon(ws_url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Wait for the daemon socket to become available, with exponential backoff.
-pub async fn wait_for_daemon() -> Result<()> {
+/// Wait for the daemon socket for `key` to become available, with exponential
+/// backoff.
+pub async fn wait_for_daemon(key: &str) -> Result<()> {
     let deadline = tokio::time::Instant::now() + daemon_wait_timeout();
     let mut delay = Duration::from_millis(50);
     loop {
@@ -71,7 +77,7 @@ pub async fn wait_for_daemon() -> Result<()> {
                 daemon_wait_timeout().as_secs()
             );
         }
-        if connect_daemon().await.is_ok() {
+        if connect_daemon(key).await.is_ok() {
             return Ok(());
         }
         // Simple jitter based on current time subseconds

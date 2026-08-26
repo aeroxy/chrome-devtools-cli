@@ -88,7 +88,8 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
             "output",
             "track_navigation",
         ],
-        "kill-daemon" => &["force"],
+        "kill-daemon" => &["force", "all"],
+        "list-daemons" => &[],
         _ => &[],
     }
 }
@@ -130,7 +131,10 @@ fn validate_args(cmd: &str, args: &serde_json::Value) -> Result<()> {
 /// rather than hitting the `_ => unreachable!()` arm in the browser-level
 /// dispatch and panicking.
 fn is_browser_level(cmd: &str) -> bool {
-    matches!(cmd, "list-pages" | "new-page" | "sw-logs" | "kill-daemon")
+    matches!(
+        cmd,
+        "list-pages" | "new-page" | "sw-logs" | "kill-daemon" | "list-daemons"
+    )
 }
 
 /// Execute a single command from a [`DaemonRequest`].
@@ -207,6 +211,9 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                 commands::sw_logs::collect_sw_logs(client, duration, extension_id, req.format())
                     .await
             }
+            "list-daemons" => Ok(CommandResult::output(
+                "list-daemons is handled directly by the CLI, not the daemon.",
+            )),
             "kill-daemon" => Ok(CommandResult::output(
                 "kill-daemon is handled directly by the CLI, not the daemon.",
             )),

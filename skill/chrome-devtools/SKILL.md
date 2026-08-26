@@ -10,12 +10,43 @@ A CLI that talks directly to your running Chrome via the DevTools Protocol.
 
 ## Prerequisites
 
-Chrome must have remote debugging enabled:
-1. Open Chrome
-2. Go to `chrome://inspect/#remote-debugging`
+The browser must have remote debugging enabled:
+1. Open Chrome (or Edge)
+2. Go to `chrome://inspect/#remote-debugging` (Edge: `edge://inspect/#remote-debugging`)
 3. Enable the remote debugging server
 
-The CLI auto-connects — no URL needed. A daemon is spawned on first invocation and reused across commands (5-minute idle timeout).
+This is a **persistent, in-browser toggle** — not a launch flag. Three things
+follow from that, and they are what make it the right route for attaching to an
+everyday browser:
+
+- **It takes effect immediately.** The server starts on the already-running
+  process; no restart, no relaunch, nothing to quit.
+- **It survives restarts.** The choice is stored in the profile's `Local State`
+  as `devtools.remote_debugging.user-enabled`, so every later launch serves a
+  port with no flags. To check whether a profile has it on, read that key.
+- **It is per-browser and per-profile.** Enabling it in Chrome does nothing for
+  Edge, and vice versa — each has its own toggle and its own `Local State`.
+
+The port is chosen by the browser and recorded in `<user-data-dir>/DevToolsActivePort`.
+Read that file rather than assuming a number: it differs per browser and can
+change between launches. Auto-connect does this for you, which is why no URL is
+needed. A daemon is spawned on first invocation and reused across commands
+(5-minute idle timeout).
+
+**Microsoft Edge** works the same — it is Chromium and speaks the same protocol.
+Add `--browser edge` so auto-connect reads Edge's profile instead of Chrome's
+(`--channel` still selects stable/beta/dev/canary). `--ws-endpoint` and
+`--user-data-dir` need no `--browser`; they already say where to connect.
+Everything below applies unchanged — only the profile location differs.
+
+The `--remote-debugging-port` launch flag is the *other* route, and it is for a
+throwaway instance rather than your everyday browser — see the headless recipe
+below. Two traps if you reach for it: it is ignored when that profile is already
+running (the launch hands off to the existing process and no port file appears,
+so quit first or use a different `--user-data-dir`), and a fresh Edge profile is
+not the clean room it looks like — Edge's first-run import pulls open tabs and
+extensions from your default browser, so a `mktemp -d` profile can come up
+holding your real session.
 
 ## ⚠️ Critical: How Page Targeting Works
 
@@ -377,9 +408,10 @@ prompt ever appears** — the whole flow runs unattended.
 ```bash
 PROFILE=$(mktemp -d)
 
-# 1. If a daemon is already attached to the user's real Chrome, stop it first
-#    (the daemon is per-user and sticks to whichever Chrome it first connected to)
-chrome-devtools kill-daemon --force
+# 1. Clear any daemon left over from a previous run of THIS profile. Not needed
+#    for isolation — daemons are per-endpoint, so the user's browser is
+#    unaffected either way — but a stale one here would hold a dead connection.
+chrome-devtools --user-data-dir "$PROFILE" kill-daemon --force 2>/dev/null
 
 # 2. Spawn headless Chrome with an isolated profile; port 0 = pick a free port
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
@@ -389,11 +421,13 @@ chrome-devtools kill-daemon --force
   about:blank &
 CHROME_PID=$!
 
-# 3. Cleanup — REQUIRED even if a later step fails: the daemon is bound to the
-#    headless instance and would otherwise hijack later commands aimed at the
-#    user's real Chrome. A trap runs it on every exit path, not just success.
+# 3. Cleanup — a trap runs it on every exit path, not just success. The daemon
+#    can no longer hijack commands aimed at another browser, but it does hold a
+#    CDP connection and an idle timer, so stop it rather than leaking it.
 cleanup() {
-  chrome-devtools kill-daemon --force
+  # Scoped to this profile: a bare kill-daemon would resolve the user's default
+  # Chrome profile and stop their daemon instead of this one.
+  chrome-devtools --user-data-dir "$PROFILE" kill-daemon --force
   kill "$CHROME_PID" 2>/dev/null
   # Chrome shuts down asynchronously, so deleting the profile right after
   # SIGTERM races its teardown and can leave it running against a directory
@@ -431,13 +465,40 @@ chrome-devtools --user-data-dir "$PROFILE" screenshot --output /tmp/shot.png
 ```
 
 Linux path: `google-chrome` or `chromium` on `$PATH` replaces the macOS
-`.app` binary path.
+`.app` binary path. For a headless Edge, swap the binary for
+`/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge` (Linux:
+`microsoft-edge`) — the flags are identical, and `--user-data-dir` already
+points the CLI at the right profile, so `--browser edge` is optional here.
 
-**⚠️ One daemon per user, bound to one Chrome.** The daemon connects to
-whichever Chrome the first command resolved, and later commands reuse it even
-if their flags point elsewhere. Always `kill-daemon --force` when switching
-between the user's Chrome and a headless instance — in both directions
-(step 1 and the EXIT trap above).
+**⚠️ A temp profile is not automatically a clean room in Edge.** Edge's
+first-run import pulls open tabs *and* extensions from the default browser, and
+`--no-first-run` does not reliably suppress it, so a `mktemp -d` profile can come
+up holding a copy of the real browsing session — and the debug port then fronts a
+signed-in profile. Verify what you actually got with `list-pages` before
+assuming isolation, and treat the port as sensitive until you have.
+
+**One daemon per browser endpoint.** A daemon is identified by the endpoint it
+is attached to, so the user's Chrome, the user's Edge, and each headless
+instance each get their own — you can drive them concurrently, and a command
+can never be answered by a daemon attached to a different browser. Two
+consequences for the recipe above:
+
+- Step 1 is not needed for isolation. It only clears a daemon left over from a
+  *previous* run of this same profile.
+- The EXIT trap must scope its kill to this profile:
+  `chrome-devtools --user-data-dir "$PROFILE" kill-daemon --force`. A bare
+  `kill-daemon` resolves the default Chrome profile and would stop the user's
+  daemon instead of the headless one.
+
+`list-daemons` shows what is running (PID, browser, endpoint, uptime), and
+`kill-daemon --all` clears every daemon regardless of endpoint — including ones
+whose browser has already exited, which a scoped kill cannot reach because it
+has no endpoint left to resolve.
+
+Older versions ran a single daemon per user, bound to whichever browser the
+first command resolved, and silently ignored later `--browser`/`--user-data-dir`
+flags. If you are reading advice that says to `kill-daemon` when switching
+browsers, it predates this.
 
 ## Complete Command Reference
 
