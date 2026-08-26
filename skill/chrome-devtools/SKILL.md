@@ -35,7 +35,9 @@ needed. A daemon is spawned on first invocation and reused across commands
 
 **Microsoft Edge** works the same — it is Chromium and speaks the same protocol.
 Add `--browser edge` so auto-connect reads Edge's profile instead of Chrome's
-(`--channel` still selects stable/beta/dev/canary). `--ws-endpoint` and
+(`--channel` still selects stable/beta/dev/canary, except that Edge ships no
+Canary for Linux — `--browser edge --channel canary` is rejected there rather
+than pointed at a directory that cannot exist). `--ws-endpoint` and
 `--user-data-dir` need no `--browser`; they already say where to connect.
 Everything below applies unchanged — only the profile location differs.
 
@@ -411,7 +413,11 @@ PROFILE=$(mktemp -d)
 # 1. Clear any daemon left over from a previous run of THIS profile. Not needed
 #    for isolation — daemons are per-endpoint, so the user's browser is
 #    unaffected either way — but a stale one here would hold a dead connection.
-chrome-devtools --user-data-dir "$PROFILE" kill-daemon --force 2>/dev/null
+#    Best-effort: a scoped kill has to resolve this profile's endpoint, and on a
+#    fresh $PROFILE there is none yet, so it exits non-zero and removes nothing.
+#    `|| true` keeps that expected failure from aborting the script under `set -e`.
+#    Do NOT reach for --all here: it would also stop the user's own daemons.
+chrome-devtools --user-data-dir "$PROFILE" kill-daemon --force 2>/dev/null || true
 
 # 2. Spawn headless Chrome with an isolated profile; port 0 = pick a free port
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
@@ -426,8 +432,10 @@ CHROME_PID=$!
 #    CDP connection and an idle timer, so stop it rather than leaking it.
 cleanup() {
   # Scoped to this profile: a bare kill-daemon would resolve the user's default
-  # Chrome profile and stop their daemon instead of this one.
-  chrome-devtools --user-data-dir "$PROFILE" kill-daemon --force
+  # Chrome profile and stop their daemon instead of this one. Best-effort for
+  # the same reason as step 1 — if Chrome died before writing its port file
+  # there is no endpoint to resolve, and a trap must not fail on that.
+  chrome-devtools --user-data-dir "$PROFILE" kill-daemon --force 2>/dev/null || true
   kill "$CHROME_PID" 2>/dev/null
   # Chrome shuts down asynchronously, so deleting the profile right after
   # SIGTERM races its teardown and can leave it running against a directory

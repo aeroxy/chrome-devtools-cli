@@ -528,7 +528,7 @@ fn short_endpoint(ws_url: &str) -> String {
 /// Reads only on-disk daemon state, so it works when every browser is gone.
 /// A daemon whose info sidecar is missing still lists — with `?` columns —
 /// because knowing a daemon holds a connection matters more than labeling it.
-fn print_daemon_list(format: format::OutputFormat) {
+fn print_daemon_list(format: format::OutputFormat) -> Result<()> {
     #[derive(serde::Serialize)]
     struct Row {
         pid: Option<u32>,
@@ -579,17 +579,19 @@ fn print_daemon_list(format: format::OutputFormat) {
         });
     }
 
-    if matches!(format, format::OutputFormat::Json) {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string())
-        );
-        return;
+    // Both structured formats go through the shared encoder, so --toon gets
+    // TOON instead of silently falling through to the text table. The empty
+    // list is emitted structurally too: `[]` is the answer, not the
+    // "No daemons running." sentence, which belongs to text output only.
+    if !format.is_text() {
+        let value = serde_json::to_value(&rows)?;
+        println!("{}", format::format_structured(&value, format)?);
+        return Ok(());
     }
 
     if rows.is_empty() {
         println!("No daemons running.");
-        return;
+        return Ok(());
     }
 
     println!("PID     BROWSER  ENDPOINT              UPTIME    STATE");
@@ -610,6 +612,7 @@ fn print_daemon_list(format: format::OutputFormat) {
     if rows.iter().any(|r| r.running == Some(false)) {
         println!("\nstale = PID file with no live process; `kill-daemon --all` clears them.");
     }
+    Ok(())
 }
 
 /// Stop the daemon instance identified by `key`, removing its socket, info and
@@ -636,10 +639,10 @@ fn stop_daemon_instance(key: &str) -> Result<()> {
 /// identify, so no scoped target can claim it, and after an upgrade nothing
 /// else will ever reach it. Silent when the files don't exist, which is the
 /// common case.
-fn stop_legacy_unkeyed_daemon() -> Result<()> {
+fn stop_legacy_unkeyed_daemon() -> Result<bool> {
     let pid_path = protocol::legacy_unkeyed_pid_path();
     if !pid_path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     // No info sidecar existed in that layout; point at a path that is
     // guaranteed absent so the removal is a no-op.
@@ -650,6 +653,7 @@ fn stop_legacy_unkeyed_daemon() -> Result<()> {
         #[cfg(unix)]
         &protocol::legacy_unkeyed_socket_path(),
     )
+    .map(|()| true)
 }
 
 /// Signal one daemon and remove its files, given their paths.
@@ -1306,7 +1310,7 @@ pub async fn run() -> Result<()> {
     // situation where you most want the list (a browser that has exited,
     // leaving a daemon behind).
     if matches!(cli.command, Commands::ListDaemons) {
-        print_daemon_list(cli.output_format());
+        print_daemon_list(cli.output_format())?;
         return Ok(());
     }
 
@@ -1358,20 +1362,28 @@ pub async fn run() -> Result<()> {
                 println!("No daemons running.");
             }
             let mut failures = 0usize;
+            let mut attempted = keys.len();
             for key in &keys {
                 if let Err(e) = stop_daemon_instance(key) {
                     failures += 1;
                     eprintln!("{e:#}");
                 }
             }
-            if let Err(e) = stop_legacy_unkeyed_daemon() {
-                failures += 1;
-                eprintln!("{e:#}");
+            // The legacy daemon is another stop attempt, so it counts toward
+            // the total — otherwise a legacy-only failure reports "1 of 0".
+            // It counts only when one was actually there, so the total does
+            // not inflate on the common no-legacy-files path.
+            match stop_legacy_unkeyed_daemon() {
+                Ok(found) => attempted += usize::from(found),
+                Err(e) => {
+                    attempted += 1;
+                    failures += 1;
+                    eprintln!("{e:#}");
+                }
             }
             if failures > 0 {
                 return Err(anyhow::anyhow!(
-                    "{failures} daemon(s) could not be stopped (of {} found)",
-                    keys.len()
+                    "{failures} of {attempted} daemon(s) could not be stopped"
                 ));
             }
         } else {
@@ -1548,7 +1560,9 @@ pub async fn run() -> Result<()> {
     }
 
     // Daemon not running — spawn it
-    client::spawn_daemon(&ws_url, &cli.browser)?;
+    // Canonical spelling, so `--browser EDGE` and `--browser msedge` both label
+    // the daemon `edge` in list-daemons.
+    client::spawn_daemon(&ws_url, &browser::canonical_name(&cli.browser))?;
     if let Err(e) = client::wait_for_daemon(&key).await {
         return run_direct_fallback(&cli, &ws_url, &e).await;
     }
