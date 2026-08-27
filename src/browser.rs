@@ -88,6 +88,15 @@ pub fn canonical_name(name: &str) -> String {
     Browser::parse(name).map_or_else(|_| name.to_string(), |b| b.flag_name().to_string())
 }
 
+/// Human-readable browser name for messages the user reads — "Chrome",
+/// "Microsoft Edge".
+///
+/// Falls back to the input for names we don't know, so a diagnostic never
+/// silently claims the wrong browser.
+pub fn display_name(name: &str) -> String {
+    Browser::parse(name).map_or_else(|_| name.to_string(), |b| b.label().to_string())
+}
+
 /// A Chromium-based browser the CLI knows how to auto-connect to.
 ///
 /// Both speak the same DevTools Protocol; they differ only in where the

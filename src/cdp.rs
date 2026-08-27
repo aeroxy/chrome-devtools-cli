@@ -192,27 +192,31 @@ fn connect_timeout() -> std::time::Duration {
 }
 
 impl CdpClient {
-    /// Connect to Chrome via WebSocket and return a CDP client.
+    /// Connect to the browser via WebSocket and return a CDP client.
     ///
-    /// Bounded by a timeout: without it, a pending Chrome remote-debugging
-    /// consent dialog leaves the WebSocket handshake hanging indefinitely,
-    /// which (via the daemon) makes every command appear to hang forever
-    /// with no diagnostic.
-    pub async fn connect(ws_url: &str) -> Result<Self> {
+    /// Bounded by a timeout: without it, a pending remote-debugging consent
+    /// dialog leaves the WebSocket handshake hanging indefinitely, which (via
+    /// the daemon) makes every command appear to hang forever with no
+    /// diagnostic.
+    ///
+    /// `browser` is the human-readable name for the diagnostics only — these
+    /// messages are the ones a user actually reads, and telling an Edge user to
+    /// go and check Chrome sends them to the wrong window.
+    pub async fn connect(ws_url: &str, browser: &str) -> Result<Self> {
         let timeout_dur = connect_timeout();
         let (ws, _) = tokio::time::timeout(timeout_dur, connect_async(ws_url))
             .await
             .map_err(|_| {
                 anyhow!(
-                    "Timed out after {}s connecting to Chrome at {ws_url}. Chrome may be \
+                    "Timed out after {}s connecting to {browser} at {ws_url}. {browser} may be \
                      waiting for a human to approve the remote-debugging connection dialog. \
                      If you are an automated agent: do not retry in a loop and do not run \
                      kill-daemon (it will not fix this and will require a fresh approval) — \
-                     stop and ask the human to check Chrome, then retry once.",
+                     stop and ask the human to check {browser}, then retry once.",
                     timeout_dur.as_secs()
                 )
             })?
-            .map_err(|e| anyhow!("Failed to connect to Chrome at {ws_url}: {e}"))?;
+            .map_err(|e| anyhow!("Failed to connect to {browser} at {ws_url}: {e}"))?;
         let (write, read) = ws.split();
         Ok(Self {
             write,
