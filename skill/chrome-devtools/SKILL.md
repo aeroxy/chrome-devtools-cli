@@ -498,10 +498,15 @@ consequences for the recipe above:
   `kill-daemon` resolves the default Chrome profile and would stop the user's
   daemon instead of the headless one.
 
-`list-daemons` shows what is running (PID, browser, endpoint, uptime), and
-`kill-daemon --all` clears every daemon regardless of endpoint — including ones
-whose browser has already exited, which a scoped kill cannot reach because it
-has no endpoint left to resolve.
+`list-daemons` shows what is running (PID, browser, endpoint, uptime), and on
+Unix `kill-daemon --all` clears every daemon regardless of endpoint — including
+ones whose browser has already exited, which a scoped kill cannot reach because
+it has no endpoint left to resolve.
+
+On Windows neither form of `kill-daemon` stops anything: it prints that it is
+unsupported and exits. Take the PID from `list-daemons` (its state column reads
+`?` there, since liveness is not probed) and pass it to `taskkill /PID <pid>`,
+or wait out the 5-minute idle timeout.
 
 Older versions ran a single daemon per user, bound to whichever browser the
 first command resolved, and silently ignored later `--browser`/`--user-data-dir`
