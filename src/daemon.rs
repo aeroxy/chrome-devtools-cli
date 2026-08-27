@@ -477,7 +477,13 @@ pub async fn run_daemon(ws_url: &str, browser: &str) -> Result<()> {
         // If we wait for CdpClient::connect first, a Chrome/network permission prompt
         // can block the daemon and cause the CLI's 5-second wait_for_daemon timeout to expire.
         let listener = TcpListener::bind("127.0.0.1:0").await?;
-        std::fs::write(addr_path(&key), listener.local_addr()?.to_string())?;
+        let addr_file = addr_path(&key);
+        std::fs::write(&addr_file, listener.local_addr()?.to_string()).with_context(|| {
+            format!(
+                "Failed to write daemon address file {}",
+                addr_file.display()
+            )
+        })?;
         listener
     };
 

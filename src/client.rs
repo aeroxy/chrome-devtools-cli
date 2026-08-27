@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::time::{Duration, SystemTime};
@@ -11,13 +11,25 @@ use crate::protocol::*;
 
 #[cfg(unix)]
 async fn connect_daemon(key: &str) -> Result<UnixStream> {
-    Ok(UnixStream::connect(socket_path(key)).await?)
+    let path = socket_path(key);
+    UnixStream::connect(&path)
+        .await
+        .with_context(|| format!("Failed to connect to daemon {key} at {}", path.display()))
 }
 
 #[cfg(windows)]
 async fn connect_daemon(key: &str) -> Result<TcpStream> {
-    let addr = std::fs::read_to_string(addr_path(key))?;
-    Ok(TcpStream::connect(addr.trim()).await?)
+    let path = addr_path(key);
+    let addr = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "Failed to read daemon {key} address file {}",
+            path.display()
+        )
+    })?;
+    let addr = addr.trim();
+    TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("Failed to connect to daemon {key} at {addr}"))
 }
 
 /// Read the daemon wait timeout from `DAEMON_WAIT_TIMEOUT_SECS`, defaulting to

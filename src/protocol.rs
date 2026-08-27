@@ -102,24 +102,31 @@ fn daemon_file_prefix() -> String {
     format!("chrome-devtools-daemon{}", user_suffix())
 }
 
-/// Path to the Unix domain socket for daemon communication.
+/// Unix domain socket a daemon listens on. The key keeps concurrent daemons
+/// from binding the same path, which is what lets one browser's daemon exist
+/// alongside another's.
 #[cfg(unix)]
 pub fn socket_path(key: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{}-{key}.sock", daemon_file_prefix()))
 }
 
-/// Path to the named-pipe address file for daemon communication (Windows).
+/// File recording the loopback TCP address a daemon listens on (Windows has no
+/// Unix sockets, so the address is published rather than the endpoint itself).
+/// Keyed for the same reason as [`socket_path`].
 #[cfg(windows)]
 pub fn addr_path(key: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{}-{key}.addr", daemon_file_prefix()))
 }
 
-/// Path to the daemon PID file.
+/// PID file for one daemon. Keyed so a sweep can tell the instances apart and
+/// signal only the one it means to — an unkeyed name would make every daemon
+/// look like the same process to `kill-daemon`.
 pub fn pid_path(key: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{}-{key}.pid", daemon_file_prefix()))
 }
 
-/// Path to the daemon's metadata sidecar (see [`DaemonInfo`]).
+/// Metadata sidecar for one daemon (see [`DaemonInfo`]), keyed alongside its
+/// PID and socket so the three always describe the same instance.
 pub fn info_path(key: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{}-{key}.info", daemon_file_prefix()))
 }

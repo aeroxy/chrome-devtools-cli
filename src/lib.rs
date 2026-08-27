@@ -501,6 +501,26 @@ fn daemon_pid_alive(pid: i32) -> bool {
     ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Whether a daemon is actually listening on `sock_path`.
+///
+/// Used to confirm a PID file still describes a live daemon before signalling
+/// it. Connecting is the check: only the daemon binds this path, so a successful
+/// connect proves one is alive, while `ECONNREFUSED` proves the opposite — a
+/// socket file left behind by a daemon that died without cleaning up.
+///
+/// The probe sends nothing and drops the connection immediately; the daemon
+/// treats that as a read error and continues serving. A daemon wedged inside a
+/// CDP call still passes, because the kernel completes the connect from the
+/// listen backlog without the daemon having to accept it.
+///
+/// Any other error (a missing socket file, a permission problem) counts as "not
+/// verified" and therefore as not alive: leaving an orphan that exits on its own
+/// idle timeout is a better failure than signalling an unrelated process.
+#[cfg(unix)]
+fn daemon_listening_at(sock_path: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(sock_path).is_ok()
+}
+
 /// Human-readable uptime, coarsened to the largest two units that matter.
 fn format_uptime(secs: u64) -> String {
     match secs {
@@ -513,8 +533,13 @@ fn format_uptime(secs: u64) -> String {
 /// Endpoint as `host:port`, dropping the browser-GUID path that makes the full
 /// URL too wide to tabulate.
 fn short_endpoint(ws_url: &str) -> String {
+    // Auto-connect only ever builds ws://, but --ws-endpoint is taken verbatim
+    // and may be wss://. Strip the longer scheme first: "ws://" is not a prefix
+    // of "wss://", but checking in the other order would still be a trap for
+    // anyone adding schemes later.
     ws_url
-        .strip_prefix("ws://")
+        .strip_prefix("wss://")
+        .or_else(|| ws_url.strip_prefix("ws://"))
         .unwrap_or(ws_url)
         .split('/')
         .next()
@@ -701,6 +726,25 @@ fn stop_daemon_at(
                         pid_path.display()
                     )
                 })?;
+                // Do not signal a PID we cannot tie back to a live daemon.
+                // A daemon killed with SIGKILL leaves its PID file behind
+                // (cleanup is skipped by design), the OS is free to reuse that
+                // PID for an unrelated process of this same user, and SIGTERM
+                // would then land on that process instead. Only the daemon
+                // binds this socket, and it does so under the same startup lock
+                // that wrote the PID file, so a live listener there is proof
+                // the recorded PID is still ours.
+                if !daemon_listening_at(sock_path) {
+                    let _ = std::fs::remove_file(sock_path);
+                    let _ = std::fs::remove_file(info_path);
+                    let _ = std::fs::remove_file(pid_path);
+                    println!(
+                        "Daemon (PID {pid}) is not listening on {}; cleaned up its files \
+                         without signalling, since that PID may now belong to another process.",
+                        sock_path.display()
+                    );
+                    return Ok(());
+                }
                 // Signal the process directly via libc to avoid shelling out
                 // to /usr/bin/kill. A return of 0 means the signal was
                 // delivered; -1 with errno ESRCH means the process is gone
@@ -2110,6 +2154,44 @@ mod tests {
         // Degrades to the input rather than empty when the shape is unexpected.
         assert_eq!(short_endpoint("127.0.0.1:9222"), "127.0.0.1:9222");
         assert_eq!(short_endpoint(""), "");
+    }
+
+    /// --ws-endpoint is taken verbatim, so a wss:// URL reaches this function
+    /// and must not render as the bare scheme "wss:".
+    #[test]
+    fn test_short_endpoint_handles_secure_scheme() {
+        assert_eq!(
+            short_endpoint("wss://example.test:9222/devtools/browser/abc"),
+            "example.test:9222"
+        );
+        assert_eq!(
+            short_endpoint("wss://example.test:9222"),
+            "example.test:9222"
+        );
+    }
+
+    /// The guard that keeps SIGTERM off a PID the daemon no longer owns.
+    #[cfg(unix)]
+    #[test]
+    fn test_daemon_listening_at_requires_a_live_listener() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Nothing bound: a bare path, and a plain file where a socket should be.
+        assert!(!daemon_listening_at(&dir.path().join("absent.sock")));
+        let regular = dir.path().join("regular.sock");
+        std::fs::write(&regular, "").unwrap();
+        assert!(!daemon_listening_at(&regular));
+
+        // A real listener at the path is what proves a daemon is alive.
+        let live = dir.path().join("live.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        assert!(daemon_listening_at(&live));
+
+        // Once it goes away the socket file remains but connects are refused —
+        // exactly the SIGKILLed-daemon case that must not be signalled.
+        drop(listener);
+        assert!(live.exists(), "socket file outlives the listener");
+        assert!(!daemon_listening_at(&live));
     }
 
     /// A live process must read as running; PID 0 is never probed because
