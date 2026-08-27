@@ -335,7 +335,7 @@ impl Drop for CleanupGuard {
 /// - `$shutdown` is polled by `&mut` reference, so the caller must pin it
 ///   first (`tokio::pin!`); passing an unpinned future fails to compile.
 macro_rules! run_accept_loop_body {
-    ($accept:expr, $client:expr, $ws_url:expr, $shutdown:expr) => {
+    ($accept:expr, $client:expr, $ws_url:expr, $browser:expr, $shutdown:expr) => {
         loop {
             tokio::select! {
                 // Shutdown first, and `biased` so a ready signal always wins
@@ -351,7 +351,7 @@ macro_rules! run_accept_loop_body {
                     break;
                 }
                 accept = tokio::time::timeout(idle_timeout(), $accept) => match accept {
-                    Ok(Ok((stream, _))) => match handle_connection(stream, $client, $ws_url).await {
+                    Ok(Ok((stream, _))) => match handle_connection(stream, $client, $ws_url, $browser).await {
                         ConnectionOutcome::Continue => {}
                         ConnectionOutcome::Fatal => break,
                     },
@@ -501,7 +501,7 @@ pub async fn run_daemon(ws_url: &str, browser: &str) -> Result<()> {
     let mut client: Option<CdpClient> = None;
 
     // Signal readiness by socket/address existence (it's already bound)
-    run_accept_loop_body!(listener.accept(), &mut client, ws_url, shutdown);
+    run_accept_loop_body!(listener.accept(), &mut client, ws_url, browser, shutdown);
 
     // File cleanup is handled by `_guard` (also covers signal/panic exits).
 
@@ -516,6 +516,7 @@ async fn handle_connection<S>(
     mut stream: S,
     client: &mut Option<CdpClient>,
     ws_url: &str,
+    browser: &str,
 ) -> ConnectionOutcome
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
@@ -547,13 +548,17 @@ where
 
     // Connect lazily
     if client.is_none() {
-        match CdpClient::connect(ws_url).await {
+        let label = crate::browser::display_name(browser);
+        match CdpClient::connect(ws_url, &label).await {
             Ok(c) => *client = Some(c),
             Err(e) => {
                 let resp = DaemonResponse {
                     success: false,
                     output: String::new(),
-                    error: format!("Failed to connect to Chrome: {e:#}"),
+                    // No prefix: CdpClient::connect's error already names the
+                    // browser and the endpoint, so wrapping it here produced
+                    // "Failed to connect to X: Failed to connect to X at ...".
+                    error: format!("{e:#}"),
                     navigated_to: None,
                     error_code: Some(ErrorCode::ChromeConnection as u32),
                 };
@@ -571,7 +576,10 @@ where
         None => DaemonResponse {
             success: false,
             output: String::new(),
-            error: String::from("Failed to connect to Chrome: client initialization failed"),
+            error: format!(
+                "Failed to connect to {}: client initialization failed",
+                crate::browser::display_name(browser)
+            ),
             navigated_to: None,
             error_code: Some(ErrorCode::ChromeConnection as u32),
         },

@@ -421,10 +421,10 @@ pub enum Commands {
     KillDaemon {
         /// Skip the confirmation/refusal guard and kill unconditionally.
         ///
-        /// Killing the daemon drops any already-approved Chrome remote-debugging
-        /// connection; reconnecting requires the human to re-approve Chrome's
-        /// consent dialog. This does NOT fix "Failed to connect to Chrome"
-        /// errors — do not use it as a retry step.
+        /// Killing the daemon drops any already-approved remote-debugging
+        /// connection; reconnecting requires the human to re-approve the
+        /// browser's consent dialog. This does NOT fix "Failed to connect to
+        /// <browser>" errors — do not use it as a retry step.
         #[arg(long)]
         force: bool,
 
@@ -1687,7 +1687,7 @@ async fn run_direct_fallback(cli: &Cli, ws_url: &str, error: &anyhow::Error) -> 
 
 /// Direct execution without daemon (fallback).
 async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
-    let mut client = cdp::CdpClient::connect(ws_url).await?;
+    let mut client = cdp::CdpClient::connect(ws_url, &browser::display_name(&cli.browser)).await?;
 
     let is_browser = cli.is_browser_level();
 
@@ -2231,7 +2231,7 @@ mod tests {
         assert!(info_path.exists(), "info file must survive a refused stop");
     }
 
-    /// The guard that keeps SIGTERM off a PID the daemon no longer owns.    /// The guard that keeps SIGTERM off a PID the daemon no longer owns.
+    /// The guard that keeps SIGTERM off a PID the daemon no longer owns.
     #[cfg(unix)]
     #[test]
     fn test_daemon_listening_at_requires_a_live_listener() {

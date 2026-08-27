@@ -498,7 +498,9 @@ consequences for the recipe above:
   `kill-daemon` resolves the default Chrome profile and would stop the user's
   daemon instead of the headless one.
 
-`list-daemons` shows what is running (PID, browser, endpoint, uptime), and on
+`list-daemons` shows every daemon with on-disk state — running ones and, on
+Unix, stale entries whose process is gone — with PID, browser, endpoint and
+uptime for each, and on
 Unix `kill-daemon --all` clears every daemon regardless of endpoint — including
 ones whose browser has already exited, which a scoped kill cannot reach because
 it has no endpoint left to resolve.
@@ -587,12 +589,15 @@ chrome-devtools kill-daemon            # refuses when run non-interactively (age
 chrome-devtools kill-daemon --force    # kills unconditionally
 ```
 
-## Failure Handling: "Failed to connect to Chrome" / a command hangs
+## Failure Handling: "Failed to connect to \<browser\>" / a command hangs
 
 Chrome's remote-debugging connection requires a one-time **human approval dialog**
 in Chrome. If a command hangs or fails with a connection/timeout error, the most
 likely cause is that this dialog is open and waiting for the human — not a bug
 you can fix by retrying.
+
+The error names whichever browser you targeted — `Failed to connect to Chrome`,
+or `Failed to connect to Microsoft Edge` under `--browser edge`.
 
 **If a command hangs for a long time or errors with "Failed to connect to Chrome"
 or "Timed out ... connecting to Chrome":**
