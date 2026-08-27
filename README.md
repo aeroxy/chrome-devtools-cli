@@ -244,7 +244,7 @@ On Unix, `kill-daemon` signals the targeted daemon with `SIGTERM`, removes its s
 | `--browser <name>` | Browser to auto-connect to (chrome/edge) |
 | `--channel <ch>` | Browser release channel (stable/beta/canary/dev) |
 
-Commands: `list-daemons` shows every running daemon; `kill-daemon [--all]` stops one or all.
+Commands: `list-daemons` shows every daemon this user has on-disk state for — running ones and, on Unix, stale entries left by a daemon that died without cleaning up; `kill-daemon [--all]` stops one or all.
 
 Global `--block-url` and `--unblock-url` update the **active tab's** block list and apply via `Network.setBlockedURLs`; the daemon re-applies each tab's list when that tab is in use, so blocking is isolated per tab. **Note:** Chrome only blocks *subresources* (images, scripts, fetch/XHR, stylesheets, CDN, trackers, fonts). The top-level navigation document itself is never blocked — e.g. `--block-url "*example.com*"` then `navigate https://example.com` still loads the page, but any `*.png`, `*.woff2`, etc. subresources on it are blocked.
 
