@@ -659,13 +659,14 @@ fn print_daemon_list(format: format::OutputFormat) -> Result<()> {
 /// (or that there was nothing to do) and returns an error only when the daemon
 /// may still be running — the caller decides whether one failure aborts a
 /// whole sweep.
-fn stop_daemon_instance(key: &str) -> Result<()> {
+async fn stop_daemon_instance(key: &str) -> Result<()> {
     stop_daemon_at(
         &protocol::pid_path(key),
         &protocol::info_path(key),
         #[cfg(unix)]
         &protocol::socket_path(key),
     )
+    .await
 }
 
 /// Stop the pre-instance-key daemon (`chrome-devtools-daemon-<uid>.pid`) left
@@ -675,7 +676,7 @@ fn stop_daemon_instance(key: &str) -> Result<()> {
 /// identify, so no scoped target can claim it, and after an upgrade nothing
 /// else will ever reach it. Silent when the files don't exist, which is the
 /// common case.
-fn stop_legacy_unkeyed_daemon() -> Result<bool> {
+async fn stop_legacy_unkeyed_daemon() -> Result<bool> {
     let pid_path = protocol::legacy_unkeyed_pid_path();
     if !pid_path.exists() {
         return Ok(false);
@@ -689,6 +690,7 @@ fn stop_legacy_unkeyed_daemon() -> Result<bool> {
         #[cfg(unix)]
         &protocol::legacy_unkeyed_socket_path(),
     )
+    .await
     .map(|()| true)
 }
 
@@ -697,11 +699,34 @@ fn stop_legacy_unkeyed_daemon() -> Result<bool> {
 /// The ownership-checked read and single SIGTERM live here so the keyed and
 /// legacy layouts cannot drift apart in how carefully they treat a predictable
 /// path in shared `/tmp`.
-fn stop_daemon_at(
+async fn stop_daemon_at(
     pid_path: &std::path::Path,
     info_path: &std::path::Path,
     #[cfg(unix)] sock_path: &std::path::Path,
 ) -> Result<()> {
+    // Held across the whole read -> probe -> signal sequence, and it must be
+    // the same lock the daemon takes to write its PID file and bind its socket.
+    //
+    // Without it the liveness probe below proves only that *some* daemon holds
+    // the key, not that the PID already in hand is that daemon's: a daemon can
+    // start between the read and the probe, so the read could return a stale
+    // PID the OS has since recycled while the probe sees the newcomer's
+    // listener — and the signal would land on an unrelated process. Holding the
+    // lock makes the two observations one atomic step.
+    //
+    // This cannot be blocked by a daemon wedged inside a CDP call: the daemon
+    // drops the startup lock before entering its accept loop, so only a
+    // concurrent startup or cleanup contends, and both are brief.
+    #[cfg(unix)]
+    let _startup_lock = {
+        use anyhow::Context as _;
+        daemon::lock_daemon_files().await.context(
+            "Could not take the daemon startup lock, so a PID could not be safely matched to \
+             its daemon; nothing was signalled. Retry — a concurrent daemon start or shutdown \
+             holds this lock only briefly.",
+        )?
+    };
+
     // Ownership-checked read: the path is predictable in shared /tmp, so
     // never act on a PID file that was planted there by another user.
     #[cfg(unix)]
@@ -730,10 +755,13 @@ fn stop_daemon_at(
                 // A daemon killed with SIGKILL leaves its PID file behind
                 // (cleanup is skipped by design), the OS is free to reuse that
                 // PID for an unrelated process of this same user, and SIGTERM
-                // would then land on that process instead. Only the daemon
-                // binds this socket, and it does so under the same startup lock
-                // that wrote the PID file, so a live listener there is proof
-                // the recorded PID is still ours.
+                // would then land on that process instead.
+                //
+                // Only the daemon binds this socket, and it binds it *after*
+                // writing its PID file, both under the startup lock this
+                // function holds. So no daemon can have appeared since the read
+                // above, and a live listener is proof that the PID just read is
+                // that listener's.
                 if !daemon_listening_at(sock_path) {
                     let _ = std::fs::remove_file(sock_path);
                     let _ = std::fs::remove_file(info_path);
@@ -1419,7 +1447,7 @@ pub async fn run() -> Result<()> {
             let mut failures = 0usize;
             let mut attempted = keys.len();
             for key in &keys {
-                if let Err(e) = stop_daemon_instance(key) {
+                if let Err(e) = stop_daemon_instance(key).await {
                     failures += 1;
                     eprintln!("{e:#}");
                 }
@@ -1428,7 +1456,7 @@ pub async fn run() -> Result<()> {
             // the total — otherwise a legacy-only failure reports "1 of 0".
             // It counts only when one was actually there, so the total does
             // not inflate on the common no-legacy-files path.
-            match stop_legacy_unkeyed_daemon() {
+            match stop_legacy_unkeyed_daemon().await {
                 Ok(found) => attempted += usize::from(found),
                 Err(e) => {
                     attempted += 1;
@@ -1460,7 +1488,7 @@ pub async fn run() -> Result<()> {
                      and you just want to stop leftover daemons, use --all."
                 )
             })?;
-            stop_daemon_instance(&protocol::instance_key(&ws_url))?;
+            stop_daemon_instance(&protocol::instance_key(&ws_url)).await?;
         }
 
         // Best-effort sweep of the pre-uid-suffix file names: a daemon
@@ -2170,7 +2198,40 @@ mod tests {
         );
     }
 
-    /// The guard that keeps SIGTERM off a PID the daemon no longer owns.
+    /// `kill-daemon` must not signal while it cannot hold the startup lock:
+    /// without it, the PID it read and the listener it probed can belong to
+    /// different daemons. `flock` is per open-file-description, so a second
+    /// handle in this process contends exactly as a starting daemon would.
+    ///
+    /// Takes the real lock file, briefly, because the path is not injectable;
+    /// no other test contends for it, and nothing here is ever signalled — the
+    /// lock is unavailable, so the function returns before reaching `kill`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stop_daemon_at_will_not_signal_without_the_startup_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("d.pid");
+        let info_path = dir.path().join("d.info");
+        let sock_path = dir.path().join("d.sock");
+        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        std::fs::write(&info_path, "{}").unwrap();
+
+        let holder = daemon::open_lock_file().unwrap();
+        holder.try_lock().unwrap();
+
+        let err = stop_daemon_at(&pid_path, &info_path, &sock_path)
+            .await
+            .expect_err("must refuse while the startup lock is held elsewhere");
+        let msg = err.to_string();
+        assert!(msg.contains("startup lock"), "{msg}");
+        assert!(msg.contains("nothing was signalled"), "{msg}");
+
+        // Failing closed also means leaving state alone for the retry.
+        assert!(pid_path.exists(), "PID file must survive a refused stop");
+        assert!(info_path.exists(), "info file must survive a refused stop");
+    }
+
+    /// The guard that keeps SIGTERM off a PID the daemon no longer owns.    /// The guard that keeps SIGTERM off a PID the daemon no longer owns.
     #[cfg(unix)]
     #[test]
     fn test_daemon_listening_at_requires_a_live_listener() {

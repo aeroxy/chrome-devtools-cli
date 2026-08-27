@@ -36,7 +36,7 @@ enum ConnectionOutcome {
 /// open() itself (it has no effect on regular files); the `is_file` check
 /// then rejects it. macOS $TMPDIR and Windows %TEMP% are per-user, so there
 /// the checks are inert.
-fn open_lock_file() -> Result<std::fs::File> {
+pub(crate) fn open_lock_file() -> Result<std::fs::File> {
     open_lock_file_at(&lock_path())
 }
 
@@ -204,7 +204,7 @@ fn lock_wait_timeout() -> Duration {
 /// pre-acquired the predictable lock path park daemon startup forever.
 /// Async (poll + `tokio::time::sleep`) so a contended lock never blocks the
 /// runtime's worker thread.
-async fn lock_daemon_files() -> Result<std::fs::File> {
+pub(crate) async fn lock_daemon_files() -> Result<std::fs::File> {
     let f = open_lock_file()?;
     let timeout = lock_wait_timeout();
     let deadline = tokio::time::Instant::now() + timeout;
@@ -453,6 +453,12 @@ pub async fn run_daemon(ws_url: &str, browser: &str) -> Result<()> {
     // predecessor can delete files this daemon just claimed.
     let startup_lock = lock_daemon_files().await?;
 
+    // Order matters beyond this function: the PID file is written *before* the
+    // endpoint is bound, and both happen under `startup_lock`. `kill-daemon`
+    // relies on that pairing — holding the same lock, it can treat a live
+    // listener as proof that the PID it just read is this daemon's, because no
+    // daemon can have bound the socket without its PID already being on disk.
+    // Reordering these, or moving either outside the lock, breaks that.
     write_pid_file_checked(&pid_path(&key))?;
     write_info_file(&key, browser, ws_url);
 
