@@ -4,8 +4,17 @@ use std::path::{Path, PathBuf};
 /// Resolve the WebSocket URL for connecting to the browser.
 ///
 /// Priority:
-/// 1. Explicit --ws-endpoint
-/// 2. Auto-connect via DevToolsActivePort (default)
+/// 1. Explicit `--ws-endpoint`
+/// 2. Auto-connect via `DevToolsActivePort` (default)
+///
+/// An explicit endpoint wins because it names the browser directly, so it must
+/// not be second-guessed by local profile discovery: it is how you reach a
+/// browser this machine cannot find on disk — another host, a container, a
+/// port-forwarded device, or an instance whose profile lives somewhere the
+/// channel tables don't describe. It also short-circuits `--browser` and
+/// `--channel` entirely, since those exist only to locate a profile directory.
+/// `DevToolsActivePort` is the automatic fallback for the ordinary case where
+/// the browser is local and its profile is where the vendor puts it.
 pub fn resolve_ws_url(
     ws_endpoint: Option<&str>,
     user_data_dir: Option<&str>,

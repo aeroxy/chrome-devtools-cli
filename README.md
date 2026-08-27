@@ -49,7 +49,7 @@ This is a lightweight Rust binary that talks directly to Chrome's DevTools Proto
 ```
 chrome-devtools navigate https://example.com
         │
-        ├─ Try daemon (Unix socket $TMPDIR/chrome-devtools-daemon-<uid>.sock;
+        ├─ Try daemon (Unix socket $TMPDIR/chrome-devtools-daemon-<uid>-<key>.sock;
         │              loopback TCP on Windows)
         │   └─ If running → send command → get result
         │
@@ -260,7 +260,7 @@ Global `--block-url` and `--unblock-url` update the **active tab's** block list 
 - **Cleanup**: endpoint + PID files are also removed on panics, and on Unix on SIGTERM/SIGINT; Windows Ctrl-C cleanup is best-effort only (a background daemon has no console to receive it). SIGQUIT, SIGHUP and SIGKILL skip cleanup by design — the leftover files are harmless and are reclaimed by the next daemon start.
 - **Protocol**: Length-prefixed JSON over the Unix socket / loopback TCP
 - **Spawned by**: First CLI invocation for a given endpoint (transparent to user)
-- **List**: `chrome-devtools list-daemons` — PID, browser, endpoint, uptime and state for every daemon this user owns. `--json` for machine-readable output. Reads only on-disk state, so it works when every browser has exited; rows whose PID no longer exists are marked `stale`.
+- **List**: `chrome-devtools list-daemons` — PID, browser, endpoint, uptime and state for every daemon this user owns. `--json` (or `--toon`) for machine-readable output. Reads only on-disk state, so it works when every browser has exited. On Unix, rows whose PID no longer exists are marked `stale`; on Windows liveness is not probed, so every row's state is `?` and `stale` never appears.
 - **Kill**: `chrome-devtools kill-daemon` stops only the daemon for the endpoint its flags resolve to, so `--browser edge kill-daemon` cannot stop your Chrome daemon. Add `--all` to stop every daemon for this user — which is also the only way to clear one whose browser has already exited, since a scoped kill has no endpoint left to resolve (it fails and says so). `--all` also sweeps the pre-key `chrome-devtools-daemon-<uid>.pid` name left by older versions. (Or delete the socket + PID file by hand; leave the lock file — see above.) It sends SIGTERM and returns once the signal is delivered, not once the process is gone: the daemon exits *between* requests, so one that is mid-command finishes it and answers that client first. Expect up to one command's latency, and note that a daemon wedged inside a CDP call outlives the command that stopped it.
 - **Kill (Windows)**: not supported — `kill-daemon` says so and exits, and a backgrounded daemon has no console for Ctrl-C. Run `chrome-devtools list-daemons` to get the PID of the daemon you want (there may be several, one per endpoint) and pass it to `taskkill /PID <pid>`, or wait out the idle timeout. Reading `%TEMP%\chrome-devtools-daemon-<key>.pid` directly works too, but only if you already know which key you want.
 

@@ -549,18 +549,29 @@ fn print_daemon_list(format: format::OutputFormat) -> Result<()> {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
 
+        // Same validation kill-daemon applies before signalling: a PID file
+        // holding 0, or a value outside pid_t, is not a PID we will act on.
+        // It matters for a read-only listing too — `kill(0, 0)` probes the
+        // caller's own process group and succeeds, so a stray 0 would other-
+        // wise be reported as a running daemon.
         #[cfg(unix)]
-        let pid_str = read_pid_file_checked(&protocol::pid_path(&key)).ok();
+        let (pid, running) = {
+            let contents = read_pid_file_checked(&protocol::pid_path(&key)).ok();
+            let pid = contents.as_deref().and_then(parse_pid_file_contents);
+            (
+                pid.and_then(|p| u32::try_from(p).ok()),
+                pid.map(daemon_pid_alive),
+            )
+        };
+        // No cheap liveness probe without libc::kill, so liveness is unknown
+        // and the state column stays "?" rather than claiming stale/running.
         #[cfg(not(unix))]
-        let pid_str = std::fs::read_to_string(protocol::pid_path(&key)).ok();
-        let pid = pid_str.and_then(|s| s.trim().parse::<u32>().ok());
-
-        #[cfg(unix)]
-        let running = pid
-            .and_then(|p| i32::try_from(p).ok())
-            .map(daemon_pid_alive);
-        #[cfg(not(unix))]
-        let running: Option<bool> = None;
+        let (pid, running) = (
+            std::fs::read_to_string(protocol::pid_path(&key))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok()),
+            None::<bool>,
+        );
 
         rows.push(Row {
             pid,
