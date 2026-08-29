@@ -1457,9 +1457,6 @@ pub async fn run() -> Result<()> {
             // attached to. Keep going after a failure so one unkillable daemon
             // cannot strand the rest.
             let keys = protocol::enumerate_instance_keys();
-            if keys.is_empty() {
-                println!("No daemons running.");
-            }
             let mut failures = 0usize;
             let mut attempted = keys.len();
             for key in &keys {
@@ -1479,6 +1476,12 @@ pub async fn run() -> Result<()> {
                     failures += 1;
                     eprintln!("{e:#}");
                 }
+            }
+            // Reported only once the legacy sweep has run: announcing it on an
+            // empty key list alone would print "No daemons running." and then
+            // stop a legacy daemon in the next breath.
+            if attempted == 0 {
+                println!("No daemons running.");
             }
             if failures > 0 {
                 return Err(anyhow::anyhow!(
