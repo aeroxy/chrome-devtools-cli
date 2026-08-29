@@ -38,8 +38,12 @@ Add `--browser edge` so auto-connect reads Edge's profile instead of Chrome's
 (`--channel` still selects stable/beta/dev/canary, except that Edge ships no
 Canary for Linux — `--browser edge --channel canary` is rejected there rather
 than pointed at a directory that cannot exist). `--ws-endpoint` and
-`--user-data-dir` need no `--browser`; they already say where to connect.
-Everything below applies unchanged — only the profile location differs.
+`--user-data-dir` already say where to connect, so `--browser` is not needed to
+*reach* Edge — but pass it anyway when you are targeting Edge, because it is
+also the label recorded for the daemon (`list-daemons`) and the browser named in
+connection errors. Without it both say Chrome, the default, whatever the
+endpoint points at. Everything below applies unchanged — only the profile
+location differs.
 
 The `--remote-debugging-port` launch flag is the *other* route, and it is for a
 throwaway instance rather than your everyday browser — see the headless recipe
@@ -476,14 +480,18 @@ Linux path: `google-chrome` or `chromium` on `$PATH` replaces the macOS
 `.app` binary path. For a headless Edge, swap the binary for
 `/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge` (Linux:
 `microsoft-edge`) — the flags are identical, and `--user-data-dir` already
-points the CLI at the right profile, so `--browser edge` is optional here.
+points the CLI at the right profile, so `--browser edge` is optional for
+*connecting* here. Pass it regardless: without it `list-daemons` labels the
+daemon `chrome` and any connection error names Chrome, which is misleading when
+you are debugging an Edge run.
 
 **⚠️ A temp profile is not automatically a clean room in Edge.** Edge's
 first-run import pulls open tabs *and* extensions from the default browser, and
 `--no-first-run` does not reliably suppress it, so a `mktemp -d` profile can come
 up holding a copy of the real browsing session — and the debug port then fronts a
-signed-in profile. Verify what you actually got with `list-pages` before
-assuming isolation, and treat the port as sensitive until you have.
+signed-in profile. Before assuming isolation, confirm it: run `list-pages` and check that the tabs
+are only the ones you opened. Until you have confirmed that, treat the port as
+fronting the user's real, signed-in session.
 
 **One daemon per browser endpoint.** A daemon is identified by the endpoint it
 is attached to, so the user's Chrome, the user's Edge, and each headless

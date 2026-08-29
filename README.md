@@ -107,7 +107,7 @@ Edge is Chromium and speaks the same DevTools Protocol, so every command works a
 | Linux | `~/.config/microsoft-edge/` |
 | Windows | `%LOCALAPPDATA%\Microsoft\Edge\User Data\` |
 
-`--channel` composes with it (`--browser edge --channel beta`). Edge Canary is not distributed for Linux, and that combination is rejected rather than pointed at a directory that cannot exist. An explicit `--ws-endpoint` or `--user-data-dir` needs no `--browser` — it only selects the default profile location.
+`--channel` composes with it (`--browser edge --channel beta`). Edge Canary is not distributed for Linux, and that combination is rejected rather than pointed at a directory that cannot exist. An explicit `--ws-endpoint` or `--user-data-dir` already says where to connect, so `--browser` is not needed to *reach* Edge. Pass it anyway when you are targeting Edge: it is also the label recorded for the daemon (shown by `list-daemons`) and the browser named in connection errors. Without it both say Chrome, the default, whatever the endpoint actually points at.
 
 Enterprise-managed Edge can have remote debugging disabled by policy; `DevToolsActivePort` then never appears and auto-connect fails with the message above. That is the same failure mode as Chrome under the equivalent policy, just more common on managed fleets.
 
@@ -227,7 +227,7 @@ A drain without a `--duration` returns instantly. Adding `--duration N` switches
 |---------|-------------|
 | `kill-daemon` | Stop the background daemon cleanly |
 
-On Unix, `kill-daemon` signals the targeted daemon with `SIGTERM`, removes its socket, info and PID files, and exits. It's a no-op if no daemon is running. Prefer this over `pkill -f __daemon__` — the process name is shared by legitimate Chrome children processes. On Windows it is not supported: it prints that and exits without signalling anything or removing any files (see **Kill (Windows)** below).
+On Unix, `kill-daemon` signals the targeted daemon with `SIGTERM`, removes its socket, info and PID files, and exits. It's a no-op when the target endpoint resolves but has no daemon attached. It is *not* a no-op when the endpoint cannot be resolved at all — a scoped kill needs an endpoint to identify its daemon, so if `DevToolsActivePort` is unreadable (the browser has already exited, say) it fails and says so; use `--all` there, which needs no endpoint. Prefer this over `pkill -f __daemon__` — the process name is shared by legitimate Chrome children processes. On Windows it is not supported: it prints that and exits without signalling anything or removing any files (see **Kill (Windows)** below).
 
 ## Global options
 

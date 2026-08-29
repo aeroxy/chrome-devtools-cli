@@ -46,6 +46,12 @@ pub(crate) fn daemon_wait_timeout() -> Duration {
 
 /// Try to send a request to the daemon for `key`. Returns an error if no
 /// daemon is attached to that endpoint.
+///
+/// The key is what makes that scoping real: it selects one daemon's socket, so
+/// a request can never be answered by a daemon attached to a different browser.
+/// A single per-user socket would route this to whichever browser the first
+/// command happened to resolve, silently ignoring the caller's `--browser` and
+/// `--user-data-dir`.
 pub async fn send_to_daemon(key: &str, request: &DaemonRequest) -> Result<DaemonResponse> {
     let mut stream = connect_daemon(key).await?;
 
@@ -79,6 +85,10 @@ pub fn spawn_daemon(ws_url: &str, browser: &str) -> Result<()> {
 
 /// Wait for the daemon socket for `key` to become available, with exponential
 /// backoff.
+///
+/// Keyed for the same reason as [`send_to_daemon`]: the loop must wait for the
+/// daemon this command just spawned for this endpoint, not settle for any
+/// daemon that happens to be running.
 pub async fn wait_for_daemon(key: &str) -> Result<()> {
     let deadline = tokio::time::Instant::now() + daemon_wait_timeout();
     let mut delay = Duration::from_millis(50);
