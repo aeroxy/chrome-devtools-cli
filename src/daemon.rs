@@ -29,21 +29,10 @@ enum ConnectionOutcome {
     Fatal,
 }
 
-/// The lock path has a predictable name and, on Linux, lives in shared /tmp,
-/// so treat a pre-existing file as potentially hostile: refuse to follow a
-/// planted symlink (O_NOFOLLOW) and only lock something that is a regular
-/// file owned by this uid. O_NONBLOCK keeps a planted FIFO from wedging the
-/// open() itself (it has no effect on regular files); the `is_file` check
-/// then rejects it. macOS $TMPDIR and Windows %TEMP% are per-user, so there
-/// the checks are inert.
-pub(crate) fn open_lock_file() -> Result<std::fs::File> {
-    open_lock_file_at(&lock_path())
-}
-
 /// Path-parameterized body of [`open_lock_file`], so tests can exercise the
 /// hostile-path checks against a scratch directory instead of the real
 /// `temp_dir()`.
-fn open_lock_file_at(path: &std::path::Path) -> Result<std::fs::File> {
+pub(crate) fn open_lock_file_at(path: &std::path::Path) -> Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).write(true).truncate(false);
     #[cfg(unix)]
@@ -205,7 +194,16 @@ fn lock_wait_timeout() -> Duration {
 /// Async (poll + `tokio::time::sleep`) so a contended lock never blocks the
 /// runtime's worker thread.
 pub(crate) async fn lock_daemon_files() -> Result<std::fs::File> {
-    let f = open_lock_file()?;
+    lock_daemon_files_at(&lock_path()).await
+}
+
+/// Path-parameterized body of [`lock_daemon_files`], mirroring
+/// [`open_lock_file_at`] and [`cleanup_at`], so tests can exercise callers of
+/// the startup lock against a scratch file instead of contending for the real
+/// one — which a concurrently starting daemon on the same machine could
+/// otherwise hold, making those tests flaky in both directions.
+pub(crate) async fn lock_daemon_files_at(path: &std::path::Path) -> Result<std::fs::File> {
+    let f = open_lock_file_at(path)?;
     let timeout = lock_wait_timeout();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -215,14 +213,14 @@ pub(crate) async fn lock_daemon_files() -> Result<std::fs::File> {
                 if tokio::time::Instant::now() >= deadline {
                     anyhow::bail!(
                         "Timed out after {timeout:?} waiting for daemon lock file {} (held by another process)",
-                        lock_path().display()
+                        path.display()
                     );
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(std::fs::TryLockError::Error(e)) => {
                 return Err(e).with_context(|| {
-                    format!("Failed to lock daemon lock file {}", lock_path().display())
+                    format!("Failed to lock daemon lock file {}", path.display())
                 });
             }
         }

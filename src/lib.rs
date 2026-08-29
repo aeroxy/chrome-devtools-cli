@@ -615,6 +615,19 @@ fn print_daemon_list(format: format::OutputFormat) -> Result<()> {
         });
     }
 
+    // Newest first: hash order is meaningless to a reader, and "which daemon did
+    // I just start" is the usual question. Rows with no info sidecar have no
+    // start time, so they sort last, and by key among themselves to stay stable
+    // between runs. `enumerate_instance_keys` keeps its own sort, so
+    // `kill-daemon --all` still walks a deterministic order.
+    rows.sort_by(|a, b| {
+        b.uptime_secs
+            .is_some()
+            .cmp(&a.uptime_secs.is_some())
+            .then_with(|| a.uptime_secs.cmp(&b.uptime_secs))
+            .then_with(|| a.key.cmp(&b.key))
+    });
+
     // Both structured formats go through the shared encoder, so --toon gets
     // TOON instead of silently falling through to the text table. The empty
     // list is emitted structurally too: `[]` is the answer, not the
@@ -661,6 +674,7 @@ fn print_daemon_list(format: format::OutputFormat) -> Result<()> {
 /// whole sweep.
 async fn stop_daemon_instance(key: &str) -> Result<()> {
     stop_daemon_at(
+        &protocol::lock_path(),
         &protocol::pid_path(key),
         &protocol::info_path(key),
         #[cfg(unix)]
@@ -685,6 +699,7 @@ async fn stop_legacy_unkeyed_daemon() -> Result<bool> {
     // guaranteed absent so the removal is a no-op.
     let info_path = pid_path.with_extension("info");
     stop_daemon_at(
+        &protocol::lock_path(),
         &pid_path,
         &info_path,
         #[cfg(unix)]
@@ -700,6 +715,7 @@ async fn stop_legacy_unkeyed_daemon() -> Result<bool> {
 /// legacy layouts cannot drift apart in how carefully they treat a predictable
 /// path in shared `/tmp`.
 async fn stop_daemon_at(
+    lock_path: &std::path::Path,
     pid_path: &std::path::Path,
     info_path: &std::path::Path,
     #[cfg(unix)] sock_path: &std::path::Path,
@@ -720,7 +736,7 @@ async fn stop_daemon_at(
     #[cfg(unix)]
     let _startup_lock = {
         use anyhow::Context as _;
-        daemon::lock_daemon_files().await.context(
+        daemon::lock_daemon_files_at(lock_path).await.context(
             "Could not take the daemon startup lock, so a PID could not be safely matched to \
              its daemon; nothing was signalled. Retry — a concurrent daemon start or shutdown \
              holds this lock only briefly.",
@@ -2203,9 +2219,10 @@ mod tests {
     /// different daemons. `flock` is per open-file-description, so a second
     /// handle in this process contends exactly as a starting daemon would.
     ///
-    /// Takes the real lock file, briefly, because the path is not injectable;
-    /// no other test contends for it, and nothing here is ever signalled — the
-    /// lock is unavailable, so the function returns before reaching `kill`.
+    /// Uses a scratch lock file rather than the real one, so a daemon starting
+    /// on this machine mid-test cannot hold it and flake the assertion. Nothing
+    /// here is ever signalled: the lock is unavailable, so the function returns
+    /// before reaching `kill`.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_stop_daemon_at_will_not_signal_without_the_startup_lock() {
@@ -2216,10 +2233,11 @@ mod tests {
         std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
         std::fs::write(&info_path, "{}").unwrap();
 
-        let holder = daemon::open_lock_file().unwrap();
+        let lock_path = dir.path().join("d.lock");
+        let holder = daemon::open_lock_file_at(&lock_path).unwrap();
         holder.try_lock().unwrap();
 
-        let err = stop_daemon_at(&pid_path, &info_path, &sock_path)
+        let err = stop_daemon_at(&lock_path, &pid_path, &info_path, &sock_path)
             .await
             .expect_err("must refuse while the startup lock is held elsewhere");
         let msg = err.to_string();
