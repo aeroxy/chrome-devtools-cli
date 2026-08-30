@@ -424,7 +424,8 @@ pub enum Commands {
         /// Killing the daemon drops any already-approved remote-debugging
         /// connection; reconnecting requires the human to re-approve the
         /// browser's consent dialog. This does NOT fix "Failed to connect to
-        /// <browser>" errors — do not use it as a retry step.
+        /// Chrome" / "Failed to connect to Microsoft Edge" errors — do not use
+        /// it as a retry step.
         #[arg(long)]
         force: bool,
 

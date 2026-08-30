@@ -97,7 +97,17 @@ pub fn instance_key(ws_url: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Shared leading part of every per-user daemon filename.
+/// Leading part shared by every daemon file belonging to this user.
+///
+/// The naming scheme is the daemon registry: [`enumerate_instance_keys`]
+/// discovers instances by scanning the temp directory for this prefix and
+/// stripping it back off, so `list-daemons` and `kill-daemon --all` enumerate
+/// what is on disk rather than a separate index that could drift out of sync
+/// with it. Two consequences worth knowing before changing this string: every
+/// file an older binary left behind becomes undiscoverable (which is what
+/// [`legacy_unkeyed_pid_path`] exists to sweep), and any other file in the temp
+/// directory that happens to start with it would be read as a daemon of ours.
+/// See [`user_suffix`] for why the uid is part of it.
 fn daemon_file_prefix() -> String {
     format!("chrome-devtools-daemon{}", user_suffix())
 }
