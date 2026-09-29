@@ -10,6 +10,9 @@ const FALLBACK_PORT: u16 = 9222;
 /// Cap on each step of the `/json/version` probe. Loopback answers in well under a millisecond, so this only bounds a listener that accepts and then says nothing.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Most a `/json/version` reply may take up, headers included. Chrome's is under 1 KiB, so this only stops a listener that is not Chrome from making the CLI buffer without end.
+const MAX_PROBE_REPLY: u64 = 64 * 1024;
+
 /// Resolve the WebSocket URL for connecting to the browser.
 ///
 /// Priority:
@@ -72,8 +75,13 @@ enum PortServer {
 
 /// Browser endpoint of the DevTools server on `port`, whichever kind it is.
 fn port_endpoint(port: u16) -> Result<String> {
+    // Whatever holds the port writes the reply, so the URL it advertises must not send the CLI to another host, port or scheme. Chrome echoes the Host header the probe sends, so a real one always starts this way.
+    let local = format!("ws://127.0.0.1:{port}/");
     Ok(match probe_port(port)? {
-        PortServer::Launched(url) => url,
+        PortServer::Launched(url) if url.starts_with(&local) => url,
+        PortServer::Launched(url) => {
+            bail!("the server there advertised {url:?}, which is not on 127.0.0.1:{port}")
+        }
         PortServer::Inspect => inspect_ws_url(port),
     })
 }
@@ -91,39 +99,49 @@ fn probe_port(port: u16) -> Result<PortServer> {
             stream,
             "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
         )?;
-        read_version_response(&mut BufReader::new(&stream))
+        read_version_response(&stream)
     };
     exchange().map_err(|e| anyhow!("127.0.0.1:{port} did not answer like a DevTools server ({e})"))
 }
 
 /// Classify a `/json/version` answer. Chrome keeps the connection open even when asked to close it, so the body is read up to `Content-Length` rather than to EOF.
-fn read_version_response(reader: &mut impl BufRead) -> Result<PortServer> {
+fn read_version_response(reply: impl Read) -> Result<PortServer> {
+    // Every read below goes through this cap, so a reply that would exceed it ends early instead of growing without bound.
+    let mut reader = BufReader::new(reply.take(MAX_PROBE_REPLY));
     let mut status_line = String::new();
     reader.read_line(&mut status_line)?;
+    match status_line.split_whitespace().nth(1) {
+        Some("404") => return Ok(PortServer::Inspect),
+        Some("200") => {}
+        _ => bail!("unexpected reply {:?}", status_line.trim()),
+    }
     let mut content_length = 0;
     let mut header = String::new();
-    while reader.read_line(&mut header)? > 0 && !header.trim().is_empty() {
+    loop {
+        header.clear();
+        if reader.read_line(&mut header)? == 0 {
+            bail!("reply cut short, or longer than {MAX_PROBE_REPLY} bytes");
+        }
+        if header.trim().is_empty() {
+            break;
+        }
         // Chrome writes `Content-Length:428`, with no space after the colon.
         if let Some((name, value)) = header.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse()?;
             }
         }
-        header.clear();
     }
-    match status_line.split_whitespace().nth(1) {
-        Some("404") => Ok(PortServer::Inspect),
-        Some("200") => {
-            let mut body = Vec::new();
-            reader.take(content_length).read_to_end(&mut body)?;
-            let version: serde_json::Value = serde_json::from_slice(&body)?;
-            let url = version["webSocketDebuggerUrl"]
-                .as_str()
-                .ok_or_else(|| anyhow!("no webSocketDebuggerUrl in its /json/version"))?;
-            Ok(PortServer::Launched(url.to_string()))
-        }
-        _ => bail!("unexpected reply {:?}", status_line.trim()),
+    if content_length > MAX_PROBE_REPLY {
+        bail!("reply of {content_length} bytes is longer than {MAX_PROBE_REPLY}");
     }
+    let mut body = Vec::new();
+    reader.take(content_length).read_to_end(&mut body)?;
+    let version: serde_json::Value = serde_json::from_slice(&body)?;
+    let url = version["webSocketDebuggerUrl"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no webSocketDebuggerUrl in its /json/version"))?;
+    Ok(PortServer::Launched(url.to_string()))
 }
 
 /// Browser endpoint of the chrome://inspect/#remote-debugging server on `port`.
@@ -536,14 +554,14 @@ mod tests {
         )
     }
 
-    const LAUNCHED_URL: &str = "ws://127.0.0.1:9/devtools/browser/abc";
+    /// The endpoint Chrome advertises when probed on `port`, since it echoes the probe's Host header.
+    fn advertised_url(port: u16) -> String {
+        format!("ws://127.0.0.1:{port}/devtools/browser/abc")
+    }
 
     /// What a browser launched with `--remote-debugging-port` answers on `/json/version`.
-    fn launched_reply() -> String {
-        http_reply(
-            "200 OK",
-            &format!(r#"{{"webSocketDebuggerUrl": "{LAUNCHED_URL}"}}"#),
-        )
+    fn launched_reply(url: &str) -> String {
+        http_reply("200 OK", &format!(r#"{{"webSocketDebuggerUrl": "{url}"}}"#))
     }
 
     /// What the chrome://inspect server answers on `/json/version`.
@@ -551,8 +569,8 @@ mod tests {
         http_reply("404 Not Found", "")
     }
 
-    /// Port of a local server that answers a single request with `reply`, standing in for a DevTools server.
-    fn serve_once(reply: String) -> u16 {
+    /// Port of a local server that answers a single request with `reply(port)`, standing in for a DevTools server.
+    fn serve_once(reply: impl FnOnce(u16) -> String + Send + 'static) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -563,7 +581,7 @@ mod tests {
             while request.read_line(&mut line).unwrap() > 2 {
                 line.clear();
             }
-            stream.write_all(reply.as_bytes()).unwrap();
+            stream.write_all(reply(port).as_bytes()).unwrap();
         });
         port
     }
@@ -579,10 +597,10 @@ mod tests {
 
     #[test]
     fn version_response_tells_the_servers_apart() {
-        let parse = |reply: String| read_version_response(&mut reply.as_bytes());
+        let parse = |reply: String| read_version_response(reply.as_bytes());
         assert_eq!(
-            parse(launched_reply()).unwrap(),
-            PortServer::Launched(LAUNCHED_URL.into())
+            parse(launched_reply(&advertised_url(9))).unwrap(),
+            PortServer::Launched(advertised_url(9))
         );
         assert_eq!(parse(inspect_reply()).unwrap(), PortServer::Inspect);
         // Anything else is not a DevTools server this CLI knows how to reach.
@@ -592,9 +610,23 @@ mod tests {
     }
 
     #[test]
+    fn replies_beyond_the_cap_are_refused() {
+        // A listener that is not Chrome can claim or send any amount, so both a declared body and the headers are held to the cap. Each reply below parses fine without it.
+        let body = format!(r#"{{"webSocketDebuggerUrl": "{}"}}"#, advertised_url(9));
+        let declared = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length:{}\r\n\r\n{body}",
+            MAX_PROBE_REPLY + 1
+        );
+        assert!(read_version_response(declared.as_bytes()).is_err());
+        let padding = format!("\r\nX-Pad:{}\r\n", "a".repeat(MAX_PROBE_REPLY as usize));
+        let padded = launched_reply(&advertised_url(9)).replacen("\r\n", &padding, 1);
+        assert!(read_version_response(padded.as_bytes()).is_err());
+    }
+
+    #[test]
     fn port_short_circuits_profile_discovery() {
         // Like an explicit endpoint, a port needs no profile: the unreadable-profile case it exists for would otherwise fail before connecting.
-        let port = serve_once(inspect_reply());
+        let port = serve_once(|_| inspect_reply());
         let ws =
             resolve_ws_url(None, Some(port), Some("/nonexistent"), "firefox", "stable").unwrap();
         assert_eq!(ws, format!("ws://127.0.0.1:{port}/devtools/browser"));
@@ -603,9 +635,27 @@ mod tests {
     #[test]
     fn port_uses_the_url_a_launched_browser_advertises() {
         // A --remote-debugging-port server rejects /devtools/browser without its UUID, so the advertised URL is the only one that works.
-        let port = serve_once(launched_reply());
+        let port = serve_once(|p| launched_reply(&advertised_url(p)));
         let ws = resolve_ws_url(None, Some(port), None, "chrome", "stable").unwrap();
-        assert_eq!(ws, LAUNCHED_URL);
+        assert_eq!(ws, advertised_url(port));
+    }
+
+    #[test]
+    fn port_refuses_an_endpoint_advertised_elsewhere() {
+        // Whatever holds the port writes the reply, so it must not be able to send the CLI to another host, port or scheme.
+        let elsewhere: [fn(u16) -> String; 4] = [
+            |p| format!("ws://203.0.113.9:{p}/devtools/browser/abc"),
+            |_| "ws://127.0.0.1:1/devtools/browser/abc".to_string(),
+            |p| format!("ws://127.0.0.1:{p}@203.0.113.9/devtools/browser/abc"),
+            |p| format!("wss://127.0.0.1:{p}/devtools/browser/abc"),
+        ];
+        for url in elsewhere {
+            let port = serve_once(move |p| launched_reply(&url(p)));
+            let err = resolve_ws_url(None, Some(port), None, "chrome", "stable")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("which is not on 127.0.0.1"), "{err}");
+        }
     }
 
     #[test]
@@ -654,7 +704,7 @@ mod tests {
         let Some(dir) = unreadable_profile() else {
             return;
         };
-        let port = serve_once(inspect_reply());
+        let port = serve_once(|_| inspect_reply());
         let ws = read_devtools_active_port(dir.path(), Browser::Chrome, Some(port)).unwrap();
         assert_eq!(ws, format!("ws://127.0.0.1:{port}/devtools/browser"));
     }
@@ -666,7 +716,7 @@ mod tests {
         let Some(dir) = unreadable_profile() else {
             return;
         };
-        let port = serve_once(launched_reply());
+        let port = serve_once(|p| launched_reply(&advertised_url(p)));
         let err = read_devtools_active_port(dir.path(), Browser::Chrome, Some(port))
             .unwrap_err()
             .to_string();
