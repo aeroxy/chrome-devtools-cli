@@ -33,6 +33,8 @@ change between launches. Auto-connect does this for you, which is why no URL is
 needed. A daemon is spawned on first invocation and reused across commands
 (5-minute idle timeout).
 
+If the OS will not let the CLI read that file, remote debugging is usually still on. For the default profile the CLI then connects to port 9222 instead and prints `Warning: cannot read ...DevToolsActivePort: Operation not permitted ...`. To use another port, pass `--port <n>` with the port shown at `chrome://inspect/#remote-debugging`. `--port` also works for a browser launched with `--remote-debugging-port`. See "Failure Handling: cannot read DevToolsActivePort" below for what to tell the user.
+
 **Microsoft Edge** works the same — it is Chromium and speaks the same protocol.
 Add `--browser edge` so auto-connect reads Edge's profile instead of Chrome's
 (`--channel` still selects stable/beta/dev/canary, except that Edge ships no
@@ -628,6 +630,15 @@ For this reason, `kill-daemon` refuses to run non-interactively without
 `--force`. As an agent, only pass `--force` if the user has explicitly asked you
 to kill the daemon for some other reason (e.g. it's stuck on unrelated JS
 execution) — never as a reaction to a connection failure.
+
+## Failure Handling: cannot read DevToolsActivePort / "Operation not permitted"
+
+This means the CLI was not allowed into the browser's profile directory. It does **not** mean remote debugging is off, so do not tell the user to enable it.
+
+- **Default profile:** the CLI has already tried the chrome://inspect server on port 9222, and the warning means it connected there. If the command succeeded, carry on; add `--port 9222` to later commands to skip the warning. It cannot tell Chrome's chrome://inspect server from Edge's, so if the pages you see are not the ones you expected (under `--browser edge`, say), ask the user for the right port.
+- **Fallback cannot connect, or the error came from an explicit `--user-data-dir`:** ask the user for the port shown at `chrome://inspect/#remote-debugging` (Edge: `edge://inspect/#remote-debugging`) and pass it as `--port <n>` on every command. If the error says the browser on 9222 was launched with `--remote-debugging-port`, that port belongs to a separate instance, not the user's everyday browser.
+- **On macOS** the usual cause is that the app you are running in (the terminal or IDE) has not been allowed to access data from other apps. Tell the user macOS may be showing a privacy prompt for it, and that approving it fixes the problem at the source.
+- **After a browser restart**, the first command over a port connection to a chrome://inspect server can fail with a WebSocket error while the old daemon exits. Rerun it once. The next attempt connects afresh and needs a new approval, so the approval-dialog steps above apply.
 
 ## Critical Gotchas
 

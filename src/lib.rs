@@ -28,6 +28,16 @@ pub struct Cli {
     #[arg(long, global = true, env = "CHROME_WS_ENDPOINT")]
     pub ws_endpoint: Option<String>,
 
+    /// Port of a local DevTools server, e.g. the one shown at chrome://inspect/#remote-debugging (skips auto-connect)
+    #[arg(
+        long,
+        global = true,
+        env = "CHROME_PORT",
+        conflicts_with = "ws_endpoint",
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    pub port: Option<u16>,
+
     /// Browser user data directory (for auto-connect)
     #[arg(long, global = true, env = "CHROME_USER_DATA_DIR")]
     pub user_data_dir: Option<String>,
@@ -1497,6 +1507,7 @@ pub async fn run() -> Result<()> {
             // to --all, which needs no endpoint.
             let ws_url = browser::resolve_ws_url(
                 cli.ws_endpoint.as_deref(),
+                cli.port,
                 cli.user_data_dir.as_deref(),
                 &cli.browser,
                 &cli.channel,
@@ -1644,6 +1655,7 @@ pub async fn run() -> Result<()> {
 
     let ws_url = browser::resolve_ws_url(
         cli.ws_endpoint.as_deref(),
+        cli.port,
         cli.user_data_dir.as_deref(),
         &cli.browser,
         &cli.channel,
@@ -2075,6 +2087,22 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_conflicts_with_ws_endpoint() {
+        // Both name the endpoint outright, so honouring either one silently could attach to a browser the other did not mean.
+        let err = Cli::try_parse_from([
+            "chrome-devtools",
+            "--port",
+            "9222",
+            "--ws-endpoint",
+            "ws://127.0.0.1:9333/devtools/browser",
+            "list-pages",
+        ])
+        .err()
+        .expect("--port with --ws-endpoint must be rejected");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
 
     #[cfg(unix)]
     #[test]

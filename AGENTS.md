@@ -13,7 +13,7 @@ src/
 ├── main.rs           # Entry point + daemon dispatch
 ├── lib.rs            # CLI (clap) + command routing
 ├── cdp.rs            # Raw CDP over WebSocket (JSON-RPC) + persistent session
-├── browser.rs        # Auto-connect (DevToolsActivePort)
+├── browser.rs        # Auto-connect (DevToolsActivePort, --port fallback)
 ├── daemon.rs         # Background daemon (persistent connection)
 ├── client.rs         # Talks to daemon via Unix socket
 ├── protocol.rs       # IPC message types (DaemonRequest / DaemonResponse)
@@ -80,6 +80,12 @@ no error and no way for a caller (especially an unattended agent) to tell what
 was wrong. The timeout error message is written to be agent-actionable: retry
 at most once, then stop and ask a human rather than looping or calling
 `kill-daemon`.
+
+### Unreadable Profile Directory
+
+Auto-connect has to read `DevToolsActivePort`, and the OS can refuse that while the browser's debugging server is up: macOS withholds another app's data from the app running the CLI until the user approves a privacy prompt, and security software can block it too. `read_devtools_active_port` (`browser.rs`) therefore treats `PermissionDenied` differently from a missing file. For the default profile it probes port 9222 and, when the chrome://inspect server answers, connects there and warns on stderr. A `--remote-debugging-port` server on 9222 is refused instead: Chrome 136+ ignores that flag on the default profile, so such a server is some other instance. For an explicit `--user-data-dir` it errors, because that usually names a throwaway instance and 9222 would reach the everyday browser. `--port` / `CHROME_PORT` connects by port directly and conflicts with `--ws-endpoint`.
+
+`probe_port` tells the two kinds of local server apart with one `GET /json/version`. A `--remote-debugging-port` server answers 200 with a `webSocketDebuggerUrl` whose UUID it requires (404 without it), so that URL is used as-is. The chrome://inspect server answers 404, serves no `/json/*` at all, and accepts `/devtools/browser` with no UUID (or any UUID), verified on Chrome 154. The request is a raw `TcpStream` exchange rather than an HTTP crate, because those honour `HTTP(S)_PROXY` and would route loopback traffic through a proxy, and the body is read by `Content-Length` because Chrome keeps the connection open even when asked to close it. A chrome://inspect port URL carries no session UUID, so its daemon key survives a browser restart: the first command afterwards fails with a WebSocket error, the daemon exits, and the next command spawns a fresh one.
 
 ### Page Targeting
 

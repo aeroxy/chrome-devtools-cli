@@ -88,14 +88,33 @@ By default, the CLI reads `DevToolsActivePort` from Chrome's user data directory
 | Linux | `~/.config/google-chrome/` |
 | Windows | `%LOCALAPPDATA%\Google\Chrome\User Data\` |
 
-Override with `--user-data-dir`, `--browser` (chrome/edge), `--channel` (beta/canary/dev), or `--ws-endpoint`. All four also read from environment variables:
+Override with `--user-data-dir`, `--browser` (chrome/edge), `--channel` (beta/canary/dev), `--ws-endpoint`, or `--port`. All five also read from environment variables:
 
 | Environment Variable | Corresponding Flag |
 |----------------------|--------------------|
 | `CHROME_WS_ENDPOINT` | `--ws-endpoint` |
+| `CHROME_PORT` | `--port` |
 | `CHROME_USER_DATA_DIR` | `--user-data-dir` |
 | `CHROME_BROWSER` | `--browser` |
 | `CHROME_CHANNEL` | `--channel` |
+
+### Unreadable profile directory
+
+Remote debugging can be on while the CLI still cannot read `DevToolsActivePort`, because the OS will not let it into the profile directory. On macOS this happens until the app running the CLI (your terminal or IDE) is allowed to access data from other apps: macOS shows a privacy prompt, and until it is approved every read fails with "Operation not permitted". Security software and file permissions can do the same.
+
+When that happens to the default profile, the CLI tries the `chrome://inspect` server on port 9222 instead, and prints a warning saying so when it connects there. If the server shown at `chrome://inspect/#remote-debugging` uses a different port, pass it with `--port` (or set `CHROME_PORT`). Connecting by port skips the profile directory, and the warning with it:
+
+```bash
+chrome-devtools --port 9222 list-pages
+export CHROME_PORT=9222   # later commands connect by port too
+```
+
+How `--port` and the fallback behave:
+
+- `--port` works with both kinds of local server. It first asks the port for `/json/version`. A browser launched with `--remote-debugging-port` answers with its browser endpoint, and the CLI uses that. The `chrome://inspect` server answers 404, and the CLI connects to `/devtools/browser`, which that server accepts without the per-session UUID stored in `DevToolsActivePort`.
+- The fallback only takes a `chrome://inspect` server. A browser launched with `--remote-debugging-port` on 9222 is a different instance, since Chrome ignores that flag on the default profile, so the fallback refuses it; pass `--port 9222` if it is the one you want.
+- An explicit `--user-data-dir` that cannot be read is an error, not a fallback: it usually names a separate instance, and 9222 would reach your everyday browser instead.
+- A daemon connected to the `chrome://inspect` server by port has no session UUID in its key. If the browser restarts while that daemon is alive, the next command fails with a WebSocket error and the daemon exits; the command after that connects afresh, and the browser asks for approval again.
 
 ### Microsoft Edge
 
@@ -227,7 +246,7 @@ A drain without a `--duration` returns instantly. Adding `--duration N` switches
 |---------|-------------|
 | `kill-daemon` | Stop the background daemon cleanly |
 
-On Unix, `kill-daemon` signals the targeted daemon with `SIGTERM`, removes its socket, info and PID files, and exits. It's a no-op when the target endpoint resolves but has no daemon attached. It is *not* a no-op when the endpoint cannot be resolved at all — a scoped kill needs an endpoint to identify its daemon, so if `DevToolsActivePort` is unreadable (the browser has already exited, say) it fails and says so; use `--all` there, which needs no endpoint. Prefer this over `pkill -f __daemon__` — the process name is shared by legitimate Chrome children processes. On Windows it is not supported: it prints that and exits without signalling anything or removing any files (see **Kill (Windows)** below).
+On Unix, `kill-daemon` signals the targeted daemon with `SIGTERM`, removes its socket, info and PID files, and exits. It's a no-op when the target endpoint resolves but has no daemon attached. It is *not* a no-op when the endpoint cannot be resolved at all — a scoped kill needs an endpoint to identify its daemon, so if `DevToolsActivePort` is missing (the browser has already exited, say) it fails and says so; use `--all` there, which needs no endpoint. Prefer this over `pkill -f __daemon__` — the process name is shared by legitimate Chrome children processes. On Windows it is not supported: it prints that and exits without signalling anything or removing any files (see **Kill (Windows)** below).
 
 ## Global options
 
@@ -240,6 +259,7 @@ On Unix, `kill-daemon` signals the targeted daemon with `SIGTERM`, removes its s
 | `--block-url <pattern>` | Add a URL pattern to the active tab's block list (repeatable; persists until un-blocked or cleared) |
 | `--unblock-url <pattern>` | Remove a URL pattern from the active tab's block list (repeatable) |
 | `--ws-endpoint <url>` | Explicit WebSocket URL |
+| `--port <n>` | Port of a local DevTools server, e.g. the one shown at `chrome://inspect` (skips reading the profile directory) |
 | `--user-data-dir <path>` | Custom browser profile directory |
 | `--browser <name>` | Browser to auto-connect to (chrome/edge) |
 | `--channel <ch>` | Browser release channel (stable/beta/canary/dev) |
@@ -276,7 +296,7 @@ src/
 ├── main.rs           # Entry point + daemon dispatch
 ├── lib.rs            # CLI (clap) + command routing
 ├── cdp.rs            # Raw CDP over WebSocket (JSON-RPC) + persistent session
-├── browser.rs        # Auto-connect (DevToolsActivePort)
+├── browser.rs        # Auto-connect (DevToolsActivePort, --port fallback)
 ├── daemon.rs         # Background daemon (persistent connection)
 ├── client.rs         # Talks to daemon via Unix socket
 ├── protocol.rs       # IPC message types (DaemonRequest / DaemonResponse)

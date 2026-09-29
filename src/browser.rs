@@ -1,11 +1,21 @@
 use anyhow::{anyhow, bail, Result};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// Port tried when the default profile's `DevToolsActivePort` exists but cannot be read. 9222 is the conventional DevTools port and what chrome://inspect/#remote-debugging shows by default; `--port` covers anything else.
+const FALLBACK_PORT: u16 = 9222;
+
+/// Cap on each step of the `/json/version` probe. Loopback answers in well under a millisecond, so this only bounds a listener that accepts and then says nothing.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Resolve the WebSocket URL for connecting to the browser.
 ///
 /// Priority:
 /// 1. Explicit `--ws-endpoint`
-/// 2. Auto-connect via `DevToolsActivePort` (default)
+/// 2. Explicit `--port`, whichever kind of local server it names (see [`PortServer`])
+/// 3. Auto-connect via `DevToolsActivePort` (default), falling back to [`FALLBACK_PORT`] when the default profile's copy cannot be read
 ///
 /// An explicit endpoint wins because it names the browser directly, so it must
 /// not be second-guessed by local profile discovery: it is how you reach a
@@ -15,14 +25,27 @@ use std::path::{Path, PathBuf};
 /// `--channel` entirely, since those exist only to locate a profile directory.
 /// `DevToolsActivePort` is the automatic fallback for the ordinary case where
 /// the browser is local and its profile is where the vendor puts it.
+///
+/// `--port` short-circuits discovery the same way, since it names the server too. It exists for the case auto-connect cannot handle on its own: a profile directory the OS will not let this process read, which hides `DevToolsActivePort` while the browser's server is up. macOS does this until the user approves a privacy prompt letting the app running the CLI access another app's data, and security software can do it for good.
 pub fn resolve_ws_url(
     ws_endpoint: Option<&str>,
+    port: Option<u16>,
     user_data_dir: Option<&str>,
     browser: &str,
     channel: &str,
 ) -> Result<String> {
     if let Some(ws) = ws_endpoint {
         return Ok(ws.to_string());
+    }
+    if let Some(port) = port {
+        // Only for the hint: --port skips profile discovery, so an unknown --browser is no error here.
+        let scheme = Browser::parse(browser).map_or("chrome", Browser::scheme);
+        return port_endpoint(port).map_err(|e| {
+            anyhow!(
+                "Cannot connect by --port {port}: {e}. Pass the port shown at \
+                 {scheme}://inspect/#remote-debugging, or the one the browser was launched with."
+            )
+        });
     }
 
     let browser = Browser::parse(browser)?;
@@ -33,25 +56,139 @@ pub fn resolve_ws_url(
         None => browser.default_user_data_dir(channel)?,
     };
 
-    read_devtools_active_port(&data_dir, browser)
+    // Only the default profile may fall back to a guessed port. An explicit --user-data-dir usually names a throwaway instance on a port of its own, where 9222 would reach the everyday browser instead.
+    let fallback_port = user_data_dir.is_none().then_some(FALLBACK_PORT);
+    read_devtools_active_port(&data_dir, browser, fallback_port)
+}
+
+/// The two kinds of DevTools server a local port can have. They need different URLs, and `/json/version` tells them apart.
+#[derive(Debug, PartialEq)]
+enum PortServer {
+    /// Started by `--remote-debugging-port`: advertises its browser endpoint there, and requires the UUID in it.
+    Launched(String),
+    /// Started from chrome://inspect/#remote-debugging: answers `/json/version` with 404, and needs no UUID.
+    Inspect,
+}
+
+/// Browser endpoint of the DevTools server on `port`, whichever kind it is.
+fn port_endpoint(port: u16) -> Result<String> {
+    Ok(match probe_port(port)? {
+        PortServer::Launched(url) => url,
+        PortServer::Inspect => inspect_ws_url(port),
+    })
+}
+
+/// Ask the server on `port` for `/json/version` to learn which kind it is.
+///
+/// A raw request rather than an HTTP client crate, because those tend to honour `HTTP(S)_PROXY` and would send this loopback request to a proxy.
+fn probe_port(port: u16) -> Result<PortServer> {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT)
+        .map_err(|e| anyhow!("nothing is listening on 127.0.0.1:{port} ({e})"))?;
+    let mut exchange = || -> Result<PortServer> {
+        stream.set_read_timeout(Some(PROBE_TIMEOUT))?;
+        write!(
+            stream,
+            "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )?;
+        read_version_response(&mut BufReader::new(&stream))
+    };
+    exchange().map_err(|e| anyhow!("127.0.0.1:{port} did not answer like a DevTools server ({e})"))
+}
+
+/// Classify a `/json/version` answer. Chrome keeps the connection open even when asked to close it, so the body is read up to `Content-Length` rather than to EOF.
+fn read_version_response(reader: &mut impl BufRead) -> Result<PortServer> {
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line)?;
+    let mut content_length = 0;
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 0 && !header.trim().is_empty() {
+        // Chrome writes `Content-Length:428`, with no space after the colon.
+        if let Some((name, value)) = header.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse()?;
+            }
+        }
+        header.clear();
+    }
+    match status_line.split_whitespace().nth(1) {
+        Some("404") => Ok(PortServer::Inspect),
+        Some("200") => {
+            let mut body = Vec::new();
+            reader.take(content_length).read_to_end(&mut body)?;
+            let version: serde_json::Value = serde_json::from_slice(&body)?;
+            let url = version["webSocketDebuggerUrl"]
+                .as_str()
+                .ok_or_else(|| anyhow!("no webSocketDebuggerUrl in its /json/version"))?;
+            Ok(PortServer::Launched(url.to_string()))
+        }
+        _ => bail!("unexpected reply {:?}", status_line.trim()),
+    }
+}
+
+/// Browser endpoint of the chrome://inspect/#remote-debugging server on `port`.
+///
+/// That server accepts `/devtools/browser` without the per-session UUID that `DevToolsActivePort` records, and serves no `/json/version` to look the UUID up from, so the port is all a client needs (verified on Chrome 154).
+fn inspect_ws_url(port: u16) -> String {
+    format!("ws://127.0.0.1:{port}/devtools/browser")
 }
 
 /// Read DevToolsActivePort file and construct the WebSocket URL.
-fn read_devtools_active_port(user_data_dir: &Path, browser: Browser) -> Result<String> {
+///
+/// With `fallback_port`, a file this process is not permitted to read yields the chrome://inspect server on that port, when there is one, instead of an error.
+fn read_devtools_active_port(
+    user_data_dir: &Path,
+    browser: Browser,
+    fallback_port: Option<u16>,
+) -> Result<String> {
     let port_path = user_data_dir.join("DevToolsActivePort");
     let label = browser.label();
+    let scheme = browser.scheme();
 
-    let content = std::fs::read_to_string(&port_path).map_err(|_| {
-        anyhow!(
-            "Could not read DevToolsActivePort at {}\n\n\
+    let content = match std::fs::read_to_string(&port_path) {
+        Ok(content) => content,
+        // Denied is not missing: the file may be there with remote debugging on, and only this process kept out of the directory. The enable-it steps below would send the user the wrong way.
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            let tried = match fallback_port.map(|port| (port, probe_port(port))) {
+                None => String::new(),
+                // Only a chrome://inspect server can be this profile's own, since Chrome 136+ ignores --remote-debugging-port on the default profile.
+                Some((port, Ok(PortServer::Inspect))) => {
+                    eprintln!(
+                        "Warning: cannot read {}: {e}. Connecting to port {port} instead; \
+                         pass --port or set CHROME_PORT to connect by port without this warning.",
+                        port_path.display()
+                    );
+                    return Ok(inspect_ws_url(port));
+                }
+                Some((port, Ok(PortServer::Launched(_)))) => format!(
+                    "\n\nPort {port} was tried too, but the browser there was launched with \
+                     --remote-debugging-port, so it is most likely a separate instance rather \
+                     than this profile. Pass --port {port} if it is the one you want."
+                ),
+                Some((port, Err(why))) => format!("\n\nPort {port} was tried too, but {why}."),
+            };
+            bail!(
+                "Could not read DevToolsActivePort at {}: {e}\n\n\
+                 This process is not allowed to read the profile directory. On macOS that \
+                 usually means the app running this command has not been allowed to access \
+                 data from other apps: approve the privacy prompt, or allow it under System \
+                 Settings > Privacy & Security. Security software or file permissions can do \
+                 the same.\n\n\
+                 You can also connect by port: pass --port with the port shown at \
+                 {scheme}://inspect/#remote-debugging, or the one the browser was launched \
+                 with.{tried}",
+                port_path.display()
+            );
+        }
+        Err(e) => bail!(
+            "Could not read DevToolsActivePort at {}: {e}\n\n\
              Make sure {label} is running with remote debugging enabled:\n\
              1. Open {label}\n\
-             2. Go to {}://inspect/#remote-debugging\n\
+             2. Go to {scheme}://inspect/#remote-debugging\n\
              3. Enable the remote debugging server",
-            port_path.display(),
-            browser.scheme()
-        )
-    })?;
+            port_path.display()
+        ),
+    };
 
     let lines: Vec<&str> = content
         .lines()
@@ -380,17 +517,191 @@ mod tests {
     #[test]
     fn ws_endpoint_short_circuits_browser_validation() {
         // An explicit endpoint needs no profile, so the browser is irrelevant.
-        let ws = resolve_ws_url(Some("ws://127.0.0.1:9222/x"), None, "firefox", "stable").unwrap();
+        let ws = resolve_ws_url(
+            Some("ws://127.0.0.1:9222/x"),
+            None,
+            None,
+            "firefox",
+            "stable",
+        )
+        .unwrap();
         assert_eq!(ws, "ws://127.0.0.1:9222/x");
+    }
+
+    /// `body` as a complete HTTP response, with the `Content-Length` a real server sends.
+    fn http_reply(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length:{}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const LAUNCHED_URL: &str = "ws://127.0.0.1:9/devtools/browser/abc";
+
+    /// What a browser launched with `--remote-debugging-port` answers on `/json/version`.
+    fn launched_reply() -> String {
+        http_reply(
+            "200 OK",
+            &format!(r#"{{"webSocketDebuggerUrl": "{LAUNCHED_URL}"}}"#),
+        )
+    }
+
+    /// What the chrome://inspect server answers on `/json/version`.
+    fn inspect_reply() -> String {
+        http_reply("404 Not Found", "")
+    }
+
+    /// Port of a local server that answers a single request with `reply`, standing in for a DevTools server.
+    fn serve_once(reply: String) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the request first: closing with it unread can reset the connection before the reply is seen.
+            let mut request = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while request.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+        port
+    }
+
+    /// A port with nothing listening on it.
+    fn closed_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[test]
+    fn version_response_tells_the_servers_apart() {
+        let parse = |reply: String| read_version_response(&mut reply.as_bytes());
+        assert_eq!(
+            parse(launched_reply()).unwrap(),
+            PortServer::Launched(LAUNCHED_URL.into())
+        );
+        assert_eq!(parse(inspect_reply()).unwrap(), PortServer::Inspect);
+        // Anything else is not a DevTools server this CLI knows how to reach.
+        assert!(parse(http_reply("200 OK", "{}")).is_err());
+        assert!(parse(http_reply("500 Internal Server Error", "")).is_err());
+        assert!(parse("SSH-2.0-OpenSSH_9.6\r\n".into()).is_err());
+    }
+
+    #[test]
+    fn port_short_circuits_profile_discovery() {
+        // Like an explicit endpoint, a port needs no profile: the unreadable-profile case it exists for would otherwise fail before connecting.
+        let port = serve_once(inspect_reply());
+        let ws =
+            resolve_ws_url(None, Some(port), Some("/nonexistent"), "firefox", "stable").unwrap();
+        assert_eq!(ws, format!("ws://127.0.0.1:{port}/devtools/browser"));
+    }
+
+    #[test]
+    fn port_uses_the_url_a_launched_browser_advertises() {
+        // A --remote-debugging-port server rejects /devtools/browser without its UUID, so the advertised URL is the only one that works.
+        let port = serve_once(launched_reply());
+        let ws = resolve_ws_url(None, Some(port), None, "chrome", "stable").unwrap();
+        assert_eq!(ws, LAUNCHED_URL);
+    }
+
+    #[test]
+    fn port_with_nothing_listening_says_so() {
+        let err = resolve_ws_url(None, Some(closed_port()), None, "edge", "stable")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nothing is listening"), "{err}");
+        assert!(err.contains("edge://inspect"), "{err}");
     }
 
     #[test]
     fn active_port_error_names_the_browser() {
         let dir = std::env::temp_dir().join("chrome-devtools-cli-nonexistent-profile");
-        let err = resolve_ws_url(None, Some(dir.to_str().unwrap()), "edge", "stable")
+        let err = resolve_ws_url(None, None, Some(dir.to_str().unwrap()), "edge", "stable")
             .unwrap_err()
             .to_string();
         assert!(err.contains("Microsoft Edge is running"), "{err}");
         assert!(err.contains("edge://inspect"), "{err}");
+    }
+
+    #[test]
+    fn missing_port_file_never_falls_back() {
+        // No file means remote debugging is off or the browser is not running, so a guessed port would trade the enable-it steps for a bare connection failure.
+        let dir = std::env::temp_dir().join("chrome-devtools-cli-nonexistent-profile");
+        let err = read_devtools_active_port(&dir, Browser::Chrome, Some(closed_port()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Enable the remote debugging server"), "{err}");
+    }
+
+    /// Profile dir whose `DevToolsActivePort` exists but cannot be read, standing in for one that macOS or security software walls off. `None` when this process can read it anyway, as root can.
+    #[cfg(unix)]
+    fn unreadable_profile() -> Option<tempfile::TempDir> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("DevToolsActivePort");
+        std::fs::write(&file, "9333\n/devtools/browser/x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::read(&file).is_err().then_some(dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_default_profile_falls_back_to_inspect_server() {
+        let Some(dir) = unreadable_profile() else {
+            return;
+        };
+        let port = serve_once(inspect_reply());
+        let ws = read_devtools_active_port(dir.path(), Browser::Chrome, Some(port)).unwrap();
+        assert_eq!(ws, format!("ws://127.0.0.1:{port}/devtools/browser"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_refuses_a_launched_browser() {
+        // Chrome ignores --remote-debugging-port on the default profile, so a server launched that way is another instance, and attaching to it would drive the wrong browser.
+        let Some(dir) = unreadable_profile() else {
+            return;
+        };
+        let port = serve_once(launched_reply());
+        let err = read_devtools_active_port(dir.path(), Browser::Chrome, Some(port))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--remote-debugging-port"), "{err}");
+        assert!(err.contains(&format!("--port {port}")), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_fallback_keeps_the_full_explanation() {
+        let Some(dir) = unreadable_profile() else {
+            return;
+        };
+        let err = read_devtools_active_port(dir.path(), Browser::Chrome, Some(closed_port()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not allowed to read the profile directory"),
+            "{err}"
+        );
+        assert!(err.contains("nothing is listening"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_explicit_profile_points_at_port_flag() {
+        let Some(dir) = unreadable_profile() else {
+            return;
+        };
+        let err = resolve_ws_url(None, None, dir.path().to_str(), "chrome", "stable")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--port"), "{err}");
+        // The OS's own reason, which the message used to drop.
+        assert!(err.contains("os error"), "{err}");
+        assert!(!err.contains("Enable the remote debugging server"), "{err}");
     }
 }
