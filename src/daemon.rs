@@ -535,6 +535,7 @@ where
                 output: String::new(),
                 error: format!("Invalid request: {e}"),
                 navigated_to: None,
+                target_id: None,
                 error_code: Some(ErrorCode::InvalidInput as u32),
             };
             if let Ok(resp_bytes) = serde_json::to_vec(&resp) {
@@ -558,6 +559,7 @@ where
                     // "Failed to connect to X: Failed to connect to X at ...".
                     error: format!("{e:#}"),
                     navigated_to: None,
+                    target_id: None,
                     error_code: Some(ErrorCode::ChromeConnection as u32),
                 };
                 if let Ok(resp_bytes) = serde_json::to_vec(&resp) {
@@ -579,6 +581,7 @@ where
                 crate::browser::display_name(browser)
             ),
             navigated_to: None,
+            target_id: None,
             error_code: Some(ErrorCode::ChromeConnection as u32),
         },
     };
@@ -613,6 +616,7 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> DaemonRe
                 output: result.output,
                 error: String::new(),
                 navigated_to: result.navigated_to,
+                target_id: result.target_id,
                 error_code: result.error_code,
             }
         }
@@ -627,6 +631,7 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> DaemonRe
                 output: String::new(),
                 error: format!("{e:#}"),
                 navigated_to: None,
+                target_id: None,
                 error_code,
             }
         }

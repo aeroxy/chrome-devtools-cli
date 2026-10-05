@@ -1354,13 +1354,18 @@ fn print_output(output: &str, navigated_to: Option<&str>, target_id: Option<&str
         eprintln!("[navigated to: {navigated_to}]");
     }
     if let Some(target_id) = target_id {
-        eprintln!("[target: {target_id}]");
+        // No space after the colon: README and SKILL.md document `[target:name]`.
+        eprintln!("[target:{target_id}]");
     }
 }
 
 fn print_response(resp: &protocol::DaemonResponse) {
     if resp.success {
-        print_output(&resp.output, resp.navigated_to.as_deref(), None);
+        print_output(
+            &resp.output,
+            resp.navigated_to.as_deref(),
+            resp.target_id.as_deref(),
+        );
     } else {
         eprintln!("error: {}", resp.error);
         telemetry::shutdown_logger();

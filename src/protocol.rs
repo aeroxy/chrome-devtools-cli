@@ -45,6 +45,8 @@ pub struct DaemonResponse {
     pub output: String,
     pub error: String,
     pub navigated_to: Option<String>,
+    /// Friendly name of the page the command ran on; the CLI prints it as `[target:name]`.
+    pub target_id: Option<String>,
     pub error_code: Option<u32>,
 }
 
@@ -306,5 +308,17 @@ mod tests {
         assert_eq!(back.browser, "edge");
         assert_eq!(back.pid, 4242);
         assert_eq!(back.ws_url, info.ws_url);
+    }
+
+    /// A daemon started before an upgrade keeps serving until it idles out, and
+    /// its responses carry no `target_id`; they must still parse.
+    #[test]
+    fn daemon_response_without_target_id_still_parses() {
+        let resp: DaemonResponse = serde_json::from_str(
+            r#"{"success":true,"output":"ok","error":"","navigated_to":null,"error_code":null}"#,
+        )
+        .unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.target_id, None);
     }
 }
