@@ -3,7 +3,6 @@ use serde_json::json;
 use std::fmt::Write;
 
 use crate::cdp::CdpClient;
-use crate::constants::NAVIGATION_TIMEOUT_MS;
 use crate::format::{format_structured, OutputFormat};
 use crate::friendly;
 use crate::result::CommandResult;
@@ -56,9 +55,13 @@ pub async fn clear_extra_headers(client: &mut CdpClient, session_id: &str) -> Re
             json!({"headers": {}}),
         )
         .await?;
-    let _ = client
-        .send_to_target(session_id, "Network.disable", json!({}))
-        .await;
+    // Undo apply_extra_headers' Network.enable only on a per-command session:
+    // the persistent session needs Network for `network` to keep collecting.
+    if client.persistent_session.as_deref() != Some(session_id) {
+        let _ = client
+            .send_to_target(session_id, "Network.disable", json!({}))
+            .await;
+    }
     Ok(())
 }
 
@@ -105,37 +108,37 @@ pub async fn new_page(
         // Create blank page so emulation/headers are applied before the real URL loads
         let target_id = client.create_target("about:blank").await?;
 
+        // emulate() records overrides as the state of the persistent session's
+        // tab, so they run on the new tab's persistent session, as `navigate`
+        // does for an existing tab. A throwaway session would lose them at
+        // detach and credit them to whichever tab was active before.
         let result: Result<()> = async {
-            let session_id = client.attach_to_target(&target_id).await?;
-
-            let inner: Result<()> = async {
-                if let Some(params) = emulation {
-                    crate::commands::emulation::emulate(client, &session_id, params).await?;
-                }
-                apply_extra_headers(client, &session_id, extra_headers).await?;
-                let nav_result = client
-                    .send_to_target(&session_id, "Page.navigate", json!({ "url": url }))
-                    .await?;
-                if let Some(error_text) = nav_result.get("errorText").and_then(|v| v.as_str()) {
-                    anyhow::bail!("Page.navigate failed: {error_text}");
-                }
-                crate::commands::navigate::wait_for_load(
-                    client,
-                    &session_id,
-                    NAVIGATION_TIMEOUT_MS,
-                )
-                .await?;
-                Ok(())
+            client.ensure_persistent_session(&target_id).await?;
+            let session_id = client
+                .persistent_session
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("No persistent session for the new page"))?;
+            if let Some(params) = emulation {
+                crate::commands::emulation::emulate(client, &session_id, params).await?;
             }
-            .await;
-
-            let _ = client.detach_from_target(&session_id).await;
-            inner
+            crate::commands::navigate::navigate(
+                client,
+                &session_id,
+                Some(url),
+                false,
+                false,
+                false,
+                extra_headers,
+                None,
+            )
+            .await?;
+            Ok(())
         }
         .await;
 
         if let Err(e) = result {
             let _ = client.close_target(&target_id).await;
+            client.forget_target(&target_id);
             return Err(e);
         }
         target_id
