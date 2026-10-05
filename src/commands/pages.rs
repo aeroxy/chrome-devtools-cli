@@ -101,7 +101,7 @@ pub async fn new_page(
     emulation: Option<crate::commands::emulation::EmulateParams>,
     extra_headers: Option<&str>,
 ) -> Result<CommandResult> {
-    if emulation.is_some() || extra_headers.is_some() {
+    let target_id = if emulation.is_some() || extra_headers.is_some() {
         // Create blank page so emulation/headers are applied before the real URL loads
         let target_id = client.create_target("about:blank").await?;
 
@@ -138,16 +138,23 @@ pub async fn new_page(
             let _ = client.close_target(&target_id).await;
             return Err(e);
         }
-
-        Ok(CommandResult::output(format!(
-            "Opened new page: {url} (target: {target_id})"
-        )))
+        target_id
     } else {
-        let target_id = client.create_target(url).await?;
-        Ok(CommandResult::output(format!(
-            "Opened new page: {url} (target: {target_id})"
-        )))
-    }
+        client.create_target(url).await?
+    };
+
+    Ok(opened_page(url, &target_id))
+}
+
+/// Name the new tab the way `list-pages` does. Browser-level commands skip the
+/// step that tags page commands with their target, so the tag is set here to
+/// give `new-page` the same `[target:name]` line.
+fn opened_page(url: &str, target_id: &str) -> CommandResult {
+    let friendly_name = friendly::to_friendly(target_id);
+    let mut result =
+        CommandResult::output(format!("Opened new page: {url} (target: {friendly_name})"));
+    result.target_id = Some(friendly_name);
+    result
 }
 
 /// Close a page target by its target ID.
@@ -219,5 +226,24 @@ pub async fn wait_for(
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Callers pin later commands to the new tab by this name, so it must be the
+    /// friendly one `list-pages` shows, and it must reach the `[target:name]` line.
+    #[test]
+    fn new_page_reports_the_friendly_name() {
+        let id = "C08EA3F291931B3333A12DFB7B570CF6";
+        let name = friendly::to_friendly(id);
+        let result = opened_page("https://example.com", id);
+        assert_eq!(
+            result.output,
+            format!("Opened new page: https://example.com (target: {name})")
+        );
+        assert_eq!(result.target_id, Some(name));
     }
 }

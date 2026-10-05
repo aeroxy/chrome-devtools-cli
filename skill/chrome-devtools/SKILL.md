@@ -125,12 +125,12 @@ chrome-devtools --target warm-squid evaluate "document.title"
 
 # 4. Open a new tab — capture the NEW target name from output
 chrome-devtools new-page https://github.com
-# stdout: Opened: https://github.com
+# stdout: Opened new page: https://github.com (target: icy-goat)
 # stderr: [target:icy-goat]  ← new tab, new target
 chrome-devtools --target icy-goat snapshot
 ```
 
-**Note**: The `[navigated to: ...]` and `[target:...]` lines go to **stderr**, not stdout. The stdout contains only the main command output ("Navigated to …", "Opened: …").
+**Note**: The `[navigated to: ...]` and `[target:...]` lines go to **stderr**, not stdout. The stdout contains only the main command output ("Navigated to …", "Opened new page: …").
 
 ### Pattern 2: Emulation (Viewport & Geolocation)
 Overrides are per-tab: each page keeps its own viewport/geolocation/URL-blocks, persisting across navigation within that tab and isolated from other tabs (until cleared, the tab closes, or the daemon exits). `emulate` with no flags shows the active tab's state.
