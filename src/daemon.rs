@@ -571,7 +571,7 @@ where
         }
     }
 
-    let response = match client.as_mut() {
+    let mut response = match client.as_mut() {
         Some(client) => handle_request(client, &request).await,
         None => DaemonResponse {
             success: false,
@@ -588,10 +588,16 @@ where
 
     // Check if the error indicates a disconnected WebSocket.
     // If so, we should exit the daemon so it can be respawned cleanly next time.
-    let is_fatal = !response.success
-        && (response.error.contains("WebSocket closed")
-            || response.error.contains("WebSocket connection closed")
-            || response.error.contains("WebSocket error"));
+    let is_fatal = !response.success && is_connection_lost(&response.error);
+    if is_fatal {
+        // A bare transport error doesn't tell the caller (often an agent) that
+        // the daemon is gone and that simply rerunning the command recovers.
+        let name = crate::browser::display_name(browser);
+        response.error.push_str(&format!(
+            "\nLost the connection to {name}, so the daemon has exited. Run the command again to \
+             reconnect; {name} may ask you to approve the new connection."
+        ));
+    }
 
     if let Ok(resp_bytes) = serde_json::to_vec(&response) {
         let _ = write_msg(&mut stream, &resp_bytes).await;
@@ -602,6 +608,13 @@ where
     } else {
         ConnectionOutcome::Continue
     }
+}
+
+/// Matches the errors `CdpClient` raises once Chrome's WebSocket is gone.
+fn is_connection_lost(error: &str) -> bool {
+    error.contains("WebSocket closed")
+        || error.contains("WebSocket connection closed")
+        || error.contains("WebSocket error")
 }
 
 async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> DaemonResponse {
@@ -641,6 +654,43 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> DaemonRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After Chrome resets the connection (as it did across a macOS sleep), the
+    /// next write fails before anything is read. That failure has to count as a
+    /// lost connection too, or the daemon keeps serving a socket that can never
+    /// work again.
+    #[tokio::test]
+    async fn write_to_a_reset_connection_counts_as_lost() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            // Dropping with zero linger resets the connection instead of closing it.
+            ws.get_ref().set_zero_linger().unwrap();
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        chrome.await.unwrap();
+
+        // The reset can land just after a write is queued, so write until one fails.
+        let mut error = None;
+        for _ in 0..50 {
+            match client
+                .send_raw_no_wait(None, "Browser.getVersion", serde_json::json!({}))
+                .await
+            {
+                Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(e) => {
+                    error = Some(format!("{e:#}"));
+                    break;
+                }
+            }
+        }
+        let error = error.expect("writing to a reset connection must fail");
+        assert!(is_connection_lost(&error), "not treated as lost: {error}");
+    }
 
     #[test]
     fn test_lock_wait_stays_shorter_than_every_client_deadline() {
