@@ -534,7 +534,12 @@ impl CdpClient {
         }
 
         let text = serde_json::to_string(&msg)?;
-        self.write.send(Message::Text(text)).await?;
+        // Labelled like read_text's failures: a failed write means Chrome's
+        // connection is gone too, and the daemon only exits on these labels.
+        self.write
+            .send(Message::Text(text))
+            .await
+            .map_err(|e| anyhow!("WebSocket error: {e}"))?;
         Ok(id)
     }
 
