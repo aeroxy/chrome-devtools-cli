@@ -14,9 +14,18 @@ use crate::telemetry;
 
 /// Read the daemon idle timeout from `DAEMON_IDLE_TIMEOUT_SECS`, defaulting to 300 (5 minutes).
 fn idle_timeout() -> Duration {
-    std::env::var("DAEMON_IDLE_TIMEOUT_SECS")
-        .ok()
+    parse_idle_timeout(std::env::var("DAEMON_IDLE_TIMEOUT_SECS").ok().as_deref())
+}
+
+/// `0` falls back to the default rather than meaning "don't wait": a daemon
+/// that exits the moment it is idle makes every command reconnect, and each
+/// reconnect can ask the user to approve it again.
+///
+/// Kept pure so it is unit-testable without setting env vars.
+fn parse_idle_timeout(value: Option<&str>) -> Duration {
+    value
         .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(300))
 }
@@ -707,6 +716,16 @@ mod tests {
         }
         // A zero budget can't be beaten, only matched: one try_lock, no wait.
         assert_eq!(derive_lock_wait_timeout(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_idle_timeout_treats_zero_as_unset() {
+        let default = Duration::from_secs(300);
+        assert_eq!(parse_idle_timeout(None), default);
+        assert_eq!(parse_idle_timeout(Some("soon")), default);
+        // Zero would make the daemon exit whenever it is idle.
+        assert_eq!(parse_idle_timeout(Some("0")), default);
+        assert_eq!(parse_idle_timeout(Some("3600")), Duration::from_secs(3600));
     }
 
     #[cfg(unix)]

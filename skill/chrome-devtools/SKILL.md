@@ -31,7 +31,7 @@ The port is chosen by the browser and recorded in `<user-data-dir>/DevToolsActiv
 Read that file rather than assuming a number: it differs per browser and can
 change between launches. Auto-connect does this for you, which is why no URL is
 needed. A daemon is spawned on first invocation and reused across commands
-(5-minute idle timeout).
+(5-minute idle timeout by default, set by `DAEMON_IDLE_TIMEOUT_SECS`).
 
 If the OS will not let the CLI read that file, remote debugging is usually still on. For the default profile the CLI then connects to port 9222 instead and prints `Warning: cannot read ...DevToolsActivePort: Operation not permitted ...`. To use another port, pass `--port <n>` with the port shown at `chrome://inspect/#remote-debugging`. `--port` also works for a browser launched with `--remote-debugging-port`. See "Failure Handling: cannot read DevToolsActivePort" below for what to tell the user.
 
@@ -518,7 +518,7 @@ it has no endpoint left to resolve.
 On Windows neither form of `kill-daemon` stops anything: it prints that it is
 unsupported and exits. Take the PID from `list-daemons` (its state column reads
 `?` there, since liveness is not probed) and pass it to `taskkill /PID <pid>`,
-or wait out the 5-minute idle timeout.
+or wait out the idle timeout.
 
 Older versions ran a single daemon per user, bound to whichever browser the
 first command resolved, and silently ignored later `--browser`/`--user-data-dir`
@@ -630,6 +630,17 @@ For this reason, `kill-daemon` refuses to run non-interactively without
 `--force`. As an agent, only pass `--force` if the user has explicitly asked you
 to kill the daemon for some other reason (e.g. it's stuck on unrelated JS
 execution) — never as a reaction to a connection failure.
+
+**If the user has to approve the dialog again after every pause of more than a
+few minutes**, the daemon is exiting on its idle timeout (5 minutes without a
+command, by default) and the next command opens a new connection. Suggest they
+set `DAEMON_IDLE_TIMEOUT_SECS` (in seconds, e.g. `3600`) in the environment your
+commands run in, and leave the choice to them: a longer timeout keeps the
+approved connection usable for longer. A daemon reads it when it is spawned, so
+the new value applies from the next daemon on; killing the running one to apply
+it would cost the very approval you are trying to save. `0` does not mean
+"never" — it falls back to the default. A computer sleep can drop the
+connection whatever the timeout.
 
 ## Failure Handling: cannot read DevToolsActivePort / "Operation not permitted"
 
