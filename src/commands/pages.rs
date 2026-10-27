@@ -222,9 +222,9 @@ pub async fn wait_for(
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     continue;
                 }
-                return Err(anyhow::anyhow!(
-                    "wait_for failed for session {session_id}: {e}"
-                ));
+                // Context rather than a new error, so a lost connection keeps
+                // its type and the daemon still exits on it.
+                return Err(e.context(format!("wait_for failed for session {session_id}")));
             }
         }
 

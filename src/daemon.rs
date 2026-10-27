@@ -6,7 +6,7 @@ use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
-use crate::cdp::CdpClient;
+use crate::cdp::{CdpClient, ConnectionLost};
 use crate::commands::executor;
 use crate::error::ErrorCode;
 use crate::protocol::*;
@@ -580,24 +580,26 @@ where
         }
     }
 
-    let mut response = match client.as_mut() {
+    let (mut response, is_fatal) = match client.as_mut() {
         Some(client) => handle_request(client, &request).await,
-        None => DaemonResponse {
-            success: false,
-            output: String::new(),
-            error: format!(
-                "Failed to connect to {}: client initialization failed",
-                crate::browser::display_name(browser)
-            ),
-            navigated_to: None,
-            target_id: None,
-            error_code: Some(ErrorCode::ChromeConnection as u32),
-        },
+        None => (
+            DaemonResponse {
+                success: false,
+                output: String::new(),
+                error: format!(
+                    "Failed to connect to {}: client initialization failed",
+                    crate::browser::display_name(browser)
+                ),
+                navigated_to: None,
+                target_id: None,
+                error_code: Some(ErrorCode::ChromeConnection as u32),
+            },
+            false,
+        ),
     };
 
-    // Check if the error indicates a disconnected WebSocket.
-    // If so, we should exit the daemon so it can be respawned cleanly next time.
-    let is_fatal = !response.success && is_connection_lost(&response.error);
+    // Fatal means Chrome's WebSocket is gone: exit the daemon so it can be
+    // respawned cleanly next time.
     if is_fatal {
         // A bare transport error doesn't tell the caller (often an agent) that
         // the daemon is gone and that simply rerunning the command recovers.
@@ -619,28 +621,31 @@ where
     }
 }
 
-/// Matches the errors `CdpClient` raises once Chrome's WebSocket is gone.
-fn is_connection_lost(error: &str) -> bool {
-    error.contains("WebSocket closed")
-        || error.contains("WebSocket connection closed")
-        || error.contains("WebSocket error")
+/// Whether `CdpClient` raised this because Chrome's WebSocket is gone. Checked
+/// by type, never text: page-supplied messages can mention a WebSocket, and
+/// `downcast_ref` also sees through context that commands add on the way up.
+fn is_connection_lost(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ConnectionLost>().is_some()
 }
 
-async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> DaemonResponse {
+/// Run one request. The flag says it failed because Chrome's connection is
+/// gone, which the daemon exits on.
+async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> (DaemonResponse, bool) {
     let start = std::time::Instant::now();
     let cmd_name = req.command.as_str();
     match executor::execute_command(client, req).await {
         Ok(result) => {
             let duration = start.elapsed();
             telemetry::log_command(cmd_name, duration, true, result.error_code);
-            DaemonResponse {
+            let response = DaemonResponse {
                 success: true,
                 output: result.output,
                 error: String::new(),
                 navigated_to: result.navigated_to,
                 target_id: result.target_id,
                 error_code: result.error_code,
-            }
+            };
+            (response, false)
         }
         Err(e) => {
             let duration = start.elapsed();
@@ -648,14 +653,15 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> DaemonRe
                 .downcast_ref::<crate::error::CliError>()
                 .map(|ce| ce.code().code());
             telemetry::log_command(cmd_name, duration, false, error_code);
-            DaemonResponse {
+            let response = DaemonResponse {
                 success: false,
                 output: String::new(),
                 error: format!("{e:#}"),
                 navigated_to: None,
                 target_id: None,
                 error_code,
-            }
+            };
+            (response, is_connection_lost(&e))
         }
     }
 }
@@ -692,13 +698,49 @@ mod tests {
             {
                 Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
                 Err(e) => {
-                    error = Some(format!("{e:#}"));
+                    error = Some(e);
                     break;
                 }
             }
         }
         let error = error.expect("writing to a reset connection must fail");
-        assert!(is_connection_lost(&error), "not treated as lost: {error}");
+        assert!(is_connection_lost(&error), "not treated as lost: {error:#}");
+    }
+
+    /// Chrome quitting shows up on the read side instead, as a close frame or EOF.
+    #[tokio::test]
+    async fn read_from_a_closed_connection_counts_as_lost() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.close(None).await.unwrap();
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        chrome.await.unwrap();
+
+        let error = client
+            .read_text()
+            .await
+            .expect_err("reading a closed connection must fail");
+        assert!(is_connection_lost(&error), "not treated as lost: {error:#}");
+    }
+
+    #[test]
+    fn lost_connection_is_recognized_by_type_not_text() {
+        // An `evaluate` exception carries the page's own message.
+        let page_error =
+            anyhow::anyhow!("Error: WebSocket closed unexpectedly\n    at <anonymous>:1:7");
+        assert!(!is_connection_lost(&page_error));
+
+        // Commands add context on the way up, which moves any label off the start.
+        let wrapped = anyhow::Error::new(ConnectionLost("WebSocket error: reset".into()))
+            .context("Failed to capture screenshot via CDP")
+            .context("while running screenshot");
+        assert!(is_connection_lost(&wrapped));
     }
 
     #[test]
