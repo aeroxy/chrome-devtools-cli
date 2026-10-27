@@ -14,6 +14,20 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Chrome's WebSocket is gone. A type rather than a message prefix, because
+/// the daemon exits on it and error text can come from the page: an
+/// `evaluate` exception can say "WebSocket closed" too.
+#[derive(Debug)]
+pub struct ConnectionLost(pub(crate) String);
+
+impl std::fmt::Display for ConnectionLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConnectionLost {}
+
 /// Trait abstracting Chrome DevTools Protocol operations.
 ///
 /// Enables dependency injection for testing command logic without
@@ -534,12 +548,12 @@ impl CdpClient {
         }
 
         let text = serde_json::to_string(&msg)?;
-        // Labelled like read_text's failures: a failed write means Chrome's
-        // connection is gone too, and the daemon only exits on these labels.
+        // A failed write means Chrome's connection is gone too, so it is a
+        // ConnectionLost like read_text's failures: the daemon exits only on those.
         self.write
             .send(Message::Text(text))
             .await
-            .map_err(|e| anyhow!("WebSocket error: {e}"))?;
+            .map_err(|e| ConnectionLost(format!("WebSocket error: {e}")))?;
         Ok(id)
     }
 
@@ -702,10 +716,12 @@ impl CdpClient {
         loop {
             match self.read.next().await {
                 Some(Ok(Message::Text(text))) => return Ok(text.to_string()),
-                Some(Ok(Message::Close(_))) => bail!("WebSocket closed by server"),
+                Some(Ok(Message::Close(_))) => {
+                    bail!(ConnectionLost("WebSocket closed by server".into()))
+                }
                 Some(Ok(_)) => continue,
-                Some(Err(e)) => bail!("WebSocket error: {e}"),
-                None => bail!("WebSocket connection closed"),
+                Some(Err(e)) => bail!(ConnectionLost(format!("WebSocket error: {e}"))),
+                None => bail!(ConnectionLost("WebSocket connection closed".into())),
             }
         }
     }

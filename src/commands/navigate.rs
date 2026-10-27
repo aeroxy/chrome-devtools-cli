@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use serde_json::json;
 
 use crate::cdp::CdpClient;
@@ -194,9 +194,9 @@ pub async fn wait_for_load(
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
-                return Err(anyhow!(
-                    "wait_for_load failed for session {session_id}: {e}"
-                ));
+                // Context rather than a new error, so a lost connection keeps
+                // its type and the daemon still exits on it.
+                return Err(e.context(format!("wait_for_load failed for session {session_id}")));
             }
         }
 
