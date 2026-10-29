@@ -642,6 +642,19 @@ it would cost the very approval you are trying to save. `0` does not mean
 "never" — it falls back to the default. A computer sleep can drop the
 connection whatever the timeout.
 
+**To keep an approved connection open for the rest of a session** (the user
+asks for it, or agrees when you suggest it), run `chrome-devtools caffeinate`
+in the background, with the same `--browser`/`--user-data-dir`/`--port` flags as
+your other commands. It never returns while the connection is fine: it checks
+it every 10 seconds, which also stops the running daemon from timing out, with
+no restart needed. It exits only when the connection is lost, with an error
+that says "Lost the connection to <browser>" (exit code 9, or 6 if the daemon
+had already exited). When that happens, tell the user the connection is gone
+and that the next command may need their approval again. Do not restart
+`caffeinate` in a loop, and never use it to retry a failed connection: it
+does not reconnect, and each new connection can ask the user to approve it. A
+computer sleep can still drop the connection.
+
 ## Failure Handling: cannot read DevToolsActivePort / "Operation not permitted"
 
 This means the CLI was not allowed into the browser's profile directory. It does **not** mean remote debugging is off, so do not tell the user to enable it.
