@@ -81,6 +81,29 @@ was wrong. The timeout error message is written to be agent-actionable: retry
 at most once, then stop and ask a human rather than looping or calling
 `kill-daemon`.
 
+### Keep-alive (`caffeinate`)
+
+`caffeinate` is a CLI-side loop (`lib.rs`): every 10s it sends the daemon a
+`caffeinate` request, which the daemon answers with one `Browser.getVersion`
+round trip (`CdpClient::ping`). Each request restarts the daemon's idle timer,
+so the daemon and its approved connection live as long as the loop does.
+Three rules keep it safe:
+
+- Only the first check may spawn a daemon. Spawning one after the connection
+  died would put up a consent dialog nobody asked for, and every check that
+  then timed out on it would put up another.
+- The daemon tags a lost-connection response with
+  `ErrorCode::WebSocketDisconnected`, and the loop exits on that code, or on the
+  daemon being gone, with an error that says "Lost the connection to
+  <browser>". That message is how an agent running it in the background learns
+  the connection died. Match the code, not the error text, which pages can
+  imitate.
+- A ping must not change what the next command sees. It leaves the event
+  buffers uncleared, and a `Page.javascriptDialogOpening` it reads goes into
+  `CdpClient::unread`, which `read_text` returns before reading the socket.
+  Without that, the next command would never learn the dialog is open and
+  could hang behind it.
+
 ### Unreadable Profile Directory
 
 Auto-connect has to read `DevToolsActivePort`, and the OS can refuse that while the browser's debugging server is up: macOS withholds another app's data from the app running the CLI until the user approves a privacy prompt, and security software can block it too. `read_devtools_active_port` (`browser.rs`) therefore treats `PermissionDenied` differently from a missing file. For the default profile it probes port 9222 and, when the chrome://inspect server answers, connects there and warns on stderr. A `--remote-debugging-port` server on 9222 is refused instead: Chrome 136+ ignores that flag on the default profile, so such a server is some other instance. For an explicit `--user-data-dir` it errors, because that usually names a throwaway instance and 9222 would reach the everyday browser. `--port` / `CHROME_PORT` connects by port directly and conflicts with `--ws-endpoint`.

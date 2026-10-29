@@ -90,6 +90,7 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         ],
         "kill-daemon" => &["force", "all"],
         "list-daemons" => &[],
+        "caffeinate" => &[],
         _ => &[],
     }
 }
@@ -133,7 +134,7 @@ fn validate_args(cmd: &str, args: &serde_json::Value) -> Result<()> {
 fn is_browser_level(cmd: &str) -> bool {
     matches!(
         cmd,
-        "list-pages" | "new-page" | "sw-logs" | "kill-daemon" | "list-daemons"
+        "list-pages" | "new-page" | "sw-logs" | "kill-daemon" | "list-daemons" | "caffeinate"
     )
 }
 
@@ -145,9 +146,10 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     let cmd = req.command.as_str();
 
     // Event-collecting commands drain the buffer via read_events_for,
-    // so they can capture events that arrived between commands.
+    // so they can capture events that arrived between commands, and a
+    // caffeinate ping leaves it as the next command would find it.
     // All other commands clear stale events to prevent memory buildup.
-    if !matches!(cmd, "console" | "network" | "sw-logs") {
+    if !matches!(cmd, "console" | "network" | "sw-logs" | "caffeinate") {
         client.clear_events();
     }
 
@@ -217,6 +219,9 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
             "kill-daemon" => Ok(CommandResult::output(
                 "kill-daemon is handled directly by the CLI, not the daemon.",
             )),
+            // One check per request: the CLI side loops, so the daemon serves
+            // other commands in between.
+            "caffeinate" => client.ping().await.map(|()| CommandResult::output("")),
             _ => unreachable!(),
         };
     }

@@ -608,6 +608,9 @@ where
             "\nLost the connection to {name}, so the daemon has exited. Run the command again to \
              reconnect; {name} may ask you to approve the new connection."
         ));
+        // The code, not the text above, is how `caffeinate` tells that its
+        // connection died from any other failed check.
+        response.error_code = Some(ErrorCode::WebSocketDisconnected as u32);
     }
 
     if let Ok(resp_bytes) = serde_json::to_vec(&response) {
@@ -636,7 +639,11 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> (DaemonR
     match executor::execute_command(client, req).await {
         Ok(result) => {
             let duration = start.elapsed();
-            telemetry::log_command(cmd_name, duration, true, result.error_code);
+            // `caffeinate` checks every few seconds, which would bury real
+            // commands in the log. A failed check is still logged below.
+            if cmd_name != "caffeinate" {
+                telemetry::log_command(cmd_name, duration, true, result.error_code);
+            }
             let response = DaemonResponse {
                 success: true,
                 output: result.output,
@@ -727,6 +734,49 @@ mod tests {
             .await
             .expect_err("reading a closed connection must fail");
         assert!(is_connection_lost(&error), "not treated as lost: {error:#}");
+    }
+
+    /// `caffeinate` exits on a lost connection by this code alone, so a check
+    /// against a browser that went away must carry it, and end the daemon.
+    #[tokio::test]
+    async fn a_check_over_a_lost_connection_reports_it_by_code() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ws_url = format!("ws://{addr}");
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.close(None).await.unwrap();
+        });
+        let mut client = Some(CdpClient::connect(&ws_url, "Chrome").await.unwrap());
+        chrome.await.unwrap();
+
+        let request = DaemonRequest {
+            command: "caffeinate".into(),
+            args: serde_json::json!({}),
+            page: None,
+            target: None,
+            json_output: false,
+            output_format: None,
+            block_url: Vec::new(),
+            unblock_url: Vec::new(),
+        };
+        let (mut cli, daemon_end) = tokio::io::duplex(64 * 1024);
+        write_msg(&mut cli, &serde_json::to_vec(&request).unwrap())
+            .await
+            .unwrap();
+        let outcome = handle_connection(daemon_end, &mut client, &ws_url, "chrome").await;
+        let response: DaemonResponse =
+            serde_json::from_slice(&read_msg(&mut cli).await.unwrap()).unwrap();
+
+        assert!(matches!(outcome, ConnectionOutcome::Fatal));
+        assert!(!response.success);
+        assert_eq!(
+            response.error_code,
+            Some(ErrorCode::WebSocketDisconnected as u32),
+            "{}",
+            response.error
+        );
     }
 
     #[test]

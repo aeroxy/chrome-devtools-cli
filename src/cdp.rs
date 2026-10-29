@@ -92,6 +92,9 @@ pub struct CdpClient {
     pub dialog_action: Option<String>,
     /// Buffer for storing unhandled events (e.g., navigation events)
     pub events: std::collections::VecDeque<Value>,
+    /// Messages already taken off the socket that `read_text` must return
+    /// before reading more, oldest first. Only [`CdpClient::ping`] fills it.
+    unread: std::collections::VecDeque<String>,
     /// Persistent CDP session for continuous event collection across commands.
     pub persistent_session: Option<String>,
     /// Target ID the persistent session is attached to.
@@ -238,6 +241,7 @@ impl CdpClient {
             next_id: 1,
             dialog_action: None,
             events: std::collections::VecDeque::new(),
+            unread: std::collections::VecDeque::new(),
             persistent_session: None,
             persistent_target_id: None,
             network_events: std::collections::VecDeque::new(),
@@ -711,8 +715,50 @@ impl CdpClient {
         }
     }
 
-    /// Read the next text message from the WebSocket, skipping non-text frames.
+    /// Check that the browser still answers, for `caffeinate`, without changing
+    /// what the next command sees.
+    ///
+    /// `send` would fail on a dialog-opening event and use it up, but nobody
+    /// reads a ping's errors: the next command would never hear about the
+    /// dialog and could hang behind it. The event is set aside for that
+    /// command instead, which reports or handles it as usual.
+    pub async fn ping(&mut self) -> Result<()> {
+        let id = self
+            .send_raw_no_wait(None, "Browser.getVersion", json!({}))
+            .await?;
+        loop {
+            // The socket, not read_text: an event set aside by an earlier ping
+            // would come straight back and be set aside again, forever.
+            let text = self.read_socket_text().await?;
+            let msg: Value = serde_json::from_str(&text)?;
+            if msg.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                if let Some(error) = msg.get("error") {
+                    bail!(
+                        "CDP error in Browser.getVersion: {}",
+                        serde_json::to_string_pretty(error)?
+                    );
+                }
+                return Ok(());
+            }
+            match msg.get("method").and_then(|v| v.as_str()) {
+                Some("Page.javascriptDialogOpening") => self.unread.push_back(text),
+                Some(_) => self.push_event(msg),
+                None => {}
+            }
+        }
+    }
+
+    /// Read the next text message, skipping non-text frames. Messages a ping
+    /// set aside come first, as if they had only just arrived.
     pub async fn read_text(&mut self) -> Result<String> {
+        if let Some(text) = self.unread.pop_front() {
+            return Ok(text);
+        }
+        self.read_socket_text().await
+    }
+
+    /// Read the next text message from the WebSocket itself, skipping non-text frames.
+    async fn read_socket_text(&mut self) -> Result<String> {
         loop {
             match self.read.next().await {
                 Some(Ok(Message::Text(text))) => return Ok(text.to_string()),
@@ -1117,5 +1163,56 @@ mod tests {
             !saved.contains_key("A"),
             "an empty tab must not create a map entry"
         );
+    }
+
+    /// A dialog that a `caffeinate` ping runs into must still reach the next
+    /// command, or that command never learns the page is blocked.
+    #[tokio::test]
+    async fn ping_sets_a_dialog_aside_for_the_next_command() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            // Answer two pings; an alert opens just before the first answer.
+            for n in 0..2 {
+                let Some(Ok(Message::Text(req))) = ws.next().await else {
+                    return;
+                };
+                let id = serde_json::from_str::<Value>(&req).unwrap()["id"].clone();
+                if n == 0 {
+                    let dialog = json!({
+                        "method": "Page.javascriptDialogOpening",
+                        "sessionId": "S",
+                        "params": {"type": "alert", "message": "hi"}
+                    });
+                    ws.send(Message::Text(dialog.to_string())).await.unwrap();
+                }
+                let reply = json!({"id": id, "result": {}});
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+            // Stay connected until the client hangs up.
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+
+        client.ping().await.expect("first ping");
+        // A later ping must neither use up the set-aside dialog nor spin on it.
+        client.ping().await.expect("second ping");
+
+        let error = client
+            .send("Target.getTargets", json!({}))
+            .await
+            .expect_err("the dialog must reach the next command");
+        assert!(
+            error
+                .to_string()
+                .contains("A javascript dialog is open (alert: hi)"),
+            "{error:#}"
+        );
+        drop(client);
+        chrome.await.unwrap();
     }
 }

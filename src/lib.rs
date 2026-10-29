@@ -447,6 +447,18 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
     },
+
+    /// Keep the daemon's approved browser connection alive until it is lost
+    ///
+    /// Checks the connection every 10 seconds, which also keeps the daemon from
+    /// exiting on its idle timeout. Runs until stopped (Ctrl-C) or until the
+    /// connection is lost. It then exits with an error that says "Lost the
+    /// connection to <browser>" (exit code 9, or 6 if the daemon had already
+    /// exited) and does not reconnect, because a new connection may need the
+    /// human's approval again. Only its first check starts a daemon when none
+    /// is running. It does not keep the computer awake, and a sleep can drop
+    /// the connection.
+    Caffeinate,
 }
 
 impl Cli {
@@ -494,6 +506,7 @@ impl Cli {
             Commands::Adapter { .. } => "adapter",
             Commands::KillDaemon { .. } => "kill-daemon",
             Commands::ListDaemons => "list-daemons",
+            Commands::Caffeinate => "caffeinate",
         }
     }
 }
@@ -1319,6 +1332,7 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
                 "track_navigation": track_navigation
             }),
         ),
+        Commands::Caffeinate => ("caffeinate", json!({})),
         Commands::KillDaemon { .. } => unreachable!("KillDaemon is handled before build_request"),
         Commands::ListDaemons => {
             unreachable!("ListDaemons is handled before build_request")
@@ -1673,6 +1687,10 @@ pub async fn run() -> Result<()> {
     // to a different browser.
     let key = protocol::instance_key(&ws_url);
 
+    if matches!(cli.command, Commands::Caffeinate) {
+        return caffeinate(&cli, &ws_url, &key, &request).await;
+    }
+
     // Try daemon first
     if let Ok(resp) = client::send_to_daemon(&key, &request).await {
         print_response(&resp);
@@ -1697,6 +1715,94 @@ pub async fn run() -> Result<()> {
             // Daemon failed — fall back to direct execution
             run_direct_fallback(&cli, &ws_url, &e).await
         }
+    }
+}
+
+/// How often `caffeinate` checks the connection: well inside the daemon's
+/// default 5-minute idle timeout, which every check restarts.
+const CAFFEINATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Keep the daemon for `key`, and the browser connection it holds, alive until
+/// that connection is lost.
+///
+/// Only the first check may spawn a daemon, so an approval prompt only ever
+/// follows a command someone ran. Respawning once the connection has died
+/// would put up a prompt nobody asked for, and another after every check that
+/// timed out waiting on it.
+async fn caffeinate(cli: &Cli, ws_url: &str, key: &str, request: &DaemonRequest) -> Result<()> {
+    let first = match client::send_to_daemon(key, request).await {
+        Ok(resp) => resp,
+        Err(_) => {
+            client::spawn_daemon(ws_url, &browser::canonical_name(&cli.browser))?;
+            client::wait_for_daemon(key).await?;
+            client::send_to_daemon(key, request).await?
+        }
+    };
+    if !first.success {
+        // Exits with the daemon's error and code, as any other command would.
+        print_response(&first);
+    }
+
+    let name = browser::display_name(&cli.browser);
+    eprintln!(
+        "Keeping the connection to {name} alive, checking it every {}s. Stop with Ctrl-C.",
+        CAFFEINATE_INTERVAL.as_secs()
+    );
+    let started = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(CAFFEINATE_INTERVAL).await;
+        let outcome = client::send_to_daemon(key, request).await;
+        if let Some(reason) = caffeinate_stop_reason(outcome, &name, started.elapsed()) {
+            return Err(reason);
+        }
+    }
+}
+
+/// Why `caffeinate` must stop after a check, or `None` while the connection is
+/// fine. A lost connection always reads "Lost the connection to <browser>": an
+/// agent running caffeinate in the background learns of it from this alone.
+fn caffeinate_stop_reason(
+    outcome: Result<protocol::DaemonResponse>,
+    browser: &str,
+    alive_for: std::time::Duration,
+) -> Option<anyhow::Error> {
+    let after = format_uptime(alive_for.as_secs());
+    let next = format!(
+        "The next chrome-devtools command opens a new connection, which {browser} may ask the \
+         human to approve. If you are an automated agent, tell the human, and do not restart \
+         caffeinate in a loop."
+    );
+    match outcome {
+        Ok(resp) if resp.success => None,
+        Ok(resp) if resp.error_code == Some(error::ErrorCode::WebSocketDisconnected.code()) => {
+            // The first line is the cause. The rest is the daemon's advice for
+            // ordinary commands, which `next` replaces.
+            let cause = resp.error.lines().next().unwrap_or_default();
+            Some(
+                error::CliError::new(
+                    error::ErrorCode::WebSocketDisconnected,
+                    format!(
+                        "Lost the connection to {browser} after {after} ({cause}). Its daemon \
+                         has exited and caffeinate has stopped. {next}"
+                    ),
+                )
+                .into(),
+            )
+        }
+        Ok(resp) => Some(anyhow::anyhow!(
+            "caffeinate stopped after {after}: {}",
+            resp.error
+        )),
+        Err(e) => Some(
+            error::CliError::new(
+                error::ErrorCode::Daemon,
+                format!(
+                    "Lost the connection to {browser} after {after}: its daemon is no longer \
+                     running ({e:#}). caffeinate has stopped. {next}"
+                ),
+            )
+            .into(),
+        ),
     }
 }
 
@@ -2092,6 +2198,56 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent running `caffeinate` in the background learns that the
+    /// connection died only from how it exits, so both ways of losing it must
+    /// say so and carry their own code.
+    #[test]
+    fn test_caffeinate_stops_only_once_the_connection_is_lost() {
+        let response =
+            |success: bool, error: &str, error_code: Option<u32>| protocol::DaemonResponse {
+                success,
+                output: String::new(),
+                error: error.to_string(),
+                navigated_to: None,
+                target_id: None,
+                error_code,
+            };
+        let code_of = |e: &anyhow::Error| e.downcast_ref::<error::CliError>().map(|ce| ce.code());
+        let alive_for = std::time::Duration::from_secs(2 * 3600 + 13 * 60);
+
+        let fine = Ok(response(true, "", None));
+        assert!(caffeinate_stop_reason(fine, "Chrome", alive_for).is_none());
+
+        let lost = Ok(response(
+            false,
+            "WebSocket closed by server\nLost the connection to Chrome, so the daemon has \
+             exited. Run the command again to reconnect; Chrome may ask you to approve the new \
+             connection.",
+            Some(error::ErrorCode::WebSocketDisconnected.code()),
+        ));
+        let lost = caffeinate_stop_reason(lost, "Chrome", alive_for).unwrap();
+        assert_eq!(
+            code_of(&lost),
+            Some(error::ErrorCode::WebSocketDisconnected)
+        );
+        let text = lost.to_string();
+        assert!(
+            text.contains("Lost the connection to Chrome after 2h13m (WebSocket closed by server)"),
+            "{text}"
+        );
+        // Rerunning is advice for ordinary commands; caffeinate must not loop.
+        assert!(!text.contains("Run the command again"), "{text}");
+
+        let gone = Err(anyhow::anyhow!("Connection refused"));
+        let gone = caffeinate_stop_reason(gone, "Chrome", alive_for).unwrap();
+        assert_eq!(code_of(&gone), Some(error::ErrorCode::Daemon));
+        assert!(
+            gone.to_string()
+                .contains("Lost the connection to Chrome after 2h13m"),
+            "{gone}"
+        );
+    }
 
     #[test]
     fn port_conflicts_with_ws_endpoint() {
