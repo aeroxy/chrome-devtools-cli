@@ -10,9 +10,21 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async_with_config,
+    tungstenite::{protocol::WebSocketConfig, Message},
+    MaybeTlsStream, WebSocketStream,
+};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Largest message read from the browser. Chrome sends each CDP message as a
+/// single frame, so this is the frame limit too. tungstenite's default of
+/// 16 MiB per frame is too small: a page can exceed it with one long console
+/// message or POST body, and after a failed read the connection is unusable.
+/// The daemon then exits, and the next command needs the user to approve a new
+/// connection. Playwright allows 256 MiB on the same connection.
+const MAX_MESSAGE_SIZE: usize = 256 << 20;
 
 /// Chrome's WebSocket is gone. A type rather than a message prefix, because
 /// the daemon exits on it and error text can come from the page: an
@@ -221,7 +233,13 @@ impl CdpClient {
     /// go and check Chrome sends them to the wrong window.
     pub async fn connect(ws_url: &str, browser: &str) -> Result<Self> {
         let timeout_dur = connect_timeout();
-        let (ws, _) = tokio::time::timeout(timeout_dur, connect_async(ws_url))
+        let config = WebSocketConfig {
+            max_message_size: Some(MAX_MESSAGE_SIZE),
+            max_frame_size: Some(MAX_MESSAGE_SIZE),
+            ..WebSocketConfig::default()
+        };
+        let connecting = connect_async_with_config(ws_url, Some(config), false);
+        let (ws, _) = tokio::time::timeout(timeout_dur, connecting)
             .await
             .map_err(|_| {
                 anyhow!(
@@ -1212,6 +1230,32 @@ mod tests {
                 .contains("A javascript dialog is open (alert: hi)"),
             "{error:#}"
         );
+        drop(client);
+        chrome.await.unwrap();
+    }
+
+    /// Chrome sends each CDP message as one frame, and a page can make one
+    /// bigger than tungstenite's 16 MiB default frame limit. Reading it failed,
+    /// the daemon took that for a lost connection and exited, and the next
+    /// command had to ask the user to approve a new connection.
+    #[tokio::test]
+    async fn a_message_over_16_mib_still_arrives() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let size = (16 << 20) + 1;
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(Message::Text("x".repeat(size))).await.unwrap();
+            // Stay connected until the client hangs up.
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+
+        let text = client.read_text().await.expect("read the large message");
+        assert_eq!(text.len(), size);
         drop(client);
         chrome.await.unwrap();
     }
