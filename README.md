@@ -354,6 +354,19 @@ chrome-devtools --target red-snake console       # drain console + exceptions
 
 Always pass `--target` from step 2 onward to stay on the same page.
 
+## Custom scripts
+
+`run-script` runs your own JavaScript file inside the page. `adapter` runs a named function from a site-specific file, and first navigates the tab to the file's `@domain` if it is on another site. See the [custom scripting guide](skill/chrome-devtools/CUSTOM_SCRIPTING.md), and the [`run-script`](wiki/run-script.md) and [`adapter`](wiki/adapter.md) pages.
+
+Ready-made scripts live in [aeroxy/chrome-devtools-cli-scripts](https://github.com/aeroxy/chrome-devtools-cli-scripts), one file per site. Use them as they are, or read them to learn how an adapter is put together. So far there is a read-only Discord helper (channels, messages, scroll-back history) that runs in a tab you already have open.
+
+```bash
+git clone https://github.com/aeroxy/chrome-devtools-cli-scripts
+chrome-devtools --target red-snake adapter chrome-devtools-cli-scripts/discord.js messages
+```
+
+To keep scripts where the agent skill finds them, copy the ones you want into the `scripts/` folder next to `SKILL.md`. It ships empty, and the skill tells the agent to check it before writing a one-off script.
+
 ## Agent skill
 
 `skill/chrome-devtools/SKILL.md` is a Claude Code skill that teaches the agent how to use this binary. Drop it into any Claude Code plugin's `skills/` directory and set `chrome-devtools` to the binary path. The skill covers the full workflow, all commands, and the `--target` pinning pattern — everything needed to reliably automate Chrome without large context overhead.
