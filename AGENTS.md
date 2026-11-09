@@ -58,6 +58,13 @@ in this repo, then re-sync/reinstall it, rather than editing the installed copy
 directly. `skill/chrome-devtools/CUSTOM_SCRIPTING.md` documents `run-script` and
 `adapter` in more depth.
 
+`skill/chrome-devtools/scripts/` is a standard part of the skill folder and lives
+next to `SKILL.md`. It ships empty (only a `.gitkeep`, since git does not track
+empty directories) and is where a user keeps their own reusable `run-script` /
+`adapter` files. In an installed copy it holds the user's data and may be a symlink
+to a collection kept elsewhere, so re-sync by copying over the installed folder, never
+by deleting and recreating it, and never commit user scripts here.
+
 ## Key Concepts
 
 ### Daemon Architecture
