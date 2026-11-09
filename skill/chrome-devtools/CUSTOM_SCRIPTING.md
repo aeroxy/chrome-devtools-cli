@@ -2,6 +2,8 @@
 
 This guide details how to create and execute custom JavaScript scripts (`run-script`) and custom domain-aware adapters (`adapter`) using the Chrome DevTools CLI.
 
+Keep scripts you want to reuse in `scripts/`, next to `SKILL.md`. It ships empty; see "Custom scripts" in `SKILL.md`.
+
 ---
 
 ## 1. Custom Scripts (`run-script`)

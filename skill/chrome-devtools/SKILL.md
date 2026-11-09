@@ -8,6 +8,14 @@ user-invocable: true
 
 A CLI that talks directly to your running Chrome via the DevTools Protocol.
 
+## Custom scripts (`scripts/`)
+
+`scripts/` sits next to this `SKILL.md`, in the same folder. It ships empty and is where the user's reusable `run-script` and `adapter` files live, so they survive across sessions. (`examples/` holds the samples that ship with the skill; don't put the user's scripts there.)
+
+Before writing a one-off script for a site, `ls scripts/` in this skill folder and reuse or extend what is there. Save a script that will be useful again as one file per site, named for the site (for example `discord.js`), and keep a short `scripts/README.md` listing what each one does. Leave throwaway scripts out of it.
+
+The CLI resolves a relative file path against your current directory, not this skill folder, so pass the path to the file inside the folder that holds this `SKILL.md`, for example `chrome-devtools --target <name> adapter <skill-folder>/scripts/discord.js messages`. Always pin `--target`, because an adapter navigates the tab it runs in when the domain does not match.
+
 ## Prerequisites
 
 The browser must have remote debugging enabled:
