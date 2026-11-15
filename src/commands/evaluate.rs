@@ -122,7 +122,7 @@ fn build_ctx_object(args_str: &str) -> String {
                     const el = document.querySelector(selector);
                     if (!el) throw new Error("Element not found: " + selector);
                     if (el.type === 'file') {{
-                        throw new Error("ctx.fill can't set a file input: page scripts have no file access. Run chrome-devtools fill <selector> <path> from the CLI before the script.");
+                        throw new Error("ctx.fill can't set a file input: page scripts have no file access. Navigate to the page this script runs on, run chrome-devtools fill <selector> <path> from the CLI there, then run the script.");
                     }}
                     // Look up the native property setter from the element's own
                     // prototype chain (rather than assigning directly) so that

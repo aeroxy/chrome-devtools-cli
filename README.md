@@ -194,7 +194,7 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 |---------|-------------|
 | `click <selector>` | Click element by CSS selector |
 | `click-at <x> <y>` | Click at specific coordinates |
-| `fill <selector> <value>` | Fill input field, dropdown (`<select>`), or toggle checkbox/radio (`"true"`/`"false"`). On a file input, the value is a local file path (relative to where you run the CLI) and that file is uploaded, one per call |
+| `fill <selector> <value>` | Fill input field, dropdown (`<select>`), or toggle checkbox/radio (`"true"`/`"false"`). On a file input, the value is a local file path (relative to where you run the CLI), and that file is selected on the input as if picked in the file dialog, one per call |
 | `type-text <text> [--submit-key <key>]` | Type into focused element (optionally press key after) |
 | `press-key <key>` | Press key (e.g. `Enter`, `Control+A`) |
 | `hover <selector>` | Hover over element |

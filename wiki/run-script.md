@@ -54,7 +54,7 @@ Before executing your script, `run-script` injects a globally-accessible helper 
 *   `ctx.waitForText(text, timeout_ms)`: Polls the page body text until the string is present (defaults to 30s).
 *   `ctx.waitForSelector(selector, timeout_ms)`: Polls until an element matching the CSS selector exists in the DOM.
 *   `ctx.click(selector)`: Clicks an element by CSS selector.
-*   `ctx.fill(selector, value)`: Fills an input field with the value and fires standard input and change events. It can't set a file input, because page scripts have no access to the disk; run `chrome-devtools fill <selector> <path>` from the CLI before the script instead.
+*   `ctx.fill(selector, value)`: Fills an input field with the value and fires standard input and change events. It can't set a file input, because page scripts have no access to the disk; run `chrome-devtools fill <selector> <path>` from the CLI instead, on the page the script runs on. A script whose `@url` doesn't match the current page navigates first and drops the file, so navigate there before the `fill`.
 
 ## Real-World Example: Search Hacker News
 
