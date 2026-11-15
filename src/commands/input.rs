@@ -363,11 +363,18 @@ if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
     )
 }
 
-/// A file as the page sees it in an input's `files`.
-struct HeldFile {
-    name: String,
-    size: u64,
-    mime: String,
+/// What a file input holds when read back after its file was set.
+enum ReadBack {
+    /// A file, as the page sees it.
+    File {
+        name: String,
+        size: u64,
+        mime: String,
+    },
+    /// Nothing: the page emptied the input after Chrome fired `change`.
+    Cleared,
+    /// Unknown, because the read failed, for example when the page navigated.
+    Unread(String),
 }
 
 /// Give the file `value` names to the file input `selector` matched.
@@ -407,10 +414,9 @@ async fn set_file(
             json!({"files": [&path], "objectId": object_id}),
         )
         .await;
-    let held = if set.is_ok() {
-        read_back_file(client, session_id, &object_id).await
-    } else {
-        None
+    let read_back = match set {
+        Ok(_) => Ok(read_back_file(client, session_id, &object_id).await),
+        Err(e) => Err(anyhow!("Can't set the file on '{selector}': {e}")),
     };
     // The daemon's session outlives this command, so an unreleased handle would
     // keep the element alive until the page navigates.
@@ -421,16 +427,16 @@ async fn set_file(
             json!({"objectId": object_id}),
         )
         .await;
-    set.map_err(|e| anyhow!("Can't set the file on '{selector}': {e}"))?;
+    let read_back = read_back?;
 
-    let new_url = client.current_url(session_id).await?;
-    Ok(CommandResult::output(file_set_report(
-        selector,
-        held.as_ref(),
-        &path,
-        size_on_disk,
-    ))
-    .with_navigated_to_if_changed(new_url, initial_url))
+    // From here nothing may fail the command: the file is set and Chrome has
+    // fired `change`, so an error would invite a retry, and a retry would start
+    // a second upload. A URL that can't be read reports no navigation.
+    let report = CommandResult::output(file_set_report(selector, &read_back, &path, size_on_disk));
+    Ok(match client.current_url(session_id).await {
+        Ok(new_url) => report.with_navigated_to_if_changed(new_url, initial_url),
+        Err(_) => report,
+    })
 }
 
 /// The file to give a file input, as an absolute path, and its size on disk.
@@ -459,16 +465,10 @@ fn upload_file(value: &str, cwd: Option<&str>) -> Result<(String, u64)> {
     }
 }
 
-/// The first file the input behind `object_id` holds, as the page sees it.
-///
-/// Best-effort: the file is set by now and Chrome has fired `change`, so an
-/// error here would invite a retry, and a retry would start a second upload.
-async fn read_back_file(
-    client: &mut CdpClient,
-    session_id: &str,
-    object_id: &str,
-) -> Option<HeldFile> {
-    let result = client
+/// What the input behind `object_id` holds now. A failed read is reported as
+/// [`ReadBack::Unread`], never as an error, because the file is already set.
+async fn read_back_file(client: &mut CdpClient, session_id: &str, object_id: &str) -> ReadBack {
+    let result = match client
         .send_to_target(
             session_id,
             "Runtime.callFunctionOn",
@@ -479,41 +479,62 @@ async fn read_back_file(
             }),
         )
         .await
-        .ok()?;
+    {
+        Ok(result) => result,
+        Err(e) => return ReadBack::Unread(e.to_string()),
+    };
+    if let Some(exception) = result.get("exceptionDetails") {
+        let text = exception["text"].as_str().unwrap_or("Unknown error");
+        let desc = exception["exception"]["description"]
+            .as_str()
+            .unwrap_or(text);
+        return ReadBack::Unread(desc.to_string());
+    }
     let file = &result["result"]["value"];
-    Some(HeldFile {
-        name: file["name"].as_str()?.to_string(),
-        size: file["size"].as_u64()?,
-        mime: file["type"].as_str().unwrap_or_default().to_string(),
-    })
+    match (file["name"].as_str(), file["size"].as_u64()) {
+        (Some(name), Some(size)) => ReadBack::File {
+            name: name.to_string(),
+            size,
+            mime: file["type"].as_str().unwrap_or_default().to_string(),
+        },
+        // `undefined` comes back without a value: the input is empty.
+        _ if file.is_null() => ReadBack::Cleared,
+        _ => ReadBack::Unread(format!("unexpected value {file}")),
+    }
 }
 
 /// `fill`'s report on a file input. It describes what the page now holds, read
 /// back from `files`, rather than echoing the argument.
-fn file_set_report(
-    selector: &str,
-    held: Option<&HeldFile>,
-    path: &str,
-    size_on_disk: u64,
-) -> String {
-    let Some(file) = held else {
-        // Upload widgets often empty the input once they have read the file.
+fn file_set_report(selector: &str, read_back: &ReadBack, path: &str, size_on_disk: u64) -> String {
+    // With no file to describe from the page, name the one given, with its size on disk.
+    let given = || {
         let name = std::path::Path::new(path)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(path);
-        return format!(
-            "Set file on '{selector}': {name} ({}); the page has since cleared the input",
+        format!(
+            "Set file on '{selector}': {name} ({})",
             format_size(size_on_disk)
-        );
+        )
     };
-    let details = if file.mime.is_empty() {
-        format_size(file.size)
+    let (name, size, mime) = match read_back {
+        ReadBack::File { name, size, mime } => (name, *size, mime),
+        // Upload widgets often empty the input once they have read the file.
+        ReadBack::Cleared => return format!("{}; the page has since cleared the input", given()),
+        ReadBack::Unread(reason) => {
+            return format!(
+                "{}; couldn't read back what the input holds: {reason}",
+                given()
+            )
+        }
+    };
+    let details = if mime.is_empty() {
+        format_size(size)
     } else {
-        format!("{}, {}", format_size(file.size), file.mime)
+        format!("{}, {mime}", format_size(size))
     };
-    let mut report = format!("Set file on '{selector}': {} ({details})", file.name);
-    if file.size == 0 && size_on_disk > 0 {
+    let mut report = format!("Set file on '{selector}': {name} ({details})");
+    if size == 0 && size_on_disk > 0 {
         report.push_str(&format!(
             "\nChrome reports 0 bytes, but the file holds {}, so Chrome can't read it. On macOS, \
              give Chrome access to that folder in System Settings > Privacy & Security > \
@@ -704,8 +725,8 @@ mod tests {
         );
     }
 
-    fn held(name: &str, size: u64, mime: &str) -> HeldFile {
-        HeldFile {
+    fn held(name: &str, size: u64, mime: &str) -> ReadBack {
+        ReadBack::File {
             name: name.into(),
             size,
             mime: mime.into(),
@@ -715,13 +736,13 @@ mod tests {
     #[test]
     fn test_file_set_report_describes_what_the_page_holds() {
         assert_eq!(
-            file_set_report("#one", Some(&held("a.txt", 5, "text/plain")), "/x/a.txt", 5),
+            file_set_report("#one", &held("a.txt", 5, "text/plain"), "/x/a.txt", 5),
             "Set file on '#one': a.txt (5 B, text/plain)"
         );
         assert_eq!(
             file_set_report(
                 r#"input[type="file"]"#,
-                Some(&held("clip.mp4", 5_300_000, "video/mp4")),
+                &held("clip.mp4", 5_300_000, "video/mp4"),
                 "/x/clip.mp4",
                 5_300_000
             ),
@@ -729,7 +750,7 @@ mod tests {
         );
         // Chrome gives no type for an extension it doesn't know.
         assert_eq!(
-            file_set_report("#one", Some(&held("data.qqq", 5, "")), "/x/data.qqq", 5),
+            file_set_report("#one", &held("data.qqq", 5, ""), "/x/data.qqq", 5),
             "Set file on '#one': data.qqq (5 B)"
         );
     }
@@ -737,8 +758,20 @@ mod tests {
     #[test]
     fn test_file_set_report_when_the_page_cleared_the_input() {
         assert_eq!(
-            file_set_report("#one", None, "/x/d/../b.txt", 5),
+            file_set_report("#one", &ReadBack::Cleared, "/x/d/../b.txt", 5),
             "Set file on '#one': b.txt (5 B); the page has since cleared the input"
+        );
+    }
+
+    /// A failed read shows nothing about the page, so it must not claim the
+    /// page cleared the input.
+    #[test]
+    fn test_file_set_report_when_the_input_could_not_be_read_back() {
+        let unread = ReadBack::Unread("Cannot find context with specified id".into());
+        assert_eq!(
+            file_set_report("#one", &unread, "/x/clip.mp4", 5_300_000),
+            "Set file on '#one': clip.mp4 (5.3 MB); couldn't read back what the input holds: \
+             Cannot find context with specified id"
         );
     }
 
@@ -746,7 +779,7 @@ mod tests {
     fn test_file_set_report_hints_when_chrome_cannot_read_the_file() {
         let report = file_set_report(
             "#one",
-            Some(&held("clip.mp4", 0, "video/mp4")),
+            &held("clip.mp4", 0, "video/mp4"),
             "/x/clip.mp4",
             5_300_000,
         );
@@ -761,7 +794,7 @@ mod tests {
         assert_eq!(
             file_set_report(
                 "#one",
-                Some(&held("empty.txt", 0, "text/plain")),
+                &held("empty.txt", 0, "text/plain"),
                 "/x/empty.txt",
                 0
             ),
