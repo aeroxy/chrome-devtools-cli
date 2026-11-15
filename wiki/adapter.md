@@ -57,7 +57,7 @@ Like `run-script`, your adapter function is passed a `ctx` context containing he
 *   `ctx.waitForText(text, timeout_ms)`: Text matching polling utility.
 *   `ctx.waitForSelector(selector, timeout_ms)`: CSS selector matching polling utility.
 *   `ctx.click(selector)`: DOM clicking helper.
-*   `ctx.fill(selector, value)`: DOM value input helper. It can't set a file input, because page scripts have no access to the disk; run `chrome-devtools fill <selector> <path>` from the CLI before the adapter instead.
+*   `ctx.fill(selector, value)`: DOM value input helper. It can't set a file input, because page scripts have no access to the disk; run `chrome-devtools fill <selector> <path>` from the CLI instead, on a page that matches the adapter's `@domain`. Otherwise the adapter navigates first, and the navigation drops the file.
 
 ## Real-World Example: Hacker News Search Adapter
 

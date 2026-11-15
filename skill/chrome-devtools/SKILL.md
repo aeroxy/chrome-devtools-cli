@@ -202,12 +202,12 @@ Two ways to fill inputs — choose based on what the site expects:
 - `fill` sets the value directly via `element.value = ...`. Fast, no key events. Works for text inputs, textareas, `<select>`, checkboxes, radio buttons, and file inputs (below). **Often breaks React/Vue apps** because these frameworks rely on real input events.
 - `type-text` dispatches individual keyboard events. Slower but triggers all the `input`, `compositionstart/end`, etc. events that frameworks listen for. **Use this when `fill` seems to "not work"** on interactive frameworks.
 
-**File inputs (`<input type="file">`):** `fill` reads the value as a local file path, relative to the directory you run the CLI from, and gives that file to the input as if a person had picked it in the file dialog. This is how to upload a file; no file dialog appears.
+**File inputs (`<input type="file">`):** `fill` reads the value as a local file path, relative to the directory you run the CLI from, and gives that file to the input as if a person had picked it in the file dialog, without opening the dialog. The page then handles it as it would a picked file: an upload widget starts uploading on `change`, while a plain form sends it only when submitted.
 - Hidden inputs work. Upload widgets usually hide the real input behind a styled button, so target `input[type="file"]` rather than the button.
 - Chrome fires `input` and `change` itself, so the widget reacts as it would to a real pick. One file per call, even on a `multiple` input.
 - The output reads back what the page now holds: `Set file on 'input[type="file"]': clip.mp4 (5.3 MB, video/mp4)`. If it ends with `the page has since cleared the input` (the widget has already taken the file) or `couldn't read back what the input holds`, the file was still set. **Don't run it again**, or the upload may start twice.
 - Chrome, not the CLI, opens the file. If the output says `Chrome reports 0 bytes`, Chrome isn't allowed to read the file's folder, which on macOS happens under Desktop, Documents and Downloads. Ask the human to allow it, or move the file elsewhere.
-- `ctx.fill` in `run-script`/`adapter` can't do this, because page scripts can't read the disk. Run the CLI's `fill` first, then the script.
+- `ctx.fill` in `run-script`/`adapter` can't do this, because page scripts can't read the disk. Run the CLI's `fill` first, on the page the script runs on, then the script. A script whose `@url` (or an adapter whose `@domain`) doesn't match the current page navigates first, which drops the file, so `navigate` there before you `fill`.
 
 ```bash
 # Click an element by CSS selector
