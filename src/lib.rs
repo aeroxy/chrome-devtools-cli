@@ -1256,13 +1256,9 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
         ),
         Commands::Click { selector } => ("click", json!({"selector": selector})),
         Commands::ClickAt { x, y } => ("click-at", json!({"x": x, "y": y})),
-        // Only the daemon can tell whether the selector lands on a file input,
-        // which reads `value` as a path, so the absolute form goes along with
-        // it. Best-effort, so an unresolvable CLI directory can't break text fills.
-        Commands::Fill { selector, value } => (
-            "fill",
-            json!({"selector": selector, "value": value, "path": absolutize_path(value).ok()}),
-        ),
+        Commands::Fill { selector, value } => {
+            ("fill", json!({"selector": selector, "value": value}))
+        }
         Commands::TypeText { text, submit_key } => {
             ("type-text", json!({"text": text, "submit_key": submit_key}))
         }
@@ -1358,7 +1354,16 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
         output_format: Some(cli.output_format()),
         block_url: cli.block_url.clone(),
         unblock_url: cli.unblock_url.clone(),
+        cwd: cli_cwd(),
     })
+}
+
+/// The CLI's working directory, if it can be read, for the daemon to resolve
+/// paths against (see `DaemonRequest::cwd`).
+fn cli_cwd() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned())
 }
 
 fn print_output(output: &str, navigated_to: Option<&str>, target_id: Option<&str>) {
@@ -2056,8 +2061,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             commands::input::click_at(&mut client, &session_id, *x, *y, None).await
         }
         Commands::Fill { selector, value } => {
-            let path = absolutize_path(value).ok();
-            commands::input::fill(&mut client, &session_id, selector, value, path.as_deref()).await
+            let cwd = cli_cwd();
+            commands::input::fill(&mut client, &session_id, selector, value, cwd.as_deref()).await
         }
         Commands::TypeText { text, submit_key } => {
             commands::input::type_text(&mut client, &session_id, text, submit_key.as_deref()).await
@@ -2254,24 +2259,19 @@ mod tests {
         );
     }
 
-    /// The daemon keeps its own startup directory, so a file-input path has to
-    /// arrive resolved against the CLI's, while `value` stays literal for text.
+    /// The daemon keeps its own startup directory, so the CLI's goes along with
+    /// the request, outside the args: a daemon from an older binary rejects
+    /// unknown args, which would break every `fill`, but ignores unknown fields.
     #[test]
-    fn test_build_request_fill_sends_an_absolute_path_alongside_the_value() {
-        let args = |value: &str| {
-            let cli = Cli::try_parse_from(["chrome-devtools", "fill", "#one", value]).unwrap();
-            build_request(&cli).unwrap().args
-        };
+    fn test_build_request_sends_the_cli_directory_outside_the_args() {
+        let cli = Cli::try_parse_from(["chrome-devtools", "fill", "#one", "../b.txt"]).unwrap();
+        let request = build_request(&cli).unwrap();
+        assert_eq!(
+            request.args,
+            json!({"selector": "#one", "value": "../b.txt"})
+        );
         let cwd = std::env::current_dir().unwrap();
-        let relative = args("../b.txt");
-        assert_eq!(relative["value"], "../b.txt");
-        assert_eq!(relative["path"], cwd.join("../b.txt").to_str().unwrap());
-
-        let absolute = std::env::temp_dir().join("clip.mp4");
-        let absolute = absolute.to_str().unwrap();
-        let args = args(absolute);
-        assert_eq!(args["value"], absolute);
-        assert_eq!(args["path"], absolute);
+        assert_eq!(request.cwd.as_deref(), cwd.to_str());
     }
 
     #[test]
