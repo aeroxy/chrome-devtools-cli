@@ -155,6 +155,12 @@ The daemon retains its startup CWD, so the CLI resolves all relative file-path
 arguments (`--output`, `--file-path`) to absolute paths in `build_request`
 before sending them to the daemon.
 
+`fill`'s value is a path only when the selector lands on a file input, and only
+the daemon can tell. So `build_request` sends the value unchanged plus a
+best-effort absolute form, `path` (`null` when the CLI's directory can't be
+resolved, so a text fill never fails on it), and only the file-input branch
+reads `path`.
+
 ## Build & Test
 
 ```bash
