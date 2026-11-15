@@ -205,7 +205,7 @@ Two ways to fill inputs — choose based on what the site expects:
 **File inputs (`<input type="file">`):** `fill` reads the value as a local file path, relative to the directory you run the CLI from, and gives that file to the input as if a person had picked it in the file dialog. This is how to upload a file; no file dialog appears.
 - Hidden inputs work. Upload widgets usually hide the real input behind a styled button, so target `input[type="file"]` rather than the button.
 - Chrome fires `input` and `change` itself, so the widget reacts as it would to a real pick. One file per call, even on a `multiple` input.
-- The output reads back what the page now holds: `Set file on 'input[type="file"]': clip.mp4 (5.3 MB, video/mp4)`. If it ends with `the page has since cleared the input`, the widget has already taken the file. **Don't run it again**, or the upload may start twice.
+- The output reads back what the page now holds: `Set file on 'input[type="file"]': clip.mp4 (5.3 MB, video/mp4)`. If it ends with `the page has since cleared the input` (the widget has already taken the file) or `couldn't read back what the input holds`, the file was still set. **Don't run it again**, or the upload may start twice.
 - Chrome, not the CLI, opens the file. If the output says `Chrome reports 0 bytes`, Chrome isn't allowed to read the file's folder, which on macOS happens under Desktop, Documents and Downloads. Ask the human to allow it, or move the file elsewhere.
 - `ctx.fill` in `run-script`/`adapter` can't do this, because page scripts can't read the disk. Run the CLI's `fill` first, then the script.
 
