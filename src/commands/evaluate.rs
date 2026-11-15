@@ -121,6 +121,9 @@ fn build_ctx_object(args_str: &str) -> String {
                 fill: async (selector, value) => {{
                     const el = document.querySelector(selector);
                     if (!el) throw new Error("Element not found: " + selector);
+                    if (el.type === 'file') {{
+                        throw new Error("ctx.fill can't set a file input: page scripts have no file access. Run chrome-devtools fill <selector> <path> from the CLI before the script.");
+                    }}
                     // Look up the native property setter from the element's own
                     // prototype chain (rather than assigning directly) so that
                     // React/Vue-style frameworks, which override the setter to
@@ -852,6 +855,11 @@ mod tests {
         // fill must special-case checkable inputs instead of setting `value`.
         assert!(ctx.contains("el.type === 'checkbox' || el.type === 'radio'"));
         assert!(ctx.contains("setNativeProp(el, 'checked'"));
+        // fill can't set a file input, since page scripts can't read the disk,
+        // so it must point at the CLI's fill instead of the browser's
+        // InvalidStateError about setting a filename.
+        assert!(ctx.contains("if (el.type === 'file')"));
+        assert!(ctx.contains("ctx.fill can't set a file input"));
         // fill must support contenteditable elements.
         assert!(ctx.contains("el.isContentEditable"));
         assert!(ctx.contains("el.innerText ="));

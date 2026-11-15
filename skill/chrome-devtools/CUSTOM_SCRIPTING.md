@@ -63,7 +63,7 @@ Both `run-script` and `adapter` functions are passed an injected `ctx` context c
 * `ctx.waitForText(text, timeout_ms)`: Polls the page body text until the string is present (defaults to 30s).
 * `ctx.waitForSelector(selector, timeout_ms)`: Polls until an element matching the CSS selector exists in the DOM.
 * `ctx.click(selector)`: DOM clicking helper.
-* `ctx.fill(selector, value)`: DOM value input helper. Highly compatible with stateful frameworks (like React, Vue, and Angular) as it overrides standard value setters and fires appropriate events.
+* `ctx.fill(selector, value)`: DOM value input helper. Highly compatible with stateful frameworks (like React, Vue, and Angular) as it overrides standard value setters and fires appropriate events. It can't set a file input, because page scripts have no access to the disk. To upload a file, run the CLI's `fill` on the input before the script: `chrome-devtools --target <name> fill 'input[type="file"]' <path>`.
 
 ---
 

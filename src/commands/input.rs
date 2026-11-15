@@ -233,11 +233,16 @@ pub async fn hover(
 }
 
 /// Fill an input field identified by CSS selector with the given value.
+///
+/// On a file input, `value` names a local file instead, and `path` is its
+/// absolute form, resolved by the CLI against its own working directory
+/// (`None` if that was unavailable).
 pub async fn fill(
     client: &mut CdpClient,
     session_id: &str,
     selector: &str,
     value: &str,
+    path: Option<&str>,
 ) -> Result<CommandResult> {
     let initial_url = client.current_url(session_id).await?;
     let escaped_sel = serde_json::to_string(selector)?;
@@ -321,7 +326,7 @@ if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
     } else if res_val == "option_not_found" {
         bail!("Could not find option with text or value '{value}' in select element: {selector}");
     } else if res_val == "file_input" {
-        bail!("Cannot fill file input with text: {selector}");
+        return set_file(client, session_id, selector, value, path, initial_url).await;
     } else if res_val == "select_ok" || res_val == "checkbox_ok" || res_val == "textarea_ok" {
         // For select/checkbox/textarea, the work is done entirely in JS
         let new_url = client.current_url(session_id).await?;
@@ -357,6 +362,174 @@ if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
         CommandResult::output(format!("Filled '{selector}' with: {value}"))
             .with_navigated_to_if_changed(new_url, initial_url),
     )
+}
+
+/// A file as the page sees it in an input's `files`.
+struct HeldFile {
+    name: String,
+    size: u64,
+    mime: String,
+}
+
+/// Give the file at `path` to the file input `selector` matched.
+///
+/// Chrome opens the file itself, so there is no size cap and the bytes never
+/// pass through the CLI, the daemon or page JavaScript, which can't read the disk.
+async fn set_file(
+    client: &mut CdpClient,
+    session_id: &str,
+    selector: &str,
+    value: &str,
+    path: Option<&str>,
+    initial_url: String,
+) -> Result<CommandResult> {
+    let (path, size_on_disk) = upload_file(value, path)?;
+
+    let escaped_sel = serde_json::to_string(selector)?;
+    let handle = client
+        .send_to_target(
+            session_id,
+            "Runtime.evaluate",
+            json!({"expression": format!("document.querySelector({escaped_sel})")}),
+        )
+        .await?;
+    // `fill`'s check just found the element, but a page script may have removed it since.
+    let object_id = handle["result"]["objectId"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Element not found: {selector}"))?
+        .to_string();
+
+    // Chrome fires `input` and `change` on the element itself. Dispatching them
+    // again could make an upload widget start the upload twice.
+    let set = client
+        .send_to_target(
+            session_id,
+            "DOM.setFileInputFiles",
+            json!({"files": [&path], "objectId": object_id}),
+        )
+        .await;
+    let held = if set.is_ok() {
+        read_back_file(client, session_id, &object_id).await
+    } else {
+        None
+    };
+    // The daemon's session outlives this command, so an unreleased handle would
+    // keep the element alive until the page navigates.
+    let _ = client
+        .send_to_target(
+            session_id,
+            "Runtime.releaseObject",
+            json!({"objectId": object_id}),
+        )
+        .await;
+    set.map_err(|e| anyhow!("Can't set the file on '{selector}': {e}"))?;
+
+    let new_url = client.current_url(session_id).await?;
+    Ok(CommandResult::output(file_set_report(
+        selector,
+        held.as_ref(),
+        &path,
+        size_on_disk,
+    ))
+    .with_navigated_to_if_changed(new_url, initial_url))
+}
+
+/// The file to give a file input, and its size on disk: `path`, the CLI's
+/// absolute form of `value`, if it names a regular file. Checked before Chrome
+/// sees it, so a bad path fails with a message that names it.
+fn upload_file(value: &str, path: Option<&str>) -> Result<(String, u64)> {
+    let path = path.ok_or_else(|| {
+        anyhow!(
+            "Can't resolve {value}: the CLI's working directory is unavailable; pass an absolute path"
+        )
+    })?;
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => Ok((path.to_string(), meta.len())),
+        Ok(_) => bail!("Not a file: {path}"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("File not found: {path}"),
+        Err(e) => bail!("Can't access {path}: {e}"),
+    }
+}
+
+/// The first file the input behind `object_id` holds, as the page sees it.
+///
+/// Best-effort: the file is set by now and Chrome has fired `change`, so an
+/// error here would invite a retry, and a retry would start a second upload.
+async fn read_back_file(
+    client: &mut CdpClient,
+    session_id: &str,
+    object_id: &str,
+) -> Option<HeldFile> {
+    let result = client
+        .send_to_target(
+            session_id,
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": "function () { const f = this.files[0]; return f && {name: f.name, size: f.size, type: f.type}; }",
+                "returnByValue": true,
+            }),
+        )
+        .await
+        .ok()?;
+    let file = &result["result"]["value"];
+    Some(HeldFile {
+        name: file["name"].as_str()?.to_string(),
+        size: file["size"].as_u64()?,
+        mime: file["type"].as_str().unwrap_or_default().to_string(),
+    })
+}
+
+/// `fill`'s report on a file input. It describes what the page now holds, read
+/// back from `files`, rather than echoing the argument.
+fn file_set_report(
+    selector: &str,
+    held: Option<&HeldFile>,
+    path: &str,
+    size_on_disk: u64,
+) -> String {
+    let Some(file) = held else {
+        // Upload widgets often empty the input once they have read the file.
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path);
+        return format!(
+            "Set file on '{selector}': {name} ({}); the page has since cleared the input",
+            format_size(size_on_disk)
+        );
+    };
+    let details = if file.mime.is_empty() {
+        format_size(file.size)
+    } else {
+        format!("{}, {}", format_size(file.size), file.mime)
+    };
+    let mut report = format!("Set file on '{selector}': {} ({details})", file.name);
+    if file.size == 0 && size_on_disk > 0 {
+        report.push_str(&format!(
+            "\nChrome reports 0 bytes, but the file holds {}, so Chrome can't read it. On macOS, \
+             give Chrome access to that folder in System Settings > Privacy & Security > \
+             Files & Folders, or move the file out of Desktop, Documents and Downloads.",
+            format_size(size_on_disk)
+        ));
+    }
+    report
+}
+
+/// A byte count in decimal units: `5 B`, `5.3 MB`.
+fn format_size(bytes: u64) -> String {
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut size = bytes as f64;
+    for unit in ["kB", "MB", "GB"] {
+        size /= 1000.0;
+        // From 999.95 up, one decimal place would print "1000.0".
+        if size < 999.95 {
+            return format!("{size:.1} {unit}");
+        }
+    }
+    format!("{:.1} TB", size / 1000.0)
 }
 
 /// Insert text at the current focus point, optionally pressing a submit key.
@@ -465,5 +638,119 @@ fn map_key(key: &str) -> (&str, &str, i32) {
         "z" => ("z", "KeyZ", 90),
         "f5" => ("F5", "F5", 116),
         _ => (key, key, 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_upload_file_accepts_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let path = file.to_str().unwrap();
+        assert_eq!(
+            upload_file("a.txt", Some(path)).unwrap(),
+            (path.to_string(), 5)
+        );
+    }
+
+    #[test]
+    fn test_upload_file_names_the_absolute_path_in_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.txt");
+        let missing = missing.to_str().unwrap();
+        let err = upload_file("missing.txt", Some(missing)).unwrap_err();
+        assert_eq!(err.to_string(), format!("File not found: {missing}"));
+
+        let d = dir.path().to_str().unwrap();
+        let err = upload_file("d", Some(d)).unwrap_err();
+        assert_eq!(err.to_string(), format!("Not a file: {d}"));
+    }
+
+    #[test]
+    fn test_upload_file_without_a_resolved_path_asks_for_an_absolute_one() {
+        let err = upload_file("clip.mp4", None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Can't resolve clip.mp4: the CLI's working directory is unavailable; pass an absolute path"
+        );
+    }
+
+    fn held(name: &str, size: u64, mime: &str) -> HeldFile {
+        HeldFile {
+            name: name.into(),
+            size,
+            mime: mime.into(),
+        }
+    }
+
+    #[test]
+    fn test_file_set_report_describes_what_the_page_holds() {
+        assert_eq!(
+            file_set_report("#one", Some(&held("a.txt", 5, "text/plain")), "/x/a.txt", 5),
+            "Set file on '#one': a.txt (5 B, text/plain)"
+        );
+        assert_eq!(
+            file_set_report(
+                r#"input[type="file"]"#,
+                Some(&held("clip.mp4", 5_300_000, "video/mp4")),
+                "/x/clip.mp4",
+                5_300_000
+            ),
+            r#"Set file on 'input[type="file"]': clip.mp4 (5.3 MB, video/mp4)"#
+        );
+        // Chrome gives no type for an extension it doesn't know.
+        assert_eq!(
+            file_set_report("#one", Some(&held("data.qqq", 5, "")), "/x/data.qqq", 5),
+            "Set file on '#one': data.qqq (5 B)"
+        );
+    }
+
+    #[test]
+    fn test_file_set_report_when_the_page_cleared_the_input() {
+        assert_eq!(
+            file_set_report("#one", None, "/x/d/../b.txt", 5),
+            "Set file on '#one': b.txt (5 B); the page has since cleared the input"
+        );
+    }
+
+    #[test]
+    fn test_file_set_report_hints_when_chrome_cannot_read_the_file() {
+        let report = file_set_report(
+            "#one",
+            Some(&held("clip.mp4", 0, "video/mp4")),
+            "/x/clip.mp4",
+            5_300_000,
+        );
+        assert!(
+            report.starts_with(
+                "Set file on '#one': clip.mp4 (0 B, video/mp4)\n\
+                 Chrome reports 0 bytes, but the file holds 5.3 MB, so Chrome can't read it."
+            ),
+            "{report}"
+        );
+        // A file that really is empty gets no hint.
+        assert_eq!(
+            file_set_report(
+                "#one",
+                Some(&held("empty.txt", 0, "text/plain")),
+                "/x/empty.txt",
+                0
+            ),
+            "Set file on '#one': empty.txt (0 B, text/plain)"
+        );
+    }
+
+    #[test]
+    fn test_format_size_uses_decimal_units() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(999), "999 B");
+        assert_eq!(format_size(1000), "1.0 kB");
+        assert_eq!(format_size(5_300_000), "5.3 MB");
+        assert_eq!(format_size(999_960), "1.0 MB");
+        assert_eq!(format_size(1_500_000_000), "1.5 GB");
     }
 }

@@ -58,6 +58,10 @@ mod tests {
         use chrome_devtools_cli::Cli;
         use clap::CommandFactory;
 
+        // Request fields that `build_request` derives from other arguments, so
+        // they have no flag of their own.
+        let derived: &[(&str, &str)] = &[("fill", "path")];
+
         let cmd = Cli::command();
         for sub in cmd.get_subcommands() {
             let name = sub.get_name();
@@ -66,6 +70,12 @@ mod tests {
                 .filter(|a| !a.is_global_set() && a.get_id() != "help" && a.get_id() != "version")
                 .map(|a| a.get_id().as_str().replace('-', "_"))
                 .collect();
+            expected_args.extend(
+                derived
+                    .iter()
+                    .filter(|(cmd, _)| *cmd == name)
+                    .map(|(_, arg)| arg.to_string()),
+            );
             let mut actual_args: Vec<String> = executor::known_args(name)
                 .iter()
                 .map(|s| s.to_string())

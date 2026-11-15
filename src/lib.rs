@@ -203,7 +203,7 @@ pub enum Commands {
     /// Click at specific coordinates
     ClickAt { x: f64, y: f64 },
 
-    /// Fill an input field by CSS selector
+    /// Fill an input field by CSS selector (a file input takes a local file path)
     Fill { selector: String, value: String },
 
     /// Type text using keyboard (into currently focused element)
@@ -1256,9 +1256,13 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
         ),
         Commands::Click { selector } => ("click", json!({"selector": selector})),
         Commands::ClickAt { x, y } => ("click-at", json!({"x": x, "y": y})),
-        Commands::Fill { selector, value } => {
-            ("fill", json!({"selector": selector, "value": value}))
-        }
+        // Only the daemon can tell whether the selector lands on a file input,
+        // which reads `value` as a path, so the absolute form goes along with
+        // it. Best-effort, so an unresolvable CLI directory can't break text fills.
+        Commands::Fill { selector, value } => (
+            "fill",
+            json!({"selector": selector, "value": value, "path": absolutize_path(value).ok()}),
+        ),
         Commands::TypeText { text, submit_key } => {
             ("type-text", json!({"text": text, "submit_key": submit_key}))
         }
@@ -2052,7 +2056,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             commands::input::click_at(&mut client, &session_id, *x, *y, None).await
         }
         Commands::Fill { selector, value } => {
-            commands::input::fill(&mut client, &session_id, selector, value).await
+            let path = absolutize_path(value).ok();
+            commands::input::fill(&mut client, &session_id, selector, value, path.as_deref()).await
         }
         Commands::TypeText { text, submit_key } => {
             commands::input::type_text(&mut client, &session_id, text, submit_key.as_deref()).await
@@ -2247,6 +2252,26 @@ mod tests {
                 .contains("Lost the connection to Chrome after 2h13m"),
             "{gone}"
         );
+    }
+
+    /// The daemon keeps its own startup directory, so a file-input path has to
+    /// arrive resolved against the CLI's, while `value` stays literal for text.
+    #[test]
+    fn test_build_request_fill_sends_an_absolute_path_alongside_the_value() {
+        let args = |value: &str| {
+            let cli = Cli::try_parse_from(["chrome-devtools", "fill", "#one", value]).unwrap();
+            build_request(&cli).unwrap().args
+        };
+        let cwd = std::env::current_dir().unwrap();
+        let relative = args("../b.txt");
+        assert_eq!(relative["value"], "../b.txt");
+        assert_eq!(relative["path"], cwd.join("../b.txt").to_str().unwrap());
+
+        let absolute = std::env::temp_dir().join("clip.mp4");
+        let absolute = absolute.to_str().unwrap();
+        let args = args(absolute);
+        assert_eq!(args["value"], absolute);
+        assert_eq!(args["path"], absolute);
     }
 
     #[test]
