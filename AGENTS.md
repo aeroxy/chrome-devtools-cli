@@ -156,10 +156,11 @@ arguments (`--output`, `--file-path`) to absolute paths in `build_request`
 before sending them to the daemon.
 
 `fill`'s value is a path only when the selector lands on a file input, and only
-the daemon can tell. So `build_request` sends the value unchanged plus a
-best-effort absolute form, `path` (`null` when the CLI's directory can't be
-resolved, so a text fill never fails on it), and only the file-input branch
-reads `path`.
+the daemon can tell. So every request carries the CLI's working directory as
+the top-level `cwd` (`None` when it can't be read), and the file-input branch
+resolves the value against it. It is a top-level field rather than an arg
+because a daemon from an older binary ignores unknown fields but rejects
+unknown args, which would break every `fill` until that daemon exited.
 
 ## Build & Test
 

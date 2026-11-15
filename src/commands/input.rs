@@ -234,15 +234,14 @@ pub async fn hover(
 
 /// Fill an input field identified by CSS selector with the given value.
 ///
-/// On a file input, `value` names a local file instead, and `path` is its
-/// absolute form, resolved by the CLI against its own working directory
-/// (`None` if that was unavailable).
+/// On a file input, `value` names a local file instead, resolved against
+/// `cwd`, the CLI's working directory (`None` if it couldn't be read).
 pub async fn fill(
     client: &mut CdpClient,
     session_id: &str,
     selector: &str,
     value: &str,
-    path: Option<&str>,
+    cwd: Option<&str>,
 ) -> Result<CommandResult> {
     let initial_url = client.current_url(session_id).await?;
     let escaped_sel = serde_json::to_string(selector)?;
@@ -326,7 +325,7 @@ if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
     } else if res_val == "option_not_found" {
         bail!("Could not find option with text or value '{value}' in select element: {selector}");
     } else if res_val == "file_input" {
-        return set_file(client, session_id, selector, value, path, initial_url).await;
+        return set_file(client, session_id, selector, value, cwd, initial_url).await;
     } else if res_val == "select_ok" || res_val == "checkbox_ok" || res_val == "textarea_ok" {
         // For select/checkbox/textarea, the work is done entirely in JS
         let new_url = client.current_url(session_id).await?;
@@ -371,7 +370,7 @@ struct HeldFile {
     mime: String,
 }
 
-/// Give the file at `path` to the file input `selector` matched.
+/// Give the file `value` names to the file input `selector` matched.
 ///
 /// Chrome opens the file itself, so there is no size cap and the bytes never
 /// pass through the CLI, the daemon or page JavaScript, which can't read the disk.
@@ -380,10 +379,10 @@ async fn set_file(
     session_id: &str,
     selector: &str,
     value: &str,
-    path: Option<&str>,
+    cwd: Option<&str>,
     initial_url: String,
 ) -> Result<CommandResult> {
-    let (path, size_on_disk) = upload_file(value, path)?;
+    let (path, size_on_disk) = upload_file(value, cwd)?;
 
     let escaped_sel = serde_json::to_string(selector)?;
     let handle = client
@@ -434,17 +433,26 @@ async fn set_file(
     .with_navigated_to_if_changed(new_url, initial_url))
 }
 
-/// The file to give a file input, and its size on disk: `path`, the CLI's
-/// absolute form of `value`, if it names a regular file. Checked before Chrome
-/// sees it, so a bad path fails with a message that names it.
-fn upload_file(value: &str, path: Option<&str>) -> Result<(String, u64)> {
-    let path = path.ok_or_else(|| {
-        anyhow!(
-            "Can't resolve {value}: the CLI's working directory is unavailable; pass an absolute path"
-        )
-    })?;
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.is_file() => Ok((path.to_string(), meta.len())),
+/// The file to give a file input, as an absolute path, and its size on disk.
+/// A relative `value` resolves against `cwd`, the CLI's working directory,
+/// because the daemon keeps its own. The file is checked before Chrome sees it,
+/// so a bad path fails with a message that names it.
+fn upload_file(value: &str, cwd: Option<&str>) -> Result<(String, u64)> {
+    let path = if std::path::Path::new(value).is_absolute() {
+        value.to_string()
+    } else {
+        let cwd = cwd.ok_or_else(|| {
+            anyhow!(
+                "Can't resolve {value}: the CLI's working directory is unavailable; pass an absolute path"
+            )
+        })?;
+        std::path::Path::new(cwd)
+            .join(value)
+            .to_string_lossy()
+            .into_owned()
+    };
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => Ok((path, meta.len())),
         Ok(_) => bail!("Not a file: {path}"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("File not found: {path}"),
         Err(e) => bail!("Can't access {path}: {e}"),
@@ -646,28 +654,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_upload_file_accepts_a_regular_file() {
+    fn test_upload_file_resolves_a_relative_value_against_the_cli_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.txt"), "world").unwrap();
+        let cli_dir = dir.path().join("d");
+        std::fs::create_dir(&cli_dir).unwrap();
+        assert_eq!(
+            upload_file("../b.txt", cli_dir.to_str()).unwrap(),
+            (cli_dir.join("../b.txt").to_str().unwrap().to_string(), 5)
+        );
+    }
+
+    #[test]
+    fn test_upload_file_takes_an_absolute_value_as_given() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "hello").unwrap();
         let path = file.to_str().unwrap();
-        assert_eq!(
-            upload_file("a.txt", Some(path)).unwrap(),
-            (path.to_string(), 5)
-        );
+        // Even when the CLI's directory couldn't be read.
+        assert_eq!(upload_file(path, None).unwrap(), (path.to_string(), 5));
     }
 
     #[test]
     fn test_upload_file_names_the_absolute_path_in_errors() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let cli_dir = dir.path().to_str();
         let missing = dir.path().join("missing.txt");
-        let missing = missing.to_str().unwrap();
-        let err = upload_file("missing.txt", Some(missing)).unwrap_err();
-        assert_eq!(err.to_string(), format!("File not found: {missing}"));
+        let err = upload_file("missing.txt", cli_dir).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("File not found: {}", missing.to_str().unwrap())
+        );
 
-        let d = dir.path().to_str().unwrap();
-        let err = upload_file("d", Some(d)).unwrap_err();
-        assert_eq!(err.to_string(), format!("Not a file: {d}"));
+        let d = dir.path().join("d");
+        let err = upload_file("d", cli_dir).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Not a file: {}", d.to_str().unwrap())
+        );
     }
 
     #[test]

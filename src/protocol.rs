@@ -24,6 +24,13 @@ pub struct DaemonRequest {
     /// URL patterns to remove from the daemon's network blocklist (from global CLI flags).
     #[serde(default)]
     pub unblock_url: Vec<String>,
+    /// The CLI's working directory. The daemon keeps its own, so it needs this
+    /// to resolve a path it only recognizes as one on the page: `fill`'s value
+    /// on a file input. It is a top-level field because a daemon from an older
+    /// binary ignores unknown fields here but rejects unknown args, which would
+    /// break every `fill` until that daemon exited.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 impl DaemonRequest {
@@ -246,6 +253,23 @@ pub async fn read_msg<R: AsyncReadExt + Unpin>(r: &mut R) -> anyhow::Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon keeps serving CLIs from newer and older binaries, so a field
+    /// only one side knows must not fail the request: an unknown field is
+    /// ignored, and a request without `cwd` (an older CLI's) still parses.
+    #[test]
+    fn daemon_request_tolerates_fields_from_other_versions() {
+        let req: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "command": "fill",
+            "args": {"selector": "#one", "value": "a.txt"},
+            "page": null,
+            "target": null,
+            "from_a_newer_cli": true,
+        }))
+        .unwrap();
+        assert_eq!(req.command, "fill");
+        assert_eq!(req.cwd, None);
+    }
 
     #[test]
     fn instance_key_is_stable_and_endpoint_specific() {

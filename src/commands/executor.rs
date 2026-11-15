@@ -47,7 +47,7 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "evaluate" => &["expression", "dialog_action", "output", "track_navigation"],
         "click" => &["selector"],
         "click-at" => &["x", "y"],
-        "fill" => &["selector", "value", "path"],
+        "fill" => &["selector", "value"],
         "type-text" => &["text", "submit_key"],
         "press-key" => &["key"],
         "hover" => &["selector"],
@@ -493,8 +493,7 @@ async fn inner_execute(
             args.get("value").and_then(|v| v.as_str()),
         ) {
             (Some(sel), Some(val)) => {
-                let path = args.get("path").and_then(|v| v.as_str());
-                commands::input::fill(client, session_id, sel, val, path).await
+                commands::input::fill(client, session_id, sel, val, req.cwd.as_deref()).await
             }
             _ => bail!("selector and value required"),
         },

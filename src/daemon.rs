@@ -760,6 +760,7 @@ mod tests {
             output_format: None,
             block_url: Vec::new(),
             unblock_url: Vec::new(),
+            cwd: None,
         };
         let (mut cli, daemon_end) = tokio::io::duplex(64 * 1024);
         write_msg(&mut cli, &serde_json::to_vec(&request).unwrap())

@@ -128,6 +128,7 @@ mod daemon_request_format_tests {
             output_format,
             block_url: vec![],
             unblock_url: vec![],
+            cwd: None,
         }
     }
 
