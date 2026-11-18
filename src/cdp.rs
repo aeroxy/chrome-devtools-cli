@@ -220,6 +220,26 @@ fn connect_timeout() -> std::time::Duration {
     parse_connect_timeout(raw.as_deref())
 }
 
+/// `ws_url` as diagnostics show it. A hosted CDP service may put an API key in
+/// the query string (`?token=`, `?apiKey=`) or the userinfo (`user:key@`), and
+/// errors end up in logs and agent transcripts. The path stays, so a local
+/// browser's `/devtools/browser/<id>` is still there to debug with.
+fn redact_endpoint(ws_url: &str) -> String {
+    let (scheme, rest) = match ws_url.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), ws_url),
+    };
+    let (before_query, query) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
+    let (authority, path) =
+        before_query.split_at(before_query.find('/').unwrap_or(before_query.len()));
+    let authority = match authority.rsplit_once('@') {
+        Some((_, host)) => format!("***@{host}"),
+        None => authority.to_string(),
+    };
+    let query = if query.is_empty() { "" } else { "?***" };
+    format!("{scheme}{authority}{path}{query}")
+}
+
 impl CdpClient {
     /// Connect to the browser via WebSocket and return a CDP client.
     ///
@@ -239,11 +259,12 @@ impl CdpClient {
             ..WebSocketConfig::default()
         };
         let connecting = connect_async_with_config(ws_url, Some(config), false);
+        let shown_url = redact_endpoint(ws_url);
         let (ws, _) = tokio::time::timeout(timeout_dur, connecting)
             .await
             .map_err(|_| {
                 anyhow!(
-                    "Timed out after {}s connecting to {browser} at {ws_url}. {browser} may be \
+                    "Timed out after {}s connecting to {browser} at {shown_url}. {browser} may be \
                      waiting for a human to approve the remote-debugging connection dialog. \
                      If you are an automated agent: do not retry in a loop and do not run \
                      kill-daemon (it will not fix this and will require a fresh approval) — \
@@ -251,7 +272,7 @@ impl CdpClient {
                     timeout_dur.as_secs()
                 )
             })?
-            .map_err(|e| anyhow!("Failed to connect to {browser} at {ws_url}: {e}"))?;
+            .map_err(|e| anyhow!("Failed to connect to {browser} at {shown_url}: {e}"))?;
         let (write, read) = ws.split();
         Ok(Self {
             write,
@@ -1288,5 +1309,39 @@ mod tests {
             .unwrap_or_else(|e| panic!("the client sent nothing ({e}); connect said: {err:#}"));
         // 0x16 is the TLS record type for a handshake, which the ClientHello opens.
         assert_eq!(first, 0x16, "connect said: {err:#}");
+    }
+
+    #[test]
+    fn redact_endpoint_hides_keys_but_keeps_where() {
+        assert_eq!(
+            redact_endpoint("wss://cdp.example/devtools/browser?token=secret"),
+            "wss://cdp.example/devtools/browser?***"
+        );
+        assert_eq!(
+            redact_endpoint("wss://user:secret@cdp.example:9222"),
+            "wss://***@cdp.example:9222"
+        );
+        assert_eq!(
+            redact_endpoint("wss://cdp.example?apiKey=secret#x"),
+            "wss://cdp.example?***"
+        );
+        // Nothing to hide in a local browser's URL, and its path is what
+        // tells one browser session from another.
+        let local = "ws://127.0.0.1:9222/devtools/browser/0b7c-uuid";
+        assert_eq!(redact_endpoint(local), local);
+    }
+
+    #[tokio::test]
+    async fn a_failed_connect_does_not_print_the_key() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let err = CdpClient::connect(&format!("ws://127.0.0.1:{port}/?token=secret"), "Chrome")
+            .await
+            .expect_err("nothing listens on a port whose listener was dropped");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("secret"), "{msg}");
+        assert!(msg.contains(&format!("127.0.0.1:{port}")), "{msg}");
     }
 }
