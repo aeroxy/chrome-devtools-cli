@@ -64,16 +64,28 @@ no sign-in:
 chrome-devtools --ws-endpoint wss://kitesurf.dev/devtools/browser list-pages
 ```
 
-Each endpoint gets its own daemon, so this never touches the user's browser.
-The connection is direct: `HTTP(S)_PROXY` is not used. Two Kitesurf habits to
-plan around:
+**Pass `--ws-endpoint` on every command of the session.** A command without it
+auto-connects to the user's own browser instead, and with no `--target` it acts
+on their first tab. `CHROME_WS_ENDPOINT` does the same job, but an exported
+variable lasts only as long as its shell, and each of your tool calls may get a
+fresh one. Each endpoint gets its own daemon. The connection is direct:
+`HTTP(S)_PROXY` is not used. Two Kitesurf habits to plan around:
 
 - **Tabs last only as long as the connection.** Every connection gets a fresh
   browser, and the daemon holds the connection, so tabs survive between commands
   until the daemon exits (5 minutes idle; `caffeinate` keeps it up). After that,
   `list-pages` shows a single `about:blank`.
 - **`new-page <url>` stays on `about:blank`.** Kitesurf ignores the URL when it
-  creates a tab. Follow it with `navigate <url>`.
+  creates a tab, so navigate the tab that `new-page` printed:
+
+  ```bash
+  chrome-devtools --ws-endpoint wss://kitesurf.dev/devtools/browser new-page https://example.com
+  # → Opened new page: https://example.com (target: quick-crab)
+  chrome-devtools --ws-endpoint wss://kitesurf.dev/devtools/browser --target quick-crab navigate https://example.com
+  ```
+
+  Without `--target`, `navigate` acts on page 0, the blank tab every Kitesurf
+  browser starts with.
 
 The `--remote-debugging-port` launch flag is the *other* route, and it is for a
 throwaway instance rather than your everyday browser — see the headless recipe
@@ -363,12 +375,15 @@ chrome-devtools sw-logs --duration 2000 --extension-id abcdef123456
 ```
 
 ### Pattern 11: Third-party Developer Tools
-For pages that expose tools to agents. The page is asked through WebMCP first
-(`document.modelContext.getTools()` / `executeTool()`), then through the legacy
-`window.__dtmcp` global. WebMCP needs a browser that has it (Chrome with
-`--enable-features=WebMCP`, or Kitesurf). It reports the tools of the page's
-own origin, same-origin iframes included; tools registered in a cross-origin
-iframe are not listed. Pass params as a JSON object.
+For pages that expose tools to agents. When the browser has WebMCP (Chrome with
+`--enable-features=WebMCP`, or Kitesurf), `list-3p-tools` lists the page's
+WebMCP tools (`document.modelContext.getTools()`) and nothing else, so a page
+that only sets the legacy `window.__dtmcp` global lists nothing there. Without
+WebMCP it lists `window.__dtmcp`'s tools. `execute-3p-tool` runs the WebMCP
+tool of that name if there is one, and otherwise looks in `window.__dtmcp`, so
+it can still run a legacy tool that the listing left out. WebMCP reports the
+tools of the page's own origin, same-origin iframes included; tools registered
+in a cross-origin iframe are not listed. Pass params as a JSON object.
 
 ```bash
 chrome-devtools --target warm-squid list-3p-tools
