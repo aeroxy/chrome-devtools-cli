@@ -104,7 +104,9 @@ Override with `--user-data-dir`, `--browser` (chrome/edge), `--channel` (beta/ca
 chrome-devtools --ws-endpoint wss://kitesurf.dev/devtools/browser list-pages
 ```
 
-The connection is made directly; `HTTP(S)_PROXY` is not used. Kitesurf gives each connection a fresh browser, so its tabs last as long as the daemon holding the connection (5 minutes idle, or longer under `caffeinate`), and it opens `new-page <url>` on `about:blank`, so follow that with `navigate <url>`.
+Give every command the endpoint, or export `CHROME_WS_ENDPOINT` once: a command with neither auto-connects to your local browser instead. The connection is made directly; `HTTP(S)_PROXY` is not used.
+
+Kitesurf gives each connection a fresh browser, so its tabs last as long as the daemon holding the connection (5 minutes idle, or longer under `caffeinate`). It also opens `new-page <url>` on `about:blank`, so navigate the tab that `new-page` printed, with `--target <name> navigate <url>`. Without `--target`, `navigate` acts on page 0, the blank tab every Kitesurf browser starts with.
 
 ### Unreadable profile directory
 
@@ -214,7 +216,7 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 | `list-3p-tools` | List developer tools the page exposes to agents |
 | `execute-3p-tool <name> <params>` | Execute a tool by name with a JSON params string |
 
-These commands ask the page through WebMCP first (`document.modelContext.getTools()` / `executeTool()`), which needs a browser that has it: Chrome with `--enable-features=WebMCP`, or Kitesurf. WebMCP reports the tools of the page's own origin, same-origin iframes included, but not those of cross-origin iframes. Without WebMCP the commands fall back to the legacy `window.__dtmcp.toolGroup` / `window.__dtmcp.executeTool`.
+These commands ask the page through WebMCP first (`document.modelContext.getTools()` / `executeTool()`), which needs a browser that has it: Chrome with `--enable-features=WebMCP`, or Kitesurf. WebMCP reports the tools of the page's own origin, same-origin iframes included, but not those of cross-origin iframes. `list-3p-tools` falls back to the legacy `window.__dtmcp.toolGroup` only when the browser has no WebMCP, so in a WebMCP browser a page that only sets `window.__dtmcp` lists nothing. `execute-3p-tool` also falls back to `window.__dtmcp.executeTool` when no WebMCP tool has the name.
 
 ### Other
 
