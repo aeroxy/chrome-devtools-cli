@@ -117,6 +117,19 @@ Auto-connect has to read `DevToolsActivePort`, and the OS can refuse that while 
 
 `probe_port` tells the two kinds of local server apart with one `GET /json/version`. A `--remote-debugging-port` server answers 200 with a `webSocketDebuggerUrl` whose UUID it requires (404 without it), so that URL is used as-is. The chrome://inspect server answers 404, serves no `/json/*` at all, and accepts `/devtools/browser` with no UUID (or any UUID), verified on Chrome 154. The request is a raw `TcpStream` exchange rather than an HTTP crate, because those honour `HTTP(S)_PROXY` and would route loopback traffic through a proxy, and the body is read by `Content-Length` because Chrome keeps the connection open even when asked to close it. A chrome://inspect port URL carries no session UUID, so its daemon key survives a browser restart: the first command afterwards fails with a WebSocket error, the daemon exits, and the next command spawns a fresh one.
 
+### Remote Endpoints (`wss://`)
+
+`--ws-endpoint` is taken verbatim, so it can name a remote CDP browser over
+`wss://`. TLS is rustls with
+the OS trust store (`rustls-tls-native-roots`), so release builds need no
+OpenSSL. tokio-tungstenite builds rustls with no crypto provider, and the
+direct `rustls` dependency in `Cargo.toml` enables `ring`. rustls installs a
+provider on first use only when exactly one of `ring` and `aws-lc-rs` is enabled
+across the whole dependency tree. If a new dependency enables the other, the
+first `wss://` connect panics; `wss_gets_as_far_as_a_tls_handshake` (`cdp.rs`)
+catches that. tungstenite ignores `HTTP(S)_PROXY`, so a remote endpoint has to
+be reachable directly.
+
 ### Page Targeting
 
 Every page gets a deterministic friendly name (e.g. `warm-squid`) derived from

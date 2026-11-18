@@ -98,6 +98,14 @@ Override with `--user-data-dir`, `--browser` (chrome/edge), `--channel` (beta/ca
 | `CHROME_BROWSER` | `--browser` |
 | `CHROME_CHANNEL` | `--channel` |
 
+`--ws-endpoint` also takes `wss://`, for a remote CDP browser such as the playground of Kitesurf, Cloudflare's experimental browser engine:
+
+```bash
+chrome-devtools --ws-endpoint wss://kitesurf.dev/devtools/browser list-pages
+```
+
+The connection is made directly; `HTTP(S)_PROXY` is not used. Kitesurf gives each connection a fresh browser, so its tabs last as long as the daemon holding the connection (5 minutes idle, or longer under `caffeinate`), and it opens `new-page <url>` on `about:blank`, so follow that with `navigate <url>`.
+
 ### Unreadable profile directory
 
 Remote debugging can be on while the CLI still cannot read `DevToolsActivePort`, because the OS will not let it into the profile directory. On macOS this happens until the app running the CLI (your terminal or IDE) is allowed to access data from other apps: macOS shows a privacy prompt, and until it is approved every read fails with "Operation not permitted". Security software and file permissions can do the same.
@@ -203,10 +211,10 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 
 | Command | Description |
 |---------|-------------|
-| `list-3p-tools` | List custom developer tools exposed via `window.__dtmcp` |
-| `execute-3p-tool <name> <params>` | Execute a custom tool by name with a JSON params string |
+| `list-3p-tools` | List developer tools the page exposes to agents |
+| `execute-3p-tool <name> <params>` | Execute a tool by name with a JSON params string |
 
-These commands interact with tools injected into the page via `window.__dtmcp.toolGroup` / `window.__dtmcp.executeTool`.
+These commands ask the page through WebMCP first (`document.modelContext.getTools()` / `executeTool()`), which needs a browser that has it: Chrome with `--enable-features=WebMCP`, or Kitesurf. WebMCP reports the tools of the page's own origin, same-origin iframes included, but not those of cross-origin iframes. Without WebMCP the commands fall back to the legacy `window.__dtmcp.toolGroup` / `window.__dtmcp.executeTool`.
 
 ### Other
 
@@ -261,7 +269,7 @@ On Unix, `kill-daemon` signals the targeted daemon with `SIGTERM`, removes its s
 | `--toon` | TOON output (compact tabular encoding for LLM agents; mutually exclusive with `--json`) |
 | `--block-url <pattern>` | Add a URL pattern to the active tab's block list (repeatable; persists until un-blocked or cleared) |
 | `--unblock-url <pattern>` | Remove a URL pattern from the active tab's block list (repeatable) |
-| `--ws-endpoint <url>` | Explicit WebSocket URL |
+| `--ws-endpoint <url>` | Explicit WebSocket URL, `ws://` or `wss://` |
 | `--port <n>` | Port of a local DevTools server, e.g. the one shown at `chrome://inspect` (skips reading the profile directory) |
 | `--user-data-dir <path>` | Custom browser profile directory |
 | `--browser <name>` | Browser to auto-connect to (chrome/edge) |
