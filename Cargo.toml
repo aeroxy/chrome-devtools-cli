@@ -26,7 +26,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 toon-format = "0.5"
-tokio-tungstenite = "0.24"
+# wss:// for remote CDP endpoints. rustls needs no OpenSSL, so release builds
+# stay self-contained, and native roots trust what the OS trusts.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+# tokio-tungstenite pulls in rustls with no crypto provider. Enabling exactly
+# one here lets rustls install it on first use, so nothing has to in main().
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 htmd = "0.5.4"
 dom_smoothie = "0.18.0"
 html-escape = "0.2.13"

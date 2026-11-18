@@ -1259,4 +1259,24 @@ mod tests {
         drop(client);
         chrome.await.unwrap();
     }
+
+    /// wss:// needs a TLS backend and a rustls crypto provider, and Cargo
+    /// features choose both. Without the backend, connecting fails with "TLS
+    /// support not compiled in"; without a provider, rustls panics. This
+    /// server only speaks TCP, so the handshake fails, but only after the
+    /// client has started one.
+    #[tokio::test]
+    async fn wss_gets_as_far_as_a_tls_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let err = CdpClient::connect(&format!("wss://{addr}/devtools/browser"), "Chrome")
+            .await
+            .expect_err("a plain TCP server cannot complete a TLS handshake");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("TLS support not compiled in"), "{msg}");
+    }
 }

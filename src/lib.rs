@@ -24,7 +24,7 @@ use serde_json::json;
     about = "Chrome DevTools Protocol CLI"
 )]
 pub struct Cli {
-    /// Explicit WebSocket endpoint (skips auto-connect)
+    /// Explicit WebSocket endpoint, ws:// or wss:// (skips auto-connect)
     #[arg(long, global = true, env = "CHROME_WS_ENDPOINT")]
     pub ws_endpoint: Option<String>,
 

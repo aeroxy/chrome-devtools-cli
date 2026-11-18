@@ -55,6 +55,26 @@ connection errors. Without it both say Chrome, the default, whatever the
 endpoint points at. Everything below applies unchanged — only the profile
 location differs.
 
+**A remote CDP browser** is reached with `--ws-endpoint`, which takes `wss://`
+as well as `ws://`.
+Kitesurf, Cloudflare's experimental browser engine, has a playground that needs
+no sign-in:
+
+```bash
+chrome-devtools --ws-endpoint wss://kitesurf.dev/devtools/browser list-pages
+```
+
+Each endpoint gets its own daemon, so this never touches the user's browser.
+The connection is direct: `HTTP(S)_PROXY` is not used. Two Kitesurf habits to
+plan around:
+
+- **Tabs last only as long as the connection.** Every connection gets a fresh
+  browser, and the daemon holds the connection, so tabs survive between commands
+  until the daemon exits (5 minutes idle; `caffeinate` keeps it up). After that,
+  `list-pages` shows a single `about:blank`.
+- **`new-page <url>` stays on `about:blank`.** Kitesurf ignores the URL when it
+  creates a tab. Follow it with `navigate <url>`.
+
 The `--remote-debugging-port` launch flag is the *other* route, and it is for a
 throwaway instance rather than your everyday browser — see the headless recipe
 below. Two traps if you reach for it: it is ignored when that profile is already
@@ -107,7 +127,7 @@ chrome-devtools --page 0 navigate https://example.com
 - **Interaction**: `click`, `fill`, `type-text`, `press-key`, `hover`, `click-at`
 - **Emulation**: `emulate` (viewport, mobile, geolocation, URL blocking)
 - **Inspection**: `console` (logs), `network` (requests), `sw-logs` (extension service workers)
-- **Third-party tools**: `list-3p-tools`, `execute-3p-tool` (tools exposed by `window.__dtmcp`)
+- **Third-party tools**: `list-3p-tools`, `execute-3p-tool` (WebMCP tools from `document.modelContext`, else the legacy `window.__dtmcp`)
 - **Synchronization**: `wait-for` (wait for text on page)
 - **Daemon control**: `kill-daemon`
 
@@ -343,7 +363,12 @@ chrome-devtools sw-logs --duration 2000 --extension-id abcdef123456
 ```
 
 ### Pattern 11: Third-party Developer Tools
-For pages that expose tools via `window.__dtmcp`.
+For pages that expose tools to agents. The page is asked through WebMCP first
+(`document.modelContext.getTools()` / `executeTool()`), then through the legacy
+`window.__dtmcp` global. WebMCP needs a browser that has it (Chrome with
+`--enable-features=WebMCP`, or Kitesurf). It reports the tools of the page's
+own origin, same-origin iframes included; tools registered in a cross-origin
+iframe are not listed. Pass params as a JSON object.
 
 ```bash
 chrome-devtools --target warm-squid list-3p-tools
