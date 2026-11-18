@@ -1263,20 +1263,30 @@ mod tests {
     /// wss:// needs a TLS backend and a rustls crypto provider, and Cargo
     /// features choose both. Without the backend, connecting fails with "TLS
     /// support not compiled in"; without a provider, rustls panics. This
-    /// server only speaks TCP, so the handshake fails, but only after the
-    /// client has started one.
+    /// server only speaks TCP, so the connect fails either way. What it checks
+    /// is that the client's first byte opens a TLS handshake: an error that
+    /// comes before one, such as an empty OS trust store, must not pass for it.
     #[tokio::test]
     async fn wss_gets_as_far_as_a_tls_handshake() {
+        use tokio::io::AsyncReadExt;
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = listener.accept().await;
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut first = [0u8; 1];
+            tcp.read_exact(&mut first).await.map(|_| first[0])
         });
 
         let err = CdpClient::connect(&format!("wss://{addr}/devtools/browser"), "Chrome")
             .await
             .expect_err("a plain TCP server cannot complete a TLS handshake");
-        let msg = format!("{err:#}");
-        assert!(!msg.contains("TLS support not compiled in"), "{msg}");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("the server task finishes once the client hangs up")
+            .unwrap()
+            .unwrap_or_else(|e| panic!("the client sent nothing ({e}); connect said: {err:#}"));
+        // 0x16 is the TLS record type for a handshake, which the ClientHello opens.
+        assert_eq!(first, 0x16, "connect said: {err:#}");
     }
 }
