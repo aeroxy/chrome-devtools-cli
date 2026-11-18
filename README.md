@@ -98,15 +98,7 @@ Override with `--user-data-dir`, `--browser` (chrome/edge), `--channel` (beta/ca
 | `CHROME_BROWSER` | `--browser` |
 | `CHROME_CHANNEL` | `--channel` |
 
-`--ws-endpoint` also takes `wss://`, for a remote CDP browser such as the playground of Kitesurf, Cloudflare's experimental browser engine:
-
-```bash
-chrome-devtools --ws-endpoint wss://kitesurf.dev/devtools/browser list-pages
-```
-
-Give every command the endpoint, or export `CHROME_WS_ENDPOINT` once: a command with neither auto-connects to your local browser instead. The connection is made directly; `HTTP(S)_PROXY` is not used.
-
-Kitesurf gives each connection a fresh browser, so its tabs last as long as the daemon holding the connection (5 minutes idle, or longer under `caffeinate`). It also opens `new-page <url>` on `about:blank`, so navigate the tab that `new-page` printed, with `--target <name> navigate <url>`. Without `--target`, `navigate` acts on page 0, the blank tab every Kitesurf browser starts with.
+`--ws-endpoint` also takes `wss://`, for a browser that runs somewhere else. See [Remote browser: the Kitesurf playground](#remote-browser-the-kitesurf-playground).
 
 ### Unreadable profile directory
 
@@ -139,6 +131,35 @@ Edge is Chromium and speaks the same DevTools Protocol, so every command works a
 `--channel` composes with it (`--browser edge --channel beta`). Edge Canary is not distributed for Linux, and that combination is rejected rather than pointed at a directory that cannot exist. An explicit `--ws-endpoint` or `--user-data-dir` already says where to connect, so `--browser` is not needed to *reach* Edge. Pass it anyway when you are targeting Edge: it is also the label recorded for the daemon (shown by `list-daemons`) and the browser named in connection errors. Without it both say Chrome, the default, whatever the endpoint actually points at.
 
 Enterprise-managed Edge can have remote debugging disabled by policy; `DevToolsActivePort` then never appears and auto-connect fails with the message above. That is the same failure mode as Chrome under the equivalent policy, just more common on managed fleets.
+
+### Remote browser: the Kitesurf playground
+
+[Kitesurf](https://kitesurf.dev) is Cloudflare's experimental browser engine. It runs inside Workers, speaks the DevTools Protocol, and has a public playground that needs no account. Kitesurf's docs connect `chrome-devtools-mcp` to it. This CLI connects to it with `--ws-endpoint`, with no MCP server and no Chrome on your machine, so there is no consent dialog either:
+
+```bash
+export CHROME_WS_ENDPOINT=wss://kitesurf.dev/devtools/browser
+
+# Kitesurf opens new tabs on about:blank, so navigate the tab new-page names
+chrome-devtools new-page https://example.com
+# Opened new page: https://example.com (target: steep-lynx)
+chrome-devtools --target steep-lynx navigate https://example.com
+
+# The daemon holds the connection, so the tab is still there for every command
+chrome-devtools --target steep-lynx read-page                        # page as markdown
+chrome-devtools --target steep-lynx screenshot --output example.png  # saved locally
+
+# WebMCP works through page JavaScript: register a tool, then list and call it
+chrome-devtools --target steep-lynx evaluate 'document.modelContext.registerTool({name: "add", description: "Add two numbers", inputSchema: {type: "object"}, execute: ({a, b}) => String(a + b)})'
+chrome-devtools --target steep-lynx list-3p-tools
+chrome-devtools --target steep-lynx execute-3p-tool add '{"a": 1, "b": 2}'
+# Executed 'add' via WebMCP:
+# "3"
+```
+
+- **Keep the endpoint on every command**, through `CHROME_WS_ENDPOINT` as above or `--ws-endpoint`. A command with neither auto-connects to your local browser instead.
+- **The daemon is the session.** Each connection gets a fresh browser, so tabs last as long as the daemon holding the connection: 5 minutes idle, or as long as `caffeinate` runs. For a second, separate browser, vary the endpoint, for example `wss://kitesurf.dev/devtools/browser?s=2`. It gets its own daemon, and Kitesurf ignores the query string.
+- **The playground is public.** Every page you open passes through Cloudflare, so open only public URLs, and don't sign in to anything there.
+- The connection is made directly; `HTTP(S)_PROXY` is not used.
 
 ## Page targeting
 
