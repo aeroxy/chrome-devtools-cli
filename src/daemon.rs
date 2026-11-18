@@ -12,6 +12,27 @@ use crate::error::ErrorCode;
 use crate::protocol::*;
 use crate::telemetry;
 
+/// Carries the endpoint from the CLI to the daemon it spawns. Every local user
+/// can read a process's arguments, but only its owner can read its
+/// environment, and a hosted CDP service may put an API key in the URL.
+pub const WS_URL_ENV: &str = "CHROME_DEVTOOLS_DAEMON_WS_URL";
+
+/// The endpoint and browser label for `__daemon__`. The spawner passes
+/// `__daemon__ <browser>` with the endpoint in [`WS_URL_ENV`]. Without that
+/// variable the spawner is an older binary, which passes
+/// `__daemon__ <ws_url> [browser]`: a CLI that started before an in-place
+/// upgrade spawns the new binary at its own path.
+///
+/// Kept pure so it is unit-testable without setting env vars.
+pub fn daemon_target(args: &[String], env_ws_url: Option<String>) -> Option<(String, String)> {
+    // Descriptive only, for `list-daemons`, so default rather than fail.
+    let browser = |i: usize| args.get(i).cloned().unwrap_or_else(|| "chrome".into());
+    match env_ws_url {
+        Some(ws_url) => Some((ws_url, browser(2))),
+        None => Some((args.get(2)?.clone(), browser(3))),
+    }
+}
+
 /// Read the daemon idle timeout from `DAEMON_IDLE_TIMEOUT_SECS`, defaulting to 300 (5 minutes).
 fn idle_timeout() -> Duration {
     parse_idle_timeout(std::env::var("DAEMON_IDLE_TIMEOUT_SECS").ok().as_deref())
@@ -819,6 +840,40 @@ mod tests {
         // Zero would make the daemon exit whenever it is idle.
         assert_eq!(parse_idle_timeout(Some("0")), default);
         assert_eq!(parse_idle_timeout(Some("3600")), Duration::from_secs(3600));
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn daemon_takes_its_endpoint_from_the_environment() {
+        let url = "wss://cdp.example/devtools/browser?token=secret";
+        assert_eq!(
+            daemon_target(
+                &argv(&["chrome-devtools", "__daemon__", "edge"]),
+                Some(url.into())
+            ),
+            Some((url.to_string(), "edge".to_string()))
+        );
+    }
+
+    #[test]
+    fn daemon_still_reads_an_older_spawners_arguments() {
+        let url = "ws://127.0.0.1:9222/devtools/browser/abc";
+        assert_eq!(
+            daemon_target(&argv(&["chrome-devtools", "__daemon__", url, "edge"]), None),
+            Some((url.to_string(), "edge".to_string()))
+        );
+        // The oldest spawners passed no browser.
+        assert_eq!(
+            daemon_target(&argv(&["chrome-devtools", "__daemon__", url]), None),
+            Some((url.to_string(), "chrome".to_string()))
+        );
+        assert_eq!(
+            daemon_target(&argv(&["chrome-devtools", "__daemon__"]), None),
+            None
+        );
     }
 
     #[cfg(unix)]

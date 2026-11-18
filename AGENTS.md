@@ -130,6 +130,13 @@ first `wss://` connect panics; `wss_gets_as_far_as_a_tls_handshake` (`cdp.rs`)
 catches that. tungstenite ignores `HTTP(S)_PROXY`, so a remote endpoint has to
 be reachable directly.
 
+A hosted CDP service may put an API key in the endpoint URL, so the CLI hands
+the URL to the daemon it spawns in `CHROME_DEVTOOLS_DAEMON_WS_URL`, not in its
+arguments: any local user can read a process's arguments, but only its owner
+can read its environment. The daemon still accepts the older
+`__daemon__ <ws_url> <browser>` form, because a CLI that started before an
+in-place upgrade spawns the new binary that way.
+
 ### Page Targeting
 
 Every page gets a deterministic friendly name (e.g. `warm-squid`) derived from

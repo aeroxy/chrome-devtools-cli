@@ -69,9 +69,16 @@ pub async fn send_to_daemon(key: &str, request: &DaemonRequest) -> Result<Daemon
 /// `list-daemons` can name the browser. The daemon's identity comes from
 /// `ws_url` alone.
 pub fn spawn_daemon(ws_url: &str, browser: &str) -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.args(["__daemon__", ws_url, browser])
+    daemon_command(&std::env::current_exe()?, ws_url, browser).spawn()?;
+    Ok(())
+}
+
+/// The endpoint goes in the environment, not the arguments (see
+/// [`crate::daemon::WS_URL_ENV`]).
+fn daemon_command(exe: &std::path::Path, ws_url: &str, browser: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["__daemon__", browser])
+        .env(crate::daemon::WS_URL_ENV, ws_url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -79,8 +86,7 @@ pub fn spawn_daemon(ws_url: &str, browser: &str) -> Result<()> {
     #[cfg(windows)]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 
-    cmd.spawn()?;
-    Ok(())
+    cmd
 }
 
 /// Wait for the daemon socket for `key` to become available, with exponential
@@ -111,5 +117,24 @@ pub async fn wait_for_daemon(key: &str) -> Result<()> {
             .unwrap_or_default();
         tokio::time::sleep(delay + jitter).await;
         delay = (delay * 2).min(Duration::from_millis(500));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_endpoint_stays_out_of_its_arguments() {
+        let url = "wss://cdp.example/devtools/browser?token=secret";
+        let cmd = daemon_command(std::path::Path::new("chrome-devtools"), url, "chrome");
+
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["__daemon__", "chrome"]);
+        let env = cmd
+            .get_envs()
+            .find(|(k, _)| *k == crate::daemon::WS_URL_ENV)
+            .and_then(|(_, v)| v);
+        assert_eq!(env, Some(std::ffi::OsStr::new(url)));
     }
 }
