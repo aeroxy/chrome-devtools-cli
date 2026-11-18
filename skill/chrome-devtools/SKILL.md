@@ -468,11 +468,14 @@ PROFILE=$(mktemp -d)
 #    Do NOT reach for --all here: it would also stop the user's own daemons.
 chrome-devtools --user-data-dir "$PROFILE" kill-daemon --force 2>/dev/null || true
 
-# 2. Spawn headless Chrome with an isolated profile; port 0 = pick a free port
+# 2. Spawn headless Chrome with an isolated profile; port 0 = pick a free port.
+#    --use-mock-keychain keeps it out of the macOS keychain. Without it, a build
+#    the keychain doesn't know (Chrome for Testing, Chromium) asks the user for
+#    their login password to read the "Safe Storage" encryption key.
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --headless=new --remote-debugging-port=0 \
   --user-data-dir="$PROFILE" \
-  --no-first-run --no-default-browser-check \
+  --no-first-run --no-default-browser-check --use-mock-keychain \
   about:blank &
 CHROME_PID=$!
 
