@@ -1,6 +1,6 @@
 [package]
 name = "chrome-devtools-cli"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
 # std::fs::File::{lock, try_lock} and std::fs::TryLockError (daemon lock path)
 # stabilized in 1.89
