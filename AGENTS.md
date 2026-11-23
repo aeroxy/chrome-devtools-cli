@@ -17,6 +17,7 @@ src/
 ├── daemon.rs         # Background daemon (persistent connection)
 ├── client.rs         # Talks to daemon via Unix socket
 ├── protocol.rs       # IPC message types (DaemonRequest / DaemonResponse)
+├── remote_object.rs  # Console values and exceptions as DevTools prints them
 ├── friendly.rs       # Target ID → word-pair names
 ├── format.rs         # OutputFormat (text/json/toon) + format_structured
 ├── result.rs         # CommandResult type
@@ -36,6 +37,9 @@ src/
     ├── emulation.rs  # emulate (viewport/geolocation/blocklist)
     ├── console.rs    # console drain / live collection
     ├── network.rs    # network drain / live collection
+    ├── network_mock.rs # mock-network / remove-network-mock (Fetch domain)
+    ├── css.rs        # css-styles (matched rules, cascade, var(), computed)
+    ├── webauthn.rs   # configure-webauthn (virtual authenticator)
     ├── sw_logs.rs    # extension service-worker log collection
     └── third_party.rs # list-3p-tools/execute-3p-tool
 ```
@@ -87,6 +91,49 @@ no error and no way for a caller (especially an unattended agent) to tell what
 was wrong. The timeout error message is written to be agent-actionable: retry
 at most once, then stop and ask a human rather than looping or calling
 `kill-daemon`.
+
+### Call Timeouts and Dialogs
+
+Every CDP call waits on `read_text_for_call` (`cdp.rs`), so nothing waits
+forever on a connected browser. After 30s of silence it pings the browser
+(`check_alive`): no answer within 15s is `ConnectionLost` and the daemon
+exits. Otherwise the call gives up at its limit with `PageUnresponsive`, 180s
+by default (`CHROME_CDP_TIMEOUT_SECS`) or `SETUP_CALL_TIMEOUT` (10s) for
+domain enables, and a `Runtime.*` call has its script stopped. The daemon
+serves one request at a time, so this bound is what keeps one stuck page from
+blocking every caller.
+
+While a JavaScript dialog is open, the page answers no CDP call, and Chrome
+announces the dialog once, only to sessions that had `Page` enabled, and only
+those can handle it (a new session gets "No dialog is showing"). So
+`note_dialog_event` records it from whichever read sees it (`open_dialog`),
+and every call on that session first handles it with the command's
+`--dialog-action` or fails with the typed `DialogOpen` at once. An input
+command whose own action opened the dialog reports success
+(`dialog_opened_by_input` in `executor.rs`), since retrying would repeat the
+click. A dialog the daemon never saw can't be handled at all; the setup
+timeout turns that into a `PageUnresponsive` error within 10s instead of a
+180s wait per call.
+
+### Stderr Notes
+
+`CommandResult::notes` / `DaemonResponse::notes` carry lines the CLI prints on
+stderr after the output: tabs an action opened, page errors raised during the
+command (`page_errors_since`, counted with `console_pushed` so they are
+listed without being drained), screenshot warnings. They never go to stdout,
+which may be data (base64, JSON). Both IPC fields default when missing, so
+CLIs and daemons of different versions still talk; responses also carry the
+daemon's `version` for the CLI's mismatch warning.
+
+### Network Mocks
+
+`mock-network` enables the Fetch domain on the persistent session, which
+pauses each matching request until it is answered. `push_event` queues
+`Fetch.requestPaused`, and `read_text` answers the queue before every read, so
+any code path that reads answers them. Between commands the daemon's accept
+loop also runs `pump_once` while `wants_idle_reads()`, or a request the page
+makes then would hang until the next command. Mocks are per-tab state in
+`TabEmulation`, like the blocklist.
 
 ### Keep-alive (`caffeinate`)
 

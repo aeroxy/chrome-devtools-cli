@@ -40,6 +40,54 @@ impl std::fmt::Display for ConnectionLost {
 
 impl std::error::Error for ConnectionLost {}
 
+/// A JavaScript dialog (alert, confirm, prompt, beforeunload) is open on the
+/// page. A type rather than a message, so input commands can tell "my click
+/// opened a dialog" apart from a real failure.
+#[derive(Debug, Clone)]
+pub struct DialogOpen {
+    pub dialog_type: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for DialogOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "A javascript dialog is open ({}: {}). The page is paused until it is handled: run \
+             `evaluate --dialog-action accept|dismiss|<prompt text> true` on this page.",
+            self.dialog_type, self.message
+        )
+    }
+}
+
+impl std::error::Error for DialogOpen {}
+
+/// The browser answers but the page doesn't. Usually a JavaScript dialog
+/// opened where this client couldn't see it (before it attached, or under a
+/// session it has since left): Chrome tells only the sessions that were
+/// listening, only they can handle it, and until then the page answers no
+/// session at all. Otherwise an endless loop or a hung renderer. A type so
+/// the executor stops instead of trying the page again on another session.
+#[derive(Debug)]
+pub struct PageUnresponsive(pub String);
+
+impl std::fmt::Display for PageUnresponsive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PageUnresponsive {}
+
+/// A dialog this client saw open and has not seen closed. Chrome sends the
+/// opening event once, to the sessions that had `Page` enabled, and only those
+/// sessions can handle it; while it is open the page answers nothing else.
+#[derive(Debug, Clone)]
+pub struct OpenDialog {
+    pub session_id: Option<String>,
+    pub dialog: DialogOpen,
+}
+
 /// Trait abstracting Chrome DevTools Protocol operations.
 ///
 /// Enables dependency injection for testing command logic without
@@ -85,6 +133,7 @@ pub trait CdpClientTrait: Debug + Send {
     fn create_target(
         &mut self,
         url: &str,
+        background: bool,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>>;
     fn close_target(
         &mut self,
@@ -102,6 +151,10 @@ pub struct CdpClient {
     /// Dialog action to automatically handle JavaScript dialogs during command execution.
     /// Valid values: "accept", "dismiss", or custom prompt text.
     pub dialog_action: Option<String>,
+    /// The dialog seen open and not yet seen closed, so the next command on
+    /// that page can handle it or fail at once instead of waiting on a page
+    /// that will not answer.
+    pub open_dialog: Option<OpenDialog>,
     /// Buffer for storing unhandled events (e.g., navigation events)
     pub events: std::collections::VecDeque<Value>,
     /// Messages already taken off the socket that `read_text` must return
@@ -116,6 +169,9 @@ pub struct CdpClient {
     pub network_events: std::collections::VecDeque<Value>,
     /// Accumulated console events from the persistent session.
     pub console_events: std::collections::VecDeque<Value>,
+    /// Console events ever buffered. Unlike the buffer's length it never
+    /// drops, so a command can tell which events arrived while it ran.
+    pub console_pushed: u64,
     /// Persistent URL block patterns for `Network.setBlockedURLs`.
     /// Re-applied by `ensure_persistent_session` whenever a new target is attached.
     pub blocklist: Vec<String>,
@@ -123,6 +179,17 @@ pub struct CdpClient {
     pub viewport: Option<ViewportOverride>,
     /// Active geolocation override, re-applied on target switch.
     pub geolocation: Option<GeolocationOverride>,
+    /// Active CSS media emulation, re-applied on target switch.
+    pub media: Option<MediaOverride>,
+    /// Virtual WebAuthn authenticator on the active tab, re-created on target
+    /// switch because Chrome removes it when the session that added it detaches.
+    pub webauthn: Option<VirtualAuthenticator>,
+    /// Network mocks on the active tab (`mock-network`), saved per tab like
+    /// the emulation state.
+    pub network_mocks: Vec<crate::commands::network_mock::NetworkMock>,
+    /// `Fetch.requestPaused` events not yet answered. The page's request
+    /// waits until they are, so every read answers them first.
+    paused_requests: std::collections::VecDeque<Value>,
     /// Per-tab emulation state for tabs that are NOT currently active. The active
     /// tab's state lives in the `blocklist`/`viewport`/`geolocation` fields above;
     /// `ensure_persistent_session` swaps state in/out of here on target switch so
@@ -161,6 +228,62 @@ pub struct GeolocationOverride {
     pub accuracy: f64,
 }
 
+/// Active CSS media emulation (`Emulation.setEmulatedMedia`). Chrome replaces
+/// every emulated feature on each call, so the whole set is kept to resend.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MediaOverride {
+    /// Emulated media type (`print` or `screen`); `None` leaves it alone.
+    pub media: Option<String>,
+    /// Emulated media features as (name, value), in the order they were set.
+    pub features: Vec<(String, String)>,
+}
+
+impl MediaOverride {
+    /// Parameters for `Emulation.setEmulatedMedia`. An empty media string and
+    /// an empty feature list are what turn the override off.
+    pub fn cdp_params(&self) -> Value {
+        let features: Vec<Value> = self
+            .features
+            .iter()
+            .map(|(name, value)| json!({"name": name, "value": value}))
+            .collect();
+        json!({"media": self.media.as_deref().unwrap_or(""), "features": features})
+    }
+}
+
+/// Options of a virtual WebAuthn authenticator, as `configure-webauthn` sets them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthenticatorOptions {
+    pub protocol: String,
+    pub transport: String,
+    pub has_resident_key: bool,
+    pub has_user_verification: bool,
+    pub is_user_verified: bool,
+}
+
+impl AuthenticatorOptions {
+    /// The `options` for `WebAuthn.addVirtualAuthenticator`. Presence is
+    /// simulated so a `navigator.credentials` call never waits for a touch.
+    pub fn cdp_options(&self) -> Value {
+        json!({
+            "protocol": self.protocol,
+            "transport": self.transport,
+            "hasResidentKey": self.has_resident_key,
+            "hasUserVerification": self.has_user_verification,
+            "isUserVerified": self.is_user_verified,
+            "automaticPresenceSimulation": true,
+        })
+    }
+}
+
+/// A virtual authenticator the CLI added to a tab. `id` belongs to the session
+/// that added it and changes whenever the authenticator is re-created.
+#[derive(Debug, Clone)]
+pub struct VirtualAuthenticator {
+    pub id: String,
+    pub options: AuthenticatorOptions,
+}
+
 /// A tab's emulation state, saved while another tab is active so each tab keeps
 /// its own viewport/geolocation/blocklist (per-tab isolation).
 #[derive(Debug, Clone, Default)]
@@ -168,12 +291,20 @@ pub struct TabEmulation {
     pub blocklist: Vec<String>,
     pub viewport: Option<ViewportOverride>,
     pub geolocation: Option<GeolocationOverride>,
+    pub media: Option<MediaOverride>,
+    pub webauthn: Option<VirtualAuthenticator>,
+    pub network_mocks: Vec<crate::commands::network_mock::NetworkMock>,
 }
 
 impl TabEmulation {
     /// True when the tab has no overrides of any kind.
     fn is_empty(&self) -> bool {
-        self.blocklist.is_empty() && self.viewport.is_none() && self.geolocation.is_none()
+        self.blocklist.is_empty()
+            && self.viewport.is_none()
+            && self.geolocation.is_none()
+            && self.media.is_none()
+            && self.webauthn.is_none()
+            && self.network_mocks.is_empty()
     }
 }
 
@@ -191,13 +322,52 @@ fn stash_tab_emulation(
     }
 }
 
+/// `Target.createTarget` parameters. `background` is only sent when set, so a
+/// foreground request stays the one non-Chrome CDP servers (Kitesurf) already
+/// accept.
+fn create_target_params(url: &str, background: bool) -> Value {
+    let mut params = json!({"url": url});
+    if background {
+        params["background"] = json!(true);
+    }
+    params
+}
+
 /// Read the Chrome WebSocket connect timeout from `CHROME_CONNECT_TIMEOUT_SECS`,
 /// defaulting to 10. Kept pure (value passed in) so the parsing policy is
 /// unit-testable without mutating process-global env vars.
 fn parse_connect_timeout(raw: Option<&str>) -> std::time::Duration {
-    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
+    parse_timeout_secs("CHROME_CONNECT_TIMEOUT_SECS", raw, 10)
+}
+
+/// How long one CDP call may go unanswered while the browser itself still
+/// answers, from `CHROME_CDP_TIMEOUT_SECS` (default 180, Puppeteer's protocol
+/// timeout). Long enough for a slow `run-script`; short enough that an endless
+/// loop or a hung renderer can't hold the daemon, which serves one request at
+/// a time, and every caller queued behind it, forever.
+fn cdp_call_timeout() -> std::time::Duration {
+    let raw = std::env::var("CHROME_CDP_TIMEOUT_SECS").ok();
+    parse_timeout_secs("CHROME_CDP_TIMEOUT_SECS", raw.as_deref(), 180)
+}
+
+/// Limit for calls that set a session up (`Runtime.enable` and the like). They
+/// answer in milliseconds unless the page is blocked, and a blocked page would
+/// otherwise cost the full call timeout for each of them in turn.
+pub const SETUP_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Silence this long during a call prompts a check that the browser still
+/// answers: a laptop that slept or a dropped network can leave the socket
+/// open with nobody on the other end.
+const QUIET_BEFORE_CHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the browser gets to answer that check. Its browser process answers
+/// even while a page is stuck, so no answer means the connection is gone.
+const ALIVE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn parse_timeout_secs(var: &str, raw: Option<&str>, default_secs: u64) -> std::time::Duration {
+    let default = std::time::Duration::from_secs(default_secs);
     match raw {
-        None => DEFAULT,
+        None => default,
         Some(v) => match v.parse::<u64>() {
             // 0 would make every connect fail instantly with the misleading
             // "Chrome may be waiting for approval" message; treat it as
@@ -205,11 +375,11 @@ fn parse_connect_timeout(raw: Option<&str>) -> std::time::Duration {
             Ok(secs) if secs > 0 => std::time::Duration::from_secs(secs),
             _ => {
                 eprintln!(
-                    "[warning] Ignoring invalid CHROME_CONNECT_TIMEOUT_SECS value '{v}' \
+                    "[warning] Ignoring invalid {var} value '{v}' \
                      (expected a positive integer); using default of {}s",
-                    DEFAULT.as_secs()
+                    default.as_secs()
                 );
-                DEFAULT
+                default
             }
         },
     }
@@ -279,15 +449,21 @@ impl CdpClient {
             read,
             next_id: 1,
             dialog_action: None,
+            open_dialog: None,
             events: std::collections::VecDeque::new(),
             unread: std::collections::VecDeque::new(),
             persistent_session: None,
             persistent_target_id: None,
             network_events: std::collections::VecDeque::new(),
             console_events: std::collections::VecDeque::new(),
+            console_pushed: 0,
             blocklist: Vec::new(),
             viewport: None,
             geolocation: None,
+            media: None,
+            webauthn: None,
+            network_mocks: Vec::new(),
+            paused_requests: std::collections::VecDeque::new(),
             emulation_saved: std::collections::HashMap::new(),
         })
     }
@@ -323,12 +499,16 @@ impl CdpClient {
                 blocklist: std::mem::take(&mut self.blocklist),
                 viewport: self.viewport.take(),
                 geolocation: self.geolocation.take(),
+                media: self.media.take(),
+                webauthn: self.webauthn.take(),
+                network_mocks: std::mem::take(&mut self.network_mocks),
             };
             stash_tab_emulation(&mut self.emulation_saved, old_target, saved);
         }
 
         // Detach old session if target changed
         if let Some(old_session) = self.persistent_session.take() {
+            self.forget_dialog(Some(&old_session));
             let _ = self
                 .send("Target.detachFromTarget", json!({"sessionId": old_session}))
                 .await;
@@ -362,7 +542,10 @@ impl CdpClient {
         // back to their own enable instead of silently draining an
         // uninitialized (always-empty) buffer.
         for method in ["Network.enable", "Runtime.enable"] {
-            if let Err(e) = self.send_to_target(&session_id, method, json!({})).await {
+            if let Err(e) = self
+                .send_to_target_within(&session_id, method, json!({}), SETUP_CALL_TIMEOUT)
+                .await
+            {
                 self.cleanup_failed_session(&session_id, target_id, false)
                     .await;
                 return Err(e);
@@ -376,6 +559,9 @@ impl CdpClient {
         self.blocklist = restored.blocklist;
         self.viewport = restored.viewport;
         self.geolocation = restored.geolocation;
+        self.media = restored.media;
+        self.webauthn = restored.webauthn;
+        self.network_mocks = restored.network_mocks;
 
         if let Err(e) = self.apply_network_rules_internal(&session_id).await {
             self.cleanup_failed_session(&session_id, target_id, true)
@@ -387,6 +573,14 @@ impl CdpClient {
             self.cleanup_failed_session(&session_id, target_id, true)
                 .await;
             return Err(e);
+        }
+
+        if !self.network_mocks.is_empty() {
+            if let Err(e) = crate::commands::network_mock::apply_mocks(self, &session_id).await {
+                self.cleanup_failed_session(&session_id, target_id, true)
+                    .await;
+                return Err(e);
+            }
         }
 
         Ok(())
@@ -407,6 +601,9 @@ impl CdpClient {
                 blocklist: std::mem::take(&mut self.blocklist),
                 viewport: self.viewport.take(),
                 geolocation: self.geolocation.take(),
+                media: self.media.take(),
+                webauthn: self.webauthn.take(),
+                network_mocks: std::mem::take(&mut self.network_mocks),
             };
             stash_tab_emulation(
                 &mut self.emulation_saved,
@@ -415,6 +612,7 @@ impl CdpClient {
             );
         }
 
+        self.forget_dialog(Some(session_id));
         let _ = self
             .send("Target.detachFromTarget", json!({"sessionId": session_id}))
             .await;
@@ -436,9 +634,14 @@ impl CdpClient {
     pub fn forget_target(&mut self, target_id: &str) {
         self.emulation_saved.remove(target_id);
         if self.persistent_target_id.as_deref() == Some(target_id) {
+            let session = self.persistent_session.clone();
+            self.forget_dialog(session.as_deref());
             self.blocklist.clear();
             self.viewport = None;
             self.geolocation = None;
+            self.media = None;
+            self.webauthn = None;
+            self.network_mocks.clear();
             self.persistent_session = None;
             self.persistent_target_id = None;
         }
@@ -473,7 +676,44 @@ impl CdpClient {
             )
             .await?;
         }
+        if let Some(media) = self.media.clone() {
+            self.send_to_target(session_id, "Emulation.setEmulatedMedia", media.cdp_params())
+                .await?;
+        }
+        if let Some(options) = self.webauthn.as_ref().map(|a| a.options.clone()) {
+            // The old authenticator went with the session that added it, so a
+            // new one replaces it; credentials registered before do not come
+            // back. If that fails the tab is left without one, as after any
+            // detach, rather than failing every later command on it.
+            match self.add_virtual_authenticator(session_id, &options).await {
+                Ok(id) => self.webauthn = Some(VirtualAuthenticator { id, options }),
+                Err(_) => self.webauthn = None,
+            }
+        }
         Ok(())
+    }
+
+    /// Turn on the virtual authenticator environment for a session and add one
+    /// authenticator to it, returning its id. `enableUI: false` keeps Chrome's
+    /// own passkey dialogs from opening in the user's browser.
+    pub(crate) async fn add_virtual_authenticator(
+        &mut self,
+        session_id: &str,
+        options: &AuthenticatorOptions,
+    ) -> Result<String> {
+        self.send_to_target(session_id, "WebAuthn.enable", json!({"enableUI": false}))
+            .await?;
+        let result = self
+            .send_to_target(
+                session_id,
+                "WebAuthn.addVirtualAuthenticator",
+                json!({"options": options.cdp_options()}),
+            )
+            .await?;
+        result["authenticatorId"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("No authenticatorId in addVirtualAuthenticator response"))
     }
 
     /// Apply the daemon's current `blocklist` to the persistent session via
@@ -507,12 +747,25 @@ impl CdpClient {
         std::mem::take(&mut self.network_events).into()
     }
 
+    /// Errors the page raised since `mark` (an earlier `console_pushed`), as
+    /// stderr notes, without draining them: `console` still returns them.
+    pub fn page_errors_since(&self, mark: u64) -> Vec<String> {
+        let new = usize::try_from(self.console_pushed - mark).unwrap_or(usize::MAX);
+        let skip = self.console_events.len().saturating_sub(new);
+        page_error_notes(self.console_events.iter().skip(skip))
+    }
+
     /// Drain accumulated console events from the persistent session.
     pub fn drain_console_events(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.console_events).into()
     }
 
     pub(crate) fn push_event(&mut self, event: Value) {
+        self.note_dialog_event(&event);
+        if event["method"] == "Fetch.requestPaused" {
+            self.paused_requests.push_back(event);
+            return;
+        }
         // Only route events into the persistent buffers when the event's
         // sessionId matches the persistent page session (flatten-mode events
         // are tagged with sessionId). Events from ad-hoc sessions (sw-logs
@@ -527,18 +780,20 @@ impl CdpClient {
         if from_persistent_session {
             let method = event.get("method").and_then(|v| v.as_str()).unwrap_or("");
             match method {
+                // Nothing reads it; buffering it only crowded requests out.
+                "Network.loadingFinished" => return,
                 "Network.requestWillBeSent"
                 | "Network.responseReceived"
-                | "Network.loadingFinished"
                 | "Network.loadingFailed" => {
-                    self.network_events.push_back(event);
+                    self.network_events.push_back(slim_network_event(event));
                     if self.network_events.len() > MAX_PERSISTENT_EVENTS {
                         self.network_events.pop_front();
                     }
                     return;
                 }
                 "Runtime.consoleAPICalled" | "Runtime.exceptionThrown" => {
-                    self.console_events.push_back(event);
+                    self.console_pushed += 1;
+                    self.console_events.push_back(slim_console_event(event));
                     if self.console_events.len() > MAX_PERSISTENT_EVENTS {
                         self.console_events.pop_front();
                     }
@@ -570,6 +825,19 @@ impl CdpClient {
         params: Value,
     ) -> Result<Value> {
         self.send_raw(method, params, Some(session_id)).await
+    }
+
+    /// [`Self::send_to_target`] with its own limit, for setup calls that should
+    /// fail fast on a blocked page ([`SETUP_CALL_TIMEOUT`]).
+    pub async fn send_to_target_within(
+        &mut self,
+        session_id: &str,
+        method: &str,
+        params: Value,
+        limit: std::time::Duration,
+    ) -> Result<Value> {
+        self.send_raw_within(method, params, Some(session_id), limit)
+            .await
     }
 
     /// Send a command and return the message ID immediately without waiting for response.
@@ -606,33 +874,45 @@ impl CdpClient {
         params: Value,
         session_id: Option<&str>,
     ) -> Result<Value> {
+        self.send_raw_within(method, params, session_id, cdp_call_timeout())
+            .await
+    }
+
+    async fn send_raw_within(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        limit: std::time::Duration,
+    ) -> Result<Value> {
+        // A page with a dialog open answers nothing until the dialog closes,
+        // and Chrome announced it only once, possibly to an earlier read.
+        if method != "Page.handleJavaScriptDialog" {
+            if let Some(sid) = session_id {
+                self.settle_open_dialog(sid).await?;
+            }
+        }
         let id = self.send_raw_no_wait(session_id, method, params).await?;
+        let started = tokio::time::Instant::now();
 
         loop {
-            let resp_text = self.read_text().await?;
+            let resp_text = self
+                .read_text_for_call(method, session_id, started, limit)
+                .await?;
             let resp: Value = serde_json::from_str(&resp_text)?;
+            self.note_dialog_event(&resp);
 
             // Proactively handle or fail if a dialog is opened during execution
             if resp.get("method").and_then(|v| v.as_str()) == Some("Page.javascriptDialogOpening")
                 && method != "Page.handleJavaScriptDialog"
             {
-                let dialog_type = resp
-                    .get("params")
-                    .and_then(|p| p.get("type"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("unknown");
-                let msg = resp
-                    .get("params")
-                    .and_then(|p| p.get("message"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("");
-
+                let dialog_session = resp["sessionId"].as_str().map(str::to_string);
                 if let Some(action) = self.dialog_action.clone() {
-                    self.handle_dialog_helper(session_id, action).await?;
+                    self.handle_dialog_helper(dialog_session.as_deref().or(session_id), action)
+                        .await?;
                     continue;
-                } else {
-                    bail!("A javascript dialog is open ({dialog_type}: {msg}). Use `evaluate` with --dialog-action to dismiss it.");
                 }
+                bail!(dialog_from_event(&resp));
             }
 
             if resp.get("id").and_then(|v| v.as_u64()) == Some(id) {
@@ -674,10 +954,15 @@ impl CdpClient {
             let id = self
                 .send_raw_no_wait(session_id, "Page.handleJavaScriptDialog", handler_params)
                 .await?;
+            let started = tokio::time::Instant::now();
+            let limit = cdp_call_timeout();
 
             loop {
-                let resp_text = self.read_text().await?;
+                let resp_text = self
+                    .read_text_for_call("Page.handleJavaScriptDialog", session_id, started, limit)
+                    .await?;
                 let resp: Value = serde_json::from_str(&resp_text)?;
+                self.note_dialog_event(&resp);
 
                 if resp.get("method").and_then(|v| v.as_str())
                     == Some("Page.javascriptDialogOpening")
@@ -688,7 +973,13 @@ impl CdpClient {
                 }
 
                 if resp.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                    self.forget_dialog(session_id);
                     if let Some(error) = resp.get("error") {
+                        // Closed meanwhile, by a person or the page navigating
+                        // away: the goal is met either way.
+                        if is_no_dialog_error(error) {
+                            return Ok(());
+                        }
                         bail!(
                             "CDP error in Page.handleJavaScriptDialog: {}",
                             serde_json::to_string_pretty(error)?
@@ -782,18 +1073,169 @@ impl CdpClient {
             match msg.get("method").and_then(|v| v.as_str()) {
                 Some("Page.javascriptDialogOpening") => self.unread.push_back(text),
                 Some(_) => self.push_event(msg),
-                None => {}
+                // A reply to a call still waiting on it: a ping can run in
+                // the middle of one (`read_text_for_call`), which must get
+                // its reply.
+                None => self.unread.push_back(text),
             }
+        }
+    }
+
+    /// Read the next message for a call waiting on its reply, giving up at
+    /// `limit` after `started`.
+    ///
+    /// Whenever the socket goes quiet, the browser gets a ping. No answer
+    /// means the connection is gone ([`ConnectionLost`], so the daemon exits
+    /// and the next command reconnects). An answer means the page, not the
+    /// connection, is slow, and the call is only given up at `limit`, leaving
+    /// the daemon and its approved connection in place.
+    async fn read_text_for_call(
+        &mut self,
+        method: &str,
+        session_id: Option<&str>,
+        started: tokio::time::Instant,
+        limit: std::time::Duration,
+    ) -> Result<String> {
+        loop {
+            let remaining = limit.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                // Whose fault: a lost connection exits the daemon, a stuck
+                // page must not.
+                self.check_alive().await?;
+                // An endless loop in the page would keep answering nothing
+                // for every later command too; stopping the script frees it.
+                let mut stopped = "";
+                if method.starts_with("Runtime.") {
+                    if let Some(sid) = session_id {
+                        let _ = self
+                            .send_raw_no_wait(Some(sid), "Runtime.terminateExecution", json!({}))
+                            .await;
+                        stopped = " (its running JavaScript was stopped)";
+                    }
+                }
+                let longer = if limit >= cdp_call_timeout() {
+                    " For a call that is just slow, set CHROME_CDP_TIMEOUT_SECS (read when the \
+                     daemon starts)."
+                } else {
+                    ""
+                };
+                bail!(PageUnresponsive(format!(
+                    "{method} got no answer from the page within {}s, though the browser \
+                     answers. Either the page is stuck (an endless loop{stopped}, a hung \
+                     renderer), or a JavaScript dialog is open that this daemon did not see \
+                     open and cannot handle: a person has to close it, or `close-page` closes \
+                     the tab.{longer}",
+                    limit.as_secs()
+                )));
+            }
+            match tokio::time::timeout(remaining.min(QUIET_BEFORE_CHECK), self.read_text()).await {
+                Ok(read) => return read,
+                Err(_) => self.check_alive().await?,
+            }
+        }
+    }
+
+    /// Fail with [`ConnectionLost`] unless the browser answers a ping soon.
+    async fn check_alive(&mut self) -> Result<()> {
+        match tokio::time::timeout(ALIVE_CHECK_TIMEOUT, self.ping()).await {
+            Err(_) => bail!(ConnectionLost(format!(
+                "The browser did not answer for {}s; the connection is treated as lost",
+                (QUIET_BEFORE_CHECK + ALIVE_CHECK_TIMEOUT).as_secs()
+            ))),
+            Ok(Err(e)) if e.downcast_ref::<ConnectionLost>().is_some() => Err(e),
+            // A CDP error is still an answer.
+            Ok(_) => Ok(()),
+        }
+    }
+
+    /// Track dialogs opening and closing, from whichever read sees them.
+    fn note_dialog_event(&mut self, msg: &Value) {
+        match msg["method"].as_str() {
+            Some("Page.javascriptDialogOpening") => {
+                self.open_dialog = Some(OpenDialog {
+                    session_id: msg["sessionId"].as_str().map(str::to_string),
+                    dialog: dialog_from_event(msg),
+                });
+            }
+            Some("Page.javascriptDialogClosed") => {
+                self.forget_dialog(msg["sessionId"].as_str());
+            }
+            _ => {}
+        }
+    }
+
+    /// Forget the open dialog if it belongs to `session_id`: it was handled,
+    /// closed, or its session is gone (only that session could handle it).
+    pub fn forget_dialog(&mut self, session_id: Option<&str>) {
+        if self
+            .open_dialog
+            .as_ref()
+            .is_some_and(|d| d.session_id.as_deref() == session_id)
+        {
+            self.open_dialog = None;
+        }
+    }
+
+    /// Deal with a dialog already open on `session_id` before a command
+    /// talks to the page, which answers nothing while it is open: handle it
+    /// with the command's `--dialog-action`, or fail now.
+    pub async fn settle_open_dialog(&mut self, session_id: &str) -> Result<()> {
+        let Some(open) = self
+            .open_dialog
+            .clone()
+            .filter(|d| d.session_id.as_deref() == Some(session_id))
+        else {
+            return Ok(());
+        };
+        match self.dialog_action.clone() {
+            Some(action) => self.handle_dialog_helper(Some(session_id), action).await,
+            None => Err(open.dialog.into()),
         }
     }
 
     /// Read the next text message, skipping non-text frames. Messages a ping
     /// set aside come first, as if they had only just arrived.
     pub async fn read_text(&mut self) -> Result<String> {
+        self.answer_paused_requests().await?;
         if let Some(text) = self.unread.pop_front() {
             return Ok(text);
         }
         self.read_socket_text().await
+    }
+
+    /// Answer the requests the page is holding for a mock. Each stays queued
+    /// until its answer is sent, so a read cancelled mid-send retries it
+    /// rather than leave the request hanging.
+    async fn answer_paused_requests(&mut self) -> Result<()> {
+        while let Some(event) = self.paused_requests.front().cloned() {
+            let session = event["sessionId"].as_str().map(str::to_string);
+            let (method, params) = crate::commands::network_mock::reply_to_paused(
+                &mut self.network_mocks,
+                &event["params"],
+            );
+            self.send_raw_no_wait(session.as_deref(), method, params)
+                .await?;
+            self.paused_requests.pop_front();
+        }
+        Ok(())
+    }
+
+    /// Whether the daemon must keep reading between commands: with mocks
+    /// set, the page's requests wait on answers only reads produce.
+    pub fn wants_idle_reads(&self) -> bool {
+        !self.network_mocks.is_empty() || !self.paused_requests.is_empty()
+    }
+
+    /// One read between commands: buffer what arrives and answer paused
+    /// requests. Cancel-safe, so the daemon can drop it for a new command.
+    pub async fn pump_once(&mut self) -> Result<()> {
+        let text = self.read_text().await?;
+        if let Ok(msg) = serde_json::from_str::<Value>(&text) {
+            if msg.get("method").is_some() {
+                self.push_event(msg);
+            }
+        }
+        self.answer_paused_requests().await
     }
 
     /// Read the next text message from the WebSocket itself, skipping non-text frames.
@@ -892,10 +1334,12 @@ impl CdpClient {
         Ok(())
     }
 
-    /// Create a new page target and return its target ID.
-    pub async fn create_target(&mut self, url: &str) -> Result<String> {
+    /// Create a new page target and return its target ID. `background` opens
+    /// it without bringing it to the front, so it doesn't take focus from the
+    /// tab the user is looking at.
+    pub async fn create_target(&mut self, url: &str, background: bool) -> Result<String> {
         let result = self
-            .send("Target.createTarget", json!({"url": url}))
+            .send("Target.createTarget", create_target_params(url, background))
             .await?;
         result["targetId"]
             .as_str()
@@ -915,7 +1359,11 @@ impl CdpClient {
     /// Drains any already-buffered events first, then reads from the WebSocket
     /// until the timeout expires. Events are also routed through persistent
     /// session buffers when active to avoid duplicates.
-    pub async fn read_events_for(&mut self, duration_ms: u64) -> Result<Vec<Value>> {
+    ///
+    /// With `collect` false the events only go to the buffers and nothing is
+    /// returned: callers draining the persistent buffers would otherwise hold
+    /// a second, uncapped copy of everything for the whole window.
+    pub async fn read_events_for(&mut self, duration_ms: u64, collect: bool) -> Result<Vec<Value>> {
         let mut events: Vec<Value> = self.events.drain(..).collect();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
 
@@ -946,7 +1394,9 @@ impl CdpClient {
                             {
                                 self.push_event(resp.clone());
                             }
-                            events.push(resp);
+                            if collect {
+                                events.push(resp);
+                            }
                         }
                     }
                 }
@@ -1015,21 +1465,128 @@ impl CdpClient {
     }
 }
 
+/// Longest string argument a buffered console event keeps. A page can log a
+/// whole file in one call, and the buffer holds thousands of events.
+const MAX_BUFFERED_STRING_CHARS: usize = 10_000;
+
+/// The fields `network` reads, and nothing else. Whole events carry headers,
+/// POST bodies and initiator stacks (kilobytes each), which made the event cap
+/// the only bound on the daemon's memory.
+fn slim_network_event(event: Value) -> Value {
+    let p = &event["params"];
+    let mut params = json!({"requestId": p["requestId"]});
+    match event["method"].as_str() {
+        Some("Network.requestWillBeSent") => {
+            params["request"] =
+                json!({"url": p["request"]["url"], "method": p["request"]["method"]});
+            params["type"] = p["type"].clone();
+            if let Some(r) = p.get("redirectResponse") {
+                params["redirectResponse"] =
+                    json!({"status": r["status"], "statusText": r["statusText"]});
+            }
+        }
+        Some("Network.responseReceived") => {
+            let r = &p["response"];
+            params["response"] = json!({"status": r["status"], "statusText": r["statusText"]});
+        }
+        Some("Network.loadingFailed") => params["errorText"] = p["errorText"].clone(),
+        _ => return event,
+    }
+    json!({"method": event["method"], "sessionId": event["sessionId"], "params": params})
+}
+
+/// A console event without its stack traces, and with long strings cut.
+fn slim_console_event(mut event: Value) -> Value {
+    if let Some(params) = event.get_mut("params").and_then(Value::as_object_mut) {
+        params.remove("stackTrace");
+        if let Some(details) = params
+            .get_mut("exceptionDetails")
+            .and_then(Value::as_object_mut)
+        {
+            details.remove("stackTrace");
+        }
+        for arg in params
+            .get_mut("args")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(Value::String(s)) = arg.get_mut("value") {
+                let cut = match crate::format::truncate_chars(s, MAX_BUFFERED_STRING_CHARS) {
+                    std::borrow::Cow::Owned(cut) => Some(cut),
+                    std::borrow::Cow::Borrowed(_) => None,
+                };
+                if let Some(cut) = cut {
+                    *s = cut;
+                }
+            }
+        }
+    }
+    event
+}
+
+/// Most errors a command lists; the rest are a `console` call away.
+const MAX_PAGE_ERROR_NOTES: usize = 10;
+
+/// One line per uncaught exception or `console.error`, so a click that broke
+/// the page doesn't look like one that worked. First lines only: the stack
+/// is in `console`.
+fn page_error_notes<'a>(events: impl Iterator<Item = &'a Value>) -> Vec<String> {
+    let errors: Vec<String> = events
+        .filter_map(|e| {
+            let params = &e["params"];
+            let text = match e["method"].as_str()? {
+                "Runtime.exceptionThrown" => {
+                    crate::remote_object::describe_exception(&params["exceptionDetails"])
+                }
+                "Runtime.consoleAPICalled" if params["type"] == "error" => {
+                    let args = params["args"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+                    format!("console.error: {}", join_console_args(args))
+                }
+                _ => return None,
+            };
+            let first_line = text.lines().next().unwrap_or("").to_string();
+            Some(first_line)
+        })
+        .collect();
+    let mut notes: Vec<String> = errors
+        .iter()
+        .take(MAX_PAGE_ERROR_NOTES)
+        .map(|e| format!("[page error] {e}"))
+        .collect();
+    if errors.len() > MAX_PAGE_ERROR_NOTES {
+        notes.push(format!(
+            "[page error] … and {} more; `console --type error` lists them all",
+            errors.len() - MAX_PAGE_ERROR_NOTES
+        ));
+    }
+    notes
+}
+
+fn dialog_from_event(event: &Value) -> DialogOpen {
+    DialogOpen {
+        dialog_type: event["params"]["type"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string(),
+        message: event["params"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+fn is_no_dialog_error(error: &Value) -> bool {
+    error["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("No dialog is showing"))
+}
+
 /// Helper to join console API arguments into a single string.
 /// Chrome's `Runtime.consoleAPICalled` returns arguments as an array of RemoteObjects.
 pub fn join_console_args(args: &[Value]) -> String {
     args.iter()
-        .map(|arg| match arg.get("value") {
-            // String primitives: emit the raw text (no quotes).
-            Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
-            // Other primitives (number, bool, null): stringify directly.
-            Some(v) => v.to_string(),
-            // Objects have no `value` — fall back to their description.
-            None => arg["description"]
-                .as_str()
-                .unwrap_or("<object>")
-                .to_string(),
-        })
+        .map(crate::remote_object::describe)
         .collect::<Vec<String>>()
         .join(" ")
 }
@@ -1037,6 +1594,72 @@ pub fn join_console_args(args: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_events_keep_only_what_is_read() {
+        let request = json!({"method": "Network.requestWillBeSent", "sessionId": "S", "params": {
+            "requestId": "1", "type": "Fetch",
+            "request": {"url": "https://a.test/x", "method": "POST", "postData": "x".repeat(5000), "headers": {"a": "b"}},
+            "initiator": {"stack": {"callFrames": [{"url": "big"}]}},
+            "redirectResponse": {"status": 302, "statusText": "Found", "headers": {"location": "/y"}},
+        }});
+        assert_eq!(
+            slim_network_event(request),
+            json!({"method": "Network.requestWillBeSent", "sessionId": "S", "params": {
+                "requestId": "1", "type": "Fetch",
+                "request": {"url": "https://a.test/x", "method": "POST"},
+                "redirectResponse": {"status": 302, "statusText": "Found"},
+            }})
+        );
+
+        let log = json!({"method": "Runtime.consoleAPICalled", "params": {
+            "type": "log", "stackTrace": {"callFrames": []},
+            "args": [{"type": "string", "value": "é".repeat(MAX_BUFFERED_STRING_CHARS + 5)}],
+        }});
+        let slim = slim_console_event(log);
+        assert!(slim["params"].get("stackTrace").is_none());
+        let kept = slim["params"]["args"][0]["value"].as_str().unwrap();
+        assert_eq!(kept.chars().count(), MAX_BUFFERED_STRING_CHARS + 1);
+    }
+
+    #[test]
+    fn page_errors_list_exceptions_and_console_errors_only() {
+        let event = |method: &str, params: Value| json!({"method": method, "params": params});
+        let events = [
+            event(
+                "Runtime.consoleAPICalled",
+                json!({"type": "log", "args": [{"type": "string", "value": "fine"}]}),
+            ),
+            event(
+                "Runtime.consoleAPICalled",
+                json!({"type": "error", "args": [{"type": "string", "value": "bad thing"}]}),
+            ),
+            event(
+                "Runtime.exceptionThrown",
+                json!({"exceptionDetails": {"text": "Uncaught", "exception": {
+                "type": "object", "subtype": "error", "description": "TypeError: x is not a function\n    at click (app.js:1:1)"}}}),
+            ),
+        ];
+        assert_eq!(
+            page_error_notes(events.iter()),
+            vec![
+                "[page error] console.error: bad thing".to_string(),
+                "[page error] TypeError: x is not a function".to_string(),
+            ]
+        );
+
+        let many: Vec<Value> = (0..12)
+            .map(|i| {
+                event(
+                    "Runtime.consoleAPICalled",
+                    json!({"type": "error", "args": [{"type": "number", "value": i}]}),
+                )
+            })
+            .collect();
+        let notes = page_error_notes(many.iter());
+        assert_eq!(notes.len(), MAX_PAGE_ERROR_NOTES + 1);
+        assert!(notes.last().unwrap().contains("2 more"), "{notes:?}");
+    }
     use serde_json::json;
 
     #[test]
@@ -1191,6 +1814,54 @@ mod tests {
         assert!(
             saved.is_empty(),
             "the restored entry should be consumed, not duplicated"
+        );
+    }
+
+    /// Media emulation and a virtual authenticator are tab state too: a tab
+    /// with only one of them must be stashed, or switching away loses it.
+    #[test]
+    fn media_or_authenticator_alone_is_stashed() {
+        let mut saved = std::collections::HashMap::new();
+        stash_tab_emulation(
+            &mut saved,
+            "A".to_string(),
+            TabEmulation {
+                media: Some(MediaOverride {
+                    media: Some("print".into()),
+                    features: vec![],
+                }),
+                ..Default::default()
+            },
+        );
+        stash_tab_emulation(
+            &mut saved,
+            "B".to_string(),
+            TabEmulation {
+                webauthn: Some(VirtualAuthenticator {
+                    id: "x".into(),
+                    options: AuthenticatorOptions {
+                        protocol: "ctap2".into(),
+                        transport: "internal".into(),
+                        has_resident_key: true,
+                        has_user_verification: true,
+                        is_user_verified: true,
+                    },
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(saved.contains_key("A") && saved.contains_key("B"));
+    }
+
+    #[test]
+    fn background_is_sent_only_when_set() {
+        assert_eq!(
+            create_target_params("about:blank", false),
+            json!({"url": "about:blank"})
+        );
+        assert_eq!(
+            create_target_params("about:blank", true),
+            json!({"url": "about:blank", "background": true})
         );
     }
 

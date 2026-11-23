@@ -51,7 +51,7 @@ pub async fn navigate(
             bail!("Navigation error: {err}");
         }
 
-        wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS).await?;
+        wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS, None).await?;
         let result =
             CommandResult::output(format!("Navigated to {url}")).with_navigated_to(url.to_string());
         Ok(result.save_output(output).await?)
@@ -89,6 +89,7 @@ async fn go_back(
     let prev_entry = &entries[(current_index - 1) as usize];
     let entry_id = prev_entry["id"].as_i64().unwrap_or(0);
 
+    let before = document_mark(client, session_id).await?;
     client
         .send_to_target(
             session_id,
@@ -97,7 +98,7 @@ async fn go_back(
         )
         .await?;
 
-    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS).await?;
+    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS, Some(&before)).await?;
     let url = prev_entry["url"].as_str().unwrap_or("unknown");
     let result = CommandResult::output(format!("Navigated back to {url}"))
         .with_navigated_to(url.to_string());
@@ -125,6 +126,7 @@ async fn go_forward(
     let next_entry = &entries[current_index + 1];
     let entry_id = next_entry["id"].as_i64().unwrap_or(0);
 
+    let before = document_mark(client, session_id).await?;
     client
         .send_to_target(
             session_id,
@@ -133,7 +135,7 @@ async fn go_forward(
         )
         .await?;
 
-    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS).await?;
+    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS, Some(&before)).await?;
     let url = next_entry["url"].as_str().unwrap_or("unknown");
     let result = CommandResult::output(format!("Navigated forward to {url}"))
         .with_navigated_to(url.to_string());
@@ -145,20 +147,60 @@ async fn do_reload(
     session_id: &str,
     output: Option<&str>,
 ) -> Result<CommandResult> {
+    let before = document_mark(client, session_id).await?;
     client
         .send_to_target(session_id, "Page.reload", json!({}))
         .await?;
-    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS).await?;
+    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS, Some(&before)).await?;
     let url = client.current_url(session_id).await?;
     let result = CommandResult::output("Reloaded page".to_string());
     Ok(result.save_output(output).await?.with_navigated_to(url))
 }
 
+/// Which document is showing: its time origin and URL. A reload keeps the URL
+/// but starts a document with a new time origin; going back to an entry of the
+/// same document keeps the origin but changes the URL.
+pub struct DocumentMark {
+    time_origin: f64,
+    url: String,
+}
+
+const DOCUMENT_STATE_JS: &str =
+    "JSON.stringify([document.readyState, performance.timeOrigin, location.href])";
+
+pub async fn document_mark(client: &mut CdpClient, session_id: &str) -> Result<DocumentMark> {
+    let result = client
+        .send_to_target(
+            session_id,
+            "Runtime.evaluate",
+            json!({"expression": DOCUMENT_STATE_JS, "returnByValue": true}),
+        )
+        .await?;
+    let (_, time_origin, url) = parse_document_state(&result)
+        .ok_or_else(|| anyhow::anyhow!("Could not read the page's document state: {result}"))?;
+    Ok(DocumentMark { time_origin, url })
+}
+
+fn parse_document_state(result: &serde_json::Value) -> Option<(String, f64, String)> {
+    let state: serde_json::Value =
+        serde_json::from_str(result["result"]["value"].as_str()?).ok()?;
+    Some((
+        state[0].as_str()?.to_string(),
+        state[1].as_f64()?,
+        state[2].as_str()?.to_string(),
+    ))
+}
+
 /// Poll until document.readyState is "complete" or the timeout expires.
+///
+/// With `previous`, the document must also have changed from that one first.
+/// `Page.reload` and `Page.navigateToHistoryEntry` return before the old page
+/// goes away, and its readyState is already "complete".
 pub async fn wait_for_load(
     client: &mut CdpClient,
     session_id: &str,
     timeout_ms: u64,
+    previous: Option<&DocumentMark>,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
@@ -174,7 +216,7 @@ pub async fn wait_for_load(
                 session_id,
                 "Runtime.evaluate",
                 json!({
-                    "expression": "document.readyState",
+                    "expression": DOCUMENT_STATE_JS,
                     "returnByValue": true,
                 }),
             )
@@ -182,8 +224,11 @@ pub async fn wait_for_load(
 
         match result {
             Ok(val) => {
-                if val["result"]["value"].as_str() == Some("complete") {
-                    return Ok(());
+                if let Some((state, origin, url)) = parse_document_state(&val) {
+                    let changed = previous.is_none_or(|p| p.time_origin != origin || p.url != url);
+                    if state == "complete" && changed {
+                        return Ok(());
+                    }
                 }
             }
             Err(e) => {

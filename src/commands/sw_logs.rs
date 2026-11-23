@@ -77,7 +77,7 @@ pub async fn collect_sw_logs(
         return Ok(CommandResult::output(err));
     }
 
-    let events_result = client.read_events_for(duration_ms).await;
+    let events_result = client.read_events_for(duration_ms, true).await;
 
     for (_, session_id) in &sessions {
         let _ = client
@@ -119,8 +119,7 @@ pub async fn collect_sw_logs(
             }
             "Runtime.exceptionThrown" => {
                 let details = &params["exceptionDetails"];
-                let text = details["text"].as_str().unwrap_or("Unknown error");
-                let description = details["exception"]["description"].as_str().unwrap_or(text);
+                let description = crate::remote_object::describe_exception(details);
 
                 messages.push(json!({
                     "extensionId": ext_id,

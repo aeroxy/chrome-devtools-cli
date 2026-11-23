@@ -173,6 +173,7 @@ fn write_info_file(key: &str, browser: &str, ws_url: &str) {
         started_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
     let path = crate::protocol::info_path(key);
     match serde_json::to_vec(&info) {
@@ -379,6 +380,9 @@ macro_rules! run_accept_loop_body {
                     break;
                 }
                 accept = tokio::time::timeout(idle_timeout(), $accept) => match accept {
+                    Ok(Ok((stream, _))) if !crate::protocol::peer_is_this_user(&stream) => {
+                        eprintln!("daemon: refused a connection from another user");
+                    }
                     Ok(Ok((stream, _))) => match handle_connection(stream, $client, $ws_url, $browser).await {
                         ConnectionOutcome::Continue => {}
                         ConnectionOutcome::Fatal => break,
@@ -389,6 +393,22 @@ macro_rules! run_accept_loop_body {
                     Err(_) => {
                         // Idle timeout — exit
                         break;
+                    }
+                },
+                // With network mocks set, the page's requests wait on answers
+                // that only reads produce, so keep reading between commands.
+                // Each event restarts the idle timer above, so a busy page
+                // keeps the daemon (and its mocks) alive.
+                pumped = async {
+                    match $client.as_mut() {
+                        Some(c) if c.wants_idle_reads() => c.pump_once().await,
+                        _ => std::future::pending().await,
+                    }
+                } => {
+                    if let Err(e) = pumped {
+                        if is_connection_lost(&e) {
+                            break;
+                        }
                     }
                 }
             }
@@ -567,8 +587,9 @@ where
                 navigated_to: None,
                 target_id: None,
                 error_code: Some(ErrorCode::InvalidInput as u32),
+                ..Default::default()
             };
-            if let Ok(resp_bytes) = serde_json::to_vec(&resp) {
+            if let Ok(resp_bytes) = serde_json::to_vec(&with_version(resp)) {
                 let _ = write_msg(&mut stream, &resp_bytes).await;
             }
             return ConnectionOutcome::Continue;
@@ -591,8 +612,9 @@ where
                     navigated_to: None,
                     target_id: None,
                     error_code: Some(ErrorCode::ChromeConnection as u32),
+                    ..Default::default()
                 };
-                if let Ok(resp_bytes) = serde_json::to_vec(&resp) {
+                if let Ok(resp_bytes) = serde_json::to_vec(&with_version(resp)) {
                     let _ = write_msg(&mut stream, &resp_bytes).await;
                 }
                 // Exit daemon if we can't connect, so the next CLI call will spawn a fresh daemon
@@ -614,6 +636,7 @@ where
                 navigated_to: None,
                 target_id: None,
                 error_code: Some(ErrorCode::ChromeConnection as u32),
+                ..Default::default()
             },
             false,
         ),
@@ -634,7 +657,7 @@ where
         response.error_code = Some(ErrorCode::WebSocketDisconnected as u32);
     }
 
-    if let Ok(resp_bytes) = serde_json::to_vec(&response) {
+    if let Ok(resp_bytes) = serde_json::to_vec(&with_version(response)) {
         let _ = write_msg(&mut stream, &resp_bytes).await;
     }
 
@@ -643,6 +666,12 @@ where
     } else {
         ConnectionOutcome::Continue
     }
+}
+
+/// Stamp a response with this daemon's version, for the CLI's mismatch check.
+fn with_version(mut response: DaemonResponse) -> DaemonResponse {
+    response.version = Some(env!("CARGO_PKG_VERSION").to_string());
+    response
 }
 
 /// Whether `CdpClient` raised this because Chrome's WebSocket is gone. Checked
@@ -672,6 +701,8 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> (DaemonR
                 navigated_to: result.navigated_to,
                 target_id: result.target_id,
                 error_code: result.error_code,
+                notes: result.notes,
+                ..Default::default()
             };
             (response, false)
         }
@@ -688,6 +719,7 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> (DaemonR
                 navigated_to: None,
                 target_id: None,
                 error_code,
+                ..Default::default()
             };
             (response, is_connection_lost(&e))
         }

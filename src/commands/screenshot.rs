@@ -5,6 +5,10 @@ use serde_json::json;
 use crate::cdp::CdpClient;
 use crate::result::CommandResult;
 
+/// Chrome's GPU texture limit: past this many device pixels in either
+/// direction, captured content repeats or comes out corrupt.
+const MAX_CAPTURE_DIMENSION: f64 = 16384.0;
+
 /// Capture a screenshot of the current page.
 pub struct ScreenshotOptions {
     pub output: Option<String>,
@@ -56,6 +60,9 @@ pub async fn take_screenshot(
     // use these to frame the visible region.
     let mut scroll_x = 0.0;
     let mut scroll_y = 0.0;
+    // Device pixels per CSS pixel. Images come out at device resolution, so
+    // --max-width/--max-height and the capture limit are in device pixels.
+    let mut dpr = 1.0;
     let needs_metrics = full_page || max_width.is_some() || max_height.is_some();
 
     if needs_metrics {
@@ -71,6 +78,10 @@ pub async fn take_screenshot(
             .await
             .context("Failed to query page layout metrics")?;
 
+        dpr = match page_device_pixel_ratio(client, session_id).await {
+            Some(ratio) => ratio,
+            None => device_pixel_ratio(&metrics),
+        };
         if full_page {
             // cssContentSize is the full scrollable content area in CSS pixels.
             // (The legacy `contentSize` returns DIPs, which are wrong on HiDPI
@@ -105,7 +116,17 @@ pub async fn take_screenshot(
         }
     }
 
-    let clip_scale = clip_scale_factor(src_w, src_h, max_width, max_height);
+    let clip_scale = clip_scale_factor(src_w * dpr, src_h * dpr, max_width, max_height);
+    let (image_w, image_h) = (src_w * dpr * clip_scale, src_h * dpr * clip_scale);
+    let mut notes = Vec::new();
+    if full_page && (image_w > MAX_CAPTURE_DIMENSION || image_h > MAX_CAPTURE_DIMENSION) {
+        notes.push(format!(
+            "[warning] The screenshot is {:.0}x{:.0}px, past Chrome's {MAX_CAPTURE_DIMENSION}px \
+             capture limit, so content beyond it may repeat or be corrupt. Downscale with \
+             --max-height (or --max-width).",
+            image_w, image_h
+        ));
+    }
 
     // Clip coordinates are relative to the document origin. For full-page
     // captures the region starts at the document origin (scroll is irrelevant
@@ -131,17 +152,45 @@ pub async fn take_screenshot(
 
     let bytes = base64::engine::general_purpose::STANDARD.decode(data_b64)?;
 
-    match output {
+    let result = match output {
         Some(path) => {
             tokio::fs::write(&path, &bytes)
                 .await
                 .with_context(|| format!("Failed to write screenshot to {}", path))?;
-            Ok(CommandResult::output(format!(
+            CommandResult::output(format!(
                 "Screenshot saved to {path} ({} bytes)",
                 bytes.len()
-            )))
+            ))
         }
-        None => Ok(CommandResult::output(data_b64.to_string())),
+        None => CommandResult::output(data_b64.to_string()),
+    };
+    Ok(CommandResult { notes, ..result })
+}
+
+/// The page's own `devicePixelRatio`, which includes an emulated
+/// `--device-scale-factor` (the layout viewports below don't). `None` where
+/// the page can't run JavaScript.
+async fn page_device_pixel_ratio(client: &mut CdpClient, session_id: &str) -> Option<f64> {
+    let result = client
+        .send_to_target(
+            session_id,
+            "Runtime.evaluate",
+            json!({"expression": "window.devicePixelRatio", "returnByValue": true}),
+        )
+        .await
+        .ok()?;
+    result["result"]["value"].as_f64().filter(|r| *r > 0.0)
+}
+
+/// Fallback for pages without JavaScript: `layoutViewport` is in device pixels and `cssLayoutViewport` in CSS
+/// pixels, so their ratio is the device pixel ratio, including an emulated
+/// `--device-scale-factor`. 1 when either is missing.
+fn device_pixel_ratio(metrics: &serde_json::Value) -> f64 {
+    let device = metrics["layoutViewport"]["clientWidth"].as_f64();
+    let css = metrics["cssLayoutViewport"]["clientWidth"].as_f64();
+    match (device, css) {
+        (Some(d), Some(c)) if d > 0.0 && c > 0.0 => d / c,
+        _ => 1.0,
     }
 }
 
@@ -169,7 +218,23 @@ fn clip_scale_factor(
 
 #[cfg(test)]
 mod tests {
-    use super::clip_scale_factor;
+    use super::{clip_scale_factor, device_pixel_ratio};
+
+    #[test]
+    fn device_pixel_ratio_comes_from_the_two_viewports() {
+        let hidpi = serde_json::json!({
+            "layoutViewport": {"clientWidth": 1600},
+            "cssLayoutViewport": {"clientWidth": 800},
+        });
+        assert_eq!(device_pixel_ratio(&hidpi), 2.0);
+        assert_eq!(device_pixel_ratio(&serde_json::json!({})), 1.0);
+        // --max-width 400 on an 800 CSS px viewport at 2x: the image is 1600
+        // device px wide, so the clip must scale by 400/1600, not 400/800.
+        assert_eq!(
+            clip_scale_factor(800.0 * 2.0, 600.0 * 2.0, Some(400.0), None),
+            0.25
+        );
+    }
 
     #[test]
     fn no_max_dimensions_returns_one() {

@@ -14,6 +14,9 @@ pub struct CommandResult {
     pub target_id: Option<String>,
     /// Optional error code for non-fatal issues (e.g., partial failures).
     pub error_code: Option<u32>,
+    /// Lines for stderr beside the output (warnings, page errors), so they
+    /// never mix into output that is data, such as a base64 screenshot.
+    pub notes: Vec<String>,
 }
 
 impl CommandResult {
@@ -21,9 +24,7 @@ impl CommandResult {
     pub fn output(output: impl Into<String>) -> Self {
         Self {
             output: output.into(),
-            navigated_to: None,
-            target_id: None,
-            error_code: None,
+            ..Default::default()
         }
     }
 
@@ -48,6 +49,22 @@ impl CommandResult {
         self
     }
 
+    /// Add a line for stderr.
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
+        self
+    }
+
+    /// Report a navigation when the URL changed or a new document loaded.
+    /// The URL alone misses a reload, or a form that posts back to its own URL.
+    pub fn with_navigation(self, after: String, before: String, new_document: bool) -> Self {
+        if new_document {
+            self.with_navigated_to(after)
+        } else {
+            self.with_navigated_to_if_changed(after, before)
+        }
+    }
+
     /// Set the `error_code` field.
     #[allow(dead_code)]
     pub fn with_error_code(mut self, code: u32) -> Self {
@@ -64,7 +81,10 @@ impl CommandResult {
         match path {
             Some(p) => {
                 fs::write(p, &self.output).await?;
-                Ok(CommandResult::output(format!("Output saved to {p}")))
+                Ok(CommandResult {
+                    notes: self.notes,
+                    ..CommandResult::output(format!("Output saved to {p}"))
+                })
             }
             None => Ok(self),
         }

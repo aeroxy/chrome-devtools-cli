@@ -281,11 +281,7 @@ pub async fn read_page(
         .await?;
 
     if let Some(exception) = result.get("exceptionDetails") {
-        let text = exception["text"]
-            .as_str()
-            .or_else(|| exception["exception"]["description"].as_str())
-            .unwrap_or("Unknown error evaluating page content");
-        anyhow::bail!("{text}");
+        anyhow::bail!("{}", crate::remote_object::describe_exception(exception));
     }
 
     let val = &result["result"]["value"];
