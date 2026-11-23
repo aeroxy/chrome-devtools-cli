@@ -9,8 +9,10 @@ use crate::result::CommandResult;
 /// `devtoolstooldiscovery` event whose `respondWith` hands back each group,
 /// then expose what came back as `window.__dtmcp`, which the list and execute
 /// expressions read. Pages that set `__dtmcp` themselves answer nothing and keep
-/// theirs. A group missing a field, or holding a malformed tool, is skipped
-/// with a console error, and the other groups still count.
+/// theirs; groups an earlier discovery installed are dropped once nothing
+/// answers, so a page that removed its listener stops listing its old tools.
+/// A group missing a field, or holding a malformed tool, is skipped with a
+/// console error, and the other groups still count.
 const DISCOVER_TOOLS_JS: &str = r#"async () => {
     const groups = [];
     const event = new CustomEvent('devtoolstooldiscovery');
@@ -32,9 +34,13 @@ const DISCOVER_TOOLS_JS: &str = r#"async () => {
     window.dispatchEvent(event);
     // A listener may answer from a microtask or a zero-delay timer.
     await new Promise(r => setTimeout(r, 0));
-    if (groups.length === 0) return;
+    if (groups.length === 0) {
+        if (window.__dtmcp && window.__dtmcp.__discovered) window.__dtmcp.toolGroups = [];
+        return;
+    }
     const dtmcp = window.__dtmcp = window.__dtmcp || {};
     dtmcp.toolGroups = groups;
+    dtmcp.__discovered = true;
     if (typeof dtmcp.executeTool !== 'function') {
         dtmcp.executeTool = async (toolName, args) => {
             for (const group of dtmcp.toolGroups || []) {

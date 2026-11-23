@@ -521,16 +521,16 @@ return `repeated ${n} times`;
 ```bash
 chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /tmp/target.heapsnapshot
 # Classes with changes, largest sizeDelta first: showing 1-3 of 3
-# idx,className,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta
-# 0,Detached <div>,10,0,10,880,0,880
-# 1,Detached <button>,10,0,10,720,0,720
-# 2,(compiled code),3,0,3,360,0,360
+# idx,className,location,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta
+# 0,Detached <div>,,10,0,10,880,0,880
+# 1,Detached <button>,,10,0,10,720,0,720
+# 2,(compiled code),,3,0,3,360,0,360
 
 chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /tmp/final.heapsnapshot
 # Classes with changes, largest sizeDelta first: showing 1-2 of 2
-# idx,className,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta
-# 0,Detached <div>,10,0,10,880,0,880
-# 1,Detached <button>,10,0,10,720,0,720
+# idx,className,location,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta
+# 0,Detached <div>,,10,0,10,880,0,880
+# 1,Detached <button>,,10,0,10,720,0,720
 ```
 
 A leak is a class whose `countDelta` is about a multiple of N in base → target
@@ -541,9 +541,13 @@ Memory panel: `Detached <div>` is DOM no longer in the document, `Function`
 holds every closure and `system / Context` the variables they capture,
 `{a, b, c}` groups plain objects by their properties, and `(string)`,
 `(array)`, `(compiled code)`, `(object shape)` and `(system)` are by type.
-Rows are paged: the header gives the total and the `--offset` for the next
-page, `--limit` sets the page size (default 50), and names longer than
-`--max-name-length` characters (default 100) end in `…`.
+As in DevTools, objects are also split by where their constructor is
+defined, so two classes that share a name get separate rows: `location` gives
+it as `scriptId:line:column`, line and column counted from 1 (V8 stores them
+from 0), and is empty when the snapshot records none. Rows are paged: the
+header gives the total and the `--offset` for the next page, `--limit` sets
+the page size (default 50), and names longer than `--max-name-length`
+characters (default 100) end in `…`.
 
 **3. List the leaked objects of a class** by its `idx`, largest first. `+`
 objects exist in the `--current` file and `-` objects only in `--base`, so
@@ -551,7 +555,7 @@ inspect each in the file that has it.
 
 ```bash
 chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /tmp/final.heapsnapshot --class-index 0 --limit 3
-# idx:0,className:Detached <div>,addedCount:10,removedCount:0,countDelta:10,addedSize:880,removedSize:0,sizeDelta:880
+# idx:0,className:Detached <div>,location:,addedCount:10,removedCount:0,countDelta:10,addedSize:880,removedSize:0,sizeDelta:880
 #
 # Objects, largest selfSize first: showing 1-3 of 10; next page: --offset 3
 # op,nodeId,selfSize
@@ -562,8 +566,11 @@ chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /t
 
 **4. Ask one of them what keeps it alive.** `inspect-heapsnapshot-node` prints
 the node, its direct retainers (closest to the root first; weak edges excluded,
-because they do not keep anything alive) and the shortest retaining path from
-the root.
+because they do not keep anything alive) and a retaining path from the root.
+Distances and the path prefer the page's roots (`Window`, the DOM), as
+DevTools measures distance: the path is the shortest from them, and from V8's
+GC roots only when no page root reaches the node, so a shorter route through
+V8 internals does not hide the one the page owns.
 
 ```bash
 chrome-devtools inspect-heapsnapshot-node --file-path /tmp/final.heapsnapshot --node-id 105
@@ -574,7 +581,7 @@ chrome-devtools inspect-heapsnapshot-node --file-path /tmp/final.heapsnapshot --
 # edgeName,edgeType,nodeId,nodeName,type,selfSize,distance
 # 2,element,11,(object elements),array,0,4
 #
-# Shortest retaining path from the root (5 edges, weak edges skipped):
+# Retaining path: shortest from the page's roots, else from the GC roots (5 edges, weak edges skipped):
 # edgeName,edgeType,nodeId,nodeName,type,selfSize
 # 4,shortcut,5,system / NativeContext / https://app.example,hidden,1240
 # global_object,internal,7,Window (global*) / https://app.example,object,40544
@@ -586,7 +593,12 @@ chrome-devtools inspect-heapsnapshot-node --file-path /tmp/final.heapsnapshot --
 Read the path from the bottom up to the first edge the application owns: here
 `window.openDialogs` keeps every closed dialog. That edge is where the fix
 goes. A node with no retaining path is only weakly held and will be collected.
-`--json` gives the same data as objects (`retainers.items`, `retainingPath`).
+A step through a WeakMap entry holds its value only while both the key and the
+WeakMap are alive, so the path goes through whichever is farther from the root
+and is followed by a line naming the other (`Step 5 is conditional: …`); the
+entry lets go of the value once either is gone. `--json` gives the same data
+as objects (`retainers.items`, `retainingPath`, with `conditionalOn` on such a
+step).
 
 **Before changing code, tell the user what holds the objects and ask.** Common
 causes are event listeners never removed, closures capturing large objects,
@@ -814,6 +826,7 @@ chrome-devtools --target warm-squid remove-network-mock             # remove all
 - A mock that shows `0 hit(s)` never matched: check the pattern against the URLs `network` lists.
 - Mocks belong to the tab and to the daemon: they stop applying while the CLI works on another tab, come back when it returns, and end when the daemon exits. A daemon with mocks stays up while the page keeps making requests; run `caffeinate` in the background to keep it for longer quiet spells.
 - Cross-origin `fetch` needs CORS headers in the mock, e.g. `--header 'Access-Control-Allow-Origin: *'`.
+- `--resource-type XHR` and `--resource-type Fetch` each match both `fetch()` and XMLHttpRequest: Chrome doesn't tell them apart when it intercepts.
 - The HTTP cache is off while any mock is set, so cached responses can't bypass it. Service workers can still answer requests before they reach a mock.
 
 ### Pattern 20: Cookie and Login Debugging
@@ -993,7 +1006,7 @@ computer sleep can still drop the connection.
 No command waits forever on a connected browser any more:
 
 - **`<method> got no answer from the page within Ns, though the browser answers`**: the browser is fine but this tab isn't. Usually a JavaScript dialog opened where the daemon couldn't see it (see Pattern 6), otherwise an endless loop (running JavaScript is stopped) or a hung renderer. Setup calls give up after 10s; other calls after 180s (`CHROME_CDP_TIMEOUT_SECS`, read when the daemon starts, raises that for long scripts). Don't retry in a loop: ask the human to close the dialog, or `close-page` the tab. Other tabs keep working.
-- **`The browser did not answer for 45s; the connection is treated as lost`** (after a laptop sleep, a dropped network, a remote browser that went away): the daemon exits as for any lost connection. Rerun the command once; the browser may ask the human to approve the new connection, and then the approval steps above apply.
+- **`The browser did not answer a check within 15s; the connection is treated as lost`**, or **`Writing to the browser did not finish within 180s`** (after a laptop sleep, a dropped network, a remote browser that went away): the daemon exits as for any lost connection. Rerun the command once; the browser may ask the human to approve the new connection, and then the approval steps above apply.
 
 ## Failure Handling: cannot read DevToolsActivePort / "Operation not permitted"
 

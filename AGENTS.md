@@ -95,13 +95,18 @@ at most once, then stop and ask a human rather than looping or calling
 ### Call Timeouts and Dialogs
 
 Every CDP call waits on `read_text_for_call` (`cdp.rs`), so nothing waits
-forever on a connected browser. After 30s of silence it pings the browser
-(`check_alive`): no answer within 15s is `ConnectionLost` and the daemon
-exits. Otherwise the call gives up at its limit with `PageUnresponsive`, 180s
-by default (`CHROME_CDP_TIMEOUT_SECS`) or `SETUP_CALL_TIMEOUT` (10s) for
-domain enables, and a `Runtime.*` call has its script stopped. The daemon
-serves one request at a time, so this bound is what keeps one stuck page from
-blocking every caller.
+forever on a connected browser. The call's limit, 180s by default
+(`CHROME_CDP_TIMEOUT_SECS`) or `SETUP_CALL_TIMEOUT` (10s) for domain enables,
+counts from before the request is written; the write itself is bounded by
+the default limit and a write that doesn't finish retires the connection.
+Whenever the socket is quiet for 30s, and once more when the limit runs out,
+the call pings the browser (`check_alive`, which `caffeinate` uses too): no
+answer within 15s is `ConnectionLost` and the daemon exits. A ping can
+therefore stretch a call past its limit by up to 15s, and a reply that
+arrives during that ping is still returned. Otherwise the call ends with
+`PageUnresponsive`, and a `Runtime.*` call has its script stopped. The
+daemon serves one request at a time, so this bound is what keeps one stuck
+page from blocking every caller.
 
 While a JavaScript dialog is open, the page answers no CDP call, and Chrome
 announces the dialog once, only to sessions that had `Page` enabled, and only

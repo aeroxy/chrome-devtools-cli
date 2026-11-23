@@ -155,6 +155,10 @@ pub struct CdpClient {
     /// that page can handle it or fail at once instead of waiting on a page
     /// that will not answer.
     pub open_dialog: Option<OpenDialog>,
+    /// Set once an input command has sent its action to the page. A dialog
+    /// that interrupts the command after that is the action's doing; before
+    /// it, the action never ran.
+    pub input_sent: bool,
     /// Buffer for storing unhandled events (e.g., navigation events)
     pub events: std::collections::VecDeque<Value>,
     /// Messages already taken off the socket that `read_text` must return
@@ -450,6 +454,7 @@ impl CdpClient {
             next_id: 1,
             dialog_action: None,
             open_dialog: None,
+            input_sent: false,
             events: std::collections::VecDeque::new(),
             unread: std::collections::VecDeque::new(),
             persistent_session: None,
@@ -687,6 +692,9 @@ impl CdpClient {
             // detach, rather than failing every later command on it.
             match self.add_virtual_authenticator(session_id, &options).await {
                 Ok(id) => self.webauthn = Some(VirtualAuthenticator { id, options }),
+                // The connection or the page failed, not WebAuthn: the caller
+                // must hear about it (a lost connection exits the daemon).
+                Err(e) if is_connection_or_page_failure(&e) => return Err(e),
                 Err(_) => self.webauthn = None,
             }
         }
@@ -860,11 +868,20 @@ impl CdpClient {
 
         let text = serde_json::to_string(&msg)?;
         // A failed write means Chrome's connection is gone too, so it is a
-        // ConnectionLost like read_text's failures: the daemon exits only on those.
-        self.write
-            .send(Message::Text(text))
-            .await
-            .map_err(|e| ConnectionLost(format!("WebSocket error: {e}")))?;
+        // ConnectionLost like read_text's failures: the daemon exits only on
+        // those. So is a write that never finishes (a remote browser that
+        // stopped reading), which would otherwise hold the daemon, and every
+        // caller queued behind it, forever; a frame given up halfway leaves
+        // the stream unusable anyway.
+        let limit = cdp_call_timeout();
+        match tokio::time::timeout(limit, self.write.send(Message::Text(text))).await {
+            Ok(sent) => sent.map_err(|e| ConnectionLost(format!("WebSocket error: {e}")))?,
+            Err(_) => bail!(ConnectionLost(format!(
+                "Writing to the browser did not finish within {}s; the connection is treated \
+                 as lost",
+                limit.as_secs()
+            ))),
+        }
         Ok(id)
     }
 
@@ -892,8 +909,9 @@ impl CdpClient {
                 self.settle_open_dialog(sid).await?;
             }
         }
-        let id = self.send_raw_no_wait(session_id, method, params).await?;
+        // The deadline covers the write as well as the wait for the reply.
         let started = tokio::time::Instant::now();
+        let id = self.send_raw_no_wait(session_id, method, params).await?;
 
         loop {
             let resp_text = self
@@ -1071,7 +1089,11 @@ impl CdpClient {
                 return Ok(());
             }
             match msg.get("method").and_then(|v| v.as_str()) {
-                Some("Page.javascriptDialogOpening") => self.unread.push_back(text),
+                // Closings wait with openings, so the next reader sees them in
+                // wire order and a dialog closed meanwhile isn't left open.
+                Some("Page.javascriptDialogOpening" | "Page.javascriptDialogClosed") => {
+                    self.unread.push_back(text)
+                }
                 Some(_) => self.push_event(msg),
                 // A reply to a call still waiting on it: a ping can run in
                 // the middle of one (`read_text_for_call`), which must get
@@ -1101,7 +1123,14 @@ impl CdpClient {
             if remaining.is_zero() {
                 // Whose fault: a lost connection exits the daemon, a stuck
                 // page must not.
-                self.check_alive().await?;
+                if self.unread.is_empty() {
+                    self.check_alive().await?;
+                }
+                // What a liveness ping set aside arrived in time, the awaited
+                // reply perhaps among it.
+                if let Some(text) = self.unread.pop_front() {
+                    return Ok(text);
+                }
                 // An endless loop in the page would keep answering nothing
                 // for every later command too; stopping the script frees it.
                 let mut stopped = "";
@@ -1136,11 +1165,12 @@ impl CdpClient {
     }
 
     /// Fail with [`ConnectionLost`] unless the browser answers a ping soon.
-    async fn check_alive(&mut self) -> Result<()> {
+    pub(crate) async fn check_alive(&mut self) -> Result<()> {
         match tokio::time::timeout(ALIVE_CHECK_TIMEOUT, self.ping()).await {
             Err(_) => bail!(ConnectionLost(format!(
-                "The browser did not answer for {}s; the connection is treated as lost",
-                (QUIET_BEFORE_CHECK + ALIVE_CHECK_TIMEOUT).as_secs()
+                "The browser did not answer a check within {}s; the connection is treated as \
+                 lost",
+                ALIVE_CHECK_TIMEOUT.as_secs()
             ))),
             Ok(Err(e)) if e.downcast_ref::<ConnectionLost>().is_some() => Err(e),
             // A CDP error is still an answer.
@@ -1209,13 +1239,18 @@ impl CdpClient {
     async fn answer_paused_requests(&mut self) -> Result<()> {
         while let Some(event) = self.paused_requests.front().cloned() {
             let session = event["sessionId"].as_str().map(str::to_string);
-            let (method, params) = crate::commands::network_mock::reply_to_paused(
-                &mut self.network_mocks,
+            let (method, params, matched) = crate::commands::network_mock::reply_to_paused(
+                &self.network_mocks,
                 &event["params"],
             );
             self.send_raw_no_wait(session.as_deref(), method, params)
                 .await?;
             self.paused_requests.pop_front();
+            // Counted only now: a send cancelled above is retried, and a
+            // retry is the same request.
+            if let Some(mock) = matched.and_then(|i| self.network_mocks.get_mut(i)) {
+                mock.hits += 1;
+            }
         }
         Ok(())
     }
@@ -1561,6 +1596,12 @@ fn page_error_notes<'a>(events: impl Iterator<Item = &'a Value>) -> Vec<String> 
         ));
     }
     notes
+}
+
+/// A failure of the connection or of the page as a whole, as opposed to one
+/// call being refused: whoever runs setup has to stop on it.
+pub fn is_connection_or_page_failure(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ConnectionLost>().is_some() || e.downcast_ref::<PageUnresponsive>().is_some()
 }
 
 fn dialog_from_event(event: &Value) -> DialogOpen {

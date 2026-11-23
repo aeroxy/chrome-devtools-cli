@@ -169,6 +169,17 @@ const DOM_DETACHED: u8 = 2;
 /// "No edge" in per-node edge arrays and "not reached" in distances.
 const NONE: u32 = u32::MAX;
 
+/// Marks a self size of `u32::MAX` or more in a 32-bit size field; the exact
+/// size is in a side table. V8 writes sizes as `size_t`, so an ArrayBuffer
+/// backing store can be 4 GiB or more, and moving owned sizes onto their
+/// owner can add up past 32 bits too.
+const WIDE: u32 = u32::MAX;
+
+/// `size` as stored in a 32-bit size field, or `None` when it needs `WIDE`.
+fn narrow(size: u64) -> Option<u32> {
+    u32::try_from(size).ok().filter(|&s| s != WIDE)
+}
+
 /// Paging and name truncation for the offline heap commands. Their output
 /// otherwise grows with the heap: hundreds of classes, every changed object,
 /// and `string` nodes whose name is the whole string, sometimes megabytes.
@@ -215,18 +226,58 @@ struct SnapshotMeta {
     root_index: usize,
 }
 
-/// A `.heapsnapshot` file as stored. The flat arrays are `u32` because
-/// DevTools keeps them in `Uint32Array`s, so every snapshot it can open fits,
-/// and that halves peak memory on multi-hundred-MB files compared with `u64`.
+/// A `.heapsnapshot` file as stored. The flat arrays are `u32`, as in
+/// DevTools' `Uint32Array`s, which halves peak memory on multi-hundred-MB
+/// files compared with `u64`.
 #[derive(serde::Deserialize)]
 struct RawSnapshot {
     snapshot: SnapshotMeta,
-    nodes: Vec<u32>,
+    nodes: NodeArray,
     #[serde(default)]
     edges: Vec<u32>,
     #[serde(default)]
     locations: Vec<u32>,
     strings: Vec<String>,
+}
+
+/// The `nodes` array, read as `u32`s. A value of `WIDE` or more, which V8
+/// writes only for `self_size`, is stored as `WIDE` and listed in `wide` with
+/// its array index, instead of widening every field of every node for the
+/// rare node that needs it. DevTools reads it into a `Uint32Array`, which
+/// wraps it; this keeps it exact.
+#[derive(Default)]
+struct NodeArray {
+    fields: Vec<u32>,
+    wide: Vec<(usize, u64)>,
+}
+
+impl<'de> serde::Deserialize<'de> for NodeArray {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Fields;
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = NodeArray;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of unsigned integers")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<NodeArray, A::Error> {
+                let mut nodes = NodeArray::default();
+                while let Some(value) = seq.next_element::<u64>()? {
+                    let field = narrow(value).unwrap_or_else(|| {
+                        nodes.wide.push((nodes.fields.len(), value));
+                        WIDE
+                    });
+                    nodes.fields.push(field);
+                }
+                Ok(nodes)
+            }
+        }
+        d.deserialize_seq(Fields)
+    }
 }
 
 /// Indices into the `node_types` enum, looked up by name because V8 does not
@@ -246,6 +297,7 @@ struct EdgeTypes {
     hidden: Option<u32>,
     weak: Option<u32>,
     property: Option<u32>,
+    internal: Option<u32>,
 }
 
 type Location = (u32, u32, u32);
@@ -277,7 +329,9 @@ struct Snap {
     /// stores edges grouped by owner in node order, so these are prefix sums
     /// of `edge_count`.
     first_edge: Vec<u32>,
-    /// Allocation site per node-array index, for `object` class keys.
+    /// Exact self size of each node, by ordinal, whose size field is `WIDE`.
+    wide_sizes: HashMap<usize, u64>,
+    /// Source location per node-array index, for `object` class keys.
     locations: HashMap<usize, Location>,
     /// DOM link state per node, after DevTools' propagation.
     dom: Vec<u8>,
@@ -316,6 +370,10 @@ impl Snap {
             locations,
             strings,
         } = raw;
+        let NodeArray {
+            fields: nodes,
+            wide,
+        } = nodes;
         let meta = snapshot.meta;
         let required = |fields: &[String], name: &str, kind: &str| {
             position(fields, name).with_context(|| {
@@ -343,6 +401,18 @@ impl Snap {
                 "Snapshot too large: {node_count} nodes, {} edge fields",
                 edges.len()
             );
+        }
+        let mut wide_sizes = HashMap::new();
+        for (i, value) in wide {
+            if i % node_size == size_off {
+                wide_sizes.insert(i / node_size, value);
+            } else if value > u64::from(WIDE) {
+                bail!(
+                    "Corrupt snapshot: node field '{}' holds {value}, which does not fit in \
+                     32 bits",
+                    nf[i % node_size]
+                );
+            }
         }
         let type_off = position(nf, "type");
         let edge_count_off = position(nf, "edge_count");
@@ -375,6 +445,7 @@ impl Snap {
             hidden: type_index(&edge_types, "hidden"),
             weak: type_index(&edge_types, "weak"),
             property: type_index(&edge_types, "property"),
+            internal: type_index(&edge_types, "internal"),
         };
 
         let mut first_edge: Vec<u32> = Vec::with_capacity(node_count + 1);
@@ -463,6 +534,7 @@ impl Snap {
             node_count,
             root: root_index / node_size,
             first_edge,
+            wide_sizes,
             locations: location_map,
             dom: Vec::new(),
             has_detachedness: det_off.is_some(),
@@ -480,8 +552,22 @@ impl Snap {
         self.field(ord, self.id_off)
     }
 
-    fn self_size(&self, ord: usize) -> u32 {
-        self.field(ord, self.size_off)
+    fn self_size(&self, ord: usize) -> u64 {
+        match self.field(ord, self.size_off) {
+            WIDE => self.wide_sizes[&ord],
+            size => size.into(),
+        }
+    }
+
+    fn set_self_size(&mut self, ord: usize, size: u64) {
+        let at = ord * self.node_size + self.size_off;
+        if self.nodes[at] == WIDE {
+            self.wide_sizes.remove(&ord);
+        }
+        self.nodes[at] = narrow(size).unwrap_or_else(|| {
+            self.wide_sizes.insert(ord, size);
+            WIDE
+        });
     }
 
     fn raw_name(&self, ord: usize) -> &str {
@@ -729,10 +815,9 @@ impl Snap {
             if self.is(owner, self.nt.synthetic) || owner == self.root {
                 continue;
             }
-            let owned_at = ord * self.node_size + self.size_off;
-            let owner_at = owner * self.node_size + self.size_off;
-            let size = std::mem::take(&mut self.nodes[owned_at]);
-            self.nodes[owner_at] = self.nodes[owner_at].saturating_add(size);
+            let size = self.self_size(ord);
+            self.set_self_size(ord, 0);
+            self.set_self_size(owner, self.self_size(owner).saturating_add(size));
         }
     }
 }
@@ -1043,21 +1128,46 @@ fn apply_interface_definitions(snap: &Snap, defs: &[InterfaceDefinition], classe
 }
 
 /// A class row's identity across two snapshots. DevTools splits `object`
-/// nodes by allocation site (script id, line, column) when the snapshot
-/// records one, so two constructors that share a name stay separate.
+/// nodes by where V8 says their constructor is defined (script id, line,
+/// column, the last two from 0) when the snapshot records it, so two
+/// constructors that share a name stay separate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct ClassKey {
     name: String,
     location: Option<Location>,
 }
 
-/// (node id, self size) of each counted node, sorted by id.
+/// (node id, self size) of each counted node, sorted by id. A size of `WIDE`
+/// or more is stored as `WIDE`, its exact value in `Aggregates::wide`, which
+/// keeps a member at 8 bytes on heaps of millions of objects.
 type Members = Vec<(u32, u32)>;
-type Aggregates = HashMap<ClassKey, Members>;
+
+/// One snapshot's class rows, keeping only what a diff needs.
+#[derive(Default)]
+struct Aggregates {
+    classes: HashMap<ClassKey, Members>,
+    /// Exact self size, by node id, of each member stored as `WIDE`.
+    wide: HashMap<u32, u64>,
+}
+
+impl Aggregates {
+    /// A class's members, empty when the snapshot has none of it.
+    fn members(&self, key: &ClassKey) -> &[(u32, u32)] {
+        self.classes.get(key).map_or(&[][..], Vec::as_slice)
+    }
+
+    fn size(&self, (id, size): (u32, u32)) -> u64 {
+        match size {
+            WIDE => self.wide[&id],
+            size => size.into(),
+        }
+    }
+}
 
 /// DevTools' `buildAggregates`, keeping only what a diff needs.
 fn build_class_aggregates(snap: &Snap, classes: &Classes) -> Aggregates {
     let mut groups: HashMap<(u32, Option<Location>), Members> = HashMap::new();
+    let mut wide = HashMap::new();
     for ord in 0..snap.node_count {
         let size = snap.self_size(ord);
         // Zero-size nodes are in no class, as in DevTools: synthetic roots,
@@ -1071,12 +1181,17 @@ fn build_class_aggregates(snap: &Snap, classes: &Classes) -> Aggregates {
         } else {
             None
         };
+        let id = snap.id(ord);
+        let size = narrow(size).unwrap_or_else(|| {
+            wide.insert(id, size);
+            WIDE
+        });
         groups
             .entry((classes.of_node[ord], location))
             .or_default()
-            .push((snap.id(ord), size));
+            .push((id, size));
     }
-    groups
+    let classes = groups
         .into_iter()
         .map(|((class, location), mut members)| {
             members.sort_unstable();
@@ -1086,7 +1201,8 @@ fn build_class_aggregates(snap: &Snap, classes: &Classes) -> Aggregates {
             };
             (key, members)
         })
-        .collect()
+        .collect();
+    Aggregates { classes, wide }
 }
 
 /// Read and index a .heapsnapshot file.
@@ -1121,18 +1237,25 @@ impl HeapSnapshotClassDiff {
     }
 }
 
-/// Walk two id-sorted member lists like DevTools' `calculateDiffForClass`,
-/// reporting `(added, id, size)` for each id found on one side only.
-fn merge_diff(base: &[(u32, u32)], current: &[(u32, u32)], mut report: impl FnMut(bool, u32, u32)) {
+/// Walk one class's id-sorted members in both snapshots like DevTools'
+/// `calculateDiffForClass`, reporting `(added, id, size)` for each id found
+/// on one side only.
+fn merge_diff(
+    base: &Aggregates,
+    current: &Aggregates,
+    key: &ClassKey,
+    mut report: impl FnMut(bool, u32, u64),
+) {
+    let (b, c) = (base.members(key), current.members(key));
     let (mut i, mut j) = (0, 0);
-    while i < base.len() && j < current.len() {
-        match base[i].0.cmp(&current[j].0) {
+    while i < b.len() && j < c.len() {
+        match b[i].0.cmp(&c[j].0) {
             std::cmp::Ordering::Less => {
-                report(false, base[i].0, base[i].1);
+                report(false, b[i].0, base.size(b[i]));
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
-                report(true, current[j].0, current[j].1);
+                report(true, c[j].0, current.size(c[j]));
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
@@ -1141,37 +1264,35 @@ fn merge_diff(base: &[(u32, u32)], current: &[(u32, u32)], mut report: impl FnMu
             }
         }
     }
-    for &(id, size) in &base[i..] {
-        report(false, id, size);
+    for &m in &b[i..] {
+        report(false, m.0, base.size(m));
     }
-    for &(id, size) in &current[j..] {
-        report(true, id, size);
+    for &m in &c[j..] {
+        report(true, m.0, current.size(m));
     }
 }
 
 /// Per-class diff rows with any change, sorted by size delta descending, then
 /// by class, so each `--class-index` names the same row on every run.
 fn diff_snapshots(base: &Aggregates, current: &Aggregates) -> Vec<HeapSnapshotClassDiff> {
-    let empty = Vec::new();
     let mut diffs = Vec::new();
-    let keys = base
-        .keys()
-        .chain(current.keys().filter(|k| !base.contains_key(*k)));
+    let keys = base.classes.keys().chain(
+        current
+            .classes
+            .keys()
+            .filter(|k| !base.classes.contains_key(*k)),
+    );
     for key in keys {
         let (mut added_count, mut removed_count, mut added_size, mut removed_size) = (0, 0, 0, 0);
-        merge_diff(
-            base.get(key).unwrap_or(&empty),
-            current.get(key).unwrap_or(&empty),
-            |added, _, size| {
-                if added {
-                    added_count += 1;
-                    added_size += size as u64;
-                } else {
-                    removed_count += 1;
-                    removed_size += size as u64;
-                }
-            },
-        );
+        merge_diff(base, current, key, |added, _, size| {
+            if added {
+                added_count += 1;
+                added_size += size;
+            } else {
+                removed_count += 1;
+                removed_size += size;
+            }
+        });
         if added_count > 0 || removed_count > 0 {
             diffs.push(HeapSnapshotClassDiff {
                 key: key.clone(),
@@ -1195,24 +1316,24 @@ fn diff_snapshots(base: &Aggregates, current: &Aggregates) -> Vec<HeapSnapshotCl
 struct DiffObject {
     added: bool,
     id: u32,
-    self_size: u32,
+    self_size: u64,
 }
 
 /// The added and deleted objects of one class, largest first so the first
 /// page shows what matters most.
-fn compute_class_node_detail(base: Option<&Members>, current: Option<&Members>) -> Vec<DiffObject> {
+fn compute_class_node_detail(
+    base: &Aggregates,
+    current: &Aggregates,
+    key: &ClassKey,
+) -> Vec<DiffObject> {
     let mut objects = Vec::new();
-    merge_diff(
-        base.map_or(&[][..], Vec::as_slice),
-        current.map_or(&[][..], Vec::as_slice),
-        |added, id, self_size| {
-            objects.push(DiffObject {
-                added,
-                id,
-                self_size,
-            })
-        },
-    );
+    merge_diff(base, current, key, |added, id, self_size| {
+        objects.push(DiffObject {
+            added,
+            id,
+            self_size,
+        })
+    });
     objects.sort_by(|a, b| {
         b.self_size
             .cmp(&a.self_size)
@@ -1228,8 +1349,13 @@ fn compute_class_node_detail(base: Option<&Members>, current: Option<&Members>) 
 /// different sessions. Class-agnostic, because an object can change class
 /// between snapshots but not its id.
 fn snapshots_share_no_node_ids(base: &Aggregates, current: &Aggregates) -> bool {
-    let base_ids: HashSet<u32> = base.values().flatten().map(|&(id, _)| id).collect();
-    let mut current_ids = current.values().flatten().map(|&(id, _)| id).peekable();
+    let base_ids: HashSet<u32> = base.classes.values().flatten().map(|&(id, _)| id).collect();
+    let mut current_ids = current
+        .classes
+        .values()
+        .flatten()
+        .map(|&(id, _)| id)
+        .peekable();
     !base_ids.is_empty()
         && current_ids.peek().is_some()
         && current_ids.all(|id| !base_ids.contains(&id))
@@ -1268,18 +1394,35 @@ fn csv_escape(s: &str) -> Cow<'_, str> {
     }
 }
 
-/// A value as a CSV cell: strings escaped, numbers as written.
+/// A value as a CSV cell: strings escaped, numbers as written, null empty.
 fn csv_cell(v: &serde_json::Value) -> Cow<'_, str> {
     match v {
         serde_json::Value::String(s) => csv_escape(s),
+        serde_json::Value::Null => Cow::Borrowed(""),
         v => Cow::Owned(v.to_string()),
     }
 }
 
+/// Where a class's constructor is defined, as `scriptId:line:column` with
+/// line and column counted from 1 as DevTools displays them (V8 stores them
+/// from 0); null when the snapshot records none. It tells apart the rows of
+/// two classes that share a name.
+fn location_value(location: Option<Location>) -> serde_json::Value {
+    match location {
+        Some((script, line, column)) => json!(format!(
+            "{script}:{}:{}",
+            u64::from(line) + 1,
+            u64::from(column) + 1
+        )),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// Columns of a diff row, in output order.
-const DIFF_COLUMNS: [&str; 8] = [
+const DIFF_COLUMNS: [&str; 9] = [
     "idx",
     "className",
+    "location",
     "addedCount",
     "removedCount",
     "countDelta",
@@ -1293,13 +1436,14 @@ fn diff_values(
     idx: usize,
     d: &HeapSnapshotClassDiff,
     opts: &ListOptions,
-) -> [serde_json::Value; 8] {
+) -> [serde_json::Value; 9] {
     [
         json!(idx),
         json!(crate::format::truncate_chars(
             &d.key.name,
             opts.max_name_length
         )),
+        location_value(d.key.location),
         json!(d.added_count),
         json!(d.removed_count),
         json!(d.count_delta()),
@@ -1445,7 +1589,7 @@ pub async fn compare_heapsnapshots_offline(
         // An object still in its class on both sides proves the ids overlap,
         // the usual case, which spares the whole-heap check.
         let removed: usize = diffs.iter().map(|d| d.removed_count).sum();
-        let kept_one = base.values().map(Vec::len).sum::<usize>() > removed;
+        let kept_one = base.classes.values().map(Vec::len).sum::<usize>() > removed;
         let no_overlap = !kept_one && snapshots_share_no_node_ids(&base, &current);
 
         let out = match class_index {
@@ -1461,8 +1605,7 @@ pub async fn compare_heapsnapshots_offline(
                         ),
                     )
                 })?;
-                let objects =
-                    compute_class_node_detail(base.get(&diff.key), current.get(&diff.key));
+                let objects = compute_class_node_detail(&base, &current, &diff.key);
                 format_class_diff_detail(idx, diff, &objects, &opts, format)?
             }
         };
@@ -1484,17 +1627,58 @@ pub async fn compare_heapsnapshots_offline(
     Ok(CommandResult::output(out))
 }
 
-/// Hop count from the root and the edge that first reached each node, by a
-/// BFS that mirrors DevTools' `calculateDistances`: the user roots (`Window`,
-/// "(Document DOM trees)") are expanded before the GC-root groups, so paths
-/// lead through page objects rather than V8 internals when both exist. Weak
-/// edges keep nothing alive and are skipped.
-fn bfs_from_root(snap: &Snap) -> (Vec<u32>, Vec<u32>) {
+/// DevTools' `tryParseWeakMapEdgeName`. V8 gives a WeakMap value two
+/// `internal` edges, one from the key and one from the WeakMap's table, both
+/// named `<n> / part of key (<key> @<id>) -> value (<value> @<id>) pair in
+/// WeakMap (table @<id>)` with only `<n>` differing. Returns the rest, which
+/// pairs them. The names in it are any text on one line, as `.` matches in
+/// DevTools' regex.
+fn weak_map_pair(name: &str) -> Option<&str> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let shared = name.trim_start_matches(|c: char| c.is_ascii_digit());
+    if shared.len() == name.len() {
+        return None;
+    }
+    let (middle, table) = shared
+        .strip_prefix(" / part of key (")?
+        .strip_suffix(')')?
+        .rsplit_once(" pair in WeakMap (table @")?;
+    let (key_and_value, value_id) = middle.strip_suffix(')')?.rsplit_once(" @")?;
+    if !digits(table)
+        || !digits(value_id)
+        || key_and_value.contains(['\n', '\r', '\u{2028}', '\u{2029}'])
+    {
+        return None;
+    }
+    // `<key> @<id>) -> value (<value>`, where either name may itself
+    // contain `) -> value (`.
+    key_and_value
+        .match_indices(") -> value (")
+        .any(|(i, _)| {
+            key_and_value[..i]
+                .rsplit_once(" @")
+                .is_some_and(|(_, id)| digits(id))
+        })
+        .then_some(shared)
+}
+
+/// Hop count from the root and the edge that set it, by a BFS that mirrors
+/// DevTools' `calculateDistances`: the user roots (`Window`, "(Document DOM
+/// trees)") are expanded before the GC-root groups, so paths lead through
+/// page objects rather than V8 internals when both exist. Weak edges keep
+/// nothing alive and are skipped.
+///
+/// A WeakMap value stays alive only while both its key and the WeakMap's
+/// table do, so as in DevTools the first of its pair of edges to arrive
+/// waits for the second, which sets the distance. The third result maps each
+/// node reached that way to the edge that waited.
+fn bfs_from_root(snap: &Snap) -> (Vec<u32>, Vec<u32>, HashMap<usize, usize>) {
     let n = snap.node_count;
     let mut dist = vec![NONE; n];
     let mut parent = vec![NONE; n];
+    let mut waited = HashMap::new();
     if n == 0 {
-        return (dist, parent);
+        return (dist, parent, waited);
     }
     let root = snap.root;
     dist[root] = 0;
@@ -1509,6 +1693,9 @@ fn bfs_from_root(snap: &Snap) -> (Vec<u32>, Vec<u32>) {
         queue.push(to as u32);
     }
     let mut head = 0;
+    // First edge of each pair, by the part of the name the pair shares. It
+    // carries over to the GC-root pass, as in DevTools.
+    let mut pending: HashMap<&str, usize> = HashMap::new();
     let mut expand = |queue: &mut Vec<u32>, head: &mut usize| {
         while *head < queue.len() {
             let ord = queue[*head] as usize;
@@ -1517,6 +1704,19 @@ fn bfs_from_root(snap: &Snap) -> (Vec<u32>, Vec<u32>) {
                 let to = snap.edge_to(e);
                 if snap.edge_is(e, snap.et.weak) || dist[to] != NONE {
                     continue;
+                }
+                if snap.edge_is(e, snap.et.internal) {
+                    if let Some(pair) = weak_map_pair(snap.string_edge_name(e)) {
+                        match pending.remove(pair) {
+                            Some(first) => {
+                                waited.insert(to, first);
+                            }
+                            None => {
+                                pending.insert(pair, e);
+                                continue;
+                            }
+                        }
+                    }
                 }
                 dist[to] = dist[ord] + 1;
                 parent[to] = e as u32;
@@ -1528,7 +1728,7 @@ fn bfs_from_root(snap: &Snap) -> (Vec<u32>, Vec<u32>) {
     // Then whatever only the GC roots reach.
     queue.push(root as u32);
     expand(&mut queue, &mut head);
-    (dist, parent)
+    (dist, parent, waited)
 }
 
 /// Edges from the root to `target` along the BFS tree, or `None` when no
@@ -1580,7 +1780,7 @@ struct NodeInfo {
     class_name: String,
     node_type: String,
     detachedness: &'static str,
-    self_size: u32,
+    self_size: u64,
     distance: Option<u32>,
 }
 
@@ -1592,8 +1792,18 @@ struct EdgeRow {
     node_id: u32,
     node_name: String,
     node_type: String,
-    self_size: u32,
+    self_size: u64,
     distance: Option<u32>,
+    /// For a path step that is one edge of a WeakMap entry: the source of the
+    /// other edge, which must stay alive too for the step to retain anything.
+    conditional_on: Option<PairedEdge>,
+}
+
+/// The other half of a WeakMap entry's pair of edges.
+struct PairedEdge {
+    /// "key" or "table": which half its source is.
+    role: &'static str,
+    node_id: u32,
 }
 
 struct NodeReport {
@@ -1621,7 +1831,7 @@ fn inspect_node(snap: &Snap, node_id: u64, opts: &ListOptions) -> Result<NodeRep
     } else {
         node_class(snap, ord)
     };
-    let (dist, parent) = bfs_from_root(snap);
+    let (dist, parent, waited) = bfs_from_root(snap);
     let distance = |ord: usize| (dist[ord] != NONE).then_some(dist[ord]);
     let row = |e: usize, ord: usize| EdgeRow {
         edge_name: truncate(&snap.edge_name(e), max).into_owned(),
@@ -1631,6 +1841,7 @@ fn inspect_node(snap: &Snap, node_id: u64, opts: &ListOptions) -> Result<NodeRep
         node_type: snap.type_name(ord).to_string(),
         self_size: snap.self_size(ord),
         distance: distance(ord),
+        conditional_on: None,
     };
 
     let node = NodeInfo {
@@ -1650,8 +1861,27 @@ fn inspect_node(snap: &Snap, node_id: u64, opts: &ListOptions) -> Result<NodeRep
     let page = &retainers[page_bounds(retainers.len(), opts)];
     let retainer_rows = page.iter().map(|&(e, src)| row(e, src)).collect();
 
-    let path = retaining_path(snap, &parent, ord)
-        .map(|edges| edges.into_iter().map(|e| row(e, snap.edge_to(e))).collect());
+    let step = |e: usize| {
+        let to = snap.edge_to(e);
+        let conditional_on = waited.get(&to).map(|&first| {
+            let node_id = snap.id(snap.edge_source(first));
+            let table = format!("(table @{node_id})");
+            PairedEdge {
+                role: if snap.string_edge_name(e).ends_with(&table) {
+                    "table"
+                } else {
+                    "key"
+                },
+                node_id,
+            }
+        });
+        EdgeRow {
+            conditional_on,
+            ..row(e, to)
+        }
+    };
+    let path =
+        retaining_path(snap, &parent, ord).map(|edges| edges.into_iter().map(step).collect());
 
     Ok(NodeReport {
         node,
@@ -1662,7 +1892,7 @@ fn inspect_node(snap: &Snap, node_id: u64, opts: &ListOptions) -> Result<NodeRep
 }
 
 fn edge_row_json(r: &EdgeRow) -> serde_json::Value {
-    json!({
+    let mut row = json!({
         "edgeName": r.edge_name,
         "edgeType": r.edge_type,
         "nodeId": r.node_id,
@@ -1670,7 +1900,12 @@ fn edge_row_json(r: &EdgeRow) -> serde_json::Value {
         "type": r.node_type,
         "selfSize": r.self_size,
         "distance": r.distance,
-    })
+    });
+    // Only on the rare conditional step, so other paths keep their shape.
+    if let Some(c) = &r.conditional_on {
+        row["conditionalOn"] = json!({ "role": c.role, "nodeId": c.node_id });
+    }
+    row
 }
 
 /// Format the node, its retainers and its retaining path for display.
@@ -1753,7 +1988,8 @@ fn format_node_report(
         Some(path) => {
             let _ = writeln!(
                 out,
-                "Shortest retaining path from the root ({} edges, weak edges skipped):",
+                "Retaining path: shortest from the page's roots, else from the GC roots \
+                 ({} edges, weak edges skipped):",
                 path.len()
             );
             out.push_str("edgeName,edgeType,nodeId,nodeName,type,selfSize\n");
@@ -1768,6 +2004,22 @@ fn format_node_report(
                     r.node_type,
                     r.self_size,
                 );
+            }
+            for (i, r) in path.iter().enumerate() {
+                if let Some(c) = &r.conditional_on {
+                    let other = if c.role == "table" {
+                        "the WeakMap's table"
+                    } else {
+                        "its key"
+                    };
+                    let _ = writeln!(
+                        out,
+                        "Step {} is conditional: as a WeakMap entry it keeps its value alive \
+                         only while {other}, node {}, is alive too.",
+                        i + 1,
+                        c.node_id
+                    );
+                }
             }
         }
     }
@@ -1825,7 +2077,7 @@ mod tests {
         ty: &'static str,
         name: String,
         id: u32,
-        size: u32,
+        size: u64,
         detachedness: u32,
         edges: Vec<(&'static str, String, usize)>,
     }
@@ -1849,7 +2101,7 @@ mod tests {
             (t, window)
         }
 
-        fn node(&mut self, ty: &'static str, name: &str, id: u32, size: u32) -> usize {
+        fn node(&mut self, ty: &'static str, name: &str, id: u32, size: u64) -> usize {
             self.nodes.push(TestNode {
                 ty,
                 name: name.to_string(),
@@ -1875,17 +2127,17 @@ mod tests {
             };
             let ty_idx = |t: &str| NODE_TYPES.iter().position(|x| *x == t).unwrap() as u32;
             let ety_idx = |t: &str| EDGE_TYPES.iter().position(|x| *x == t).unwrap() as u32;
-            let mut nodes = Vec::new();
+            let mut nodes: Vec<u64> = Vec::new();
             let mut edges = Vec::new();
             for n in &self.nodes {
                 let name = intern(&n.name);
                 nodes.extend([
-                    ty_idx(n.ty),
-                    name,
-                    n.id,
+                    ty_idx(n.ty).into(),
+                    name.into(),
+                    n.id.into(),
                     n.size,
-                    n.edges.len() as u32,
-                    n.detachedness,
+                    n.edges.len() as u64,
+                    n.detachedness.into(),
                 ]);
                 for (ty, name, to) in &n.edges {
                     let name_or_index = if *ty == "element" || *ty == "hidden" {
@@ -1991,13 +2243,13 @@ mod tests {
             t.edge(window, "property", &format!("p{i}"), to);
         }
         let aggs = t.aggregates();
-        assert_eq!(aggs[&key("Function")].len(), 2);
-        assert_eq!(aggs[&key("<div>")].len(), 2);
-        assert_eq!(aggs[&key("(string)")].len(), 2);
+        assert_eq!(aggs.members(&key("Function")).len(), 2);
+        assert_eq!(aggs.members(&key("<div>")).len(), 2);
+        assert_eq!(aggs.members(&key("(string)")).len(), 2);
         // Zero-size nodes belong to no class, as in DevTools.
-        assert!(!aggs.contains_key(&key("(number)")));
-        assert!(!aggs.contains_key(&key("(synthetic)")));
-        assert!(!aggs.contains_key(&key("onClick")));
+        assert!(!aggs.classes.contains_key(&key("(number)")));
+        assert!(!aggs.classes.contains_key(&key("(synthetic)")));
+        assert!(!aggs.classes.contains_key(&key("onClick")));
     }
 
     #[test]
@@ -2016,8 +2268,8 @@ mod tests {
             name: "Foo".into(),
             location: Some((7, 10, 2)),
         };
-        assert_eq!(aggs[&located], vec![(11, 20), (13, 20)]);
-        assert_eq!(aggs[&key("Foo")], vec![(15, 20)]);
+        assert_eq!(aggs.members(&located), [(11, 20), (13, 20)]);
+        assert_eq!(aggs.members(&key("Foo")), [(15, 20)]);
     }
 
     #[test]
@@ -2453,7 +2705,7 @@ mod tests {
     }
 
     /// Nodes of one type hanging off Window, for diff tests.
-    fn hanging(ty: &'static str, items: &[(u32, &str, u32)]) -> TestSnap {
+    fn hanging(ty: &'static str, items: &[(u32, &str, u64)]) -> TestSnap {
         let (mut t, window) = TestSnap::page();
         for (i, &(id, name, size)) in items.iter().enumerate() {
             let node = t.node(ty, name, id, size);
@@ -2463,7 +2715,7 @@ mod tests {
     }
 
     /// Named objects hanging off Window.
-    fn objects(items: &[(u32, &str, u32)]) -> Aggregates {
+    fn objects(items: &[(u32, &str, u64)]) -> Aggregates {
         hanging("object", items).aggregates()
     }
 
@@ -2488,7 +2740,7 @@ mod tests {
             rows,
             [("Window", 1, 0, 500), ("Map", 1, 1, 50), ("Set", 0, 1, -50)]
         );
-        let detail = compute_class_node_detail(base.get(&key("Map")), current.get(&key("Map")));
+        let detail = compute_class_node_detail(&base, &current, &key("Map"));
         assert_eq!(
             detail,
             [
@@ -2504,7 +2756,7 @@ mod tests {
                 },
             ]
         );
-        let gone = compute_class_node_detail(base.get(&key("Set")), current.get(&key("Set")));
+        let gone = compute_class_node_detail(&base, &current, &key("Set"));
         assert_eq!(
             gone,
             [DiffObject {
@@ -2520,7 +2772,7 @@ mod tests {
         let same = objects(&[(11, "Map", 100)]);
         assert!(diff_snapshots(&same, &same).is_empty());
 
-        let strings = |items: &[(u32, &str, u32)]| hanging("string", items).aggregates();
+        let strings = |items: &[(u32, &str, u64)]| hanging("string", items).aggregates();
         let diffs = diff_snapshots(
             &strings(&[(11, "hello", 16), (13, "world", 16)]),
             &strings(&[(11, "hello", 16), (15, "foo", 16)]),
@@ -2535,13 +2787,24 @@ mod tests {
         let a = objects(&[(11, "Map", 100)]);
         let b = objects(&[(13, "Map", 100)]);
         // Window (id 3) is in both, so build disjoint aggregates by hand.
-        let only = |id: u32| Aggregates::from([(key("Map"), vec![(id, 100)])]);
-        assert!(snapshots_share_no_node_ids(&only(1), &only(2)));
+        let only = |class: &str, id: u32| Aggregates {
+            classes: HashMap::from([(key(class), vec![(id, 100)])]),
+            ..Default::default()
+        };
+        assert!(snapshots_share_no_node_ids(
+            &only("Map", 1),
+            &only("Map", 2)
+        ));
         assert!(!snapshots_share_no_node_ids(&a, &b));
         // An id that changed class still counts as shared.
-        let moved = Aggregates::from([(key("Set"), vec![(1, 100)])]);
-        assert!(!snapshots_share_no_node_ids(&only(1), &moved));
-        assert!(!snapshots_share_no_node_ids(&Aggregates::new(), &only(1)));
+        assert!(!snapshots_share_no_node_ids(
+            &only("Map", 1),
+            &only("Set", 1)
+        ));
+        assert!(!snapshots_share_no_node_ids(
+            &Aggregates::default(),
+            &only("Map", 1)
+        ));
     }
 
     #[test]
@@ -2558,8 +2821,8 @@ mod tests {
         assert_eq!(
             summary,
             "Classes with changes, largest sizeDelta first: showing 2-2 of 3; next page: --offset 2\n\
-             idx,className,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta\n\
-             1,Ma…,2,1,1,240,100,140\n"
+             idx,className,location,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta\n\
+             1,Ma…,,2,1,1,240,100,140\n"
         );
         let json: serde_json::Value = serde_json::from_str(
             &format_class_diff_summary(&diffs, &opts, OutputFormat::Json).unwrap(),
@@ -2568,8 +2831,7 @@ mod tests {
         assert_eq!(json["totalClasses"], 3);
         assert_eq!(json["diffs"][0]["idx"], 1);
 
-        let objects =
-            compute_class_node_detail(base.get(&diffs[1].key), current.get(&diffs[1].key));
+        let objects = compute_class_node_detail(&base, &current, &diffs[1].key);
         let opts = ListOptions {
             limit: 2,
             ..defaults()
@@ -2578,7 +2840,7 @@ mod tests {
             format_class_diff_detail(1, &diffs[1], &objects, &opts, OutputFormat::Text).unwrap();
         assert_eq!(
             detail,
-            "idx:1,className:Map,addedCount:2,removedCount:1,countDelta:1,addedSize:240,removedSize:100,sizeDelta:140\n\
+            "idx:1,className:Map,location:,addedCount:2,removedCount:1,countDelta:1,addedSize:240,removedSize:100,sizeDelta:140\n\
              \nObjects, largest selfSize first: showing 1-2 of 3; next page: --offset 2\n\
              op,nodeId,selfSize\n+,17,150\n-,11,100\n"
         );
@@ -2586,7 +2848,7 @@ mod tests {
 
     #[test]
     fn test_compare_offline_end_to_end_via_files() {
-        let file = |items: &[(u32, &str, u32)]| hanging("object", items).file();
+        let file = |items: &[(u32, &str, u64)]| hanging("object", items).file();
         let base = file(&[(11, "Map", 100), (13, "Set", 50)]);
         let current = file(&[(15, "Window", 500), (17, "Map", 150)]);
         let (base, current) = (
@@ -2606,7 +2868,7 @@ mod tests {
 
         let summary = run(None).unwrap().output;
         assert!(summary.contains("showing 1-3 of 3\n"), "{summary}");
-        assert!(summary.contains("\n0,Window,1,0,1,500,0,500\n"));
+        assert!(summary.contains("\n0,Window,,1,0,1,500,0,500\n"));
         assert!(summary.contains("\n1,Map,"));
 
         let detail = run(Some(0)).unwrap().output;
@@ -2637,6 +2899,257 @@ mod tests {
         assert!(out.starts_with(
             "nodeId,nodeName,className,type,detachedness,selfSize,distance\n13,Leak,Leak,object,unknown,64,3\n"
         ));
-        assert!(out.contains("\n1,shortcut,3,Window / https://example.com,object,40\n"));
+        // The fixture's GC-root route is shorter, so the heading says which
+        // roots the path prefers rather than calling it the shortest.
+        assert!(out.contains(
+            "\nRetaining path: shortest from the page's roots, else from the GC roots \
+             (3 edges, weak edges skipped):\n\
+             edgeName,edgeType,nodeId,nodeName,type,selfSize\n\
+             1,shortcut,3,Window / https://example.com,object,40\n"
+        ));
+    }
+
+    /// The key and the table of a WeakMap entry each have an edge to the
+    /// value, `key_hops` and `table_hops` objects below Window.
+    fn weak_map_fixture(key_hops: usize, table_hops: usize) -> TestSnap {
+        let (mut t, window) = TestSnap::page();
+        let chain = |t: &mut TestSnap, hops: usize, first_id: u32| {
+            let mut at = window;
+            for i in 0..hops {
+                let next = t.node("object", "Link", first_id + 2 * i as u32, 16);
+                t.edge(at, "property", "next", next);
+                at = next;
+            }
+            at
+        };
+        let key_holder = chain(&mut t, key_hops, 101);
+        let wm_holder = chain(&mut t, table_hops, 201);
+        let key = t.node("object", "Key", 11, 16);
+        let wm = t.node("object", "WeakMap", 13, 24);
+        let table = t.node("array", "", 15, 64);
+        let value = t.node("object", "Val", 17, 16);
+        let entry = "part of key (Key @11) -> value (Val @17) pair in WeakMap (table @15)";
+        t.edge(key_holder, "property", "key", key);
+        t.edge(wm_holder, "property", "wm", wm);
+        t.edge(wm, "internal", "table", table);
+        t.edge(key, "internal", &format!("1 / {entry}"), value);
+        t.edge(table, "internal", &format!("3 / {entry}"), value);
+        t
+    }
+
+    #[test]
+    fn test_weak_map_value_waits_for_its_key_and_table() {
+        // Key 3 hops below Window, table 2 (Window -> wm -> table): DevTools
+        // waits for the key's edge, so the value is 5 from the root, not 4.
+        let snap = weak_map_fixture(2, 0).snap();
+        let report = inspect_node(&snap, 17, &defaults()).unwrap();
+        assert_eq!(report.node.distance, Some(5));
+        let path = report.path.as_ref().unwrap();
+        let ids: Vec<u32> = path.iter().map(|r| r.node_id).collect();
+        assert_eq!(ids, [3, 101, 103, 11, 17]);
+        assert!(path[..4].iter().all(|r| r.conditional_on.is_none()));
+        let c = path[4].conditional_on.as_ref().unwrap();
+        assert_eq!((c.role, c.node_id), ("table", 15));
+        // Both halves are still listed as retainers.
+        assert_eq!(report.retainers_total, 2);
+
+        let text = format_node_report(&report, &defaults(), OutputFormat::Text).unwrap();
+        assert!(text.ends_with(
+            "\nStep 5 is conditional: as a WeakMap entry it keeps its value alive only \
+             while the WeakMap's table, node 15, is alive too.\n"
+        ));
+        let json: serde_json::Value = serde_json::from_str(
+            &format_node_report(&report, &defaults(), OutputFormat::Json).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            json["retainingPath"][4]["conditionalOn"],
+            json!({ "role": "table", "nodeId": 15 })
+        );
+        assert!(json["retainingPath"][3].get("conditionalOn").is_none());
+
+        // The other way round (key 1 hop, table 4: Window -> 2 links -> wm
+        // -> table), the table's edge sets the distance and the key is the
+        // condition.
+        let snap = weak_map_fixture(0, 2).snap();
+        let report = inspect_node(&snap, 17, &defaults()).unwrap();
+        assert_eq!(report.node.distance, Some(6));
+        let path = report.path.unwrap();
+        assert_eq!(
+            path[5].edge_name,
+            "3 / part of key (Key @11) -> value (Val @17) pair in WeakMap (table @15)"
+        );
+        let c = path[5].conditional_on.as_ref().unwrap();
+        assert_eq!((c.role, c.node_id), ("key", 11));
+
+        // With no way to the key, the table alone does not retain the value.
+        let mut t = weak_map_fixture(0, 0);
+        t.nodes[1].edges.retain(|(_, name, _)| name != "key");
+        let report = inspect_node(&t.snap(), 17, &defaults()).unwrap();
+        assert_eq!(report.node.distance, None);
+        assert!(report.path.is_none());
+    }
+
+    #[test]
+    fn test_weak_map_edge_names_parse_like_devtools() {
+        let name = "12 / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @5)";
+        assert_eq!(
+            weak_map_pair(name),
+            Some(" / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @5)")
+        );
+        // Names may contain the separators, but not a line break, which
+        // DevTools' `.` does not match.
+        assert!(weak_map_pair(
+            "1 / part of key (a) -> value (b @1) @2) -> value (c @3) pair in WeakMap (table @4)"
+        )
+        .is_some());
+        assert!(
+            weak_map_pair("1 / part of key ( @2) -> value ( @3) pair in WeakMap (table @4)")
+                .is_some()
+        );
+        assert!(weak_map_pair(
+            "1 / part of key (a\nb @2) -> value (c @3) pair in WeakMap (table @4)"
+        )
+        .is_none());
+        for not_a_pair in [
+            "part of key -> value pair in ephemeron table",
+            " / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @5)",
+            "1 / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @)",
+            "1 / part of key (Key @x) -> value (Val @9) pair in WeakMap (table @5)",
+            "1 / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @5) ",
+            "map",
+        ] {
+            assert!(weak_map_pair(not_a_pair).is_none(), "{not_a_pair}");
+        }
+    }
+
+    #[test]
+    fn test_sizes_past_32_bits_load_from_a_file() {
+        // A 5 GiB ArrayBuffer backing store, and a size that is exactly the
+        // `WIDE` marker.
+        let (mut t, window) = TestSnap::page();
+        let buffer = t.node("object", "ArrayBuffer", 11, 80);
+        let store = t.node("native", "system / JSArrayBufferData", 13, 5 << 30);
+        let edge = t.node("native", "Edge", 15, u32::MAX.into());
+        t.edge(window, "property", "buf", buffer);
+        t.edge(buffer, "internal", "backing_store", store);
+        t.edge(window, "property", "edge", edge);
+        let file = t.file();
+        let snap = load_snapshot(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(snap.self_size(store), 5 << 30);
+        assert_eq!(snap.self_size(edge), u64::from(u32::MAX));
+        assert_eq!(snap.self_size(buffer), 80);
+        let report = inspect_node(&snap, 13, &defaults()).unwrap();
+        assert_eq!(report.node.self_size, 5 << 30);
+
+        let base = TestSnap::page().0.file();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let run = |idx| {
+            rt.block_on(compare_heapsnapshots_offline(
+                base.path().to_str().unwrap(),
+                file.path().to_str().unwrap(),
+                idx,
+                defaults(),
+                OutputFormat::Text,
+            ))
+            .unwrap()
+            .output
+        };
+        let summary = run(None);
+        assert!(
+            summary.contains("\n0,system / JSArrayBufferData,,1,0,1,5368709120,0,5368709120\n"),
+            "{summary}"
+        );
+        assert!(summary.contains("\n1,Edge,,1,0,1,4294967295,0,4294967295\n"));
+        assert!(run(Some(0)).ends_with("\n+,13,5368709120\n"));
+
+        // Only `self_size` may be that wide.
+        let mut v = t.json();
+        v["nodes"][2] = json!(1u64 << 32);
+        let err = Snap::new(serde_json::from_value(v).unwrap()).err().unwrap();
+        assert!(
+            err.to_string().contains("node field 'id' holds 4294967296"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_owned_sizes_add_up_past_32_bits() {
+        // A 64-byte owner of two 2 GiB arrays: 4 GiB + 64 bytes in all.
+        let (mut t, window) = TestSnap::page();
+        let owner = t.node("object", "Big", 11, 64);
+        let elements = t.node("array", "(object elements)", 13, 2 << 30);
+        let properties = t.node("array", "(object properties)", 15, 2 << 30);
+        t.edge(window, "property", "big", owner);
+        t.edge(owner, "internal", "elements", elements);
+        t.edge(owner, "internal", "properties", properties);
+        let snap = t.snap();
+        assert_eq!(snap.self_size(owner), 4_294_967_360);
+        assert_eq!(
+            (snap.self_size(elements), snap.self_size(properties)),
+            (0, 0)
+        );
+
+        let base = TestSnap::page().0.aggregates();
+        let current = t.aggregates();
+        let diffs = diff_snapshots(&base, &current);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].added_size, 4_294_967_360);
+        assert_eq!(
+            compute_class_node_detail(&base, &current, &diffs[0].key)[0].self_size,
+            4_294_967_360
+        );
+        let summary = format_class_diff_summary(&diffs, &defaults(), OutputFormat::Text).unwrap();
+        assert!(
+            summary.ends_with("\n0,Big,,1,0,1,4294967360,0,4294967360\n"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn test_rows_split_by_location_show_it() {
+        let (mut t, window) = TestSnap::page();
+        for (i, location) in [None, Some((7, 0, 4)), Some((7, 9, 0))]
+            .into_iter()
+            .enumerate()
+        {
+            let foo = t.node("object", "Foo", 11 + 2 * i as u32, 20);
+            t.edge(window, "property", &format!("p{i}"), foo);
+            if let Some((script, line, column)) = location {
+                t.locations.push((foo, script, line, column));
+            }
+        }
+        let (base, current) = (TestSnap::page().0.aggregates(), t.aggregates());
+        let diffs = diff_snapshots(&base, &current);
+        let summary = format_class_diff_summary(&diffs, &defaults(), OutputFormat::Text).unwrap();
+        // Line and column count from 1; V8 stores them from 0.
+        assert!(summary.ends_with(
+            "\nidx,className,location,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta\n\
+             0,Foo,,1,0,1,20,0,20\n\
+             1,Foo,7:1:5,1,0,1,20,0,20\n\
+             2,Foo,7:10:1,1,0,1,20,0,20\n"
+        ), "{summary}");
+        let json: serde_json::Value = serde_json::from_str(
+            &format_class_diff_summary(&diffs, &defaults(), OutputFormat::Json).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["diffs"][0]["location"], serde_json::Value::Null);
+        assert_eq!(json["diffs"][1]["location"], "7:1:5");
+
+        let objects = compute_class_node_detail(&base, &current, &diffs[2].key);
+        let detail =
+            format_class_diff_detail(2, &diffs[2], &objects, &defaults(), OutputFormat::Text)
+                .unwrap();
+        assert!(
+            detail.starts_with("idx:2,className:Foo,location:7:10:1,addedCount:1,"),
+            "{detail}"
+        );
+        assert!(detail.ends_with("\n+,15,20\n"));
+        let json: serde_json::Value = serde_json::from_str(
+            &format_class_diff_detail(2, &diffs[2], &objects, &defaults(), OutputFormat::Json)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["location"], "7:10:1");
     }
 }

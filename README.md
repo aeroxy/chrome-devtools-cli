@@ -220,7 +220,7 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 | `css-styles <selector> [--computed <prop>,...] [--ua-rules]` | CSS for the first matching element: computed values, matched rules (highest precedence first, `[overridden]` declarations tagged, `var()` values resolved, `file:line` sources), inline style, inherited rules |
 | `take-heapsnapshot --output <path>` | Capture V8 heap snapshot (streamed via CDP) |
 | `compare-heapsnapshots --base <path> --current <path> [--class-index N]` | Diff two snapshots per class, grouped as in the DevTools Memory panel; `--class-index` lists one class's added/deleted objects (offline) |
-| `inspect-heapsnapshot-node --file-path <path> --node-id <id>` | Show a node's class, detachedness, direct retainers and shortest retaining path from the root (offline) |
+| `inspect-heapsnapshot-node --file-path <path> --node-id <id>` | Show a node's class, detachedness, direct retainers and a retaining path from the root, shortest through the page's roots before the GC roots (offline) |
 
 The offline heap commands page their rows with `--limit` (default 50) and `--offset`, say how many rows there are in total, and cut names longer than `--max-name-length` (default 100) characters.
 
@@ -259,7 +259,7 @@ These commands ask the page through WebMCP first (`document.modelContext.getTool
 | `emulate --clear-blocks` | Clear all blocked URL patterns |
 | `emulate --clear-all` | Clear all overrides (viewport, geolocation, CSS media, blocks) |
 | `configure-webauthn` | Add a virtual WebAuthn authenticator (ctap2, internal, passkey-capable) so `navigator.credentials.create()`/`get()` work without a device; again with no flags shows it and its credentials |
-| `configure-webauthn --protocol u2f --transport usb` | Choose the authenticator (`--protocol ctap2\|u2f`, `--transport internal\|usb\|nfc\|ble\|hybrid`, `--has-resident-key`, `--has-user-verification`, `--is-user-verified true\|false`) |
+| `configure-webauthn --protocol u2f --transport usb` | Choose the authenticator (`--protocol ctap2\|u2f`, `--transport internal\|usb\|nfc\|ble\|hybrid`, `--has-resident-key true\|false`, `--has-user-verification true\|false`, `--is-user-verified true\|false`); u2f can't use hybrid |
 | `configure-webauthn --remove` | Remove the virtual authenticator |
 | `wait-for <text> [--timeout ms]` | Wait for text to appear (default 30s) |
 
@@ -292,7 +292,7 @@ Other page commands list the errors the page raised while they ran (uncaught exc
 |---------|-------------|
 | `mock-network <url-glob> [--status N] [--header "Name: value"] [--body <text> \| --body-file <path>]` | Answer matching requests on this tab from the CLI instead of the network |
 | `mock-network <url-glob> --abort` | Fail matching requests with a network error |
-| `mock-network <url-glob> ... --resource-type <type>` | Only requests of one type (`Document`, `Script`, `Image`, `XHR`, `Fetch`, ...) |
+| `mock-network <url-glob> ... --resource-type <type>` | Only requests of one type (`Document`, `Script`, `Image`, `XHR`, `Fetch`, ...; Chrome reports `fetch()` as XHR when it intercepts, so `XHR` and `Fetch` each match both) |
 | `mock-network` | List the tab's mocks with hit counts |
 | `remove-network-mock [<url-glob>]` | Remove one mock, or all of them on the tab |
 
@@ -341,7 +341,7 @@ Global `--block-url` and `--unblock-url` update the **active tab's** block list 
 - **Cleanup**: endpoint + PID files are also removed on panics, and on Unix on SIGTERM/SIGINT; Windows Ctrl-C cleanup is best-effort only (a background daemon has no console to receive it). SIGQUIT, SIGHUP and SIGKILL skip cleanup by design — the leftover files are harmless and are reclaimed by the next daemon start.
 - **Protocol**: Length-prefixed JSON over the Unix socket / loopback TCP. Responses carry the daemon's version, and the CLI warns when it differs from its own (an older daemon keeps serving after an upgrade until it idles out).
 - **Peer check (Unix)**: daemon and CLI each check that the other end of the socket runs as the same user, since on Linux the socket sits in the shared `/tmp`.
-- **Call timeouts**: a CDP call on a page gives up after 180 s (`CHROME_CDP_TIMEOUT_SECS`, read when the daemon starts), stopping any running JavaScript, so one stuck page can't hold the daemon for every other caller. Calls that set a session up give up after 10 s. When the browser goes quiet for 30 s mid-call, the daemon pings it; no answer within 15 s counts as a lost connection, and the daemon exits.
+- **Call timeouts**: a CDP call on a page gives up after 180 s (`CHROME_CDP_TIMEOUT_SECS`, read when the daemon starts), counted from before the request is written, stopping any running JavaScript, so one stuck page can't hold the daemon for every other caller. Calls that set a session up give up after 10 s. When the socket is quiet for 30 s mid-call, and once more when a call's limit runs out, the daemon pings the browser; no answer within 15 s counts as a lost connection and the daemon exits, so a call can run up to 15 s past its limit. `caffeinate` uses the same bounded check, and a write to the browser that doesn't finish within 180 s also counts as a lost connection.
 - **Spawned by**: First CLI invocation for a given endpoint (transparent to user)
 - **List**: `chrome-devtools list-daemons` — PID, browser, endpoint, uptime and state for every daemon this user owns. `--json` (or `--toon`) for machine-readable output. Reads only on-disk state, so it works when every browser has exited. On Unix, rows whose PID no longer exists are marked `stale`; on Windows liveness is not probed, so every row's state is `?` and `stale` never appears.
 - **Kill**: `chrome-devtools kill-daemon` stops only the daemon for the endpoint its flags resolve to, so `--browser edge kill-daemon` cannot stop your Chrome daemon. Add `--all` to stop every daemon for this user — which is also the only way to clear one whose browser has already exited, since a scoped kill has no endpoint left to resolve (it fails and says so). `--all` also sweeps the pre-key `chrome-devtools-daemon-<uid>.pid` name left by older versions. (Or delete the socket + PID file by hand; leave the lock file — see above.) It sends SIGTERM and returns once the signal is delivered, not once the process is gone: the daemon exits *between* requests, so one that is mid-command finishes it and answers that client first. Expect up to one command's latency, and note that a daemon wedged inside a CDP call outlives the command that stopped it.

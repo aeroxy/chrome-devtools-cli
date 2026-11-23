@@ -47,7 +47,8 @@ pub struct MockRequest<'a> {
     pub resource_type: Option<&'a str>,
 }
 
-/// Chrome's resource type names, for the `--resource-type` check.
+/// Chrome's resource type names, for the `--resource-type` check. WebSocket
+/// is not one: the Fetch domain can't intercept it and rejects the filter.
 const RESOURCE_TYPES: &[&str] = &[
     "Document",
     "Stylesheet",
@@ -60,7 +61,6 @@ const RESOURCE_TYPES: &[&str] = &[
     "Fetch",
     "Prefetch",
     "EventSource",
-    "WebSocket",
     "Manifest",
     "SignedExchange",
     "Ping",
@@ -122,13 +122,36 @@ impl MockRequest<'_> {
     }
 }
 
+/// A header Chrome will accept. One it rejects would fail the reply after the
+/// request was taken off the queue, leaving the page's request paused.
 fn parse_header(header: &str) -> Result<(String, String)> {
-    match header.split_once(':') {
-        Some((name, value)) if !name.trim().is_empty() => {
-            Ok((name.trim().to_string(), value.trim().to_string()))
-        }
-        _ => bail!("--header '{header}' is not 'Name: value'"),
+    let Some((name, value)) = header.split_once(':') else {
+        bail!("--header '{header}' is not 'Name: value'");
+    };
+    let (name, value) = (name.trim(), value.trim());
+    if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+        bail!("--header '{header}': '{name}' is not a valid header name");
     }
+    if value.contains(['\0', '\r', '\n']) {
+        bail!("--header '{header}': the value has a line break or NUL in it");
+    }
+    Ok((name.to_string(), value.to_string()))
+}
+
+/// Chrome can't tell `fetch()` from XMLHttpRequest when it intercepts: it
+/// reports both as XHR. So each of the two types matches either.
+fn same_resource_type(wanted: &str, reported: &str) -> bool {
+    let xhr_like = |t: &str| t == "XHR" || t == "Fetch";
+    wanted == reported || (xhr_like(wanted) && xhr_like(reported))
+}
+
+/// The status line's phrase. Chrome supplies one only for codes it knows and
+/// rejects a reply without one, which would leave the request paused.
+fn reason_phrase(status: u16) -> &'static str {
+    http::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|code| code.canonical_reason())
+        .unwrap_or("Mocked")
 }
 
 /// Match `text` against a Fetch-domain URL glob: `*` is any run of
@@ -186,24 +209,30 @@ fn fetch_patterns(mocks: &[NetworkMock]) -> Value {
 }
 
 /// The answer to a `Fetch.requestPaused` event, as a CDP method and its
-/// params. The most recently added matching mock wins; a request none
-/// matches (Chrome's matching and ours disagree, or the mock was just
-/// removed) goes on to the network.
-pub fn reply_to_paused(mocks: &mut [NetworkMock], params: &Value) -> (&'static str, Value) {
+/// params, and the index of the mock that gave it. The most recently added
+/// matching mock wins; a request none matches (Chrome's matching and ours
+/// disagree, or the mock was just removed) goes on to the network.
+pub fn reply_to_paused(
+    mocks: &[NetworkMock],
+    params: &Value,
+) -> (&'static str, Value, Option<usize>) {
     let request_id = params["requestId"].clone();
     let url = params["request"]["url"].as_str().unwrap_or("");
     let resource_type = params["resourceType"].as_str().unwrap_or("");
-    let mock = mocks.iter_mut().rev().find(|m| {
+    let matched = mocks.iter().rposition(|m| {
         glob_match(&m.pattern, url)
             && m.resource_type
                 .as_deref()
-                .is_none_or(|t| t == resource_type)
+                .is_none_or(|t| same_resource_type(t, resource_type))
     });
-    let Some(mock) = mock else {
-        return ("Fetch.continueRequest", json!({"requestId": request_id}));
+    let Some(i) = matched else {
+        return (
+            "Fetch.continueRequest",
+            json!({"requestId": request_id}),
+            None,
+        );
     };
-    mock.hits += 1;
-    match &mock.action {
+    let (method, params) = match &mocks[i].action {
         MockAction::Abort => (
             "Fetch.failRequest",
             json!({"requestId": request_id, "errorReason": "Failed"}),
@@ -217,6 +246,7 @@ pub fn reply_to_paused(mocks: &mut [NetworkMock], params: &Value) -> (&'static s
             json!({
                 "requestId": request_id,
                 "responseCode": status,
+                "responsePhrase": reason_phrase(*status),
                 "responseHeaders": headers
                     .iter()
                     .map(|(name, value)| json!({"name": name, "value": value}))
@@ -224,7 +254,8 @@ pub fn reply_to_paused(mocks: &mut [NetworkMock], params: &Value) -> (&'static s
                 "body": base64::engine::general_purpose::STANDARD.encode(body),
             }),
         ),
-    }
+    };
+    (method, params, Some(i))
 }
 
 /// Make the session intercept exactly what `client.network_mocks` covers.
@@ -280,12 +311,19 @@ pub async fn mock_network(
 ) -> Result<CommandResult> {
     require_persistent_session(client, session_id)?;
     let mock = request.into_mock()?;
+    let previous = client.network_mocks.clone();
     client
         .network_mocks
         .retain(|m| !(m.pattern == mock.pattern && m.resource_type == mock.resource_type));
     let summary = describe_mock(&mock);
     client.network_mocks.push(mock);
-    apply_mocks(client, session_id).await?;
+    if let Err(e) = apply_mocks(client, session_id).await {
+        // A mock Chrome refused must not linger, or every later change would
+        // resend it and fail too: go back to what applied before.
+        client.network_mocks = previous;
+        let _ = apply_mocks(client, session_id).await;
+        return Err(e);
+    }
     Ok(CommandResult::output(format!(
         "Mocked {summary}. It applies to this tab while the daemon runs (see `caffeinate`), \
          and only to requests made from now on: reload to mock the page's own requests."
@@ -401,7 +439,7 @@ mod tests {
 
     #[test]
     fn the_latest_matching_mock_answers() {
-        let mut mocks = vec![
+        let mocks = vec![
             mock("*", MockAction::Abort),
             mock(
                 "*/api/*",
@@ -414,21 +452,35 @@ mod tests {
         ];
         let paused = |url: &str| json!({"requestId": "r1", "resourceType": "Fetch", "request": {"url": url}});
 
-        let (method, params) = reply_to_paused(&mut mocks, &paused("https://a.test/api/u"));
-        assert_eq!(method, "Fetch.fulfillRequest");
+        let (method, params, matched) = reply_to_paused(&mocks, &paused("https://a.test/api/u"));
+        assert_eq!((method, matched), ("Fetch.fulfillRequest", Some(1)));
         assert_eq!(params["responseCode"], 201);
+        assert_eq!(params["responsePhrase"], "Created");
         assert_eq!(params["body"], "e30=");
         assert_eq!(params["responseHeaders"][0]["name"], "Content-Type");
 
-        let (method, _) = reply_to_paused(&mut mocks, &paused("https://a.test/logo.png"));
-        assert_eq!(method, "Fetch.failRequest");
-        assert_eq!((mocks[0].hits, mocks[1].hits), (1, 1));
+        let (method, _, matched) = reply_to_paused(&mocks, &paused("https://a.test/logo.png"));
+        assert_eq!((method, matched), ("Fetch.failRequest", Some(0)));
 
-        let (method, params) = reply_to_paused(&mut [], &paused("https://a.test/"));
+        let (method, params, matched) = reply_to_paused(&[], &paused("https://a.test/"));
         assert_eq!(
-            (method, params["requestId"].as_str()),
-            ("Fetch.continueRequest", Some("r1"))
+            (method, params["requestId"].as_str(), matched),
+            ("Fetch.continueRequest", Some("r1"), None)
         );
+    }
+
+    /// Chrome reports both fetch() and XMLHttpRequest as XHR when it
+    /// intercepts, and has no phrase of its own for unusual codes.
+    #[test]
+    fn replies_fit_what_chrome_reports_and_accepts() {
+        let mut fetch_only = mock("*", MockAction::Abort);
+        fetch_only.resource_type = Some("Fetch".into());
+        let mocks = [fetch_only];
+        let paused = |ty: &str| json!({"requestId": "r", "resourceType": ty, "request": {"url": "https://a.test/"}});
+        assert_eq!(reply_to_paused(&mocks, &paused("XHR")).2, Some(0));
+        assert_eq!(reply_to_paused(&mocks, &paused("Script")).2, None);
+        assert_eq!(reason_phrase(404), "Not Found");
+        assert_eq!(reason_phrase(599), "Mocked");
     }
 
     #[test]
@@ -454,6 +506,12 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Name: value"));
+        let refused = |headers: Vec<&str>, ty: Option<&'static str>| {
+            req(None, headers, ty).into_mock().unwrap_err().to_string()
+        };
+        assert!(refused(vec!["Bad Name: v"], None).contains("not a valid header name"));
+        assert!(refused(vec!["X-A: a\rb"], None).contains("line break"));
+        assert!(refused(vec![], Some("WebSocket")).contains("Unknown resource type"));
         assert!(req(None, vec![], Some("Pic"))
             .into_mock()
             .unwrap_err()

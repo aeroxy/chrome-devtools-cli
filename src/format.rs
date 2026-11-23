@@ -47,6 +47,26 @@ pub fn format_structured(value: &Value, format: OutputFormat) -> Result<String> 
     }
 }
 
+/// Make `--json` output safe for a terminal without changing its data.
+/// serde_json already escapes C0 controls, ESC among them; DEL and the C1
+/// controls (U+0080–U+009F, which some terminals act on) are left raw, and can
+/// only occur inside strings, where `\u` escapes say the same thing.
+pub fn escape_json_controls(json: &str) -> std::borrow::Cow<'_, str> {
+    let raw = |c: char| matches!(c as u32, 0x7f..=0x9f);
+    if !json.chars().any(raw) {
+        return std::borrow::Cow::Borrowed(json);
+    }
+    let mut out = String::with_capacity(json.len() + 16);
+    for c in json.chars() {
+        if raw(c) {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Cut `s` to at most `max_chars` characters, ending a cut one with "…".
 /// Counts and cuts by `char`, so a multi-byte character is never split.
 pub fn truncate_chars(s: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
@@ -121,6 +141,26 @@ fn osc_end(b: &[u8], i: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The data survives a JSON round trip, and no raw C1 control is left.
+    #[test]
+    fn json_controls_become_escapes() {
+        let original = serde_json::json!({"text": "a\u{85}b\u{9b}31m\u{7f}"});
+        let rendered = serde_json::to_string(&original).unwrap();
+        let safe = escape_json_controls(&rendered);
+        assert!(
+            !safe.chars().any(|c| matches!(c as u32, 0x7f..=0x9f)),
+            "{safe}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&safe).unwrap(),
+            original
+        );
+        assert!(matches!(
+            escape_json_controls("{\"a\": 1}"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 
     #[test]
     fn truncate_chars_cuts_at_char_boundaries() {

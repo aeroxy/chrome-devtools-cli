@@ -263,7 +263,8 @@ pub enum Commands {
     /// the file, no Chrome connection required. Prints the node (class,
     /// detachedness, self size, distance from the root), its direct retainers
     /// closest to the root first (paged with --limit/--offset), and one
-    /// shortest retaining path from the root, skipping weak edges.
+    /// retaining path from the root, skipping weak edges: the shortest
+    /// through the page's roots, else through the GC roots.
     #[command(name = "inspect-heapsnapshot-node")]
     InspectHeapSnapshotNode {
         /// Path to the .heapsnapshot file to analyze
@@ -1342,9 +1343,8 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
             accuracy,
             extra_headers,
             background,
-        } => (
-            "new-page",
-            json!({
+        } => {
+            let mut args = json!({
                 "url": url,
                 "viewport": viewport,
                 "device_scale_factor": device_scale_factor,
@@ -1352,9 +1352,14 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
                 "geolocation": geolocation,
                 "accuracy": accuracy,
                 "extra_headers": extra_headers,
-                "background": background
-            }),
-        ),
+            });
+            // Sent only when used: a daemon from before the option rejects
+            // keys it doesn't know, which would break every new-page.
+            if *background {
+                args["background"] = json!(true);
+            }
+            ("new-page", args)
+        }
         Commands::ClosePage { id_or_index } => {
             ("close-page", json!({ "id_or_index": id_or_index }))
         }
@@ -1417,10 +1422,21 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
             media,
             media_feature,
             clear_media,
-        } => (
-            "emulate",
-            json!({"viewport": viewport, "device_scale_factor": device_scale_factor, "mobile": mobile, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all, "clear_blocks": clear_blocks, "media": media, "media_feature": media_feature, "clear_media": clear_media}),
-        ),
+        } => {
+            let mut args = json!({"viewport": viewport, "device_scale_factor": device_scale_factor, "mobile": mobile, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all, "clear_blocks": clear_blocks});
+            // Sent only when used: a daemon from before these options rejects
+            // keys it doesn't know, which would break every emulate.
+            if let Some(media) = media {
+                args["media"] = json!(media);
+            }
+            if !media_feature.is_empty() {
+                args["media_feature"] = json!(media_feature);
+            }
+            if *clear_media {
+                args["clear_media"] = json!(true);
+            }
+            ("emulate", args)
+        }
         Commands::MockNetwork {
             pattern,
             status,
@@ -1557,14 +1573,25 @@ fn cli_cwd() -> Option<String> {
 }
 
 /// Everything printed here can carry page text (console messages, titles,
-/// URLs), so control sequences are stripped before it reaches the terminal.
+/// URLs), so control sequences never reach the terminal raw. Structured
+/// output is data a program may parse, so it keeps every character: JSON says
+/// them as escapes, and TOON, which has no escape for them, loses them only
+/// when printed to a terminal.
 fn print_output(
     output: &str,
     navigated_to: Option<&str>,
     target_id: Option<&str>,
     notes: &[String],
+    output_format: format::OutputFormat,
 ) {
-    let output = format::strip_terminal_escapes(output);
+    use std::io::IsTerminal;
+    let output = match output_format {
+        format::OutputFormat::Json => format::escape_json_controls(output),
+        format::OutputFormat::Toon if !std::io::stdout().is_terminal() => {
+            std::borrow::Cow::Borrowed(output)
+        }
+        _ => format::strip_terminal_escapes(output),
+    };
     let navigated_to = navigated_to.map(format::strip_terminal_escapes);
     if !output.is_empty() {
         print!("{output}");
@@ -1603,7 +1630,7 @@ fn daemon_version_warning(daemon_version: Option<&str>) -> Option<String> {
     ))
 }
 
-fn print_response(resp: &protocol::DaemonResponse) {
+fn print_response(resp: &protocol::DaemonResponse, output_format: format::OutputFormat) {
     if let Some(warning) = daemon_version_warning(resp.version.as_deref()) {
         eprintln!("{warning}");
     }
@@ -1613,6 +1640,7 @@ fn print_response(resp: &protocol::DaemonResponse) {
             resp.navigated_to.as_deref(),
             resp.target_id.as_deref(),
             &resp.notes,
+            output_format,
         );
     } else {
         eprintln!("error: {}", format::strip_terminal_escapes(&resp.error));
@@ -1621,12 +1649,13 @@ fn print_response(resp: &protocol::DaemonResponse) {
     }
 }
 
-fn print_result(result: &result::CommandResult) {
+fn print_result(result: &result::CommandResult, output_format: format::OutputFormat) {
     print_output(
         &result.output,
         result.navigated_to.as_deref(),
         result.target_id.as_deref(),
         &result.notes,
+        output_format,
     );
 }
 
@@ -1890,7 +1919,7 @@ pub async fn run() -> Result<()> {
             cli.output_format(),
         )
         .await?;
-        print_result(&result);
+        print_result(&result, cli.output_format());
         return Ok(());
     }
 
@@ -1911,7 +1940,7 @@ pub async fn run() -> Result<()> {
             cli.output_format(),
         )
         .await?;
-        print_result(&result);
+        print_result(&result, cli.output_format());
         return Ok(());
     }
 
@@ -1936,7 +1965,7 @@ pub async fn run() -> Result<()> {
 
     // Try daemon first
     if let Ok(resp) = client::send_to_daemon(&key, &request).await {
-        print_response(&resp);
+        print_response(&resp, cli.output_format());
         return Ok(());
     }
 
@@ -1951,7 +1980,7 @@ pub async fn run() -> Result<()> {
     // Retry via daemon
     match client::send_to_daemon(&key, &request).await {
         Ok(resp) => {
-            print_response(&resp);
+            print_response(&resp, cli.output_format());
             Ok(())
         }
         Err(e) => {
@@ -1983,7 +2012,7 @@ async fn caffeinate(cli: &Cli, ws_url: &str, key: &str, request: &DaemonRequest)
     };
     if !first.success {
         // Exits with the daemon's error and code, as any other command would.
-        print_response(&first);
+        print_response(&first, cli.output_format());
     }
 
     let name = browser::display_name(&cli.browser);
@@ -2059,7 +2088,7 @@ async fn run_direct_fallback(cli: &Cli, ws_url: &str, error: &anyhow::Error) -> 
     match &result {
         Ok(r) => {
             telemetry::log_command(cmd_name, duration, true, r.error_code);
-            print_result(r);
+            print_result(r, cli.output_format());
         }
         Err(e) => {
             let code = e
@@ -2645,6 +2674,31 @@ mod tests {
             }
             assert_eq!(args_of(&argv)["geolocation"], "-33.86,151.2", "{cmd}");
         }
+    }
+
+    /// A daemon that predates an option rejects its key, so a request that
+    /// doesn't use the option must not carry it.
+    #[test]
+    fn unused_new_options_stay_out_of_requests() {
+        let args_of = |argv: &[&str]| {
+            let mut full = vec!["chrome-devtools"];
+            full.extend_from_slice(argv);
+            build_request(&Cli::try_parse_from(full).unwrap())
+                .unwrap()
+                .args
+        };
+        let plain = args_of(&["new-page", "https://a.test"]);
+        assert!(plain.get("background").is_none(), "{plain}");
+        assert_eq!(
+            args_of(&["new-page", "--background", "https://a.test"])["background"],
+            true
+        );
+        let emulate = args_of(&["emulate", "--viewport", "400x300"]);
+        for key in ["media", "media_feature", "clear_media"] {
+            assert!(emulate.get(key).is_none(), "{key}: {emulate}");
+        }
+        let dark = args_of(&["emulate", "--media-feature", "prefers-color-scheme=dark"]);
+        assert_eq!(dark["media_feature"][0], "prefers-color-scheme=dark");
     }
 
     #[test]

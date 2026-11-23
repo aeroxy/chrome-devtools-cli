@@ -73,6 +73,7 @@ async fn dispatch_mouse(
     button: &str,
     click_count: u32,
 ) -> Result<()> {
+    client.input_sent = true;
     client
         .send_to_target(
             session_id,
@@ -118,6 +119,8 @@ pub async fn click(
         }})()"#
     );
 
+    // For an <option> this evaluate is the click: it selects and fires change.
+    client.input_sent = true;
     let result = client
         .send_to_target(
             session_id,
@@ -160,22 +163,23 @@ pub async fn click(
 /// navigation; it starts after the script's task ends, so the request counts
 /// as a start too, or the caller would read the old page's URL and race the
 /// load.
-pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str) -> Result<bool> {
-    // Get the main frame ID to ensure we only wait for top-level navigations
+/// The id of the page's main frame, so waits can ignore iframe navigations.
+pub(crate) async fn main_frame_id(client: &mut CdpClient, session_id: &str) -> Result<String> {
     let frame_tree = client
         .send_to_target(session_id, "Page.getFrameTree", json!({}))
         .await?;
-    let main_frame_id = frame_tree
-        .get("frameTree")
-        .and_then(|t| t.get("frame"))
-        .and_then(|f| f.get("id"))
-        .and_then(|i| i.as_str())
+    frame_tree["frameTree"]["frame"]["id"]
+        .as_str()
+        .map(str::to_string)
         .ok_or_else(|| {
             anyhow!(
                 "Failed to determine main frame ID from Page.getFrameTree response: {frame_tree}"
             )
-        })?
-        .to_string();
+        })
+}
+
+pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str) -> Result<bool> {
+    let main_frame_id = main_frame_id(client, session_id).await?;
     let in_main_frame = |m: &str, p: &serde_json::Value| {
         let main = p.get("frameId").and_then(|f| f.as_str()) == Some(&main_frame_id);
         // A navigation into a new tab or a download leaves this page alone.
@@ -285,6 +289,9 @@ pub async fn click_at(
         None => client.current_url(session_id).await?,
     };
     let pages_before = page_ids(client).await?;
+    // Everything Chrome sent before that reply has been read by now, so what
+    // gets buffered from here on came after the action began.
+    client.clear_events();
     dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0).await?;
     dispatch_mouse(client, session_id, "mousePressed", x, y, "left", 1).await?;
     dispatch_mouse(client, session_id, "mouseReleased", x, y, "left", 1).await?;
@@ -387,6 +394,8 @@ if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
         }})()"#
     );
 
+    // This evaluate already acts: it sets values and fires input and change.
+    client.input_sent = true;
     let result = client
         .send_to_target(
             session_id,
@@ -651,12 +660,15 @@ pub async fn type_text(
     // typed, and a retry would type it twice.
     let submit = submit_key.map(parse_key_spec).transpose()?;
     let initial_url = client.current_url(session_id).await?;
+    client.input_sent = true;
     client
         .send_to_target(session_id, "Input.insertText", json!({"text": text}))
         .await?;
 
     let mut new_document = false;
     if let Some(spec) = &submit {
+        // Only navigations from the key press count.
+        client.clear_events();
         dispatch_key(client, session_id, spec).await?;
         new_document = wait_for_navigation(client, session_id)
             .await
@@ -680,6 +692,9 @@ pub async fn press_key(
     let spec = parse_key_spec(key)?;
     let initial_url = client.current_url(session_id).await?;
     let pages_before = page_ids(client).await?;
+    // Everything Chrome sent before that reply has been read by now, so what
+    // gets buffered from here on came after the key press.
+    client.clear_events();
     dispatch_key(client, session_id, &spec).await?;
     let new_document = wait_for_navigation(client, session_id)
         .await
@@ -822,12 +837,23 @@ fn single_char_key(s: &str, shift: bool) -> Option<(String, String, i32)> {
         ']' | '}' => ("BracketRight", 221),
         '\\' | '|' => ("Backslash", 220),
         '`' | '~' => ("Backquote", 192),
+        ')' => ("Digit0", 48),
+        '!' => ("Digit1", 49),
+        '@' => ("Digit2", 50),
+        '#' => ("Digit3", 51),
+        '$' => ("Digit4", 52),
+        '%' => ("Digit5", 53),
+        '^' => ("Digit6", 54),
+        '&' => ("Digit7", 55),
+        '*' => ("Digit8", 56),
+        '(' => ("Digit9", 57),
         _ => return None,
     };
     Some((c.to_string(), code.to_string(), key_code))
 }
 
 async fn dispatch_key(client: &mut CdpClient, session_id: &str, spec: &KeySpec) -> Result<()> {
+    client.input_sent = true;
     let mut down = json!({
         "type": "keyDown",
         "key": spec.key,
@@ -891,6 +917,12 @@ mod tests {
         let plus = parse_key_spec("Ctrl++").unwrap();
         assert_eq!((plus.key.as_str(), plus.modifiers), ("+", CTRL));
         assert_eq!(parse_key_spec("+").unwrap().code, "Equal");
+        let bang = parse_key_spec("!").unwrap();
+        assert_eq!(
+            (bang.code.as_str(), bang.text.as_deref()),
+            ("Digit1", Some("!"))
+        );
+        assert_eq!(parse_key_spec("(").unwrap().key_code, 57);
     }
 
     #[test]

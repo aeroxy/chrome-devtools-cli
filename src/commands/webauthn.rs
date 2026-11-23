@@ -233,6 +233,25 @@ fn output(
     Ok(CommandResult::output(format_structured(&value, format)?))
 }
 
+/// Option pairs Chrome refuses to add.
+fn check_supported(options: &AuthenticatorOptions) -> Result<()> {
+    if options.protocol == "u2f" && options.transport == "hybrid" {
+        bail!(
+            "protocol u2f supports only the usb, nfc and ble transports, not hybrid: add \
+             --transport usb (or nfc, ble)"
+        );
+    }
+    Ok(())
+}
+
+/// Whether Chrome's error says the authenticator no longer exists, rather than
+/// that this one call failed. These are Chrome's own messages, not page text.
+fn authenticator_gone(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}");
+    text.contains("Could not find a Virtual Authenticator")
+        || text.contains("Virtual Authenticator Environment has not been enabled")
+}
+
 /// Whether the tab is hidden behind another one. Unknown counts as no, since
 /// the note is advice and the authenticator works either way.
 async fn is_background_tab(client: &mut CdpClient, session_id: &str) -> bool {
@@ -286,7 +305,14 @@ pub async fn configure_webauthn(
 
     let current = client.webauthn.clone();
     let next = resolve_options(&params, current.as_ref().map(|c| &c.options));
+    // Checked on the merged options, before anything is removed: a flag can
+    // combine with the current authenticator into a pair Chrome refuses, and
+    // replacing would already have deleted the old one and its credentials.
+    check_supported(&next)?;
     let plan = plan(current.as_ref(), &next);
+    // Adding or replacing can leave the tab with no authenticator when it
+    // fails; anything else leaves the current one as it was.
+    let creates = matches!(plan, Plan::Add | Plan::Replace(_));
 
     if matches!(plan, Plan::Add | Plan::Replace(_))
         && client.persistent_session.as_deref() != Some(session_id)
@@ -338,8 +364,12 @@ pub async fn configure_webauthn(
     let (id, action) = match applied {
         Ok(v) => v,
         Err(e) => {
-            // Start from scratch next time rather than reuse an id that may be stale.
-            client.webauthn = None;
+            // Start from scratch next time rather than reuse an id that may be
+            // stale. An interrupted update (a dialog, say) keeps the
+            // authenticator and its credentials, so a retry updates it again.
+            if creates || authenticator_gone(&e) {
+                client.webauthn = None;
+            }
             return Err(e.context("Failed to configure the virtual authenticator"));
         }
     };
@@ -357,14 +387,16 @@ pub async fn configure_webauthn(
         .await
     {
         Ok(v) => v["credentials"].as_array().cloned().unwrap_or_default(),
-        Err(e) => {
-            // The authenticator is gone (the tab crashed, or another client
-            // disabled the environment), so forget it.
+        Err(e) if authenticator_gone(&e) => {
+            // The tab crashed, or another client disabled the environment.
             client.webauthn = None;
             return Err(e).context(
                 "The virtual authenticator is gone; run configure-webauthn again to add one",
             );
         }
+        // Anything else (a dialog, a slow page) leaves the authenticator and
+        // its credentials in place; listing them can simply be retried.
+        Err(e) => return Err(e).context("Failed to read the virtual authenticator's credentials"),
     };
 
     let background_tab = is_background_tab(client, session_id).await;
@@ -455,6 +487,43 @@ mod tests {
             plan(Some(&added(ctap2())), &usb),
             Plan::Replace("a1".into())
         );
+    }
+
+    /// `--protocol u2f` on a ctap2/hybrid authenticator inherits hybrid,
+    /// which Chrome refuses; that must be caught before the old one is removed.
+    #[test]
+    fn merged_options_chrome_refuses_are_caught() {
+        let current = resolve_options(
+            &WebAuthnParams {
+                transport: Some("hybrid".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(check_supported(&current).is_ok());
+        let switched = resolve_options(
+            &WebAuthnParams {
+                protocol: Some("u2f".into()),
+                ..Default::default()
+            },
+            Some(&current),
+        );
+        assert!(check_supported(&switched).is_err());
+        let to_usb = resolve_options(
+            &WebAuthnParams {
+                protocol: Some("u2f".into()),
+                transport: Some("usb".into()),
+                ..Default::default()
+            },
+            Some(&current),
+        );
+        assert!(check_supported(&to_usb).is_ok());
+
+        let gone = anyhow::anyhow!("CDP error in WebAuthn.getCredentials: Could not find a Virtual Authenticator matching the ID");
+        assert!(authenticator_gone(&gone));
+        assert!(!authenticator_gone(&anyhow::anyhow!(
+            "A javascript dialog is open"
+        )));
     }
 
     #[test]
