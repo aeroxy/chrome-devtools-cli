@@ -138,7 +138,7 @@ chrome-devtools --page 0 navigate https://example.com
 - **Extraction**: `screenshot`, `snapshot` (accessibility tree), `evaluate` (JavaScript), `read-page` (page content as markdown), `run-script` (run local JS file), `adapter` (run site adapter)
 - **Interaction**: `click`, `fill`, `type-text`, `press-key`, `hover`, `click-at`
 - **Emulation**: `emulate` (viewport, mobile, geolocation, CSS media type/features such as dark mode, URL blocking)
-- **Inspection**: `console` (logs), `network` (requests), `sw-logs` (extension service workers), `css-styles` (the CSS cascade for one element)
+- **Inspection**: `console` (logs), `network` (requests), `cookies` (what the page would send, HttpOnly included), `sw-logs` (extension service workers), `css-styles` (the CSS cascade for one element)
 - **Passkeys**: `configure-webauthn` (virtual WebAuthn authenticator)
 - **Third-party tools**: `list-3p-tools`, `execute-3p-tool` (WebMCP tools from `document.modelContext`, else the legacy `window.__dtmcp`)
 - **Synchronization**: `wait-for` (wait for text on page)
@@ -833,17 +833,25 @@ chrome-devtools --target warm-squid remove-network-mock             # remove all
 For "logged out after reload", "redirected to the login page", or a request that fails with 401/403:
 
 ```bash
-# Cookies the page's JavaScript can see (cookieStore needs a secure origin;
-# fall back to document.cookie on http://)
-chrome-devtools --target warm-squid evaluate "cookieStore.getAll()"
-chrome-devtools --target warm-squid evaluate "document.cookie"
+# The cookies Chrome would send to the page's URL, HttpOnly and partitioned ones
+# included: names, domains, paths, expiry and flags, values hidden
+chrome-devtools --target warm-squid cookies
+chrome-devtools --target warm-squid cookies --url https://example.com/api/
+
+# With values, for a tool that needs the session (a tunnel client, curl):
+# one Cookie header, or every field as JSON
+chrome-devtools --target warm-squid cookies --header
+chrome-devtools --target warm-squid cookies --name sid --header
+chrome-devtools --target warm-squid --json cookies
 
 # Watch what the reload sends and gets back: redirect hops are listed with their 3xx status
 chrome-devtools --target warm-squid navigate --reload
 chrome-devtools --target warm-squid network --type Document --type Fetch --type XHR
 ```
 
-- **HttpOnly cookies are invisible to JavaScript**: missing from both reads above, and deleting them from JS fails silently. The session cookie is usually one of them.
+- **Use `cookies`, not `evaluate "document.cookie"`**: page JavaScript can't see HttpOnly cookies (the session cookie is usually one), and deleting them from JS fails silently. `cookies` reads them over the daemon's approved connection, so the browser asks for no new approval; don't open your own DevTools connection for them.
+- **Values are credentials.** The default table shows only their lengths. Print them (`--header`, `--json`) only when a tool needs them, and don't echo them back to the user or into files without a reason.
+- `cookies` answers for the page's own site. A partitioned cookie that a cross-site iframe on the page set isn't included.
 - Check each suspect cookie's `domain` and `path` (does it cover the failing URL?), `secure` (never sent over `http://`), `sameSite` (`Strict`/`Lax` cookies are not sent on many cross-site requests) and `expires`.
 - `network` shows URLs, methods and statuses, not headers, so it can't show `Set-Cookie` or why Chrome rejected a cookie. When that's the question, ask the human to look at the Application and Network panels in DevTools.
 - For a clean, logged-out session, use a throwaway profile (Pattern 16) rather than deleting the user's cookies.
@@ -870,6 +878,7 @@ chrome-devtools --target <name> snapshot
 chrome-devtools --target <name> read-page [--output <path>]
 chrome-devtools --target <name> evaluate "<js-expression>" [--dialog-action accept|dismiss|text]
 chrome-devtools --target <name> network [--duration <ms>] [--type <resource>]
+chrome-devtools --target <name> cookies [--url <url>]... [--name <name>]... [--header]   # values only with --header/--json
 chrome-devtools --target <name> console [--duration <ms>] [--type <level>]
 chrome-devtools --target <name> css-styles "<css-selector>" [--computed <prop>,...] [--ua-rules]
 chrome-devtools sw-logs [--duration <ms>] [--extension-id <id>]
