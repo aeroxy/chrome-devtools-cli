@@ -285,12 +285,15 @@ pub async fn configure_webauthn(
         let disabled = client
             .send_to_target(session_id, "WebAuthn.disable", json!({}))
             .await;
-        let had_one = client.webauthn.take().is_some();
         if let Err(e) = disabled {
-            if had_one {
+            // A failed removal (a dialog, a slow page) leaves the authenticator
+            // in place, so keep tracking it: forgetting it would make the next
+            // configure-webauthn add a second one instead of updating it.
+            if client.webauthn.is_some() && !authenticator_gone(&e) {
                 return Err(e.context("Failed to remove the virtual authenticator"));
             }
         }
+        let had_one = client.webauthn.take().is_some();
         return if format.is_text() {
             Ok(CommandResult::output(if had_one {
                 "Removed the virtual authenticator."
