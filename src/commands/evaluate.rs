@@ -22,6 +22,9 @@ pub async fn evaluate(
     // `Page.javascriptDialogOpening` events that occur.
 
     let initial_url = if track_navigation {
+        // run-script's auto-navigation leaves its own navigation events
+        // buffered, and the wait below would take them for this expression's.
+        client.clear_events();
         Some(client.current_url(session_id).await?)
     } else {
         None

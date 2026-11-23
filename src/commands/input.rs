@@ -97,30 +97,24 @@ pub async fn click(
     selector: &str,
 ) -> Result<CommandResult> {
     let initial_url = client.current_url(session_id).await?;
-    // Special handling for native <option> elements which don't always respond to mouse clicks
+    // Native <option> elements don't always respond to mouse clicks, so an
+    // option is selected from script instead. This check changes nothing: a
+    // dialog that blocks it was not opened by the click, so it must fail the
+    // command rather than count as one.
     let escaped = serde_json::to_string(selector)?;
     let check_expr = format!(
         r#"(() => {{
             const el = document.querySelector({escaped});
             if (!el) return 'not_found';
-            if (el.tagName.toLowerCase() === 'option') {{
-                if (el.disabled) return 'option_disabled';
-                const select = el.closest('select');
-                if (!select) return 'option_no_select';
-                if (select.disabled) return 'select_disabled';
-                if (select.multiple) return 'select_multiple';
-
-                select.value = el.value;
-                select.dispatchEvent(new Event('input', {{bubbles: true}}));
-                select.dispatchEvent(new Event('change', {{bubbles: true}}));
-                return 'selected';
-            }}
-            return 'not_option';
+            if (el.tagName.toLowerCase() !== 'option') return 'not_option';
+            if (el.disabled) return 'option_disabled';
+            const select = el.closest('select');
+            if (!select) return 'option_no_select';
+            if (select.disabled) return 'select_disabled';
+            if (select.multiple) return 'select_multiple';
+            return 'option';
         }})()"#
     );
-
-    // For an <option> this evaluate is the click: it selects and fires change.
-    client.input_sent = true;
     let result = client
         .send_to_target(
             session_id,
@@ -137,7 +131,30 @@ pub async fn click(
     let res_val = result["result"]["value"].as_str().unwrap_or("error");
     match res_val {
         "not_found" => bail!("Element not found: {selector}"),
-        "selected" => {
+        "option" => {
+            // This evaluate is the click: a dialog from the change handler
+            // means it worked.
+            client.input_sent = true;
+            let select_expr = format!(
+                r#"(() => {{
+                    const el = document.querySelector({escaped});
+                    const select = el.closest('select');
+                    select.value = el.value;
+                    select.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    select.dispatchEvent(new Event('change', {{bubbles: true}}));
+                }})()"#
+            );
+            let result = client
+                .send_to_target(
+                    session_id,
+                    "Runtime.evaluate",
+                    json!({"expression": select_expr}),
+                )
+                .await?;
+            if let Some(exception) = result.get("exceptionDetails") {
+                let desc = crate::remote_object::describe_exception(exception);
+                bail!("JavaScript error while selecting the option: {desc}");
+            }
             let new_url = client.current_url(session_id).await?;
             Ok(CommandResult::output(format!("Selected option: {selector}"))
                 .with_navigated_to_if_changed(new_url, initial_url))
@@ -821,6 +838,13 @@ fn single_char_key(s: &str, shift: bool) -> Option<(String, String, i32)> {
         let key = if shift { upper } else { c };
         return Some((key.to_string(), format!("Key{upper}"), upper as i32));
     }
+    // Shift+1 types "!" on a US layout, and the page reads that as the key.
+    const UNSHIFTED: &str = "1234567890-=,./;'[]\\`";
+    const SHIFTED: &str = "!@#$%^&*()_+<>?:\"{}|~";
+    let c = match UNSHIFTED.find(c) {
+        Some(i) if shift => SHIFTED.as_bytes()[i] as char,
+        _ => c,
+    };
     if c.is_ascii_digit() {
         return Some((c.to_string(), format!("Digit{c}"), c as i32));
     }
@@ -923,6 +947,29 @@ mod tests {
             ("Digit1", Some("!"))
         );
         assert_eq!(parse_key_spec("(").unwrap().key_code, 57);
+
+        let shift_1 = parse_key_spec("Shift+1").unwrap();
+        assert_eq!(
+            (
+                shift_1.key.as_str(),
+                shift_1.code.as_str(),
+                shift_1.key_code,
+                shift_1.text.as_deref(),
+                shift_1.modifiers
+            ),
+            ("!", "Digit1", 49, Some("!"), SHIFT)
+        );
+        let shift_slash = parse_key_spec("Shift+/").unwrap();
+        assert_eq!(
+            (
+                shift_slash.key.as_str(),
+                shift_slash.code.as_str(),
+                shift_slash.text.as_deref()
+            ),
+            ("?", "Slash", Some("?"))
+        );
+        assert_eq!(parse_key_spec("Shift+!").unwrap().key, "!");
+        assert_eq!(parse_key_spec("Ctrl+Shift+=").unwrap().key, "+");
     }
 
     #[test]

@@ -145,10 +145,13 @@ fn split_array_description(description: &str) -> (&str, usize) {
     let Some(open) = description.rfind(['(', '[']) else {
         return (description, 0);
     };
-    let digits = &description[open + 1..description.len().saturating_sub(1)];
+    // The page names the class, so the text after the bracket can be anything.
+    let Some(digits) = description[open + 1..].strip_suffix([')', ']']) else {
+        return (description, 0);
+    };
     match digits.parse() {
-        Ok(n) if description.ends_with([')', ']']) => (&description[..open], n),
-        _ => (description, 0),
+        Ok(n) => (&description[..open], n),
+        Err(_) => (description, 0),
     }
 }
 
@@ -359,6 +362,15 @@ mod tests {
         let out = describe(&json!({"type": "function", "description": src}));
         assert_eq!(out.chars().count(), MAX_DESCRIPTION_LENGTH + 1);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn array_descriptions_split_without_panicking() {
+        assert_eq!(split_array_description("Array(3)"), ("Array", 3));
+        assert_eq!(split_array_description("Uint8Array(2)"), ("Uint8Array", 2));
+        for odd in ["x(", "é(é", "(", "Array(x)", "Foo"] {
+            assert_eq!(split_array_description(odd), (odd, 0));
+        }
     }
 
     /// `throw 'boom'` used to read as a bare "Uncaught".
