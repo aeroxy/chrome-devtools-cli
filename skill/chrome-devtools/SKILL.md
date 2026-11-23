@@ -314,6 +314,9 @@ chrome-devtools --target warm-squid console --type error --type warning
 # Image, Font, XHR, Fetch, Manifest, Media, Other
 chrome-devtools --target warm-squid network --type Fetch --type XHR
 
+# Headers: what each request was sent with (> lines) and what came back (< lines)
+chrome-devtools --target warm-squid network --type Fetch --request-headers --response-headers
+
 # Live monitoring: blocks for N milliseconds, collecting events during that window
 chrome-devtools --target warm-squid console --duration 5000
 chrome-devtools --target warm-squid network --duration 3000
@@ -323,6 +326,8 @@ chrome-devtools --target warm-squid console --duration 0
 ```
 
 **Valid `--type` values for `network`** (any case): `Document`, `Script`, `Stylesheet`, `Image`, `Media`, `Font`, `Manifest`, `XHR`, `Fetch`, `Other`. WebSocket connections are not listed by `network`.
+
+**Headers** (`--request-headers`, `--response-headers`) are what went over the wire when Chrome reports that, so `Cookie` and `Set-Cookie` are included; for a response from the cache or a service worker you get the page's view, which leaves those two out. Each redirect hop shows its own, so a login's 302 shows the `Set-Cookie` it answered with. A header sent more than once prints one line per value. They can carry credentials (`Cookie`, `Authorization`, `Set-Cookie`): ask for them only when you need them.
 
 ### Pattern 6: JavaScript Evaluation
 
@@ -844,16 +849,18 @@ chrome-devtools --target warm-squid cookies --header
 chrome-devtools --target warm-squid cookies --name sid --header
 chrome-devtools --target warm-squid --json cookies
 
-# Watch what the reload sends and gets back: redirect hops are listed with their 3xx status
+# Watch what the reload sends and gets back: redirect hops are listed with their 3xx
+# status, and the header flags show the Cookie each request carried and the
+# Set-Cookie each response answered with
 chrome-devtools --target warm-squid navigate --reload
-chrome-devtools --target warm-squid network --type Document --type Fetch --type XHR
+chrome-devtools --target warm-squid network --type Document --type Fetch --type XHR --request-headers --response-headers
 ```
 
 - **Use `cookies`, not `evaluate "document.cookie"`**: page JavaScript can't see HttpOnly cookies (the session cookie is usually one), and deleting them from JS fails silently. `cookies` reads them over the daemon's approved connection, so the browser asks for no new approval; don't open your own DevTools connection for them.
 - **Values are credentials.** The default table shows only their lengths. Print them (`--header`, `--json`) only when a tool needs them, and don't echo them back to the user or into files without a reason.
 - `cookies` answers for the page's own site. A partitioned cookie that a cross-site iframe on the page set isn't included.
 - Check each suspect cookie's `domain` and `path` (does it cover the failing URL?), `secure` (never sent over `http://`), `sameSite` (`Strict`/`Lax` cookies are not sent on many cross-site requests) and `expires`.
-- `network` shows URLs, methods and statuses, not headers, so it can't show `Set-Cookie` or why Chrome rejected a cookie. When that's the question, ask the human to look at the Application and Network panels in DevTools.
+- `network --request-headers --response-headers` shows which cookies a request actually carried and which `Set-Cookie` headers came back, but not why Chrome rejected a cookie. When that's the question, ask the human to look at the Application and Network panels in DevTools.
 - For a clean, logged-out session, use a throwaway profile (Pattern 16) rather than deleting the user's cookies.
 
 ## Complete Command Reference
@@ -877,7 +884,7 @@ chrome-devtools --target <name> screenshot [--output <path>] [--full-page]
 chrome-devtools --target <name> snapshot
 chrome-devtools --target <name> read-page [--output <path>]
 chrome-devtools --target <name> evaluate "<js-expression>" [--dialog-action accept|dismiss|text]
-chrome-devtools --target <name> network [--duration <ms>] [--type <resource>]
+chrome-devtools --target <name> network [--duration <ms>] [--type <resource>] [--request-headers] [--response-headers]
 chrome-devtools --target <name> cookies [--url <url>]... [--name <name>]... [--header]   # values only with --header/--json
 chrome-devtools --target <name> console [--duration <ms>] [--type <level>]
 chrome-devtools --target <name> css-styles "<css-selector>" [--computed <prop>,...] [--ua-rules]

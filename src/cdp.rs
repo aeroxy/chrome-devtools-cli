@@ -791,7 +791,9 @@ impl CdpClient {
                 // Nothing reads it; buffering it only crowded requests out.
                 "Network.loadingFinished" => return,
                 "Network.requestWillBeSent"
+                | "Network.requestWillBeSentExtraInfo"
                 | "Network.responseReceived"
+                | "Network.responseReceivedExtraInfo"
                 | "Network.loadingFailed" => {
                     self.network_events.push_back(slim_network_event(event));
                     if self.network_events.len() > MAX_PERSISTENT_EVENTS {
@@ -1504,25 +1506,39 @@ impl CdpClient {
 /// whole file in one call, and the buffer holds thousands of events.
 const MAX_BUFFERED_STRING_CHARS: usize = 10_000;
 
-/// The fields `network` reads, and nothing else. Whole events carry headers,
-/// POST bodies and initiator stacks (kilobytes each), which made the event cap
-/// the only bound on the daemon's memory.
+/// The fields `network` reads, headers included so `--request-headers` and
+/// `--response-headers` can show requests made before the command. POST
+/// bodies, initiator stacks (up to hundreds of kilobytes each) and timing are
+/// dropped, or the event cap would be the only bound on the daemon's memory.
 fn slim_network_event(event: Value) -> Value {
     let p = &event["params"];
     let mut params = json!({"requestId": p["requestId"]});
     match event["method"].as_str() {
         Some("Network.requestWillBeSent") => {
+            let r = &p["request"];
             params["request"] =
-                json!({"url": p["request"]["url"], "method": p["request"]["method"]});
+                json!({"url": r["url"], "method": r["method"], "headers": r["headers"]});
             params["type"] = p["type"].clone();
             if let Some(r) = p.get("redirectResponse") {
-                params["redirectResponse"] =
-                    json!({"status": r["status"], "statusText": r["statusText"]});
+                params["redirectResponse"] = json!({
+                    "status": r["status"],
+                    "statusText": r["statusText"],
+                    "headers": r["headers"],
+                });
             }
         }
         Some("Network.responseReceived") => {
             let r = &p["response"];
-            params["response"] = json!({"status": r["status"], "statusText": r["statusText"]});
+            params["response"] = json!({
+                "status": r["status"],
+                "statusText": r["statusText"],
+                "headers": r["headers"],
+            });
+        }
+        // The headers as they went over the wire, Cookie and Set-Cookie
+        // included, which the page's view leaves out.
+        Some("Network.requestWillBeSentExtraInfo" | "Network.responseReceivedExtraInfo") => {
+            params["headers"] = p["headers"].clone();
         }
         Some("Network.loadingFailed") => params["errorText"] = p["errorText"].clone(),
         _ => return event,
@@ -1648,8 +1664,18 @@ mod tests {
             slim_network_event(request),
             json!({"method": "Network.requestWillBeSent", "sessionId": "S", "params": {
                 "requestId": "1", "type": "Fetch",
-                "request": {"url": "https://a.test/x", "method": "POST"},
-                "redirectResponse": {"status": 302, "statusText": "Found"},
+                "request": {"url": "https://a.test/x", "method": "POST", "headers": {"a": "b"}},
+                "redirectResponse": {"status": 302, "statusText": "Found", "headers": {"location": "/y"}},
+            }})
+        );
+        let wire = json!({"method": "Network.requestWillBeSentExtraInfo", "sessionId": "S", "params": {
+            "requestId": "1", "headers": {"cookie": "sid=1"},
+            "associatedCookies": [{"cookie": {"name": "sid"}, "blockedReasons": []}],
+        }});
+        assert_eq!(
+            slim_network_event(wire),
+            json!({"method": "Network.requestWillBeSentExtraInfo", "sessionId": "S", "params": {
+                "requestId": "1", "headers": {"cookie": "sid=1"},
             }})
         );
 

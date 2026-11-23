@@ -281,6 +281,7 @@ The daemon keeps a persistent CDP session on the active page that continuously c
 | `cookies --header` | The same cookies as one `Cookie` request header (`name=value; ...`), values included; `--json` / `--toon` print every field |
 | `network --type Fetch --type XHR` | Filter by resource type (`Document`, `Script`, `Stylesheet`, `Image`, `Font`, `XHR`, `Fetch`, `Manifest`, `Media`, `Other`) |
 | `network --duration 5000` | Live collection for 5 s |
+| `network --request-headers --response-headers` | Also show each request's headers (`>` lines) and each response's (`<` lines): what went over the wire, `Cookie` and `Set-Cookie` included, when Chrome reports it, else what the page sees; one set per redirect hop; `requestHeaders` / `responseHeaders` in `--json` |
 | `sw-logs [--duration 2000]` | Collect console logs from extension service workers (2 s default) |
 | `sw-logs --extension-id <id>` | Filter service-worker logs to one extension |
 

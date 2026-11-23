@@ -103,7 +103,7 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "list-3p-tools" => &[],
         "execute-3p-tool" => &["name", "params"],
         "console" => &["duration", "type"],
-        "network" => &["duration", "type"],
+        "network" => &["duration", "type", "request_headers", "response_headers"],
         "cookies" => &["urls", "names", "header"],
         "sw-logs" => &["duration", "extension_id"],
         "run-script" => &[
@@ -831,8 +831,20 @@ async fn inner_execute(
                         .collect()
                 })
                 .unwrap_or_default();
-            commands::network::collect_network(client, session_id, duration, types, req.format())
-                .await
+            let flag = |name: &str| args.get(name).and_then(|v| v.as_bool()).unwrap_or(false);
+            let headers = commands::network::Headers {
+                request: flag("request_headers"),
+                response: flag("response_headers"),
+            };
+            commands::network::collect_network(
+                client,
+                session_id,
+                duration,
+                types,
+                headers,
+                req.format(),
+            )
+            .await
         }
         "run-script" => {
             let a = script_exec_args(args)?;
