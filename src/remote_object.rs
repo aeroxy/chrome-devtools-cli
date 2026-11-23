@@ -152,8 +152,17 @@ fn split_array_description(description: &str) -> (&str, usize) {
     }
 }
 
+/// The array index a property name stands for, by JavaScript's rule: the
+/// canonical decimal form of an integer below 2³² − 1. `"01"` and `"+1"` are
+/// ordinary named properties.
+fn array_index(name: &str) -> Option<u32> {
+    name.parse::<u32>()
+        .ok()
+        .filter(|&i| i != u32::MAX && i.to_string() == name)
+}
+
 fn format_array_items(properties: &[Value]) -> Vec<String> {
-    let index_of = |p: &&Value| p["name"].as_str().and_then(|n| n.parse::<usize>().ok());
+    let index_of = |p: &&Value| p["name"].as_str().and_then(array_index);
     let mut indexed: Vec<&Value> = properties
         .iter()
         .filter(|p| index_of(p).is_some())
@@ -317,6 +326,21 @@ mod tests {
             {"name": "[[PromiseResult]]", "type": "number", "value": "5"},
         ]}});
         assert_eq!(describe(&promise), "Promise {<fulfilled>: 5}");
+    }
+
+    /// `a["01"] = 99` is a named property, not a third element.
+    #[test]
+    fn only_canonical_indexes_are_elements() {
+        let arr = json!({"type": "object", "subtype": "array", "description": "Array(2)",
+        "preview": {"type": "object", "subtype": "array", "description": "Array(2)", "overflow": false, "properties": [
+            {"name": "0", "type": "number", "value": "1"},
+            {"name": "1", "type": "number", "value": "2"},
+            {"name": "01", "type": "number", "value": "99"},
+        ]}});
+        assert_eq!(describe(&arr), "(2) [1, 2, 01: 99]");
+        assert_eq!(array_index("+1"), None);
+        assert_eq!(array_index("4294967295"), None);
+        assert_eq!(array_index("4294967294"), Some(4294967294));
     }
 
     #[test]

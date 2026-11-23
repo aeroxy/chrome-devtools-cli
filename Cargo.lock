@@ -259,6 +259,7 @@ dependencies = [
  "futures-util",
  "htmd",
  "html-escape",
+ "http",
  "libc",
  "rustls",
  "serde",

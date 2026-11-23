@@ -182,6 +182,9 @@ struct Decl {
     /// The longhands this declaration sets (just its name for a longhand).
     #[serde(skip)]
     longhands: Vec<String>,
+    /// A shorthand CDP lists without its longhands (one using `var()`).
+    #[serde(skip)]
+    unexpanded: bool,
 }
 
 impl Decl {
@@ -225,6 +228,9 @@ struct Block {
     /// Enclosing at-rules and nesting parents, outermost first.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     conditions: Vec<String>,
+    /// The cascade layer the rule is in (see `layer_key`), empty for none.
+    #[serde(skip)]
+    layer: String,
     #[serde(rename = "properties")]
     decls: Vec<Decl>,
 }
@@ -237,20 +243,24 @@ struct InheritedView {
 
 /// What the page says about the element and its ancestors, which CDP's style
 /// calls don't: a readable label for each, the custom property values an
-/// ancestor's `var()` references resolve to there, and the element's computed
-/// shorthands (CDP's computed style lists longhands only).
+/// ancestor's `var()` references resolve to there, the element's computed
+/// shorthands (CDP's computed style lists longhands only), and the longhands
+/// of the shorthands CDP didn't expand.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct PageInfo {
     element: String,
     ancestors: Vec<AncestorInfo>,
     shorthands: HashMap<String, String>,
+    longhands: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct AncestorInfo {
     label: String,
+    /// The referenced custom properties the ancestor has, empty ones
+    /// included; one it doesn't have is left out.
     vars: HashMap<String, String>,
 }
 
@@ -278,14 +288,32 @@ fn level_styles(level: &Value) -> impl Iterator<Item = &Value> {
     )
 }
 
-fn is_inherited(name: &str, registrations: &[Value]) -> bool {
-    if name.starts_with("--") {
-        // Custom properties inherit unless an @property rule says otherwise.
-        return registrations
+/// Custom properties registered not to inherit. CDP lists the registration in
+/// effect for each name: a stylesheet `@property` rule in `cssPropertyRules`,
+/// or a `CSS.registerProperty` call in `cssPropertyRegistrations`.
+fn non_inheriting(matched: &Value) -> HashSet<String> {
+    let rules = items(&matched["cssPropertyRules"]).iter().filter_map(|r| {
+        let inherits = items(&r["style"]["cssProperties"])
             .iter()
-            .find(|r| r["propertyName"].as_str() == Some(name))
-            .and_then(|r| r["inherits"].as_bool())
-            .unwrap_or(true);
+            .find(|p| p["name"] == "inherits")?;
+        // The authored text keeps its case (`inherits: FALSE`).
+        let off = inherits["value"]
+            .as_str()?
+            .trim()
+            .eq_ignore_ascii_case("false");
+        r["propertyName"]["text"].as_str().filter(|_| off)
+    });
+    let scripts = items(&matched["cssPropertyRegistrations"])
+        .iter()
+        .filter(|r| r["inherits"] == false)
+        .filter_map(|r| r["propertyName"].as_str());
+    rules.chain(scripts).map(String::from).collect()
+}
+
+fn is_inherited(name: &str, non_inheriting: &HashSet<String>) -> bool {
+    if name.starts_with("--") {
+        // Custom properties inherit unless registered otherwise.
+        return !non_inheriting.contains(name);
     }
     INHERITED.contains(&name)
 }
@@ -305,10 +333,13 @@ fn strip_important(value: &str) -> &str {
 /// An authored style lists its declarations (those with a source range) and
 /// then every longhand they expand to. A shorthand names its longhands in
 /// `longhandProperties`, except when it uses `var()`: Chrome can't expand it
-/// before substitution, so it takes the unclaimed trailing longhands named
-/// after it (`padding` takes `padding-top`, ...). User-agent and attribute
-/// styles have no ranges and list longhands only.
-fn declarations(style: &Value) -> Vec<Decl> {
+/// before substitution. Then the page's expansion in `expanded` says what it
+/// sets, since the longhands needn't be named after it (`border-color` sets
+/// `border-top-color`, `font` sets `line-height`). Without one, it takes the
+/// unclaimed trailing longhands named after it (`padding` takes
+/// `padding-top`, ...). User-agent and attribute styles have no ranges and
+/// list longhands only.
+fn declarations(style: &Value, expanded: &HashMap<String, Vec<String>>) -> Vec<Decl> {
     let props: Vec<&Value> = style["cssProperties"]
         .as_array()
         .map(|a| a.iter().collect())
@@ -338,10 +369,15 @@ fn declarations(style: &Value) -> Vec<Decl> {
             }
         })
         .collect();
+    let unexpanded: Vec<bool> = longhands.iter().map(Option::is_none).collect();
     let claimed: HashSet<String> = longhands.iter().flatten().flatten().cloned().collect();
     for (p, slot) in authored.iter().zip(longhands.iter_mut()) {
         if slot.is_none() {
             let name = name_of(p);
+            if let Some(parts) = expanded.get(&name).filter(|parts| !parts.is_empty()) {
+                *slot = Some(parts.clone());
+                continue;
+            }
             let prefix = format!("{name}-");
             let found: Vec<String> = trailing_names
                 .iter()
@@ -355,7 +391,8 @@ fn declarations(style: &Value) -> Vec<Decl> {
     authored
         .iter()
         .zip(longhands)
-        .map(|(p, longhands)| {
+        .zip(unexpanded)
+        .map(|((p, longhands), unexpanded)| {
             let important = p["important"].as_bool().unwrap_or(false);
             let raw = p["value"].as_str().unwrap_or("");
             let status = if p["parsedOk"].as_bool() == Some(false) {
@@ -372,6 +409,7 @@ fn declarations(style: &Value) -> Vec<Decl> {
                 important,
                 status,
                 longhands: longhands.unwrap_or_default(),
+                unexpanded,
             }
         })
         .collect()
@@ -491,7 +529,29 @@ fn conditions(rule: &Value) -> Vec<String> {
     inner_first
 }
 
-fn rule_block(rule_match: &Value, sheets: &HashMap<String, Value>) -> Block {
+/// A key for a rule's cascade layer, the same for every rule in it: the
+/// dotted layer path (`@layer a.b` is `@layer a { @layer b }`), with an
+/// anonymous layer, which can't be reopened, named by where it starts. Empty
+/// for an unlayered rule.
+fn layer_key(rule: &Value) -> String {
+    items(&rule["layers"])
+        .iter()
+        .map(|l| match l["text"].as_str() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => format!(
+                "{}:{}:{}",
+                l["styleSheetId"], l["range"]["startLine"], l["range"]["startColumn"]
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn rule_block(
+    rule_match: &Value,
+    sheets: &HashMap<String, Value>,
+    expanded: &HashMap<String, Vec<String>>,
+) -> Block {
     let rule = &rule_match["rule"];
     let selectors = rule["selectorList"]["selectors"]
         .as_array()
@@ -520,17 +580,21 @@ fn rule_block(rule_match: &Value, sheets: &HashMap<String, Value>) -> Block {
         source: rule_source(rule, sheets),
         origin: rule["origin"].as_str().unwrap_or("regular").to_string(),
         conditions: conditions(rule),
-        decls: declarations(&rule["style"]),
+        layer: layer_key(rule),
+        decls: declarations(&rule["style"], expanded),
     }
 }
 
 /// A node's styles, highest precedence first: inline style, matched rules
-/// (CDP lists them lowest first), then presentational attributes.
+/// (CDP lists them lowest first), with presentational attributes below the
+/// author rules but above the user-agent ones, as the author origin's
+/// lowest-precedence rules.
 fn node_blocks(
     inline: &Value,
     rules: &Value,
     attributes: &Value,
     sheets: &HashMap<String, Value>,
+    expanded: &HashMap<String, Vec<String>>,
 ) -> Vec<Block> {
     let mut blocks = Vec::new();
     if inline.is_object() {
@@ -539,20 +603,29 @@ fn node_blocks(
             source: None,
             origin: "inline".into(),
             conditions: vec![],
-            decls: declarations(inline),
+            layer: String::new(),
+            decls: declarations(inline, expanded),
         });
     }
     if let Some(rules) = rules.as_array() {
-        blocks.extend(rules.iter().rev().map(|r| rule_block(r, sheets)));
+        blocks.extend(rules.iter().rev().map(|r| rule_block(r, sheets, expanded)));
     }
     if attributes.is_object() {
-        blocks.push(Block {
-            selector: "[attributes style]".into(),
-            source: None,
-            origin: "attributes".into(),
-            conditions: vec![],
-            decls: declarations(attributes),
-        });
+        let at = blocks
+            .iter()
+            .position(|b| b.origin == "user-agent")
+            .unwrap_or(blocks.len());
+        blocks.insert(
+            at,
+            Block {
+                selector: "[attributes style]".into(),
+                source: None,
+                origin: "attributes".into(),
+                conditions: vec![],
+                layer: String::new(),
+                decls: declarations(attributes, expanded),
+            },
+        );
     }
     blocks.retain(|b| !b.decls.is_empty());
     blocks
@@ -561,49 +634,86 @@ fn node_blocks(
 /// Run the cascade over one node's blocks, marking each declaration that wins
 /// at least one of its longhands active. `claimed` longhands are already
 /// decided (set on the element itself, or on a nearer ancestor) and nothing
-/// here wins them. Returns the longhands the blocks set.
+/// here wins them. Returns the longhands decided here. A winning `inherit`
+/// or `unset` decides none: the value comes from an ancestor's declaration,
+/// so that one still applies.
 ///
-/// `!important` beats normal, and among important declarations a user-agent
-/// one beats an author one. Cascade layers are not modelled.
+/// `!important` beats normal, and an important declaration is ranked by
+/// `important_order`.
 fn cascade(blocks: &mut [Block], claimed: &HashSet<String>) -> HashSet<String> {
     let mut won = HashSet::new();
-    let mut set_here = HashSet::new();
-    let ua_first: Vec<usize> = (0..blocks.len())
-        .filter(|&i| blocks[i].origin == "user-agent")
-        .chain((0..blocks.len()).filter(|&i| blocks[i].origin != "user-agent"))
-        .collect();
+    let mut decided = HashSet::new();
+    let ranked = important_order(blocks);
     let in_order: Vec<usize> = (0..blocks.len()).collect();
-    for (important, order) in [(true, &ua_first), (false, &in_order)] {
+    for (important, order) in [(true, &ranked), (false, &in_order)] {
         for &bi in order {
             // Within a block the last declaration wins.
             for d in blocks[bi].decls.iter_mut().rev() {
                 if d.important != important || !d.usable() {
                     continue;
                 }
+                let value = d.value.trim();
+                let from_parent =
+                    value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset");
                 for longhand in &d.longhands {
-                    set_here.insert(longhand.clone());
                     if !claimed.contains(longhand) && won.insert(longhand.clone()) {
                         d.status = Status::Active;
+                        if !from_parent {
+                            decided.insert(longhand.clone());
+                        }
                     }
                 }
             }
         }
     }
-    set_here
+    decided
 }
 
-/// Byte offset of the next `var(` that is a function call, not the end of a
-/// longer name such as `somevar(`.
+/// The blocks in the order their `!important` declarations take precedence.
+/// Importance reverses origins and cascade layers: a user-agent declaration
+/// beats an author one, a layered one beats an unlayered one, and an earlier
+/// layer beats a later one. The style attribute beats every rule either way.
+/// The blocks come in normal order, which CDP sorts by layer first, so each
+/// layer's rules are one run of them; reversing the runs keeps the order
+/// within a layer.
+fn important_order(blocks: &[Block]) -> Vec<usize> {
+    let of = |keep: fn(&str) -> bool| (0..blocks.len()).filter(move |&i| keep(&blocks[i].origin));
+    let rules: Vec<usize> = of(|o| o != "user-agent" && o != "inline").collect();
+    of(|o| o == "user-agent")
+        .chain(of(|o| o == "inline"))
+        .chain(
+            rules
+                .chunk_by(|&a, &b| blocks[a].layer == blocks[b].layer)
+                .rev()
+                .flatten()
+                .copied(),
+        )
+        .collect()
+}
+
+/// Byte offset of the next `var(` that is a function call: not the end of a
+/// longer name such as `somevar(`, and not text in a string such as
+/// `content: "var(--x)"`, which the browser shows as written.
 fn find_var(s: &str) -> Option<usize> {
-    let lower = s.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(i) = lower[from..].find("var(") {
-        let at = from + i;
-        let prev = lower[..at].chars().next_back();
-        if !prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-            return Some(at);
+    let bytes = s.as_bytes();
+    let mut quote = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let prev = i.checked_sub(1).map(|p| bytes[p]);
+        let call = bytes
+            .get(i..i + 4)
+            .is_some_and(|w| w.eq_ignore_ascii_case(b"var("))
+            && !prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
+        match (quote, bytes[i]) {
+            // An escaped character is never a quote or the start of `var(`.
+            (_, b'\\') => i += 1,
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, c @ (b'"' | b'\'')) => quote = Some(c),
+            (None, _) if call => return Some(i),
+            _ => {}
         }
-        from = at + 4;
+        i += 1;
     }
     None
 }
@@ -638,9 +748,11 @@ fn split_var(args: &str) -> Option<(&str, Option<&str>, usize)> {
     })
 }
 
-/// Replace every `var(--x, fallback)` in `value`. `None` when a reference has
-/// no value and no fallback, which makes the declaration invalid at
-/// computed-value time, so there is nothing to show.
+/// Replace every `var(--x, fallback)` in `value`. `lookup` is `None` for a
+/// custom property that isn't defined; an empty one (`--x: ;`) is defined,
+/// and its empty value replaces the reference rather than the fallback.
+/// `None` when a reference has no value and no fallback, which makes the
+/// declaration invalid at computed-value time, so there is nothing to show.
 fn substitute(
     value: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
@@ -655,7 +767,7 @@ fn substitute(
         out.push_str(&rest[..pos]);
         let args = &rest[pos + 4..];
         let (name, fallback, close) = split_var(args)?;
-        match lookup(name).filter(|v| !v.is_empty()) {
+        match lookup(name) {
             Some(v) => out.push_str(&v),
             None => out.push_str(&substitute(fallback?.trim(), lookup, depth + 1)?),
         }
@@ -695,13 +807,14 @@ fn var_names(value: &str, out: &mut Vec<String>) {
 /// The custom properties each ancestor's inheritable declarations reference,
 /// so the page can be asked for their values on that ancestor.
 fn ancestor_var_names(matched: &Value) -> Vec<Vec<String>> {
-    let registrations = items(&matched["cssPropertyRegistrations"]);
+    let non_inheriting = non_inheriting(matched);
+    let none = HashMap::new();
     items(&matched["inherited"])
         .iter()
         .map(|level| {
             let mut names = Vec::new();
-            for d in level_styles(level).flat_map(declarations) {
-                if is_inherited(&d.name, registrations) {
+            for d in level_styles(level).flat_map(|s| declarations(s, &none)) {
+                if is_inherited(&d.name, &non_inheriting) {
                     var_names(&d.value, &mut names);
                 }
             }
@@ -710,11 +823,30 @@ fn ancestor_var_names(matched: &Value) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// The shorthands the element's and its ancestors' styles declare that CDP
+/// didn't expand, so the page can say what they set.
+fn unexpanded_shorthands(matched: &Value) -> Vec<String> {
+    let none = HashMap::new();
+    let mut names: Vec<String> = Vec::new();
+    let levels = std::iter::once(matched).chain(items(&matched["inherited"]));
+    for d in levels
+        .flat_map(level_styles)
+        .flat_map(|s| declarations(s, &none))
+    {
+        if d.unexpanded && d.usable() && !names.contains(&d.name) {
+            names.push(d.name);
+        }
+    }
+    names
+}
+
 /// The blocks worth showing, with `var()` references resolved, noting what
-/// they declare. User-agent blocks are only counted unless asked for.
+/// they declare. User-agent blocks are only counted unless asked for. `vars`
+/// is `None` when the node's custom properties are unknown, and then nothing
+/// is resolved rather than guessed.
 fn shown_blocks(
     blocks: Vec<Block>,
-    vars: &HashMap<String, String>,
+    vars: Option<&HashMap<String, String>>,
     ua_rules: bool,
     hidden_ua: &mut usize,
     declared: &mut Declared,
@@ -732,7 +864,7 @@ fn shown_blocks(
             if d.usable() {
                 declared.add(d);
             }
-            d.resolved = resolve_vars(&d.value, vars);
+            d.resolved = vars.and_then(|vars| resolve_vars(&d.value, vars));
         }
         out.push(block);
     }
@@ -789,7 +921,9 @@ fn pick_computed(
             longhands.push(name.clone());
         } else if let Some(value) = shorthand(name) {
             push(name, value);
-        } else {
+        } else if !name.starts_with("--") {
+            // A custom property has no longhands: `--theme` is not the
+            // shorthand of `--theme-accent`.
             let prefix = format!("{name}-");
             longhands.extend(
                 computed
@@ -838,7 +972,7 @@ fn element_props_to_read(
     extra: &[String],
 ) -> Vec<String> {
     let listed: HashSet<&str> = computed.iter().map(|(n, _)| n.as_str()).collect();
-    let registrations = items(&matched["cssPropertyRegistrations"]);
+    let non_inheriting = non_inheriting(matched);
     let own = level_styles(matched).map(|style| (style, false));
     let inherited = items(&matched["inherited"])
         .iter()
@@ -850,10 +984,10 @@ fn element_props_to_read(
         }
     };
     for (style, ancestor) in own.chain(inherited) {
-        for d in declarations(style) {
+        for d in declarations(style, &HashMap::new()) {
             if !d.usable()
                 || d.name.starts_with("--")
-                || (ancestor && !is_inherited(&d.name, registrations))
+                || (ancestor && !is_inherited(&d.name, &non_inheriting))
             {
                 continue;
             }
@@ -885,12 +1019,12 @@ fn build_report(
     page: &PageInfo,
     opts: &CssOptions,
 ) -> Report {
-    let registrations = items(&matched["cssPropertyRegistrations"]);
+    let non_inheriting = non_inheriting(matched);
     let mut hidden_ua = 0;
     let mut declared = Declared::default();
 
     // The element's own styles. Custom properties resolve against the
-    // element's computed values.
+    // element's computed values, which list each defined one, empty or not.
     let element_vars: HashMap<String, String> = computed
         .iter()
         .filter(|(n, _)| n.starts_with("--"))
@@ -901,11 +1035,12 @@ fn build_report(
         &matched["matchedCSSRules"],
         &matched["attributesStyle"],
         sheets,
+        &page.longhands,
     );
     let mut claimed = cascade(&mut blocks, &HashSet::new());
     let rules = shown_blocks(
         blocks,
-        &element_vars,
+        Some(&element_vars),
         opts.ua_rules,
         &mut hidden_ua,
         &mut declared,
@@ -914,7 +1049,6 @@ fn build_report(
     // Ancestors, nearest first. Only inheritable declarations reach the
     // element, and only where neither it nor a nearer ancestor sets them.
     let mut inherited = Vec::new();
-    let no_vars = HashMap::new();
     for (i, level) in items(&matched["inherited"]).iter().enumerate() {
         let info = page.ancestors.get(i);
         let mut blocks = node_blocks(
@@ -922,15 +1056,18 @@ fn build_report(
             &level["matchedCSSRules"],
             &Value::Null,
             sheets,
+            &page.longhands,
         );
         for block in &mut blocks {
-            block.decls.retain(|d| is_inherited(&d.name, registrations));
+            block
+                .decls
+                .retain(|d| is_inherited(&d.name, &non_inheriting));
         }
         let set_here = cascade(&mut blocks, &claimed);
         claimed.extend(set_here);
         let rules = shown_blocks(
             blocks,
-            info.map_or(&no_vars, |a| &a.vars),
+            info.map(|a| &a.vars),
             opts.ua_rules,
             &mut hidden_ua,
             &mut declared,
@@ -1041,9 +1178,10 @@ fn report_json(report: &Report) -> Result<Value> {
 
 /// Labels the element and its ancestors (flat-tree parents, as CDP walks them
 /// for inherited styles), reads on each ancestor the custom properties its
-/// declarations reference, and reads the element's computed `props`. Runs
-/// with `this` bound to the element.
-const PAGE_INFO_JS: &str = r#"function (varNames, props) {
+/// declarations reference, reads the element's computed `props`, and expands
+/// the shorthands in `expand` into their longhands. Runs with `this` bound to
+/// the element.
+const PAGE_INFO_JS: &str = r#"function (varNames, props, expand) {
   const label = (el) => {
     let s = el.localName;
     if (el.id) s += '#' + el.id;
@@ -1055,14 +1193,29 @@ const PAGE_INFO_JS: &str = r#"function (varNames, props) {
   const own = getComputedStyle(this);
   const shorthands = {};
   for (const p of props) shorthands[p] = own.getPropertyValue(p).trim();
-  const out = { element: label(this), ancestors: [], shorthands };
+  // A shorthand set on a scratch style lists the longhands it sets. The
+  // HTML namespace gives the element a style in any document.
+  const scratch = document.createElementNS('http://www.w3.org/1999/xhtml', 'div').style;
+  const longhands = {};
+  for (const p of expand) {
+    scratch.cssText = '';
+    scratch.setProperty(p, 'initial');
+    longhands[p] = [...scratch];
+  }
+  const out = { element: label(this), ancestors: [], shorthands, longhands };
   let el = this;
   for (const names of varNames) {
     el = parent(el);
     if (!el) break;
     const cs = getComputedStyle(el);
     const vars = {};
-    for (const n of names) vars[n] = cs.getPropertyValue(n).trim();
+    let defined;
+    for (const n of names) {
+      const v = cs.getPropertyValue(n).trim();
+      // '' is both an empty value and no value. Only a defined custom
+      // property is among the computed style's names.
+      if (v || (defined = defined || new Set(cs)).has(n)) vars[n] = v;
+    }
     out.ancestors.push({ label: label(el), vars });
   }
   return out;
@@ -1074,6 +1227,7 @@ async fn page_info(
     node_id: i64,
     var_names: &[Vec<String>],
     props: &[String],
+    expand: &[String],
 ) -> Result<PageInfo> {
     let resolved = client
         .send_to_target(
@@ -1093,7 +1247,7 @@ async fn page_info(
             json!({
                 "objectId": object_id,
                 "functionDeclaration": PAGE_INFO_JS,
-                "arguments": [{"value": var_names}, {"value": props}],
+                "arguments": [{"value": var_names}, {"value": props}, {"value": expand}],
                 "returnByValue": true,
             }),
         )
@@ -1198,11 +1352,13 @@ async fn collect(
         .unwrap_or_default();
 
     // What the page adds is a nicety: without it the output says
-    // "ancestor N", leaves ancestor var() references unresolved, and lists
-    // shorthands' computed longhands one by one.
+    // "ancestor N", leaves ancestor var() references unresolved, lists
+    // shorthands' computed longhands one by one, and guesses what a var()
+    // shorthand sets from its longhands' names.
     let names = ancestor_var_names(&matched);
     let props = element_props_to_read(&matched, &computed, &opts.computed);
-    let page = page_info(client, session_id, node_id, &names, &props)
+    let expand = unexpanded_shorthands(&matched);
+    let page = page_info(client, session_id, node_id, &names, &props, &expand)
         .await
         .unwrap_or_else(|_| PageInfo {
             element: selector.to_string(),
@@ -1315,6 +1471,7 @@ mod tests {
                 vars: HashMap::from([("--fg".to_string(), "#222".to_string())]),
             }],
             shorthands: HashMap::from([("padding".to_string(), "8px".to_string())]),
+            longhands: HashMap::new(),
         }
     }
 
@@ -1381,8 +1538,21 @@ mod tests {
             source: None,
             origin: "regular".into(),
             conditions: vec![],
-            decls: declarations(style),
+            layer: String::new(),
+            decls: declarations(style, &HashMap::new()),
         }
+    }
+
+    /// A rule in the cascade layer `layer` (`""` for an anonymous one, at
+    /// `line`).
+    fn layered(selector: &str, line: u64, layer: &str, style: Value) -> Value {
+        let mut r = rule(selector, line, style);
+        r["rule"]["layers"] = json!([{"text": layer, "styleSheetId": "s1", "range": range(line)}]);
+        r
+    }
+
+    fn statuses(block: &Block) -> Vec<Status> {
+        block.decls.iter().map(|d| d.status).collect()
     }
 
     #[test]
@@ -1490,7 +1660,7 @@ Inherited from body:
         let mut style = authored(&[("colr", "red"), ("color", "red")], &[("color", "red")]);
         style["cssProperties"][0]["parsedOk"] = json!(false);
         style["cssProperties"][1]["disabled"] = json!(true);
-        let decls = declarations(&style);
+        let decls = declarations(&style, &HashMap::new());
         assert_eq!(decls[0].status, Status::Invalid);
         assert_eq!(decls[1].status, Status::Disabled);
     }
@@ -1545,13 +1715,40 @@ Inherited from body:
         assert_eq!(ancestor_var_names(&m), vec![vec!["--fg".to_string()]]);
     }
 
+    /// A stylesheet `@property` rule and a `CSS.registerProperty` call can
+    /// each stop a custom property inheriting; an unregistered one inherits.
     #[test]
     fn registered_custom_property_can_opt_out_of_inheritance() {
-        let regs = vec![json!({"propertyName": "--x", "inherits": false})];
-        assert!(!is_inherited("--x", &regs));
-        assert!(is_inherited("--y", &regs));
-        assert!(is_inherited("color", &regs));
-        assert!(!is_inherited("margin", &regs));
+        let inherits = |v: &str| json!({"cssProperties": [{"name": "inherits", "value": v}]});
+        let regs = json!({
+            "cssPropertyRules": [
+                {"propertyName": {"text": "--rule"}, "style": inherits("FALSE")},
+                {"propertyName": {"text": "--on"}, "style": inherits("true")},
+            ],
+            "cssPropertyRegistrations": [{"propertyName": "--script", "inherits": false}],
+        });
+        let off = non_inheriting(&regs);
+        assert!(!is_inherited("--rule", &off));
+        assert!(!is_inherited("--script", &off));
+        assert!(is_inherited("--on", &off));
+        assert!(is_inherited("--y", &off));
+        assert!(is_inherited("color", &off));
+        assert!(!is_inherited("margin", &off));
+
+        // The body's `--rule` stays on the body: the report leaves it out,
+        // and the page isn't asked about what it references.
+        let mut m = matched();
+        m["cssPropertyRules"] = regs["cssPropertyRules"].clone();
+        let decls = [("--rule", "var(--a)"), ("--free", "var(--b)")];
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(&decls, &decls);
+        assert_eq!(ancestor_var_names(&m), vec![vec!["--b".to_string()]]);
+        let report = report_for(&m, CssOptions::default());
+        let body: Vec<&str> = report.inherited[0].rules[0]
+            .decls
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(body, ["--free"]);
     }
 
     #[test]
@@ -1601,7 +1798,10 @@ Inherited from body:
             },
             "matchingSelectors": [1],
         });
-        assert_eq!(rule_block(&m, &HashMap::new()).selector, ".btn");
+        assert_eq!(
+            rule_block(&m, &HashMap::new(), &HashMap::new()).selector,
+            ".btn"
+        );
     }
 
     #[test]
@@ -1765,6 +1965,7 @@ Inherited from body:
             source: Some("page.html:12".into()),
             origin: "regular".into(),
             conditions: vec!["@media (prefers-color-scheme: dark)".into()],
+            layer: String::new(),
             decls: vec![Decl {
                 name: "background".into(),
                 value: "rgb(17, 17, 17)".into(),
@@ -1772,6 +1973,7 @@ Inherited from body:
                 important: false,
                 status: Status::Active,
                 longhands: vec!["background".into()],
+                unexpanded: false,
             }],
         };
         let mut out = String::new();
@@ -1780,5 +1982,251 @@ Inherited from body:
             out,
             "  @media (prefers-color-scheme: dark) {\n    body (page.html:12) {\n      background: rgb(17, 17, 17); /* a *\\/ b */\n    }\n  }\n"
         );
+    }
+
+    /// CDP can't say that `border-color: var(--c)` sets `border-top-color`,
+    /// so the page expands it, and it then overrides a lower rule's
+    /// `border-top-color`. The ancestors' var() shorthands are expanded too.
+    #[test]
+    fn page_expansion_gives_var_shorthands_their_longhands() {
+        let low = [("border-top-color", "red")];
+        let high = [("border-color", "var(--c)")];
+        let high_longhands = [("border-top-color", ""), ("border-left-color", "")];
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([
+            rule(".low", 3, authored(&low, &low)),
+            rule(".high", 4, authored(&high, &high_longhands)),
+        ]);
+        let font = [("font", "var(--f)")];
+        let font_longhands = [("font-size", ""), ("line-height", "")];
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(&font, &font_longhands);
+        assert_eq!(unexpanded_shorthands(&m), ["border-color", "font"]);
+
+        // Without the page, `border-color` is only its own name.
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(report.rules[2].selector, ".low");
+        assert_eq!(report.rules[2].decls[0].status, Status::Active);
+
+        let mut info = page();
+        let sides = ["top", "right", "bottom", "left"].map(|s| format!("border-{s}-color"));
+        info.longhands = HashMap::from([("border-color".to_string(), sides.to_vec())]);
+        let report = build_report(&m, &computed(), &sheets(), &info, &CssOptions::default());
+        assert_eq!(report.rules[1].decls[0].status, Status::Active);
+        assert_eq!(report.rules[2].decls[0].status, Status::Overridden);
+    }
+
+    /// Importance reverses cascade layers: layer `one`'s important color
+    /// beats layer `two`'s and the unlayered one, while the unlayered rule
+    /// still wins the normal background. The style attribute stays on top.
+    #[test]
+    fn important_declarations_reverse_the_layer_order() {
+        use Status::{Active, Overridden};
+        let style = |color: &str| {
+            let important = format!("{color} !important");
+            let decls = [("color", important.as_str()), ("background-color", color)];
+            authored(&decls, &decls)
+        };
+        let mut m = matched();
+        m["inlineStyle"] = Value::Null;
+        // CDP lists rules lowest precedence first, layer by layer.
+        m["matchedCSSRules"] = json!([
+            layered(".a", 3, "one", style("red")),
+            layered(".a", 4, "two", style("green")),
+            rule(".a", 5, style("blue")),
+        ]);
+        let report = report_for(&m, CssOptions::default());
+        let all: Vec<Vec<Status>> = report.rules.iter().map(statuses).collect();
+        assert_eq!(
+            all,
+            [
+                vec![Overridden, Active],
+                vec![Overridden, Overridden],
+                vec![Active, Overridden],
+            ]
+        );
+
+        // Anonymous layers are told apart by where they start.
+        m["matchedCSSRules"] = json!([
+            layered(".a", 3, "", style("red")),
+            layered(".a", 4, "", style("green")),
+        ]);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(statuses(&report.rules[1]), [Active, Overridden]);
+
+        m["inlineStyle"] = authored(
+            &[("color", "purple !important")],
+            &[("color", "purple !important")],
+        );
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(statuses(&report.rules[0]), [Active]);
+        assert_eq!(report.rules[2].decls[0].status, Overridden);
+
+        let path = |layers: Value| layer_key(&json!({ "layers": layers }));
+        assert_eq!(
+            path(json!([{"text": "a"}, {"text": "b"}])),
+            path(json!([{"text": "a.b"}]))
+        );
+    }
+
+    /// A winning `color: inherit` takes the parent's color, so the parent's
+    /// declaration applies, and through `unset` the grandparent's; a
+    /// concrete value on the element still blocks them.
+    #[test]
+    fn inherit_leaves_the_property_to_the_ancestors() {
+        let mut m = matched();
+        // The user-agent rule and `.btn`, without `.btn.primary`'s
+        // important white.
+        m["matchedCSSRules"].as_array_mut().unwrap().truncate(2);
+        m["inlineStyle"] = authored(&[("color", "inherit")], &[("color", "inherit")]);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(report.rules[0].decls[0].status, Status::Active);
+        assert_eq!(report.rules[1].decls[0].status, Status::Overridden);
+        assert_eq!(report.inherited[0].rules[0].decls[0].status, Status::Active);
+
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] =
+            authored(&[("color", "unset")], &[("color", "unset")]);
+        let html = rule(
+            "html",
+            1,
+            authored(&[("color", "red")], &[("color", "red")]),
+        );
+        m["inherited"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "matchedCSSRules": [html] }));
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(report.inherited[0].rules[0].decls[0].status, Status::Active);
+        assert_eq!(report.inherited[1].rules[0].decls[0].status, Status::Active);
+
+        m["inlineStyle"] = authored(&[("color", "blue")], &[("color", "blue")]);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(
+            report.inherited[0].rules[0].decls[0].status,
+            Status::Overridden
+        );
+        assert_eq!(
+            report.inherited[1].rules[0].decls[0].status,
+            Status::Overridden
+        );
+    }
+
+    /// `<table cellspacing>` beats the user-agent stylesheet's spacing, and
+    /// an author rule beats it.
+    #[test]
+    fn attribute_style_ranks_between_author_and_user_agent_rules() {
+        let spacing = |h: &str, v: &str| {
+            json!({"cssProperties": [
+                {"name": "-webkit-border-horizontal-spacing", "value": h},
+                {"name": "-webkit-border-vertical-spacing", "value": v},
+            ]})
+        };
+        let ua = json!({
+            "rule": {
+                "origin": "user-agent",
+                "selectorList": {"text": "table", "selectors": [{"text": "table"}]},
+                "style": spacing("2px", "2px"),
+            },
+            "matchingSelectors": [0],
+        });
+        let author = rule(
+            "table",
+            3,
+            authored(
+                &[("-webkit-border-horizontal-spacing", "4px")],
+                &[("-webkit-border-horizontal-spacing", "4px")],
+            ),
+        );
+        let mut blocks = node_blocks(
+            &Value::Null,
+            &json!([ua, author]),
+            &spacing("8px", "8px"),
+            &sheets(),
+            &HashMap::new(),
+        );
+        let origins: Vec<&str> = blocks.iter().map(|b| b.origin.as_str()).collect();
+        assert_eq!(origins, ["regular", "attributes", "user-agent"]);
+        cascade(&mut blocks, &HashSet::new());
+        assert_eq!(statuses(&blocks[0]), [Status::Active]);
+        assert_eq!(statuses(&blocks[1]), [Status::Overridden, Status::Active]);
+        assert_eq!(
+            statuses(&blocks[2]),
+            [Status::Overridden, Status::Overridden]
+        );
+    }
+
+    /// `var(` in a string is text: `content: "var(--word)"` shows as written.
+    #[test]
+    fn var_in_a_string_is_not_a_reference() {
+        let vars = HashMap::from([("--word".to_string(), "\"hello\"".to_string())]);
+        assert_eq!(resolve_vars("\"var(--word)\"", &vars), None);
+        // An escaped quote doesn't end the string.
+        assert_eq!(resolve_vars(r"'it\'s var(--word)'", &vars), None);
+        assert_eq!(
+            resolve_vars("\"(\" var(--word)", &vars).as_deref(),
+            Some("\"(\" \"hello\"")
+        );
+        let mut names = Vec::new();
+        var_names("'var(--a)' var(--b)", &mut names);
+        assert_eq!(names, ["--b"]);
+    }
+
+    /// `--computed=--theme` names one custom property, not every one that
+    /// starts with it, while `padding` still stands for its longhands.
+    #[test]
+    fn computed_custom_property_is_matched_exactly() {
+        let mut list = computed();
+        list.push(("--theme-accent".into(), "teal".into()));
+        let extra = ["--theme".to_string(), "padding".to_string()];
+        let picked = pick_computed(&list, &Declared::default(), &HashMap::new(), &extra);
+        let names: Vec<&str> = picked.iter().skip(3).map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "padding-bottom",
+                "padding-left",
+                "padding-right",
+                "padding-top"
+            ]
+        );
+    }
+
+    /// An empty custom property (`--p: ;`) is a value, so `var(--p, x)` is
+    /// empty, not `x`. An ancestor the page said nothing about could have
+    /// either, so nothing is resolved there.
+    #[test]
+    fn empty_custom_property_is_a_value() {
+        let vars = HashMap::from([("--p".to_string(), String::new())]);
+        assert_eq!(
+            resolve_vars("var(--p, Georgia,) serif", &vars).as_deref(),
+            Some("serif")
+        );
+        assert_eq!(
+            resolve_vars("var(--q, Georgia,) serif", &vars).as_deref(),
+            Some("Georgia, serif")
+        );
+
+        let mut m = matched();
+        let decls = [("font-family", "var(--p, Georgia,) serif")];
+        m["inlineStyle"] = authored(&decls, &decls);
+        let html = rule(
+            "html",
+            1,
+            authored(&[("color", "var(--x, red)")], &[("color", "var(--x, red)")]),
+        );
+        m["inherited"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "matchedCSSRules": [html] }));
+        // CDP's computed list has every defined custom property.
+        let mut list = computed();
+        list.push(("--p".into(), String::new()));
+        let report = build_report(&m, &list, &sheets(), &page(), &CssOptions::default());
+        assert_eq!(report.rules[0].decls[0].resolved.as_deref(), Some("serif"));
+        assert_eq!(
+            report.inherited[0].rules[0].decls[0].resolved.as_deref(),
+            Some("#222")
+        );
+        assert_eq!(report.inherited[1].from, "ancestor 2");
+        assert_eq!(report.inherited[1].rules[0].decls[0].resolved, None);
     }
 }

@@ -89,16 +89,7 @@ async fn go_back(
     let prev_entry = &entries[(current_index - 1) as usize];
     let entry_id = prev_entry["id"].as_i64().unwrap_or(0);
 
-    let before = document_mark(client, session_id).await?;
-    client
-        .send_to_target(
-            session_id,
-            "Page.navigateToHistoryEntry",
-            json!({"entryId": entry_id}),
-        )
-        .await?;
-
-    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS, Some(&before)).await?;
+    traverse_history(client, session_id, entry_id).await?;
     let url = prev_entry["url"].as_str().unwrap_or("unknown");
     let result = CommandResult::output(format!("Navigated back to {url}"))
         .with_navigated_to(url.to_string());
@@ -126,7 +117,23 @@ async fn go_forward(
     let next_entry = &entries[current_index + 1];
     let entry_id = next_entry["id"].as_i64().unwrap_or(0);
 
-    let before = document_mark(client, session_id).await?;
+    traverse_history(client, session_id, entry_id).await?;
+    let url = next_entry["url"].as_str().unwrap_or("unknown");
+    let result = CommandResult::output(format!("Navigated forward to {url}"))
+        .with_navigated_to(url.to_string());
+    Ok(result.save_output(output).await?)
+}
+
+/// Go to a history entry and wait until the page shows it.
+///
+/// `Page.navigateToHistoryEntry` returns before the traversal commits, and an
+/// entry that `pushState` made can keep the document and even the URL, so
+/// the wait is for the commit itself: a new document in the main frame, or a
+/// navigation within it.
+async fn traverse_history(client: &mut CdpClient, session_id: &str, entry_id: i64) -> Result<()> {
+    let main_frame = super::input::main_frame_id(client, session_id).await?;
+    // Only this traversal's commit counts.
+    client.clear_events();
     client
         .send_to_target(
             session_id,
@@ -134,12 +141,26 @@ async fn go_forward(
             json!({"entryId": entry_id}),
         )
         .await?;
-
-    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS, Some(&before)).await?;
-    let url = next_entry["url"].as_str().unwrap_or("unknown");
-    let result = CommandResult::output(format!("Navigated forward to {url}"))
-        .with_navigated_to(url.to_string());
-    Ok(result.save_output(output).await?)
+    client
+        .wait_for_event_match(
+            &["Page.frameNavigated", "Page.navigatedWithinDocument"],
+            std::time::Duration::from_millis(NAVIGATION_TIMEOUT_MS),
+            |method, p| {
+                let frame = if method == "Page.frameNavigated" {
+                    &p["frame"]["id"]
+                } else {
+                    &p["frameId"]
+                };
+                frame.as_str() == Some(main_frame.as_str())
+            },
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Timeout ({NAVIGATION_TIMEOUT_MS}ms) waiting for the history navigation to happen"
+            )
+        })?;
+    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS, None).await
 }
 
 async fn do_reload(
@@ -158,8 +179,7 @@ async fn do_reload(
 }
 
 /// Which document is showing: its time origin and URL. A reload keeps the URL
-/// but starts a document with a new time origin; going back to an entry of the
-/// same document keeps the origin but changes the URL.
+/// but starts a document with a new time origin.
 pub struct DocumentMark {
     time_origin: f64,
     url: String,

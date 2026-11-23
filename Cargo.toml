@@ -21,6 +21,8 @@ chrono = "0.4.44"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
 futures-util = "0.3"
+# Already built for tungstenite; used for HTTP status phrases and header names.
+http = "1"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

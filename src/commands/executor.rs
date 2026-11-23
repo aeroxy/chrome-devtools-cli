@@ -259,7 +259,12 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
             )),
             // One check per request: the CLI side loops, so the daemon serves
             // other commands in between.
-            "caffeinate" => client.ping().await.map(|()| CommandResult::output("")),
+            // Bounded like every other call, so a connection that died
+            // without closing ends caffeinate instead of hanging the daemon.
+            "caffeinate" => client
+                .check_alive()
+                .await
+                .map(|()| CommandResult::output("")),
             _ => unreachable!(),
         };
     }
@@ -296,8 +301,9 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     if cmd != "close-page" && cmd != "select-page" {
         if let Err(e) = client.ensure_persistent_session(&target_id).await {
             // A blocked page answers no session, so a second one would only
-            // wait out the same timeout again.
-            if e.downcast_ref::<crate::cdp::PageUnresponsive>().is_some() {
+            // wait out the same timeout again; a lost connection must reach
+            // the daemon, which exits on it.
+            if crate::cdp::is_connection_or_page_failure(&e) {
                 return Err(e);
             }
         }
@@ -367,12 +373,14 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let console_mark = client.console_pushed;
+    client.input_sent = false;
     // A dialog left open by an earlier command blocks the page: handle it
     // first, or fail now rather than wait on a page that won't answer.
     let result = match client.settle_open_dialog(&session_id).await {
-        Ok(()) => inner_execute(client, &session_id, req)
-            .await
-            .or_else(|e| dialog_opened_by_input(cmd, e)),
+        Ok(()) => {
+            let result = inner_execute(client, &session_id, req).await;
+            result.or_else(|e| dialog_opened_by_input(cmd, client.input_sent, e))
+        }
         Err(e) => Err(e),
     };
 
@@ -402,8 +410,16 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
 
 /// An input action that opens a dialog did what it was asked: the page reacted
 /// with a dialog, and the action's reply can't come back until it closes.
-/// Reporting that as a failure invites a retry, which would click twice.
-fn dialog_opened_by_input(cmd: &str, error: anyhow::Error) -> Result<CommandResult> {
+/// Reporting that as a failure invites a retry, which would click twice. A
+/// dialog that turned up before the action was sent is an ordinary failure.
+fn dialog_opened_by_input(
+    cmd: &str,
+    input_sent: bool,
+    error: anyhow::Error,
+) -> Result<CommandResult> {
+    if !input_sent {
+        return Err(error);
+    }
     let verb = match cmd {
         "click" | "click-at" => "Clicked",
         "hover" => "Hovered",
