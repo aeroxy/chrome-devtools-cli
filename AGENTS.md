@@ -36,6 +36,7 @@ src/
     ├── input.rs      # click/fill/type/press/hover
     ├── emulation.rs  # emulate (viewport/geolocation/blocklist)
     ├── console.rs    # console drain / live collection
+    ├── cookies.rs    # cookies (Network.getCookies over the page's session)
     ├── network.rs    # network drain / live collection
     ├── network_mock.rs # mock-network / remove-network-mock (Fetch domain)
     ├── css.rs        # css-styles (matched rules, cascade, var(), computed)

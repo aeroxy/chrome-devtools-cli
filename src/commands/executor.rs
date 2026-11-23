@@ -104,6 +104,7 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "execute-3p-tool" => &["name", "params"],
         "console" => &["duration", "type"],
         "network" => &["duration", "type"],
+        "cookies" => &["urls", "names", "header"],
         "sw-logs" => &["duration", "extension_id"],
         "run-script" => &[
             "file_path",
@@ -805,6 +806,19 @@ async fn inner_execute(
                 .unwrap_or_default();
             commands::console::collect_console(client, session_id, duration, types, req.format())
                 .await
+        }
+        "cookies" => {
+            commands::cookies::cookies(
+                client,
+                session_id,
+                &string_list(args.get("urls")),
+                &string_list(args.get("names")),
+                args.get("header")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                req.format(),
+            )
+            .await
         }
         "network" => {
             let duration = args.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);

@@ -478,6 +478,22 @@ pub enum Commands {
         r#type: Vec<String>,
     },
 
+    /// Show the cookies Chrome would send to the page's URL, HttpOnly and
+    /// partitioned ones included, read over the daemon's connection. The
+    /// table leaves values out; --header, --json and --toon print them
+    Cookies {
+        /// URL to read the cookies for (repeatable); defaults to the page's URL
+        #[arg(long = "url", value_name = "URL")]
+        urls: Vec<String>,
+        /// Only cookies with this name (repeatable)
+        #[arg(long = "name", value_name = "NAME")]
+        names: Vec<String>,
+        /// Print them as one Cookie request header (name=value; ...), values
+        /// included
+        #[arg(long)]
+        header: bool,
+    },
+
     /// Collect network requests from the page
     Network {
         /// Duration in ms for live collection (events remain available to a later drain).
@@ -638,6 +654,7 @@ impl Cli {
             Commands::Execute3pTool { .. } => "execute-3p-tool",
             Commands::Console { .. } => "console",
             Commands::Network { .. } => "network",
+            Commands::Cookies { .. } => "cookies",
             Commands::SwLogs { .. } => "sw-logs",
             Commands::RunScript { .. } => "run-script",
             Commands::Adapter { .. } => "adapter",
@@ -1499,6 +1516,14 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
         Commands::Network { duration, r#type } => {
             ("network", json!({"duration": duration, "type": r#type}))
         }
+        Commands::Cookies {
+            urls,
+            names,
+            header,
+        } => (
+            "cookies",
+            json!({"urls": urls, "names": names, "header": header}),
+        ),
         Commands::SwLogs {
             duration,
             extension_id,
@@ -2507,6 +2532,21 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             )
             .await
         }
+        Commands::Cookies {
+            urls,
+            names,
+            header,
+        } => {
+            commands::cookies::cookies(
+                &mut client,
+                &session_id,
+                urls,
+                names,
+                *header,
+                cli.output_format(),
+            )
+            .await
+        }
         Commands::Network { duration, r#type } => {
             commands::network::collect_network(
                 &mut client,
@@ -2674,6 +2714,28 @@ mod tests {
             }
             assert_eq!(args_of(&argv)["geolocation"], "-33.86,151.2", "{cmd}");
         }
+    }
+
+    #[test]
+    fn cookies_requests_carry_urls_names_and_header() {
+        let cli = Cli::try_parse_from([
+            "chrome-devtools",
+            "cookies",
+            "--url",
+            "https://a.test/",
+            "--url",
+            "https://b.test/x",
+            "--name",
+            "sid",
+            "--header",
+        ])
+        .unwrap();
+        let request = build_request(&cli).unwrap();
+        assert_eq!(request.command, "cookies");
+        assert_eq!(
+            request.args,
+            json!({"urls": ["https://a.test/", "https://b.test/x"], "names": ["sid"], "header": true})
+        );
     }
 
     /// A daemon that predates an option rejects its key, so a request that

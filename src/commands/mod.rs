@@ -1,4 +1,5 @@
 pub mod console;
+pub mod cookies;
 pub mod css;
 pub mod emulation;
 pub mod evaluate;

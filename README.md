@@ -277,6 +277,8 @@ The daemon keeps a persistent CDP session on the active page that continuously c
 | `console --type error --type warning` | Filter by level (`log`, `warn`, `info`, `error`, `debug`, `exception`) |
 | `console --duration 5000` | Live collection for 5 s (consumes events — they won't reappear on a later drain) |
 | `network` | Drain accumulated network requests |
+| `cookies [--url <url>]... [--name <name>]...` | The cookies Chrome would send to the page's URL (or each `--url`), HttpOnly and partitioned ones included, read over the daemon's approved connection: name, domain, path, expiry, flags and value length, values hidden |
+| `cookies --header` | The same cookies as one `Cookie` request header (`name=value; ...`), values included; `--json` / `--toon` print every field |
 | `network --type Fetch --type XHR` | Filter by resource type (`Document`, `Script`, `Stylesheet`, `Image`, `Font`, `XHR`, `Fetch`, `Manifest`, `Media`, `Other`) |
 | `network --duration 5000` | Live collection for 5 s |
 | `sw-logs [--duration 2000]` | Collect console logs from extension service workers (2 s default) |
@@ -385,6 +387,7 @@ src/
     ├── css.rs        # css-styles (matched rules, cascade status, var() resolution, computed)
     ├── webauthn.rs   # configure-webauthn (virtual authenticator on the persistent session)
     ├── console.rs    # console drain / live collection
+    ├── cookies.rs    # cookies (Network.getCookies over the page's session)
     ├── network.rs    # network drain / live collection
     ├── network_mock.rs # mock-network / remove-network-mock (Fetch domain)
     ├── sw_logs.rs    # extension service-worker log collection
