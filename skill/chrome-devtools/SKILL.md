@@ -177,7 +177,7 @@ chrome-devtools new-page --background https://github.com
 **Note**: The `[navigated to: ...]` and `[target:...]` lines go to **stderr**, not stdout. The stdout contains only the main command output ("Navigated to …", "Opened new page: …"). Other stderr lines to act on:
 
 - `[navigated to: <url>]` also appears when a click or key press reloads the page or posts a form back to the same URL, and when `evaluate --track-navigation` sets `location.href`.
-- `[opened: <name> <url>]`: a click or key press opened a new tab (a `target=_blank` link, `window.open`). Use that name for the new tab; the command's own `[target:...]` is still the old one.
+- `[opened: <name> <url>]`: a click or key press opened a new tab (a `target=_blank` link, `window.open`). Use that name for the new tab; the command's own `[target:...]` is still the old one. `[new tab: <name> <url>]` is a tab that appeared while the command ran without this page as its opener, such as one the human opened.
 - `[page error] …`: the page threw an uncaught exception or called `console.error` while the command ran (first line of each, at most 10). The command itself did what it reports; `console --type error` has the full messages.
 - `[warning] …`: for example a full-page screenshot past Chrome's 16384px limit, or a daemon from an older version still serving this browser (leave restarting it to the human).
 
@@ -215,6 +215,8 @@ chrome-devtools --target warm-squid emulate --clear-media      # media type and 
 ```
 
 `--media-feature name=value` adds to the features already set (setting one again replaces its value); clear them all with `--clear-media`. Supported: `prefers-color-scheme` (light, dark), `prefers-reduced-motion` and `prefers-reduced-transparency` (reduce, no-preference), `prefers-contrast` (more, less, custom, no-preference), `forced-colors` (active, none), `color-gamut` (srgb, p3, rec2020). Anything else is rejected before any override is applied, because Chrome would silently ignore it.
+
+CSS media needs the daemon's session for the tab, as network mocks do: without the daemon, or when it could not attach to the tab, `--media` and `--media-feature` fail, because the override would end with the command.
 
 ### Pattern 3: URL Blocking (Network Debugging)
 Block URL patterns using simple `*` wildcards: `*.png` (all PNG files), `cdn.example.com/*` (a domain path), `*analytics*` (any URL containing "analytics"). Patterns persist in the daemon until cleared.
@@ -260,7 +262,10 @@ Two ways to fill inputs — choose based on what the site expects:
 - `ctx.fill` in `run-script`/`adapter` can't do this, because page scripts can't read the disk. Run the CLI's `fill` first, on the page the script runs on, then the script. A script whose `@url` (or an adapter whose `@domain`) doesn't match the current page navigates first, which drops the file, so `navigate` there before you `fill`.
 
 ```bash
-# Click an element by CSS selector
+# Click an element by CSS selector. It is scrolled into view first. If something
+# else covers its centre (a cookie banner, a modal, a sticky header), click and
+# hover fail and name it instead of acting on it; click-at with the coordinates
+# the error gives clicks there anyway.
 chrome-devtools --target warm-squid click "button.submit"
 
 # Click at viewport-relative coordinates (0,0 is top-left of the visible viewport)
@@ -361,7 +366,9 @@ chrome-devtools --target warm-squid evaluate "JSON.stringify(performance.timing)
 
 **Avoid `evaluate` for DOM traversal.** Use `snapshot` to read page structure and `click`/`fill` to interact.
 
-**Dialogs opened by an action.** When a `click`, `press-key`, `fill`, `hover` or `type-text` makes the page open a dialog, the command succeeds and says so: `Clicked, and the page opened a confirm dialog: "Delete?"`. **Don't repeat the action.** Handle the dialog next with `evaluate --dialog-action accept|dismiss|<text> true`. Steps after the dialog opened did not run (for `type-text`, its `--submit-key`).
+**Dialogs opened by an action.** When a `click`, `press-key`, `fill`, `hover` or `type-text` makes the page open a dialog, the command succeeds and says so: `Clicked, and the page opened a confirm dialog: "Delete?"`. **Don't repeat the action.** Handle the dialog next with `evaluate --dialog-action accept|dismiss|<text> true`. Steps after the dialog opened did not run (for `type-text`, its `--submit-key`). If the CLI warned that it ran without the daemon, no later command can handle the dialog: ask the human to close it, or `close-page` the tab.
+
+A dialog that opens while the command is only getting ready fails it instead, because the action never happened: `Moving the pointer there opened a dialog, so the click was not sent` (a mouseover handler) or `Focusing or clearing the field opened a dialog, so the value was not entered` (`fill`). Handle the dialog, then run the command again.
 
 If a command instead fails with `got no answer from the page` and mentions a dialog this daemon did not see, the dialog opened before the daemon attached to the tab (or under an earlier session). The CLI cannot handle such a dialog: ask the human to close it, or `close-page` the tab.
 
@@ -387,7 +394,7 @@ chrome-devtools --target warm-squid snapshot
 chrome-devtools --target warm-squid snapshot --output /tmp/ax-tree.txt
 ```
 
-The text output is the compact one: an indented outline in document order, `[role] "name" #id` per node, with plain text as `"text" #id`. Wrapper nodes, line fragments and text that only repeats its parent's name are left out:
+The text output is the compact one: an indented outline in document order, `[role] "name" #id` per node, with plain text as `"text" #id`. Names and text are quoted as JSON strings, so a quote, backslash or line break inside one is escaped (`\"`, `\\`, `\n`) and every row is one node: a `<br>` reads `[LineBreak] "\n" #12`. Wrapper nodes, line fragments and text that only repeats its parent's name are left out:
 
 ```
 [RootWebArea] "Shop" #1
@@ -400,7 +407,7 @@ The text output is the compact one: an indented outline in document order, `[rol
 `--json` and `--toon` return Chrome's raw accessibility tree instead, many times larger; use them only for properties the outline leaves out.
 
 ### Pattern 9: Screenshots
-`--max-width`/`--max-height` are in image pixels, so they hold on HiDPI screens too. A `--full-page` capture past 16384px in either direction warns on stderr, because Chrome repeats or corrupts content beyond that: add `--max-height`.
+`--max-width`/`--max-height` are in image pixels, so they hold on HiDPI screens and at any browser zoom too. A `--full-page` capture past 16384px in either direction warns on stderr, because Chrome repeats or corrupts content beyond that: add `--max-height`.
 
 ```bash
 # Default: viewport-only PNG
@@ -804,7 +811,7 @@ chrome-devtools --target warm-squid configure-webauthn --protocol u2f --transpor
 chrome-devtools --target warm-squid configure-webauthn --remove
 ```
 
-- Omitted flags keep their current values. Defaults: `ctap2`, `internal` (a platform authenticator like Touch ID), resident keys and user verification on. `u2f` has neither.
+- Omitted flags keep their current values. Defaults: `ctap2`, `internal` (a platform authenticator like Touch ID), resident keys and user verification on. `u2f` has neither, so `--has-resident-key true` or `--has-user-verification true` fails on a `u2f` authenticator, also one set up earlier: add `--protocol ctap2` to switch.
 - The authenticator lives on the daemon's session for the tab (Chrome removes it when the session that added it detaches), so it lasts across commands on that tab until `--remove`, the tab closes, or the daemon exits.
 - **Working on another tab drops its credentials.** When the CLI comes back to the tab, it re-creates the authenticator with the same options but empty. Finish a register-then-sign-in flow on one tab.
 - `credentialId` is shown as the page sees it (`PublicKeyCredential.id`). Private keys are never printed.
@@ -831,6 +838,7 @@ chrome-devtools --target warm-squid remove-network-mock             # remove all
 ```
 
 - A mock that shows `0 hit(s)` never matched: check the pattern against the URLs `network` lists.
+- `--body-file` must be a regular file of at most 64 MiB. The daemon reads it, and would wait on a pipe or a device (`<(...)`, `/dev/stdin`), so those fail: save the body to a file first.
 - Mocks belong to the tab and to the daemon: they stop applying while the CLI works on another tab, come back when it returns, and end when the daemon exits. A daemon with mocks stays up while the page keeps making requests; run `caffeinate` in the background to keep it for longer quiet spells.
 - Cross-origin `fetch` needs CORS headers in the mock, e.g. `--header 'Access-Control-Allow-Origin: *'`.
 - `--resource-type XHR` and `--resource-type Fetch` each match both `fetch()` and XMLHttpRequest: Chrome doesn't tell them apart when it intercepts.
@@ -872,7 +880,7 @@ chrome-devtools --target warm-squid network --type Document --type Fetch --type 
 chrome-devtools list-pages
 chrome-devtools navigate <url> [--viewport WxH] [--mobile] [--device-scale-factor N] [--geolocation lat,lon]
 chrome-devtools navigate <url> --extra-headers '{"Authorization":"Bearer ..."}'
-chrome-devtools navigate --back
+chrome-devtools navigate --back      # an entry an iframe's navigation made moves only that iframe
 chrome-devtools navigate --forward
 chrome-devtools navigate --reload
 chrome-devtools new-page <url> [--viewport WxH] [--mobile] [--background]

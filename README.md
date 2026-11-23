@@ -195,7 +195,7 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 | Command | Description |
 |---------|-------------|
 | `navigate <url>` | Go to URL (waits for load) |
-| `navigate --back` | Go back in history |
+| `navigate --back` | Go back in history (an entry an iframe's navigation made moves only that iframe) |
 | `navigate --forward` | Go forward |
 | `navigate --reload` | Reload page |
 | `new-page <url>` | Open new tab |
@@ -228,12 +228,12 @@ The offline heap commands page their rows with `--limit` (default 50) and `--off
 
 | Command | Description |
 |---------|-------------|
-| `click <selector>` | Click element by CSS selector |
+| `click <selector>` | Click element by CSS selector (fails, naming it, when another element covers it) |
 | `click-at <x> <y>` | Click at specific coordinates |
 | `fill <selector> <value>` | Fill input field, dropdown (`<select>`), or toggle checkbox/radio (`"true"`/`"false"`). On a file input, the value is a local file path (relative to where you run the CLI), and that file is selected on the input as if picked in the file dialog, one per call |
 | `type-text <text> [--submit-key <key>]` | Type into focused element (optionally press key after) |
 | `press-key <key>` | Press key (e.g. `Enter`, `Control+A`) |
-| `hover <selector>` | Hover over element |
+| `hover <selector>` | Hover over element (fails, naming it, when another element covers it) |
 
 ### Third-party developer tools
 
@@ -259,11 +259,11 @@ These commands ask the page through WebMCP first (`document.modelContext.getTool
 | `emulate --clear-blocks` | Clear all blocked URL patterns |
 | `emulate --clear-all` | Clear all overrides (viewport, geolocation, CSS media, blocks) |
 | `configure-webauthn` | Add a virtual WebAuthn authenticator (ctap2, internal, passkey-capable) so `navigator.credentials.create()`/`get()` work without a device; again with no flags shows it and its credentials |
-| `configure-webauthn --protocol u2f --transport usb` | Choose the authenticator (`--protocol ctap2\|u2f`, `--transport internal\|usb\|nfc\|ble\|hybrid`, `--has-resident-key true\|false`, `--has-user-verification true\|false`, `--is-user-verified true\|false`); u2f can't use hybrid |
+| `configure-webauthn --protocol u2f --transport usb` | Choose the authenticator (`--protocol ctap2\|u2f`, `--transport internal\|usb\|nfc\|ble\|hybrid`, `--has-resident-key true\|false`, `--has-user-verification true\|false`, `--is-user-verified true\|false`); u2f can't use hybrid, resident keys or user verification |
 | `configure-webauthn --remove` | Remove the virtual authenticator |
 | `wait-for <text> [--timeout ms]` | Wait for text to appear (default 30s) |
 
-`emulate` with no flags shows the active tab's overrides. Viewport, geolocation, CSS media, and URL blocks are all **per-tab** — each page keeps its own. They persist across navigation within that tab and do **not** leak to other tabs, so you can hold (say) a mobile viewport with images blocked on one tab and a desktop baseline on another at the same time. They persist until you clear them (`--clear-viewport`, `--clear-geolocation`, `--clear-media`, `--clear-blocks`, or `--clear-all`), the tab closes, or the daemon exits. `--media-feature` values add to the ones already set (setting a feature again replaces its value), and unknown names or values are rejected before anything is applied, because Chrome would accept and ignore them.
+`emulate` with no flags shows the active tab's overrides. Viewport, geolocation, CSS media, and URL blocks are all **per-tab** — each page keeps its own. They persist across navigation within that tab and do **not** leak to other tabs, so you can hold (say) a mobile viewport with images blocked on one tab and a desktop baseline on another at the same time. They persist until you clear them (`--clear-viewport`, `--clear-geolocation`, `--clear-media`, `--clear-blocks`, or `--clear-all`), the tab closes, or the daemon exits. `--media-feature` values add to the ones already set (setting a feature again replaces its value), and unknown names or values are rejected before anything is applied, because Chrome would accept and ignore them. CSS media needs the daemon's session for the tab: without the daemon, or when it could not attach, `--media` and `--media-feature` fail rather than set an override that ends with the command.
 
 The virtual authenticator lives on the daemon's session for the tab, because Chrome removes it when the session that added it detaches; it therefore lasts across commands on that tab until `--remove`, the tab closes, or the daemon exits. When the CLI works on another tab and comes back, the authenticator is re-created with the same options but without the credentials registered before. Chrome only answers WebAuthn calls from the front tab, so `select-page` the tab first; `configure-webauthn` says so when the tab is in the background. Changing `--protocol`, `--transport`, `--has-resident-key`, or `--has-user-verification` replaces the authenticator and deletes its credentials; `--is-user-verified` changes in place.
 
@@ -293,7 +293,7 @@ Other page commands list the errors the page raised while they ran (uncaught exc
 
 | Command | Description |
 |---------|-------------|
-| `mock-network <url-glob> [--status N] [--header "Name: value"] [--body <text> \| --body-file <path>]` | Answer matching requests on this tab from the CLI instead of the network |
+| `mock-network <url-glob> [--status N] [--header "Name: value"] [--body <text> \| --body-file <path>]` | Answer matching requests on this tab from the CLI instead of the network (`--body-file`: a regular file, up to 64 MiB) |
 | `mock-network <url-glob> --abort` | Fail matching requests with a network error |
 | `mock-network <url-glob> ... --resource-type <type>` | Only requests of one type (`Document`, `Script`, `Image`, `XHR`, `Fetch`, ...; Chrome reports `fetch()` as XHR when it intercepts, so `XHR` and `Fetch` each match both) |
 | `mock-network` | List the tab's mocks with hit counts |

@@ -646,13 +646,19 @@ impl Snap {
                     );
                 }
             }
-            for chunk in locations.chunks_exact(stride) {
+            for (i, chunk) in locations.chunks_exact(stride).enumerate() {
+                // V8 writes a node index here. Lookups use node indices, so
+                // any other value would be ignored without a word.
+                let at = chunk[o] as usize;
+                if !at.is_multiple_of(node_size) || at >= nodes.len() {
+                    bail!("Corrupt snapshot: location {i} points to invalid node index {at}");
+                }
                 // Where it is unknown, the object keeps no location, like
                 // one whose constructor has no script.
                 if chunk[l] == UNKNOWN || chunk[c] == UNKNOWN {
                     continue;
                 }
-                location_map.insert(chunk[o] as usize, (chunk[s], chunk[l], chunk[c]));
+                location_map.insert(at, (chunk[s], chunk[l], chunk[c]));
             }
         }
 
@@ -682,7 +688,7 @@ impl Snap {
             has_detachedness: det_off.is_some(),
         };
         snap.dom = snap.dom_states(det_off);
-        snap.transfer_owned_sizes();
+        snap.transfer_owned_sizes()?;
         Ok(snap)
     }
 
@@ -808,12 +814,11 @@ impl Snap {
             self.edge_is(e, self.et.property) && self.string_edge_name(e) != "__proto__"
         });
         let (mut front, mut back): (Vec<Cow<str>>, Vec<Cow<str>>) = (Vec::new(), Vec::new());
-        let mut more = None;
+        let (mut from_back, mut more) = (false, false);
         // UTF-16 code units, as DevTools counts: the braces, then each side's
         // names and the separators between them.
         let mut len = 2;
         loop {
-            let from_back = front.len() > back.len();
             let Some(e) = (if from_back {
                 edges.next_back()
             } else {
@@ -823,20 +828,35 @@ impl Snap {
             };
             let name = format_property_name(self.string_edge_name(e));
             let name_len = name.encode_utf16().count();
-            // Always at least one property, however long.
+            // Always at least one property, however long. `front` holds a
+            // name only once it holds text, so this is DevTools' test that
+            // the front is more than its brace.
             if !front.is_empty() && len + name_len > 100 {
-                more = Some(Cow::Borrowed("…"));
+                more = true;
                 break;
             }
             let side = if from_back { &mut back } else { &mut front };
+            from_back = !from_back;
+            // As in DevTools, a separator goes in only once the side holds
+            // text, so an empty name first on its side adds nothing.
             if !side.is_empty() {
                 len += 2;
+            } else if name.is_empty() {
+                continue;
             }
             len += name_len;
             side.push(name);
         }
         back.reverse();
-        let parts: Vec<Cow<str>> = front.into_iter().chain(more).chain(back).collect();
+        // DevTools puts "…" and the back names after a separator even when
+        // the front holds no text, so `["", "x"]` reads `{, x}`.
+        let mut parts = vec![front.join(", ")];
+        if more {
+            parts.push("…".to_string());
+        }
+        if !back.is_empty() {
+            parts.push(back.join(", "));
+        }
         format!("{{{}}}", parts.join(", "))
     }
 
@@ -905,7 +925,7 @@ impl Snap {
     /// a class's size includes its backing stores and the internals stop
     /// showing up as rows of their own. Skipped for snapshots taken with
     /// internals exposed (no user roots), as DevTools does.
-    fn transfer_owned_sizes(&mut self) {
+    fn transfer_owned_sizes(&mut self) -> Result<()> {
         const UNVISITED: u32 = u32::MAX;
         const MULTIPLE: u32 = u32::MAX - 1;
         let n = self.node_count;
@@ -914,7 +934,7 @@ impl Snap {
                 .edge_range(self.root)
                 .any(|e| self.is_user_root(self.edge_to(e)))
         {
-            return;
+            return Ok(());
         }
         let mut owners = vec![UNVISITED; n];
         let mut worklist: Vec<u32> = Vec::new();
@@ -956,10 +976,22 @@ impl Snap {
             if self.is(owner, self.nt.synthetic) || owner == self.root {
                 continue;
             }
-            let size = self.self_size(ord);
+            // Each size fits in a u64; a corrupt file can still make the sum
+            // overflow.
+            let total = self
+                .self_size(owner)
+                .checked_add(self.self_size(ord))
+                .with_context(|| {
+                    format!(
+                        "Corrupt snapshot: node {} and the objects it owns add up to 2^64 bytes \
+                         or more, which no heap holds",
+                        self.id(owner)
+                    )
+                })?;
             self.set_self_size(ord, 0);
-            self.set_self_size(owner, self.self_size(owner).saturating_add(size));
+            self.set_self_size(owner, total);
         }
+        Ok(())
     }
 }
 
@@ -1373,6 +1405,7 @@ impl HeapSnapshotClassDiff {
         self.added_count as i64 - self.removed_count as i64
     }
 
+    /// Exact: `diff_snapshots` keeps both totals below 2^63.
     fn size_delta(&self) -> i64 {
         self.added_size as i64 - self.removed_size as i64
     }
@@ -1415,7 +1448,7 @@ fn merge_diff(
 
 /// Per-class diff rows with any change, sorted by size delta descending, then
 /// by class, so each `--class-index` names the same row on every run.
-fn diff_snapshots(base: &Aggregates, current: &Aggregates) -> Vec<HeapSnapshotClassDiff> {
+fn diff_snapshots(base: &Aggregates, current: &Aggregates) -> Result<Vec<HeapSnapshotClassDiff>> {
     let mut diffs = Vec::new();
     let keys = base.classes.keys().chain(
         current
@@ -1424,23 +1457,40 @@ fn diff_snapshots(base: &Aggregates, current: &Aggregates) -> Vec<HeapSnapshotCl
             .filter(|k| !base.classes.contains_key(*k)),
     );
     for key in keys {
-        let (mut added_count, mut removed_count, mut added_size, mut removed_size) = (0, 0, 0, 0);
+        // Summed in u128, which fewer than 2^32 sizes below 2^64 cannot
+        // overflow, and checked below.
+        let (mut added_count, mut removed_count, mut added_size, mut removed_size) =
+            (0, 0, 0u128, 0u128);
         merge_diff(base, current, key, |added, _, size| {
             if added {
                 added_count += 1;
-                added_size += size;
+                added_size += u128::from(size);
             } else {
                 removed_count += 1;
-                removed_size += size;
+                removed_size += u128::from(size);
             }
         });
         if added_count > 0 || removed_count > 0 {
+            // `size_delta` subtracts the totals as i64s. Only a corrupt file
+            // reaches 2^63 bytes.
+            let total = |size: u128, objects: &str| {
+                u64::try_from(size)
+                    .ok()
+                    .filter(|&size| size < 1 << 63)
+                    .with_context(|| {
+                        format!(
+                            "Corrupt snapshot: {objects} objects of class '{}' add up to 2^63 \
+                             bytes or more, which no heap holds",
+                            key.name
+                        )
+                    })
+            };
             diffs.push(HeapSnapshotClassDiff {
                 key: key.clone(),
                 added_count,
                 removed_count,
-                added_size,
-                removed_size,
+                added_size: total(added_size, "the current snapshot's added")?,
+                removed_size: total(removed_size, "the base snapshot's removed")?,
             });
         }
     }
@@ -1449,7 +1499,7 @@ fn diff_snapshots(base: &Aggregates, current: &Aggregates) -> Vec<HeapSnapshotCl
             .cmp(&a.size_delta())
             .then_with(|| a.key.cmp(&b.key))
     });
-    diffs
+    Ok(diffs)
 }
 
 /// One added or deleted object of a class.
@@ -1726,7 +1776,7 @@ pub async fn compare_heapsnapshots_offline(
             let snap = load_snapshot(&base_path)?;
             build_class_aggregates(&snap, &assign_classes(&snap, &defs))
         };
-        let diffs = diff_snapshots(&base, &current);
+        let diffs = diff_snapshots(&base, &current)?;
         // An object still in its class on both sides proves the ids overlap,
         // the usual case, which spares the whole-heap check.
         let removed: usize = diffs.iter().map(|d| d.removed_count).sum();
@@ -2617,6 +2667,38 @@ mod tests {
     }
 
     #[test]
+    fn test_plain_object_names_place_empty_names_like_devtools() {
+        // What DevTools' `#plainObjectName` prints for each, run on its code.
+        let (q, r) = ("q".repeat(150), "r".repeat(150));
+        let cases: [(&[&str], String); 6] = [
+            // An empty name first on its side adds nothing...
+            (&["", "x", "y"], "{x, y}".into()),
+            (&["x", "y", ""], "{x, y}".into()),
+            (&["x", ""], "{x}".into()),
+            // ...but one after a name keeps its separator,
+            (&["x", "", "y"], "{x, , y}".into()),
+            // and the back names follow a separator even after a bare brace.
+            (&["", "x"], "{, x}".into()),
+            // The 100-unit limit waits for the front to show a name.
+            (&["", &q, &r], format!("{{{q}, {r}}}")),
+        ];
+        let (mut t, window) = TestSnap::page();
+        let mut objs = Vec::new();
+        for (i, (props, _)) in cases.iter().enumerate() {
+            let obj = t.node("object", "Object", 101 + 2 * i as u32, 16);
+            t.edge(window, "property", &format!("o{i}"), obj);
+            for p in *props {
+                t.edge(obj, "property", p, window);
+            }
+            objs.push(obj);
+        }
+        let snap = t.snap();
+        for (obj, (props, expected)) in objs.into_iter().zip(&cases) {
+            assert_eq!(snap.display_name(obj), *expected, "{props:?}");
+        }
+    }
+
+    #[test]
     fn test_utf16_ordering_matches_js() {
         // U+FF5E sorts after U+1F600 in UTF-8 byte order but before it in
         // JS's UTF-16 order.
@@ -2896,7 +2978,7 @@ mod tests {
     fn test_diff_added_removed_and_retained() {
         let base = objects(&[(11, "Map", 100), (13, "Map", 100), (15, "Set", 50)]);
         let current = objects(&[(11, "Map", 100), (17, "Map", 150), (19, "Window", 500)]);
-        let diffs = diff_snapshots(&base, &current);
+        let diffs = diff_snapshots(&base, &current).unwrap();
         let rows: Vec<(&str, usize, usize, i64)> = diffs
             .iter()
             .map(|d| {
@@ -2943,13 +3025,14 @@ mod tests {
     #[test]
     fn test_diff_filters_unchanged_classes_and_groups_strings() {
         let same = objects(&[(11, "Map", 100)]);
-        assert!(diff_snapshots(&same, &same).is_empty());
+        assert!(diff_snapshots(&same, &same).unwrap().is_empty());
 
         let strings = |items: &[(u32, &str, u64)]| hanging("string", items).aggregates();
         let diffs = diff_snapshots(
             &strings(&[(11, "hello", 16), (13, "world", 16)]),
             &strings(&[(11, "hello", 16), (15, "foo", 16)]),
-        );
+        )
+        .unwrap();
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].key.name, "(string)");
         assert_eq!((diffs[0].added_count, diffs[0].removed_count), (1, 1));
@@ -2984,7 +3067,7 @@ mod tests {
     fn test_summary_pages_and_detail_shares_indices() {
         let base = objects(&[(11, "Map", 100), (13, "Set", 50)]);
         let current = objects(&[(15, "Window", 500), (17, "Map", 150), (19, "Map", 90)]);
-        let diffs = diff_snapshots(&base, &current);
+        let diffs = diff_snapshots(&base, &current).unwrap();
         let opts = ListOptions {
             limit: 1,
             offset: 1,
@@ -3284,7 +3367,7 @@ mod tests {
 
         let base = TestSnap::page().0.aggregates();
         let current = t.aggregates();
-        let diffs = diff_snapshots(&base, &current);
+        let diffs = diff_snapshots(&base, &current).unwrap();
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].added_size, 4_294_967_360);
         assert_eq!(
@@ -3295,6 +3378,84 @@ mod tests {
         assert!(
             summary.ends_with("\n0,Big,,1,0,1,4294967360,0,4294967360\n"),
             "{summary}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_owned_sizes_past_64_bits() {
+        // A 1-byte owner of an array as large as a u64 can say.
+        let (mut t, window) = TestSnap::page();
+        let owner = t.node("object", "Big", 11, 1);
+        let elements = t.node("array", "(object elements)", 13, u64::MAX);
+        t.edge(window, "property", "big", owner);
+        t.edge(owner, "internal", "elements", elements);
+        let err = Snap::new(serde_json::from_value(t.json()).unwrap())
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string()
+                .contains("node 11 and the objects it owns add up to 2^64 bytes or more"),
+            "{err}"
+        );
+        // One byte less fits, and moves whole.
+        t.nodes[elements].size = u64::MAX - 1;
+        let snap = t.snap();
+        assert_eq!(
+            (snap.self_size(owner), snap.self_size(elements)),
+            (u64::MAX, 0)
+        );
+    }
+
+    #[test]
+    fn test_rejects_class_totals_past_63_bits() {
+        // Two objects of one class whose sizes add up past a u64.
+        let page = TestSnap::page().0.aggregates();
+        let foo = objects(&[(11, "Foo", u64::MAX), (13, "Foo", 1)]);
+        let err = diff_snapshots(&page, &foo).err().unwrap();
+        assert!(
+            err.to_string().contains(
+                "the current snapshot's added objects of class 'Foo' add up to 2^63 bytes or more"
+            ),
+            "{err}"
+        );
+        let err = diff_snapshots(&foo, &page).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("the base snapshot's removed objects of class 'Foo' add up to"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_size_delta_keeps_its_sign() {
+        // 2^63 bytes would read as a negative i64.
+        let page = TestSnap::page().0.aggregates();
+        let err = diff_snapshots(&page, &objects(&[(11, "Foo", 1 << 63)]))
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("add up to 2^63 bytes or more"),
+            "{err}"
+        );
+        // One byte less sorts and prints with its sign, either way round.
+        let big = objects(&[(11, "Foo", (1 << 63) - 1), (13, "Bar", 8)]);
+        let deltas = |diffs: &[HeapSnapshotClassDiff]| -> Vec<(String, i64)> {
+            diffs
+                .iter()
+                .map(|d| (d.key.name.clone(), d.size_delta()))
+                .collect()
+        };
+        let grew = diff_snapshots(&page, &big).unwrap();
+        assert_eq!(deltas(&grew), [("Foo".into(), i64::MAX), ("Bar".into(), 8)]);
+        let summary = format_class_diff_summary(&grew, &defaults(), OutputFormat::Text).unwrap();
+        assert!(
+            summary.contains("\n0,Foo,,1,0,1,9223372036854775807,0,9223372036854775807\n"),
+            "{summary}"
+        );
+        let shrank = diff_snapshots(&big, &page).unwrap();
+        assert_eq!(
+            deltas(&shrank),
+            [("Bar".into(), -8), ("Foo".into(), -i64::MAX)]
         );
     }
 
@@ -3312,7 +3473,7 @@ mod tests {
             }
         }
         let (base, current) = (TestSnap::page().0.aggregates(), t.aggregates());
-        let diffs = diff_snapshots(&base, &current);
+        let diffs = diff_snapshots(&base, &current).unwrap();
         let summary = format_class_diff_summary(&diffs, &defaults(), OutputFormat::Text).unwrap();
         // Line and column count from 1; V8 stores them from 0.
         assert!(summary.ends_with(
@@ -3466,6 +3627,31 @@ mod tests {
         assert!(load_json(&v).unwrap().locations.is_empty());
         v.as_object_mut().unwrap().remove("locations");
         assert!(load_json(&v).unwrap().locations.is_empty());
+    }
+
+    #[test]
+    fn test_rejects_locations_of_no_node() {
+        let (mut t, window) = TestSnap::page();
+        let foo = t.node("object", "Foo", 11, 20);
+        t.edge(window, "property", "foo", foo);
+        t.locations.push((foo, 7, 0, 4));
+        assert_eq!(t.snap().locations.len(), 1);
+        // Three nodes of six fields: an object_index is 0, 6 or 12. A record
+        // has to name one even when its line is unknown.
+        for (object_index, line) in [(7, 0), (18, 0), (u32::MAX, 0), (13, -1)] {
+            let v = with_fields(
+                t.json(),
+                "locations",
+                &[(0, json!(object_index)), (2, json!(line))],
+            );
+            let err = Snap::new(serde_json::from_value(v).unwrap()).err().unwrap();
+            assert!(
+                err.to_string().contains(&format!(
+                    "location 0 points to invalid node index {object_index}"
+                )),
+                "{err}"
+            );
+        }
     }
 
     #[test]

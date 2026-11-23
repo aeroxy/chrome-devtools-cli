@@ -294,7 +294,17 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         (req.target.as_deref(), req.page)
     };
 
-    let target = client.resolve_page(target_id_arg, page_idx_arg).await?;
+    // A dialog that opened while the daemon was idle is announced to whatever
+    // reads next, which is this lookup. The dialog doesn't block the lookup,
+    // and reading it recorded it on its own session, so look again: it is then
+    // settled below, with this command's --dialog-action, only if it is on the
+    // page this command resolves to.
+    let target = match client.resolve_page(target_id_arg, page_idx_arg).await {
+        Err(e) if e.downcast_ref::<crate::cdp::DialogOpen>().is_some() => {
+            client.resolve_page(target_id_arg, page_idx_arg).await?
+        }
+        resolved => resolved?,
+    };
     let target_id = target.target_id.clone();
 
     // Maintain a persistent CDP session for continuous event collection
@@ -380,7 +390,8 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     let result = match client.settle_open_dialog(&session_id).await {
         Ok(()) => {
             let result = inner_execute(client, &session_id, req).await;
-            result.or_else(|e| dialog_opened_by_input(cmd, client.input_sent, e))
+            result
+                .or_else(|e| dialog_opened_by_input(cmd, client.input_sent, e, HANDLE_DIALOG_NEXT))
         }
         Err(e) => Err(e),
     };
@@ -409,14 +420,26 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     })
 }
 
+/// What to do about a dialog an input opened, when the daemon ran it: its
+/// session saw the dialog open, and only such a session can handle it.
+pub(crate) const HANDLE_DIALOG_NEXT: &str = "The page is paused until the dialog is handled: \
+     run `evaluate --dialog-action accept|dismiss|<prompt text> true` on this page next.";
+
+/// The same without the daemon: the session that saw the dialog open ends
+/// with the command, and Chrome tells no later session about the dialog.
+pub(crate) const DIRECT_DIALOG_NEXT: &str = "This ran without the daemon, so no later command \
+     can handle the dialog: a person has to close it, or `close-page` closes the tab.";
+
 /// An input action that opens a dialog did what it was asked: the page reacted
 /// with a dialog, and the action's reply can't come back until it closes.
 /// Reporting that as a failure invites a retry, which would click twice. A
 /// dialog that turned up before the action was sent is an ordinary failure.
-fn dialog_opened_by_input(
+/// `next` says what to do about the dialog, which depends on who ran it.
+pub(crate) fn dialog_opened_by_input(
     cmd: &str,
     input_sent: bool,
     error: anyhow::Error,
+    next: &str,
 ) -> Result<CommandResult> {
     if !input_sent {
         return Err(error);
@@ -439,8 +462,7 @@ fn dialog_opened_by_input(
     };
     Ok(CommandResult::output(format!(
         "{verb}, and the page opened {article} {} dialog: \"{}\". Steps after it opened did not run \
-         (for type-text, a --submit-key). The page is paused until the dialog is handled: run \
-         `evaluate --dialog-action accept|dismiss|<prompt text> true` on this page next.",
+         (for type-text, a --submit-key). {next}",
         dialog.dialog_type, dialog.message
     )))
 }
@@ -879,5 +901,453 @@ async fn inner_execute(
             .await
         }
         _ => bail!("Unknown command: {cmd}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::Value;
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// What the fake browser does with one call: send `events`, then the reply,
+    /// or no reply at all, as a page blocked by a dialog gives none.
+    struct Answer {
+        events: Vec<Value>,
+        reply: Option<Value>,
+    }
+
+    fn reply(result: Value) -> Answer {
+        Answer {
+            events: Vec::new(),
+            reply: Some(result),
+        }
+    }
+
+    fn value(v: &str) -> Answer {
+        reply(json!({"result": {"type": "string", "value": v}}))
+    }
+
+    fn dialog_event(message: &str) -> Value {
+        json!({
+            "method": "Page.javascriptDialogOpening",
+            "sessionId": "S1",
+            "params": {"type": "alert", "message": message},
+        })
+    }
+
+    /// The page opens a dialog while handling the call, so the call gets no reply.
+    fn dialog(message: &str) -> Answer {
+        Answer {
+            events: vec![dialog_event(message)],
+            reply: None,
+        }
+    }
+
+    /// One tab, T1, which the daemon's persistent session S1 is attached to.
+    fn usual(method: &str, params: &Value) -> Answer {
+        match method {
+            "Target.getTargets" => reply(json!({"targetInfos": [
+                {"targetId": "T1", "type": "page", "title": "", "url": "https://a.test/"},
+            ]})),
+            "Target.attachToTarget" => reply(json!({"sessionId": "S2"})),
+            "Runtime.evaluate" if params["expression"] == "window.location.href" => {
+                value("https://a.test/")
+            }
+            _ => reply(json!({})),
+        }
+    }
+
+    /// A client of a browser that answers each call with `answer(method,
+    /// params)`. The task yields the calls it got, as `method@session`.
+    async fn fake_browser(
+        answer: impl Fn(&str, &Value) -> Answer + Send + 'static,
+    ) -> (CdpClient, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let browser = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut calls = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: Value = serde_json::from_str(&text).unwrap();
+                let method = call["method"].as_str().unwrap_or_default();
+                let session = call["sessionId"].as_str().unwrap_or_default();
+                calls.push(format!("{method}@{session}"));
+                let answer = answer(method, &call["params"]);
+                for event in answer.events {
+                    ws.send(Message::Text(event.to_string())).await.unwrap();
+                }
+                if let Some(result) = answer.reply {
+                    let reply = json!({"id": call["id"], "sessionId": session, "result": result});
+                    ws.send(Message::Text(reply.to_string())).await.unwrap();
+                }
+            }
+            calls
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        client.persistent_session = Some("S1".into());
+        client.persistent_target_id = Some("T1".into());
+        (client, browser)
+    }
+
+    async fn calls_made(
+        client: CdpClient,
+        browser: tokio::task::JoinHandle<Vec<String>>,
+    ) -> Vec<String> {
+        drop(client);
+        browser.await.unwrap()
+    }
+
+    fn request(command: &str, args: Value) -> DaemonRequest {
+        serde_json::from_value(json!({"command": command, "args": args})).unwrap()
+    }
+
+    fn is_dialog(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<crate::cdp::DialogOpen>().is_some()
+    }
+
+    /// The error a command was expected to fail with.
+    fn failure(result: Result<CommandResult>) -> anyhow::Error {
+        match result {
+            Ok(r) => panic!("expected a failure, got: {}", r.output),
+            Err(e) => e,
+        }
+    }
+
+    /// `fill`'s check of what the element is, which changes nothing.
+    fn fill_check(expr: &str) -> bool {
+        expr.contains("const kind") && !expr.contains("dispatchEvent")
+    }
+
+    /// `fill`'s evaluation that sets a select, checkbox or textarea.
+    fn fill_set(expr: &str) -> bool {
+        expr.contains("const kind") && expr.contains("dispatchEvent")
+    }
+
+    /// A mouseover handler's dialog stops the click before the button is
+    /// pressed, so reporting a click would be false, and a retry is safe.
+    #[tokio::test]
+    async fn a_dialog_from_moving_the_pointer_fails_the_click() {
+        let (mut client, browser) = fake_browser(|method, params| match method {
+            "Input.dispatchMouseEvent" if params["type"] == "mouseMoved" => dialog("hovered"),
+            _ => usual(method, params),
+        })
+        .await;
+        let click = request("click-at", json!({"x": 5, "y": 5}));
+        let error = failure(execute_command(&mut client, &click).await);
+        assert!(is_dialog(&error), "{error:#}");
+        assert!(
+            format!("{error:#}").starts_with(
+                "Moving the pointer there opened a dialog, so the click was not sent: A javascript \
+                 dialog is open (alert: hovered)"
+            ),
+            "{error:#}"
+        );
+        let calls = calls_made(client, browser).await;
+        let mouse_events = calls
+            .iter()
+            .filter(|c| c.starts_with("Input.dispatchMouseEvent"));
+        assert_eq!(mouse_events.count(), 1, "{calls:?}");
+    }
+
+    /// The press starts the click, as it does a person's: a dialog from it, or
+    /// from the click handler, is the click's outcome, and a retry would repeat it.
+    #[tokio::test]
+    async fn a_dialog_from_pressing_or_clicking_reports_the_click() {
+        for step in ["mousePressed", "mouseReleased"] {
+            let (mut client, browser) = fake_browser(move |method, params| match method {
+                "Input.dispatchMouseEvent" if params["type"] == step => dialog("clicked"),
+                _ => usual(method, params),
+            })
+            .await;
+            let result =
+                execute_command(&mut client, &request("click-at", json!({"x": 5, "y": 5})))
+                    .await
+                    .expect("the page got the click");
+            assert!(
+                result
+                    .output
+                    .starts_with("Clicked, and the page opened an alert dialog: \"clicked\"."),
+                "{step}: {}",
+                result.output
+            );
+            calls_made(client, browser).await;
+        }
+    }
+
+    /// The page can disable an option between the check and the selection,
+    /// so the evaluation that selects checks again.
+    #[tokio::test]
+    async fn an_option_refused_when_it_is_selected_fails_the_click() {
+        let (mut client, browser) = fake_browser(|method, params| {
+            let expr = params["expression"].as_str().unwrap_or_default();
+            match method {
+                "Runtime.evaluate" if expr.contains("return 'option'") => value("option"),
+                "Runtime.evaluate" if expr.contains("return 'selected'") => {
+                    value("select_disabled")
+                }
+                _ => usual(method, params),
+            }
+        })
+        .await;
+        let click = request("click", json!({"selector": "#b"}));
+        let error = failure(execute_command(&mut client, &click).await);
+        assert_eq!(
+            error.to_string(),
+            "Cannot click option in disabled select: #b"
+        );
+        calls_made(client, browser).await;
+    }
+
+    /// The check that comes first changes nothing, so a dialog that blocks it
+    /// was not opened by the fill: the command fails before setting anything.
+    #[tokio::test]
+    async fn a_dialog_that_blocks_the_check_fails_the_fill() {
+        let (mut client, browser) = fake_browser(|method, params| {
+            let expr = params["expression"].as_str().unwrap_or_default();
+            match method {
+                "Runtime.evaluate" if fill_check(expr) => dialog("already open"),
+                _ => usual(method, params),
+            }
+        })
+        .await;
+        let fill = request("fill", json!({"selector": "#q", "value": "hello"}));
+        let error = failure(execute_command(&mut client, &fill).await);
+        assert!(is_dialog(&error), "{error:#}");
+        let calls = calls_made(client, browser).await;
+        // The page's URL, then the check, and nothing after it.
+        let evaluations = calls.iter().filter(|c| c.starts_with("Runtime.evaluate"));
+        assert_eq!(evaluations.count(), 2, "{calls:?}");
+    }
+
+    /// The page can change the element between the check and the fill, so
+    /// the evaluation that fills checks again.
+    #[tokio::test]
+    async fn an_option_gone_by_the_time_it_is_set_fails_the_fill() {
+        let (mut client, browser) = fake_browser(|method, params| {
+            let expr = params["expression"].as_str().unwrap_or_default();
+            match method {
+                "Runtime.evaluate" if fill_check(expr) => value("select"),
+                "Runtime.evaluate" if fill_set(expr) => value("option_not_found"),
+                _ => usual(method, params),
+            }
+        })
+        .await;
+        let fill = request("fill", json!({"selector": "#s", "value": "b"}));
+        let error = failure(execute_command(&mut client, &fill).await);
+        assert_eq!(
+            error.to_string(),
+            "Could not find option with text or value 'b' in select element: #s"
+        );
+        calls_made(client, browser).await;
+    }
+
+    /// Focusing a text field only gets it ready: a dialog from its focus
+    /// handler means the value never went in, so `fill` must not report it.
+    #[tokio::test]
+    async fn a_dialog_from_focusing_the_field_fails_the_fill() {
+        let (mut client, browser) = fake_browser(|method, params| {
+            let expr = params["expression"].as_str().unwrap_or_default();
+            match method {
+                "Runtime.evaluate" if fill_check(expr) => value("text"),
+                "Runtime.evaluate" if expr.contains("el.focus()") => dialog("focused"),
+                _ => usual(method, params),
+            }
+        })
+        .await;
+        let fill = request("fill", json!({"selector": "#q", "value": "hello"}));
+        let error = failure(execute_command(&mut client, &fill).await);
+        assert!(is_dialog(&error), "{error:#}");
+        assert!(
+            format!("{error:#}").starts_with(
+                "Focusing or clearing the field opened a dialog, so the value was not entered"
+            ),
+            "{error:#}"
+        );
+        let calls = calls_made(client, browser).await;
+        assert!(
+            !calls.iter().any(|c| c.starts_with("Input.insertText")),
+            "{calls:?}"
+        );
+    }
+
+    /// A textarea's value is set by the same evaluation that fires `change`,
+    /// so a dialog from its handler comes after the fill.
+    #[tokio::test]
+    async fn a_dialog_after_the_value_is_set_reports_the_fill() {
+        let (mut client, browser) = fake_browser(|method, params| {
+            let expr = params["expression"].as_str().unwrap_or_default();
+            match method {
+                "Runtime.evaluate" if fill_check(expr) => value("textarea"),
+                "Runtime.evaluate" if fill_set(expr) => dialog("changed"),
+                _ => usual(method, params),
+            }
+        })
+        .await;
+        let result = execute_command(
+            &mut client,
+            &request("fill", json!({"selector": "textarea", "value": "hello"})),
+        )
+        .await
+        .expect("the value is set");
+        assert!(
+            result
+                .output
+                .starts_with("Filled, and the page opened an alert dialog"),
+            "{}",
+            result.output
+        );
+        calls_made(client, browser).await;
+    }
+
+    /// Chrome sets the file before firing `change`, so a dialog from the
+    /// handler means the file is set; an error would invite a second upload.
+    #[tokio::test]
+    async fn a_dialog_from_a_file_inputs_change_handler_reports_the_fill() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let (mut client, browser) = fake_browser(|method, params| {
+            let expr = params["expression"].as_str().unwrap_or_default();
+            match method {
+                "Runtime.evaluate" if fill_check(expr) => value("file_input"),
+                "Runtime.evaluate" if expr.starts_with("document.querySelector") => {
+                    reply(json!({"result": {"type": "object", "objectId": "O1"}}))
+                }
+                "DOM.setFileInputFiles" => dialog("file changed"),
+                _ => usual(method, params),
+            }
+        })
+        .await;
+        let args = json!({"selector": "#f", "value": file.to_str().unwrap()});
+        let result = execute_command(&mut client, &request("fill", args))
+            .await
+            .expect("the file is set");
+        assert!(
+            result
+                .output
+                .starts_with("Filled, and the page opened an alert dialog: \"file changed\""),
+            "{}",
+            result.output
+        );
+        calls_made(client, browser).await;
+    }
+
+    /// A browser whose page T1 opened a dialog while nothing was reading: the
+    /// event waits ahead of the next reply, the target lookup's.
+    fn dialog_while_idle(targets: Value) -> impl Fn(&str, &Value) -> Answer + Send + 'static {
+        let lookups = std::sync::atomic::AtomicUsize::new(0);
+        move |method, params| match method {
+            "Target.getTargets" => Answer {
+                events: if lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    vec![dialog_event("later")]
+                } else {
+                    Vec::new()
+                },
+                reply: Some(json!({"targetInfos": targets})),
+            },
+            "Runtime.evaluate" if params["expression"] == "'done'" => value("done"),
+            _ => usual(method, params),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_recovery_request_handles_a_dialog_that_opened_while_idle() {
+        let page = json!([{"targetId": "T1", "type": "page", "url": "https://a.test/"}]);
+        let (mut client, browser) = fake_browser(dialog_while_idle(page.clone())).await;
+        let recover = request(
+            "evaluate",
+            json!({"expression": "'done'", "dialog_action": "accept"}),
+        );
+        let result = execute_command(&mut client, &recover)
+            .await
+            .expect("--dialog-action handles the dialog");
+        assert_eq!(result.output, "done");
+        let calls = calls_made(client, browser).await;
+        assert!(
+            calls.contains(&"Page.handleJavaScriptDialog@S1".to_string()),
+            "{calls:?}"
+        );
+
+        // Without an action, the dialog still fails a command on that page at once.
+        let (mut client, browser) = fake_browser(dialog_while_idle(page)).await;
+        let plain = request("evaluate", json!({"expression": "'done'"}));
+        let error = failure(execute_command(&mut client, &plain).await);
+        assert!(is_dialog(&error), "{error:#}");
+        calls_made(client, browser).await;
+    }
+
+    /// The dialog is on T1 and the command is for T2: T2 isn't blocked, and
+    /// the action meant for T2 must not answer T1's dialog.
+    #[tokio::test]
+    async fn a_dialog_on_another_page_neither_fails_the_command_nor_takes_its_action() {
+        let pages = json!([
+            {"targetId": "T1", "type": "page", "url": "https://a.test/"},
+            {"targetId": "T2", "type": "page", "url": "https://b.test/"},
+        ]);
+        let (mut client, browser) = fake_browser(dialog_while_idle(pages)).await;
+        let mut other = request(
+            "evaluate",
+            json!({"expression": "'done'", "dialog_action": "accept"}),
+        );
+        other.target = Some("T2".into());
+        let result = execute_command(&mut client, &other)
+            .await
+            .expect("T2 answers");
+        assert_eq!(result.output, "done");
+        let calls = calls_made(client, browser).await;
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("Page.handleJavaScriptDialog")),
+            "{calls:?}"
+        );
+    }
+
+    /// Without the daemon, the session that saw the dialog open ends with the
+    /// command, so the report can't send the caller to `--dialog-action`.
+    #[test]
+    fn the_report_on_a_dialog_says_who_can_handle_it() {
+        let opened = || {
+            anyhow::Error::new(crate::cdp::DialogOpen {
+                dialog_type: "confirm".into(),
+                message: "Delete?".into(),
+            })
+        };
+        let daemon = dialog_opened_by_input("click", true, opened(), HANDLE_DIALOG_NEXT).unwrap();
+        assert_eq!(
+            daemon.output,
+            "Clicked, and the page opened a confirm dialog: \"Delete?\". Steps after it opened did \
+             not run (for type-text, a --submit-key). The page is paused until the dialog is \
+             handled: run `evaluate --dialog-action accept|dismiss|<prompt text> true` on this \
+             page next."
+        );
+        let direct = dialog_opened_by_input("fill", true, opened(), DIRECT_DIALOG_NEXT).unwrap();
+        assert!(
+            direct.output.starts_with("Filled, and the page opened"),
+            "{}",
+            direct.output
+        );
+        assert!(
+            direct
+                .output
+                .ends_with("a person has to close it, or `close-page` closes the tab."),
+            "{}",
+            direct.output
+        );
+        assert!(
+            !direct.output.contains("--dialog-action"),
+            "{}",
+            direct.output
+        );
+
+        // Before the action was sent, or for a command that isn't input, it
+        // stays a failure.
+        assert!(dialog_opened_by_input("click", false, opened(), DIRECT_DIALOG_NEXT).is_err());
+        assert!(dialog_opened_by_input("evaluate", true, opened(), DIRECT_DIALOG_NEXT).is_err());
     }
 }

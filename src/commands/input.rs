@@ -13,6 +13,13 @@ async fn get_element_center(
     // Mouse events go to whatever is at the point, so an element off screen
     // or without a box would send the click elsewhere (a hidden button's
     // centre is the page's top-left corner) while reporting success.
+    //
+    // Scrolling doesn't settle that either: a fixed overlay or header can
+    // cover the point, and a fixed element off screen stays there. So the
+    // point must hit the element. A label counts as its control, since a
+    // click on it activates the control (styled checkboxes hide theirs
+    // behind it), and each line of a wrapped link is tried, because the
+    // centre of its box can fall between the lines.
     let expr = format!(
         r#"(() => {{
             const el = document.querySelector({escaped});
@@ -29,7 +36,21 @@ async fn get_element_center(
                 el.scrollIntoView({{block: 'center', inline: 'center', behavior: 'instant'}});
                 rect = el.getBoundingClientRect();
             }}
-            return JSON.stringify({{x: rect.x + rect.width/2, y: rect.y + rect.height/2}});
+            const reaches = hit => hit && (el.contains(hit) || hit.closest('label')?.control === el);
+            for (const r of [rect, ...el.getClientRects()]) {{
+                const x = r.x + r.width / 2, y = r.y + r.height / 2;
+                if (reaches(document.elementFromPoint(x, y))) return JSON.stringify({{x, y}});
+            }}
+            const x = Math.round(rect.x + rect.width / 2), y = Math.round(rect.y + rect.height / 2);
+            const top = document.elementFromPoint(x, y);
+            if (!top) {{
+                return JSON.stringify({{error: "Element is outside the visible page, and scrolling doesn't bring it in: " + {escaped}}});
+            }}
+            const name = top.tagName.toLowerCase() + (top.id ? '#' + top.id : '') +
+                [...top.classList].slice(0, 2).map(c => '.' + c).join('');
+            return JSON.stringify({{error: "Element is under <" + name + "> at (" + x + ", " + y +
+                "), which would get the click or hover instead (click-at " + x + " " + y +
+                " sends one there anyway): " + {escaped}}});
         }})()"#
     );
 
@@ -73,7 +94,6 @@ async fn dispatch_mouse(
     button: &str,
     click_count: u32,
 ) -> Result<()> {
-    client.input_sent = true;
     client
         .send_to_target(
             session_id,
@@ -90,6 +110,17 @@ async fn dispatch_mouse(
     Ok(())
 }
 
+/// A dialog opened by a step that only gets the action ready (moving the
+/// pointer, focusing a field) means the action itself was never sent. The
+/// command fails, so a retry is safe, and says what opened the dialog.
+fn before_action(error: anyhow::Error, what_happened: &'static str) -> anyhow::Error {
+    if error.downcast_ref::<crate::cdp::DialogOpen>().is_some() {
+        error.context(what_happened)
+    } else {
+        error
+    }
+}
+
 /// Click an element identified by CSS selector.
 pub async fn click(
     client: &mut CdpClient,
@@ -100,21 +131,20 @@ pub async fn click(
     // Native <option> elements don't always respond to mouse clicks, so an
     // option is selected from script instead. This check changes nothing: a
     // dialog that blocks it was not opened by the click, so it must fail the
-    // command rather than count as one.
+    // command rather than count as one. The evaluation that selects repeats
+    // it, because the page can disable the option or its select in between.
     let escaped = serde_json::to_string(selector)?;
-    let check_expr = format!(
-        r#"(() => {{
-            const el = document.querySelector({escaped});
+    let option_check = format!(
+        r#"const el = document.querySelector({escaped});
             if (!el) return 'not_found';
             if (el.tagName.toLowerCase() !== 'option') return 'not_option';
             if (el.disabled) return 'option_disabled';
             const select = el.closest('select');
             if (!select) return 'option_no_select';
             if (select.disabled) return 'select_disabled';
-            if (select.multiple) return 'select_multiple';
-            return 'option';
-        }})()"#
+            if (select.multiple) return 'select_multiple';"#
     );
+    let check_expr = format!("(() => {{ {option_check} return 'option'; }})()");
     let result = client
         .send_to_target(
             session_id,
@@ -130,44 +160,69 @@ pub async fn click(
 
     let res_val = result["result"]["value"].as_str().unwrap_or("error");
     match res_val {
-        "not_found" => bail!("Element not found: {selector}"),
         "option" => {
             // This evaluate is the click: a dialog from the change handler
             // means it worked.
             client.input_sent = true;
             let select_expr = format!(
                 r#"(() => {{
-                    const el = document.querySelector({escaped});
-                    const select = el.closest('select');
+                    {option_check}
                     select.value = el.value;
                     select.dispatchEvent(new Event('input', {{bubbles: true}}));
                     select.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    return 'selected';
                 }})()"#
             );
             let result = client
                 .send_to_target(
                     session_id,
                     "Runtime.evaluate",
-                    json!({"expression": select_expr}),
+                    json!({"expression": select_expr, "returnByValue": true}),
                 )
                 .await?;
             if let Some(exception) = result.get("exceptionDetails") {
                 let desc = crate::remote_object::describe_exception(exception);
                 bail!("JavaScript error while selecting the option: {desc}");
             }
+            match result["result"]["value"].as_str().unwrap_or("error") {
+                "selected" => {}
+                refused => return Err(option_refusal(refused, selector)),
+            }
             let new_url = client.current_url(session_id).await?;
-            Ok(CommandResult::output(format!("Selected option: {selector}"))
-                .with_navigated_to_if_changed(new_url, initial_url))
+            Ok(
+                CommandResult::output(format!("Selected option: {selector}"))
+                    .with_navigated_to_if_changed(new_url, initial_url),
+            )
         }
-        "option_disabled" => bail!("Cannot click disabled option: {selector}"),
-        "option_no_select" => bail!("Option element is not inside a select: {selector}"),
-        "select_disabled" => bail!("Cannot click option in disabled select: {selector}"),
-        "select_multiple" => bail!("Manual clicking on <option> is not supported for <select multiple>. Use `evaluate` to update selection instead: {selector}"),
         "not_option" => {
             let (x, y) = get_element_center(client, session_id, selector).await?;
             click_at(client, session_id, x, y, Some(initial_url)).await
         }
-        _ => bail!("Unexpected response from page during click handling: {res_val}"),
+        refused => Err(option_refusal(refused, selector)),
+    }
+}
+
+/// Why `click` didn't select an `<option>`, from the status its check returned.
+fn option_refusal(status: &str, selector: &str) -> anyhow::Error {
+    match status {
+        "not_found" => anyhow!("Element not found: {selector}"),
+        "option_disabled" => anyhow!("Cannot click disabled option: {selector}"),
+        "option_no_select" => anyhow!("Option element is not inside a select: {selector}"),
+        "select_disabled" => anyhow!("Cannot click option in disabled select: {selector}"),
+        "select_multiple" => anyhow!("Manual clicking on <option> is not supported for <select multiple>. Use `evaluate` to update selection instead: {selector}"),
+        _ => anyhow!("Unexpected response from page during click handling: {status}"),
+    }
+}
+
+/// Why `fill` set nothing, from the status its check returned.
+fn fill_refusal(status: &str, selector: &str, value: &str) -> anyhow::Error {
+    match status {
+        "not_found" => anyhow!("Element not found: {selector}"),
+        "option_not_found" => anyhow!(
+            "Could not find option with text or value '{value}' in select element: {selector}"
+        ),
+        // A different kind of element by the time it was filled.
+        _ => anyhow!("The page changed the element before it could be filled: {selector}"),
     }
 }
 
@@ -270,25 +325,62 @@ async fn page_ids(client: &mut CdpClient) -> Result<std::collections::HashSet<St
         .collect())
 }
 
-/// One stderr note per tab opened since `before` (a `target=_blank` link, a
-/// `window.open` button), so the caller learns its name instead of carrying
-/// on in the old tab.
+/// One stderr note per tab that appeared since `before`, so the caller learns
+/// its name instead of carrying on in the old tab.
 async fn opened_pages(
     client: &mut CdpClient,
+    session_id: &str,
     before: &std::collections::HashSet<String>,
 ) -> Vec<String> {
-    let Ok(pages) = client.get_page_targets().await else {
+    let Ok(targets) = client.send("Target.getTargets", json!({})).await else {
         return Vec::new();
     };
-    pages
-        .into_iter()
-        .filter(|p| !before.contains(&p.target_id))
-        .map(|p| {
-            format!(
-                "[opened: {} {}]",
-                crate::friendly::to_friendly(&p.target_id),
-                p.url
-            )
+    let infos = targets["targetInfos"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let notes = new_tab_notes(infos, before, None);
+    if notes.is_empty() {
+        return notes;
+    }
+    // Which tab acted, asked only once there is a new one to place.
+    let own = client
+        .send_to_target(session_id, "Target.getTargetInfo", json!({}))
+        .await
+        .ok();
+    let own_id = own
+        .as_ref()
+        .and_then(|info| info["targetInfo"]["targetId"].as_str());
+    new_tab_notes(infos, before, own_id)
+}
+
+/// Notes for the page targets in `infos` (`Target.getTargets`) missing from
+/// `before`. Chrome names the tab that opened one, even through `noopener`:
+/// `[opened: …]` is a tab `acting` opened (a `target=_blank` link, a
+/// `window.open` button). Any other, such as one a person opened meanwhile,
+/// is only `[new tab: …]`, since the action can't be shown to have opened it.
+fn new_tab_notes(
+    infos: &[serde_json::Value],
+    before: &std::collections::HashSet<String>,
+    acting: Option<&str>,
+) -> Vec<String> {
+    infos
+        .iter()
+        .filter(|t| t["type"] == "page")
+        .filter_map(|t| {
+            let id = t["targetId"].as_str()?;
+            if before.contains(id) {
+                return None;
+            }
+            let label = match t["openerId"].as_str() {
+                Some(opener) if Some(opener) == acting => "opened",
+                _ => "new tab",
+            };
+            let url = t["url"].as_str().unwrap_or_default();
+            Some(format!(
+                "[{label}: {} {url}]",
+                crate::friendly::to_friendly(id)
+            ))
         })
         .collect()
 }
@@ -309,7 +401,16 @@ pub async fn click_at(
     // Everything Chrome sent before that reply has been read by now, so what
     // gets buffered from here on came after the action began.
     client.clear_events();
-    dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0).await?;
+    dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0)
+        .await
+        .map_err(|e| {
+            before_action(
+                e,
+                "Moving the pointer there opened a dialog, so the click was not sent",
+            )
+        })?;
+    // The press starts the click: the page may act on it, as on a person's.
+    client.input_sent = true;
     dispatch_mouse(client, session_id, "mousePressed", x, y, "left", 1).await?;
     dispatch_mouse(client, session_id, "mouseReleased", x, y, "left", 1).await?;
 
@@ -323,7 +424,7 @@ pub async fn click_at(
         initial_url,
         new_document,
     );
-    result.notes = opened_pages(client, &pages_before).await;
+    result.notes = opened_pages(client, session_id, &pages_before).await;
     Ok(result)
 }
 
@@ -335,6 +436,8 @@ pub async fn hover(
 ) -> Result<CommandResult> {
     let initial_url = client.current_url(session_id).await?;
     let (x, y) = get_element_center(client, session_id, selector).await?;
+    // Here moving the pointer is the action.
+    client.input_sent = true;
     dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0).await?;
     let new_url = client.current_url(session_id).await?;
     Ok(CommandResult::output(format!("Hovered: {selector}"))
@@ -357,92 +460,125 @@ pub async fn fill(
     // Escape value for safely injecting into JS
     let escaped_val = serde_json::to_string(value)?;
 
-    let expr = format!(
-        r#"(() => {{
-            const el = document.querySelector({escaped_sel});
-            if (!el) return 'not_found';
-
-            const tagName = el.tagName.toLowerCase();
-            const type = el.type ? el.type.toLowerCase() : '';
-
-            if (tagName === 'select') {{
-                let optionFound = false;
-                for (const option of el.options) {{
-                    if (option.value === {escaped_val} || option.text === {escaped_val}) {{
-                        el.value = option.value;
-                        optionFound = true;
-                        break;
-                    }}
-                }}
-                if (!optionFound) {{
-                    return 'option_not_found';
-                }}
-                el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                return 'select_ok';
-            }}
-
-if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
-                 const isTrue = {escaped_val}.toLowerCase() === 'true';
-                 if (el.checked !== isTrue) {{
-                     el.checked = isTrue;
-                     el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                     el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                 }}
-                 return 'checkbox_ok';
-             }}
-
-             if (tagName === 'textarea') {{
-                 el.value = {escaped_val};
-                 el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                 el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                 return 'textarea_ok';
-             }}
-
-             if (type === 'file') {{
-                 return 'file_input';
-             }}
-
-             // For contenteditable elements or other text-like elements
-             el.focus();
-             el.value = '';
-             el.dispatchEvent(new Event('input', {{bubbles: true}}));
-             return 'ok';
-        }})()"#
+    // What the element is, and for a select which option matches. This check
+    // changes nothing: a dialog that blocks it was not opened by the fill, so
+    // it must fail the command rather than count as one. The evaluation that
+    // fills repeats it, because the page can change the element in between.
+    let classify = format!(
+        r#"const el = document.querySelector({escaped_sel});
+            const tagName = el ? el.tagName.toLowerCase() : '';
+            const type = el && el.type ? el.type.toLowerCase() : '';
+            const option = tagName === 'select'
+                ? [...el.options].find(o => o.value === {escaped_val} || o.text === {escaped_val})
+                : undefined;
+            const kind = !el ? 'not_found'
+                : tagName === 'select' ? (option ? 'select' : 'option_not_found')
+                : tagName === 'input' && (type === 'checkbox' || type === 'radio') ? 'checkbox'
+                : tagName === 'textarea' ? 'textarea'
+                : type === 'file' ? 'file_input'
+                : 'text';"#
     );
-
-    // This evaluate already acts: it sets values and fires input and change.
-    client.input_sent = true;
+    let check_expr = format!("(() => {{ {classify} return kind; }})()");
     let result = client
         .send_to_target(
             session_id,
             "Runtime.evaluate",
-            json!({"expression": expr, "returnByValue": true}),
+            json!({"expression": check_expr, "returnByValue": true}),
         )
         .await?;
-
     if let Some(exception) = result.get("exceptionDetails") {
         let desc = crate::remote_object::describe_exception(exception);
         bail!("JavaScript error during fill handling: {desc}");
     }
 
-    let res_val = result["result"]["value"].as_str().unwrap_or("error");
-
-    if res_val == "not_found" {
-        bail!("Element not found: {selector}");
-    } else if res_val == "option_not_found" {
-        bail!("Could not find option with text or value '{value}' in select element: {selector}");
-    } else if res_val == "file_input" {
-        return set_file(client, session_id, selector, value, cwd, initial_url).await;
-    } else if res_val == "select_ok" || res_val == "checkbox_ok" || res_val == "textarea_ok" {
-        // For select/checkbox/textarea, the work is done entirely in JS
-        let new_url = client.current_url(session_id).await?;
-        return Ok(
-            CommandResult::output(format!("Filled '{selector}' with: {value}"))
-                .with_navigated_to_if_changed(new_url, initial_url),
-        );
+    let kind = result["result"]["value"].as_str().unwrap_or("error");
+    match kind {
+        "not_found" | "option_not_found" => return Err(fill_refusal(kind, selector, value)),
+        "select" | "checkbox" | "textarea" => {
+            // This evaluate is the fill: it sets the value and fires input and
+            // change, so a dialog from their handlers means it worked.
+            client.input_sent = true;
+            let expected = serde_json::to_string(kind)?;
+            let fill_expr = format!(
+                r#"(() => {{
+                    {classify}
+                    if (kind !== {expected}) return kind;
+                    if (kind === 'select') {{
+                        el.value = option.value;
+                    }} else if (kind === 'checkbox') {{
+                        const isTrue = {escaped_val}.toLowerCase() === 'true';
+                        if (el.checked === isTrue) return 'filled';
+                        el.checked = isTrue;
+                    }} else {{
+                        el.value = {escaped_val};
+                    }}
+                    el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    return 'filled';
+                }})()"#
+            );
+            let result = client
+                .send_to_target(
+                    session_id,
+                    "Runtime.evaluate",
+                    json!({"expression": fill_expr, "returnByValue": true}),
+                )
+                .await?;
+            if let Some(exception) = result.get("exceptionDetails") {
+                let desc = crate::remote_object::describe_exception(exception);
+                bail!("JavaScript error during fill handling: {desc}");
+            }
+            match result["result"]["value"].as_str().unwrap_or("error") {
+                "filled" => {}
+                refused => return Err(fill_refusal(refused, selector, value)),
+            }
+            let new_url = client.current_url(session_id).await?;
+            return Ok(
+                CommandResult::output(format!("Filled '{selector}' with: {value}"))
+                    .with_navigated_to_if_changed(new_url, initial_url),
+            );
+        }
+        "file_input" => {
+            return set_file(client, session_id, selector, value, cwd, initial_url).await;
+        }
+        // Contenteditable and other text-like elements, typed into below.
+        _ => {}
     }
 
+    // Focusing and clearing the field only get it ready: a dialog a focus or
+    // input handler opens means the value was never entered.
+    let prepare_expr = format!(
+        r#"(() => {{
+            const el = document.querySelector({escaped_sel});
+            if (!el) return 'not_found';
+            el.focus();
+            el.value = '';
+            el.dispatchEvent(new Event('input', {{bubbles: true}}));
+            return 'ready';
+        }})()"#
+    );
+    let result = client
+        .send_to_target(
+            session_id,
+            "Runtime.evaluate",
+            json!({"expression": prepare_expr, "returnByValue": true}),
+        )
+        .await
+        .map_err(|e| {
+            before_action(
+                e,
+                "Focusing or clearing the field opened a dialog, so the value was not entered",
+            )
+        })?;
+    if let Some(exception) = result.get("exceptionDetails") {
+        let desc = crate::remote_object::describe_exception(exception);
+        bail!("JavaScript error during fill handling: {desc}");
+    }
+    if result["result"]["value"] == "not_found" {
+        bail!("Element not found: {selector}");
+    }
+
+    client.input_sent = true;
     client
         .send_to_target(session_id, "Input.insertText", json!({"text": value}))
         .await?;
@@ -514,7 +650,10 @@ async fn set_file(
         .to_string();
 
     // Chrome fires `input` and `change` on the element itself. Dispatching them
-    // again could make an upload widget start the upload twice.
+    // again could make an upload widget start the upload twice. Chrome sets
+    // the file before firing them, so a dialog their handlers open means the
+    // file is set.
+    client.input_sent = true;
     let set = client
         .send_to_target(
             session_id,
@@ -524,6 +663,8 @@ async fn set_file(
         .await;
     let read_back = match set {
         Ok(_) => Ok(read_back_file(client, session_id, &object_id).await),
+        // Kept as it is, so the executor reports the file as set.
+        Err(e) if e.downcast_ref::<crate::cdp::DialogOpen>().is_some() => Err(e),
         Err(e) => Err(anyhow!("Can't set the file on '{selector}': {e}")),
     };
     // The daemon's session outlives this command, so an unreleased handle would
@@ -723,7 +864,7 @@ pub async fn press_key(
         initial_url,
         new_document,
     );
-    result.notes = opened_pages(client, &pages_before).await;
+    result.notes = opened_pages(client, session_id, &pages_before).await;
     Ok(result)
 }
 
@@ -1111,6 +1252,36 @@ mod tests {
                 0
             ),
             "Set file on '#one': empty.txt (0 B, text/plain)"
+        );
+    }
+
+    /// A tab counts as opened by the action only when this tab opened it;
+    /// Chrome names the opener even of a `noopener` link.
+    #[test]
+    fn new_tabs_are_credited_to_the_action_only_when_this_tab_opened_them() {
+        let before: std::collections::HashSet<String> = ["A".to_string(), "B".to_string()].into();
+        let infos = [
+            json!({"targetId": "A", "type": "page", "url": "https://a.test/"}),
+            json!({"targetId": "C", "type": "page", "url": "https://a.test/pop", "openerId": "A"}),
+            json!({"targetId": "D", "type": "page", "url": "about:blank"}),
+            json!({"targetId": "E", "type": "page", "url": "https://b.test/", "openerId": "B"}),
+            json!({"targetId": "F", "type": "service_worker", "url": "https://a.test/sw.js", "openerId": "A"}),
+        ];
+        let name = crate::friendly::to_friendly;
+        assert_eq!(
+            new_tab_notes(&infos, &before, Some("A")),
+            [
+                format!("[opened: {} https://a.test/pop]", name("C")),
+                format!("[new tab: {} about:blank]", name("D")),
+                format!("[new tab: {} https://b.test/]", name("E")),
+            ]
+        );
+        // Without knowing which tab acted, no tab is credited to the action.
+        let unplaced = new_tab_notes(&infos, &before, None);
+        assert_eq!(unplaced.len(), 3);
+        assert!(
+            unplaced.iter().all(|n| n.starts_with("[new tab: ")),
+            "{unplaced:?}"
         );
     }
 

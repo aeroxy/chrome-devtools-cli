@@ -48,14 +48,6 @@ impl WebAuthnParams {
                 );
             }
         }
-        if self.protocol.as_deref() == Some("u2f")
-            && (self.has_resident_key == Some(true) || self.has_user_verification == Some(true))
-        {
-            bail!(
-                "protocol u2f supports neither resident keys nor user verification: \
-                 omit --has-resident-key and --has-user-verification, or set them to false"
-            );
-        }
         Ok(())
     }
 }
@@ -233,8 +225,20 @@ fn output(
     Ok(CommandResult::output(format_structured(&value, format)?))
 }
 
-/// Option pairs Chrome refuses to add.
-fn check_supported(options: &AuthenticatorOptions) -> Result<()> {
+/// Option pairs Chrome refuses to add, and flags the merged options can't
+/// honour. u2f comes from the current authenticator too when --protocol is
+/// omitted, and [`resolve_options`] turns resident keys and user verification
+/// off for it: asking for either must fail rather than be dropped.
+fn check_supported(params: &WebAuthnParams, options: &AuthenticatorOptions) -> Result<()> {
+    if options.protocol == "u2f"
+        && (params.has_resident_key == Some(true) || params.has_user_verification == Some(true))
+    {
+        bail!(
+            "protocol u2f supports neither resident keys nor user verification: omit \
+             --has-resident-key and --has-user-verification, set them to false, or switch with \
+             --protocol ctap2"
+        );
+    }
     if options.protocol == "u2f" && options.transport == "hybrid" {
         bail!(
             "protocol u2f supports only the usb, nfc and ble transports, not hybrid: add \
@@ -313,7 +317,7 @@ pub async fn configure_webauthn(
     // Checked on the merged options, before anything is removed: a flag can
     // combine with the current authenticator into a pair Chrome refuses, and
     // replacing would already have deleted the old one and its credentials.
-    check_supported(&next)?;
+    check_supported(&params, &next)?;
     let plan = plan(current.as_ref(), &next);
     // Adding or replacing can leave the tab with no authenticator when it
     // fails; anything else leaves the current one as it was.
@@ -505,31 +509,29 @@ mod tests {
     /// which Chrome refuses; that must be caught before the old one is removed.
     #[test]
     fn merged_options_chrome_refuses_are_caught() {
-        let current = resolve_options(
-            &WebAuthnParams {
+        let check = |params: WebAuthnParams, current: Option<&AuthenticatorOptions>| {
+            let next = resolve_options(&params, current);
+            check_supported(&params, &next).map(|()| next)
+        };
+        let current = check(
+            WebAuthnParams {
                 transport: Some("hybrid".into()),
                 ..Default::default()
             },
             None,
-        );
-        assert!(check_supported(&current).is_ok());
-        let switched = resolve_options(
-            &WebAuthnParams {
-                protocol: Some("u2f".into()),
-                ..Default::default()
-            },
-            Some(&current),
-        );
-        assert!(check_supported(&switched).is_err());
-        let to_usb = resolve_options(
-            &WebAuthnParams {
-                protocol: Some("u2f".into()),
-                transport: Some("usb".into()),
-                ..Default::default()
-            },
-            Some(&current),
-        );
-        assert!(check_supported(&to_usb).is_ok());
+        )
+        .unwrap();
+        let switched = WebAuthnParams {
+            protocol: Some("u2f".into()),
+            ..Default::default()
+        };
+        assert!(check(switched, Some(&current)).is_err());
+        let to_usb = WebAuthnParams {
+            protocol: Some("u2f".into()),
+            transport: Some("usb".into()),
+            ..Default::default()
+        };
+        assert!(check(to_usb, Some(&current)).is_ok());
 
         let gone = anyhow::anyhow!("CDP error in WebAuthn.getCredentials: Could not find a Virtual Authenticator matching the ID");
         assert!(authenticator_gone(&gone));
@@ -550,24 +552,62 @@ mod tests {
             ..Default::default()
         };
         assert!(bad_transport.validate().is_err());
-        let u2f_rk = WebAuthnParams {
-            protocol: Some("u2f".into()),
-            has_resident_key: Some(true),
-            ..Default::default()
-        };
-        assert!(u2f_rk.validate().is_err());
-        let u2f_off = WebAuthnParams {
-            protocol: Some("u2f".into()),
-            has_resident_key: Some(false),
-            ..Default::default()
-        };
-        assert!(u2f_off.validate().is_ok());
         let remove_and_set = WebAuthnParams {
             remove: true,
             transport: Some("usb".into()),
             ..Default::default()
         };
         assert!(remove_and_set.validate().is_err());
+    }
+
+    /// u2f can't have a resident key or user verification, whether --protocol
+    /// says u2f or the current authenticator already is one: the flag must
+    /// fail, not be dropped from a command that then succeeds.
+    #[test]
+    fn u2f_refuses_capabilities_it_would_drop() {
+        let refused = |params: WebAuthnParams, current: Option<&AuthenticatorOptions>| {
+            check_supported(&params, &resolve_options(&params, current)).is_err()
+        };
+        let u2f = AuthenticatorOptions {
+            protocol: "u2f".into(),
+            transport: "usb".into(),
+            has_resident_key: false,
+            has_user_verification: false,
+            ..ctap2()
+        };
+        let resident_key = || WebAuthnParams {
+            has_resident_key: Some(true),
+            ..Default::default()
+        };
+        assert!(refused(resident_key(), Some(&u2f)));
+        let user_verification = WebAuthnParams {
+            has_user_verification: Some(true),
+            ..Default::default()
+        };
+        assert!(refused(user_verification, Some(&u2f)));
+        assert!(refused(
+            WebAuthnParams {
+                protocol: Some("u2f".into()),
+                transport: Some("usb".into()),
+                ..resident_key()
+            },
+            None
+        ));
+        // Switching to ctap2 can ask for them, and u2f can turn them off.
+        assert!(!refused(
+            WebAuthnParams {
+                protocol: Some("ctap2".into()),
+                ..resident_key()
+            },
+            Some(&u2f)
+        ));
+        let off = WebAuthnParams {
+            protocol: Some("u2f".into()),
+            transport: Some("usb".into()),
+            has_resident_key: Some(false),
+            ..Default::default()
+        };
+        assert!(!refused(off, None));
     }
 
     #[test]

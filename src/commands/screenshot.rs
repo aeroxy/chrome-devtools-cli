@@ -63,6 +63,8 @@ pub async fn take_screenshot(
     // Device pixels per CSS pixel. Images come out at device resolution, so
     // --max-width/--max-height and the capture limit are in device pixels.
     let mut dpr = 1.0;
+    // DIPs per CSS pixel: the browser zoom, which the clip has to include.
+    let mut zoom = 1.0;
     let needs_metrics = full_page || max_width.is_some() || max_height.is_some();
 
     if needs_metrics {
@@ -82,6 +84,7 @@ pub async fn take_screenshot(
             Some(ratio) => ratio,
             None => device_pixel_ratio(&metrics),
         };
+        zoom = browser_zoom(&metrics);
         if full_page {
             // cssContentSize is the full scrollable content area in CSS pixels.
             // (The legacy `contentSize` returns DIPs, which are wrong on HiDPI
@@ -134,11 +137,7 @@ pub async fn take_screenshot(
     // downscaling, the layout viewport's scroll offsets (pageX/pageY) must be
     // used so the visible region — not the document's top-left — is framed.
     if full_page || clip_scale < 1.0 {
-        params["clip"] = json!({
-            "x": scroll_x, "y": scroll_y,
-            "width": src_w, "height": src_h,
-            "scale": clip_scale,
-        });
+        params["clip"] = capture_clip(scroll_x, scroll_y, src_w, src_h, zoom, clip_scale);
     }
 
     let result = client
@@ -167,24 +166,71 @@ pub async fn take_screenshot(
     Ok(CommandResult { notes, ..result })
 }
 
-/// The page's own `devicePixelRatio`, which includes an emulated
-/// `--device-scale-factor` (the layout viewports below don't). `None` where
-/// the page can't run JavaScript.
+/// The window's `devicePixelRatio`: the browser zoom times the device scale
+/// factor, an emulated `--device-scale-factor` included (the layout viewports
+/// below leave that out). Read in an isolated world, since the page can
+/// replace `window.devicePixelRatio` in its own, as some fingerprinting
+/// defences do, and a smaller value there would let a capture past
+/// --max-width through. Chrome reuses a world of the same name, so repeated
+/// screenshots don't add any. `None` where the page can't run JavaScript.
 async fn page_device_pixel_ratio(client: &mut CdpClient, session_id: &str) -> Option<f64> {
+    let frame_id = super::input::main_frame_id(client, session_id).await.ok()?;
+    let world = client
+        .send_to_target(
+            session_id,
+            "Page.createIsolatedWorld",
+            json!({"frameId": frame_id, "worldName": "chrome-devtools-cli"}),
+        )
+        .await
+        .ok()?;
     let result = client
         .send_to_target(
             session_id,
             "Runtime.evaluate",
-            json!({"expression": "window.devicePixelRatio", "returnByValue": true}),
+            json!({
+                "expression": "devicePixelRatio",
+                "contextId": world["executionContextId"],
+                "returnByValue": true,
+            }),
         )
         .await
         .ok()?;
     result["result"]["value"].as_f64().filter(|r| *r > 0.0)
 }
 
-/// Fallback for pages without JavaScript: `layoutViewport` is in device pixels and `cssLayoutViewport` in CSS
-/// pixels, so their ratio is the device pixel ratio, including an emulated
-/// `--device-scale-factor`. 1 when either is missing.
+/// DIPs per CSS pixel, which is the browser zoom (`cssVisualViewport.zoom`;
+/// pinch zoom is its `scale`). 1 when missing.
+fn browser_zoom(metrics: &serde_json::Value) -> f64 {
+    metrics["cssVisualViewport"]["zoom"]
+        .as_f64()
+        .filter(|z| z.is_finite() && *z > 0.0)
+        .unwrap_or(1.0)
+}
+
+/// `Page.captureScreenshot`'s clip for a region in CSS pixels. Chrome reads
+/// the rectangle in DIPs, which are CSS pixels times the browser zoom, and
+/// renders it at `scale` times the device scale factor. Verified on Chrome
+/// 158: at 200% zoom, a rectangle in CSS pixels covered only the top-left
+/// quarter of the viewport, and a full-page one only half of the page.
+fn capture_clip(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    zoom: f64,
+    scale: f64,
+) -> serde_json::Value {
+    json!({
+        "x": x * zoom, "y": y * zoom,
+        "width": width * zoom, "height": height * zoom,
+        "scale": scale,
+    })
+}
+
+/// Fallback for pages without JavaScript: `layoutViewport` is in device pixels
+/// and `cssLayoutViewport` in CSS pixels, so their ratio is the browser zoom
+/// times the screen's scale factor. It misses an emulated
+/// `--device-scale-factor`, which neither includes. 1 when either is missing.
 fn device_pixel_ratio(metrics: &serde_json::Value) -> f64 {
     let device = metrics["layoutViewport"]["clientWidth"].as_f64();
     let css = metrics["cssLayoutViewport"]["clientWidth"].as_f64();
@@ -218,7 +264,27 @@ fn clip_scale_factor(
 
 #[cfg(test)]
 mod tests {
-    use super::{clip_scale_factor, device_pixel_ratio};
+    use super::{browser_zoom, capture_clip, clip_scale_factor, device_pixel_ratio};
+
+    /// Page.getLayoutMetrics at 200% browser zoom on a 1x screen (Chrome
+    /// 158), scrolled to y=500: the clip must be in DIPs to frame the viewport.
+    #[test]
+    fn the_clip_is_in_dips_at_any_browser_zoom() {
+        let metrics = serde_json::json!({
+            "layoutViewport": {"pageX": 0, "pageY": 1000, "clientWidth": 756, "clientHeight": 469},
+            "cssLayoutViewport": {"pageX": 0, "pageY": 500, "clientWidth": 378, "clientHeight": 234},
+            "cssVisualViewport": {"clientWidth": 378, "clientHeight": 234.5, "scale": 1, "zoom": 2},
+        });
+        let zoom = browser_zoom(&metrics);
+        assert_eq!(zoom, 2.0);
+        assert_eq!(
+            capture_clip(0.0, 500.0, 378.0, 234.0, zoom, 0.5),
+            serde_json::json!({"x": 0.0, "y": 1000.0, "width": 756.0, "height": 468.0, "scale": 0.5})
+        );
+        assert_eq!(browser_zoom(&serde_json::json!({})), 1.0);
+        // The fallback ratio has the zoom in it, as devicePixelRatio does.
+        assert_eq!(device_pixel_ratio(&metrics), 2.0);
+    }
 
     #[test]
     fn device_pixel_ratio_comes_from_the_two_viewports() {

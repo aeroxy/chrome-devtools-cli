@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::fmt::Write;
+use std::io::Read;
 
 use crate::cdp::CdpClient;
 use crate::format::{format_structured, OutputFormat};
@@ -103,8 +104,7 @@ impl MockRequest<'_> {
                 .collect::<Result<Vec<_>>>()?;
             let body = match (self.body, self.body_file) {
                 (Some(text), _) => text.as_bytes().to_vec(),
-                (None, Some(path)) => std::fs::read(path)
-                    .with_context(|| format!("Failed to read --body-file {path}"))?,
+                (None, Some(path)) => read_body_file(path)?,
                 (None, None) => Vec::new(),
             };
             MockAction::Fulfill {
@@ -120,6 +120,45 @@ impl MockRequest<'_> {
             hits: 0,
         })
     }
+}
+
+/// The largest `--body-file`. Every answer carries the body base64-encoded in
+/// one CDP message, and Chrome closes the connection on a message past 100 MiB
+/// (verified on Chrome 158), which would end the daemon.
+const MAX_BODY_FILE_BYTES: u64 = 64 << 20;
+
+/// Read `--body-file` in the daemon, which serves one command at a time. A
+/// read that never ends (a FIFO nobody writes, /dev/stdin, /dev/zero) would
+/// hold up every other caller, so only a regular file is read, and at most
+/// [`MAX_BODY_FILE_BYTES`] of it.
+fn read_body_file(path: &str) -> Result<Vec<u8>> {
+    let context = || format!("Failed to read --body-file {path}");
+    // Checked before opening: opening a FIFO waits for a writer.
+    let metadata = std::fs::metadata(path).with_context(context)?;
+    if !metadata.is_file() {
+        bail!(
+            "--body-file {path} is not a regular file. Save the body to a file first: the daemon \
+             would wait on a pipe or a device, and every other command with it."
+        );
+    }
+    let too_big = || {
+        anyhow::anyhow!(
+            "--body-file {path} is larger than {} MiB, the most one mocked response can carry",
+            MAX_BODY_FILE_BYTES >> 20
+        )
+    };
+    if metadata.len() > MAX_BODY_FILE_BYTES {
+        return Err(too_big());
+    }
+    let mut body = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(MAX_BODY_FILE_BYTES + 1).read_to_end(&mut body))
+        .with_context(context)?;
+    // It grew after the check.
+    if body.len() as u64 > MAX_BODY_FILE_BYTES {
+        return Err(too_big());
+    }
+    Ok(body)
 }
 
 /// A header Chrome will accept. One it rejects would fail the reply after the
@@ -519,5 +558,42 @@ mod tests {
             .contains("Unknown resource type"));
         let ok = req(None, vec!["X-A: 1"], Some("xhr")).into_mock().unwrap();
         assert_eq!(ok.resource_type.as_deref(), Some("XHR"));
+    }
+
+    #[test]
+    fn a_body_file_is_read_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.bin");
+        let bytes = [0u8, 0xff, 0xfe, b'\n', b'{', b'}'];
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(read_body_file(path.to_str().unwrap()).unwrap(), bytes);
+    }
+
+    /// The daemon serves one command at a time: nothing may wait on the file.
+    #[test]
+    fn a_body_file_that_could_stall_the_daemon_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = |path: &std::path::Path| {
+            read_body_file(path.to_str().unwrap())
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(refused(dir.path()).contains("not a regular file"));
+        #[cfg(unix)]
+        {
+            assert!(refused(std::path::Path::new("/dev/zero")).contains("not a regular file"));
+            // A FIFO nobody writes: opening it would block forever.
+            let fifo = dir.path().join("fifo");
+            let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            assert!(refused(&fifo).contains("not a regular file"));
+        }
+        // Sparse, so the test writes nothing.
+        let big = dir.path().join("big");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_BODY_FILE_BYTES + 1)
+            .unwrap();
+        assert!(refused(&big).contains("larger than 64 MiB"));
     }
 }

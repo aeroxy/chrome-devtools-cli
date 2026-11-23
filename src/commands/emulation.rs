@@ -153,12 +153,33 @@ impl EmulateParams {
     }
 }
 
+/// Chrome drops an override when the session that set it detaches. A one-off
+/// session (no daemon, or it could not attach to the tab) detaches as the
+/// command ends, so a media override set there would be gone by then, and the
+/// value the client keeps would belong to no tab: the next tab whose setup
+/// fails would get it. Only `emulate` sets media, so unlike the viewport it
+/// has no use within a single command.
+fn check_media_session(params: &EmulateParams, persistent: bool) -> Result<()> {
+    if (params.media.is_some() || !params.media_features.is_empty()) && !persistent {
+        anyhow::bail!(
+            "CSS media emulation needs the daemon's long-lived session for this tab, which this \
+             command is not running in (no daemon, or it could not attach), so the override \
+             would end with the command. Run it again once the daemon is up."
+        );
+    }
+    Ok(())
+}
+
 /// Execute the unified emulation command.
 pub async fn emulate(
     client: &mut CdpClient,
     session_id: &str,
     params: EmulateParams,
 ) -> Result<CommandResult> {
+    check_media_session(
+        &params,
+        client.persistent_session.as_deref() == Some(session_id),
+    )?;
     let mut actions = Vec::new();
 
     // 0. Handle network blocklist (applied to the persistent session, not the
@@ -446,6 +467,25 @@ mod tests {
         assert!(p.validate().is_ok());
         p.media = Some("braille".into());
         assert!(p.validate().is_err());
+    }
+
+    /// A one-off session takes its overrides with it when it detaches.
+    #[test]
+    fn media_needs_the_daemons_session() {
+        let mut p = params();
+        p.media = Some("print".into());
+        let err = check_media_session(&p, false).unwrap_err().to_string();
+        assert!(err.contains("long-lived session"), "{err}");
+        assert!(check_media_session(&p, true).is_ok());
+        let mut p = params();
+        p.media_features = vec!["prefers-color-scheme=dark".into()];
+        assert!(check_media_session(&p, false).is_err());
+        // Clearing leaves nothing behind, and the viewport applies to the
+        // command's own navigation.
+        let mut p = params();
+        p.clear_media = true;
+        p.viewport = Some("800x600".into());
+        assert!(check_media_session(&p, false).is_ok());
     }
 
     #[test]

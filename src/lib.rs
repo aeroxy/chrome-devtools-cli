@@ -1624,7 +1624,8 @@ fn cli_cwd() -> Option<String> {
 /// URLs), so control sequences never reach the terminal raw. Structured
 /// output is data a program may parse, so it keeps every character: JSON says
 /// them as escapes, and TOON, which has no escape for them, loses them only
-/// when printed to a terminal.
+/// when printed to a terminal. Plain text is cleaned even under `--json`
+/// (see `format::for_stdout`).
 fn print_output(
     output: &str,
     navigated_to: Option<&str>,
@@ -1633,13 +1634,7 @@ fn print_output(
     output_format: format::OutputFormat,
 ) {
     use std::io::IsTerminal;
-    let output = match output_format {
-        format::OutputFormat::Json => format::escape_json_controls(output),
-        format::OutputFormat::Toon if !std::io::stdout().is_terminal() => {
-            std::borrow::Cow::Borrowed(output)
-        }
-        _ => format::strip_terminal_escapes(output),
-    };
+    let output = format::for_stdout(output, output_format, std::io::stdout().is_terminal());
     let navigated_to = navigated_to.map(format::strip_terminal_escapes);
     if !output.is_empty() {
         print!("{output}");
@@ -2058,10 +2053,10 @@ async fn caffeinate(cli: &Cli, ws_url: &str, key: &str, request: &DaemonRequest)
             client::send_to_daemon(key, request).await?
         }
     };
-    if !first.success {
-        // Exits with the daemon's error and code, as any other command would.
-        print_response(&first, cli.output_format());
-    }
+    // A failure exits with the daemon's error and code, as any other command
+    // would. A success prints nothing but the warning for a daemon of another
+    // version, once: caffeinate is what keeps such a daemon from exiting.
+    print_response(&first, cli.output_format());
 
     let name = browser::display_name(&cli.browser);
     eprintln!(
@@ -2629,6 +2624,16 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
         }
         _ => unreachable!(),
     };
+    // As with the daemon, an input whose own action opened a dialog worked,
+    // and a retry would repeat it.
+    let result = result.or_else(|e| {
+        commands::executor::dialog_opened_by_input(
+            cli.command_name(),
+            client.input_sent,
+            e,
+            commands::executor::DIRECT_DIALOG_NEXT,
+        )
+    });
 
     let _ = client.detach_from_target(&session_id).await;
     let name = friendly::to_friendly(&target_id);

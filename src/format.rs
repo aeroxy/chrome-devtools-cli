@@ -67,6 +67,24 @@ pub fn escape_json_controls(json: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// What stdout gets for a command's `output`, `terminal` saying whether stdout
+/// is one. Text loses its control sequences, JSON keeps them all as escapes,
+/// and TOON, which has no escape for them, keeps them only off a terminal.
+/// Some commands answer `--json` with a plain-text message (a click that
+/// opened a dialog says so in a sentence), and nothing has escaped its
+/// controls. serde_json leaves none below U+0020 raw but the newlines it
+/// writes, so `--json` output holding any other is such a message, and is
+/// cleaned as text.
+pub fn for_stdout(output: &str, format: OutputFormat, terminal: bool) -> std::borrow::Cow<'_, str> {
+    match format {
+        OutputFormat::Json if !output.contains(|c: char| c < ' ' && c != '\n') => {
+            escape_json_controls(output)
+        }
+        OutputFormat::Toon if !terminal => std::borrow::Cow::Borrowed(output),
+        _ => strip_terminal_escapes(output),
+    }
+}
+
 /// Cut `s` to at most `max_chars` characters, ending a cut one with "…".
 /// Counts and cuts by `char`, so a multi-byte character is never split.
 pub fn truncate_chars(s: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
@@ -82,20 +100,29 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
 /// and a page can log `ESC ] 0 ; title BEL` to rename the terminal, OSC 52 to
 /// write the clipboard, or CSI codes to recolour or hide output. CSI and OSC
 /// sequences go with their payloads; other C0 and C1 controls go too, except
-/// newline, tab and carriage return. An unterminated OSC loses only its ESC,
+/// newline and tab. A carriage return stays only where it ends a line (`\r\n`):
+/// anywhere else it sends the cursor back to the start of the line, and the
+/// text after it would print over what is already there, an `error:` prefix
+/// included, so it becomes a newline. An unterminated OSC loses only its ESC,
 /// so the rest of its line stays readable.
 pub fn strip_terminal_escapes(s: &str) -> std::borrow::Cow<'_, str> {
     let stripped =
         |c: char| matches!(c as u32, 0x00..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f | 0x7f..=0x9f);
-    if !s.chars().any(stripped) {
+    let b = s.as_bytes();
+    let lone_cr = |i: usize| b[i] == b'\r' && b.get(i + 1) != Some(&b'\n');
+    if !s.chars().any(stripped) && !(0..b.len()).any(lone_cr) {
         return std::borrow::Cow::Borrowed(s);
     }
-    let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < s.len() {
         if b[i] == 0x1b {
             i = csi_end(b, i).or_else(|| osc_end(b, i)).unwrap_or(i + 1);
+            continue;
+        }
+        if lone_cr(i) {
+            out.push('\n');
+            i += 1;
             continue;
         }
         let c = s[i..].chars().next().unwrap_or_default();
@@ -195,6 +222,46 @@ mod tests {
             strip_terminal_escapes("plain"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    /// A carriage return that doesn't end a line would let page text print
+    /// over the start of its line, such as the `error:` prefix.
+    #[test]
+    fn lone_carriage_returns_become_newlines() {
+        assert_eq!(
+            strip_terminal_escapes("Uncaught Error: x\rAll good"),
+            "Uncaught Error: x\nAll good"
+        );
+        assert_eq!(strip_terminal_escapes("a\r\rb\r"), "a\n\nb\n");
+        assert_eq!(strip_terminal_escapes("a\x1b[2K\rb"), "a\nb");
+        // CRLF ends a line without moving back over it, so it stays.
+        assert!(matches!(
+            strip_terminal_escapes("one\r\ntwo\r\n"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// `--json` can bring back a plain-text message, which is cleaned like
+    /// text; JSON itself keeps every character, as escapes.
+    #[test]
+    fn json_mode_cleans_plain_text_and_keeps_json() {
+        let message = "Clicked, and the page opened an alert dialog: \"\x1b]0;PWNED\x07hi\rFAKE\"";
+        assert_eq!(
+            for_stdout(message, OutputFormat::Json, true),
+            "Clicked, and the page opened an alert dialog: \"hi\nFAKE\""
+        );
+        let value = json!({"text": "\x1b[31m\u{9b}red\r\n"});
+        let rendered = serde_json::to_string_pretty(&value).unwrap();
+        let printed = for_stdout(&rendered, OutputFormat::Json, true);
+        assert!(!printed.contains(['\x1b', '\u{9b}', '\r']), "{printed}");
+        assert_eq!(serde_json::from_str::<Value>(&printed).unwrap(), value);
+        // TOON keeps its bytes off a terminal, and text never does.
+        assert_eq!(
+            for_stdout("a\x1b[31mb", OutputFormat::Toon, false),
+            "a\x1b[31mb"
+        );
+        assert_eq!(for_stdout("a\x1b[31mb", OutputFormat::Toon, true), "ab");
+        assert_eq!(for_stdout("a\x1b[31mb", OutputFormat::Text, false), "ab");
     }
     use serde_json::json;
 

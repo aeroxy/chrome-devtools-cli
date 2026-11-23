@@ -128,11 +128,11 @@ async fn go_forward(
 ///
 /// `Page.navigateToHistoryEntry` returns before the traversal commits, and an
 /// entry that `pushState` made can keep the document and even the URL, so
-/// the wait is for the commit itself: a new document in the main frame, or a
-/// navigation within it.
+/// the wait is for the commit itself: a new document, or a navigation within
+/// one, in a frame the traversal moves ([`traversal_frames`]).
 async fn traverse_history(client: &mut CdpClient, session_id: &str, entry_id: i64) -> Result<()> {
     let main_frame = super::input::main_frame_id(client, session_id).await?;
-    // Only this traversal's commit counts.
+    // Only this traversal's events count.
     client.clear_events();
     client
         .send_to_target(
@@ -141,26 +141,75 @@ async fn traverse_history(client: &mut CdpClient, session_id: &str, entry_id: i6
             json!({"entryId": entry_id}),
         )
         .await?;
-    client
-        .wait_for_event_match(
-            &["Page.frameNavigated", "Page.navigatedWithinDocument"],
-            std::time::Duration::from_millis(NAVIGATION_TIMEOUT_MS),
-            |method, p| {
-                let frame = if method == "Page.frameNavigated" {
-                    &p["frame"]["id"]
-                } else {
-                    &p["frameId"]
-                };
-                frame.as_str() == Some(main_frame.as_str())
-            },
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Timeout ({NAVIGATION_TIMEOUT_MS}ms) waiting for the history navigation to happen"
+    let frames = traversal_frames(&client.events, session_id, &main_frame);
+    // None named: the entry moves only an iframe from another site, which
+    // commits in its own process, out of this session's sight.
+    if !frames.is_empty() {
+        client
+            .wait_for_event_match(
+                &["Page.frameNavigated", "Page.navigatedWithinDocument"],
+                std::time::Duration::from_millis(NAVIGATION_TIMEOUT_MS),
+                |method, p| {
+                    let frame = if method == "Page.frameNavigated" {
+                        &p["frame"]["id"]
+                    } else {
+                        &p["frameId"]
+                    };
+                    frame
+                        .as_str()
+                        .is_some_and(|f| frames.iter().any(|w| w == f))
+                },
             )
-        })?;
+            .await
+            .map_err(history_wait_error)?;
+    }
     wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS, None).await
+}
+
+/// A lost connection keeps its type, which the daemon exits on; any other
+/// failure of the wait is the wait running out.
+fn history_wait_error(e: anyhow::Error) -> anyhow::Error {
+    if crate::cdp::is_connection_or_page_failure(&e) {
+        e
+    } else {
+        anyhow::anyhow!(
+            "Timeout ({NAVIGATION_TIMEOUT_MS}ms) waiting for the history navigation to happen"
+        )
+    }
+}
+
+/// The frames whose commit ends a history traversal, from the events read
+/// while `Page.navigateToHistoryEntry` was answered.
+///
+/// Chrome names each frame of the page that a traversal navigates
+/// (`Page.frameStartedNavigating`, `Page.frameStartedLoading`) before it
+/// replies, even while the page is busy: the browser sends them. Verified on
+/// Chrome 158. An entry that an iframe's own navigation made moves only that
+/// iframe, so the main frame never commits. `Page.getNavigationHistory` can't
+/// tell instead: its `currentIndex` points at the entry before the commit.
+fn traversal_frames(
+    events: &std::collections::VecDeque<serde_json::Value>,
+    session_id: &str,
+    main_frame: &str,
+) -> Vec<String> {
+    let mut started: Vec<String> = events
+        .iter()
+        .filter(|e| e["sessionId"].as_str() == Some(session_id))
+        .filter(|e| {
+            matches!(
+                e["method"].as_str(),
+                Some("Page.frameStartedNavigating" | "Page.frameStartedLoading")
+            )
+        })
+        .filter_map(|e| e["params"]["frameId"].as_str().map(str::to_string))
+        .collect();
+    started.dedup();
+    // When the main frame moves too, its commit is the one that counts.
+    if started.iter().any(|f| f == main_frame) {
+        vec![main_frame.to_string()]
+    } else {
+        started
+    }
 }
 
 async fn do_reload(
@@ -185,8 +234,9 @@ pub struct DocumentMark {
     url: String,
 }
 
-const DOCUMENT_STATE_JS: &str =
-    "JSON.stringify([document.readyState, performance.timeOrigin, location.href])";
+/// Read with `returnByValue`, which serializes outside the page: a page can
+/// replace `JSON.stringify`, and the load would then never look complete.
+const DOCUMENT_STATE_JS: &str = "[document.readyState, performance.timeOrigin, location.href]";
 
 pub async fn document_mark(client: &mut CdpClient, session_id: &str) -> Result<DocumentMark> {
     let result = client
@@ -201,9 +251,10 @@ pub async fn document_mark(client: &mut CdpClient, session_id: &str) -> Result<D
     Ok(DocumentMark { time_origin, url })
 }
 
+/// The fields of [`DOCUMENT_STATE_JS`]; `None` unless all three are there, so
+/// a document that can't be identified never counts as a new one.
 fn parse_document_state(result: &serde_json::Value) -> Option<(String, f64, String)> {
-    let state: serde_json::Value =
-        serde_json::from_str(result["result"]["value"].as_str()?).ok()?;
+    let state = &result["result"]["value"];
     Some((
         state[0].as_str()?.to_string(),
         state[1].as_f64()?,
@@ -266,5 +317,67 @@ pub async fn wait_for_load(
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn started(session: &str, method: &str, frame: &str) -> serde_json::Value {
+        json!({"sessionId": session, "method": method, "params": {"frameId": frame}})
+    }
+
+    /// What Chrome 158 sent before replying to `Page.navigateToHistoryEntry`.
+    #[test]
+    fn traversal_waits_for_the_frames_chrome_names() {
+        let main_frame = started("s1", "Page.frameStartedNavigating", "MAIN");
+        let iframe = [
+            started("s1", "Page.frameStartedNavigating", "CHILD"),
+            started("s1", "Page.frameStartedLoading", "CHILD"),
+        ];
+        let events = [main_frame, iframe[0].clone()].into();
+        assert_eq!(traversal_frames(&events, "s1", "MAIN"), ["MAIN"]);
+        // An entry an iframe's navigation made: the main frame never commits.
+        let events = iframe.clone().into();
+        assert_eq!(traversal_frames(&events, "s1", "MAIN"), ["CHILD"]);
+        // An iframe from another site commits in its own process: nothing.
+        assert!(traversal_frames(&Default::default(), "s1", "MAIN").is_empty());
+        // Another session's events are no part of it.
+        let other = [started("s2", "Page.frameStartedLoading", "MAIN")].into();
+        assert!(traversal_frames(&other, "s1", "MAIN").is_empty());
+    }
+
+    #[test]
+    fn a_lost_connection_is_not_reported_as_a_timeout() {
+        let lost = history_wait_error(anyhow::Error::new(crate::cdp::ConnectionLost(
+            "WebSocket closed by server".into(),
+        )));
+        assert!(lost.downcast_ref::<crate::cdp::ConnectionLost>().is_some());
+        let waited = history_wait_error(anyhow::anyhow!("Timeout waiting for any event"));
+        assert!(waited.to_string().starts_with(&format!(
+            "Timeout ({NAVIGATION_TIMEOUT_MS}ms) waiting for the history"
+        )));
+    }
+
+    /// The state comes back as an array by value; the page's JSON.stringify,
+    /// replaced or not, is never involved.
+    #[test]
+    fn document_state_is_read_by_value() {
+        let state = json!({"result": {"type": "object", "subtype": "array",
+            "value": ["complete", 1732371234567.125, "https://a.test/"]}});
+        assert_eq!(
+            parse_document_state(&state),
+            Some((
+                "complete".to_string(),
+                1732371234567.125,
+                "https://a.test/".to_string()
+            ))
+        );
+        let stringified = json!({"result": {"type": "string",
+            "value": "[\"complete\",1732371234567.125,\"https://a.test/\"]"}});
+        assert_eq!(parse_document_state(&stringified), None);
+        let no_origin = json!({"result": {"value": ["complete", null, "https://a.test/"]}});
+        assert_eq!(parse_document_state(&no_origin), None);
     }
 }
