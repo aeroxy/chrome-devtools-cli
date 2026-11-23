@@ -23,7 +23,7 @@ pub async fn collect_network(
         // window so they land in the buffer, then drain the buffer as the single
         // source of truth. Draining also consumes them, so a later drain can't
         // repeat them (read_events_for's own return value would double-count).
-        client.read_events_for(duration_ms).await?;
+        client.read_events_for(duration_ms, false).await?;
         client.drain_network_events()
     } else {
         // Live mode, direct/fallback: no persistent buffer. Enable Network on our
@@ -31,7 +31,7 @@ pub async fn collect_network(
         client
             .send_to_target(session_id, "Network.enable", json!({}))
             .await?;
-        let events_result = client.read_events_for(duration_ms).await;
+        let events_result = client.read_events_for(duration_ms, true).await;
         let _ = client
             .send_to_target(session_id, "Network.disable", json!({}))
             .await;

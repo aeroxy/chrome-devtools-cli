@@ -40,11 +40,7 @@ pub async fn evaluate(
         .await?;
 
     if let Some(exception) = result.get("exceptionDetails") {
-        let text = exception["text"].as_str().unwrap_or("Unknown error");
-        let desc = exception["exception"]["description"]
-            .as_str()
-            .unwrap_or(text);
-        anyhow::bail!("{desc}");
+        anyhow::bail!("{}", crate::remote_object::describe_exception(exception));
     }
 
     let value = &result["result"];
@@ -70,13 +66,16 @@ pub async fn evaluate(
     };
 
     if let Some(initial_url) = initial_url {
+        // `location.href = ...` or `form.submit()` only requests a navigation,
+        // which starts after the script returns.
+        let new_document = crate::commands::input::wait_for_navigation(client, session_id)
+            .await
+            .unwrap_or(false);
         let new_url = client.current_url(session_id).await?;
-        let result = CommandResult::output(output_hint)
-            .with_navigated_to_if_changed(new_url.clone(), initial_url.clone());
-        Ok(result
+        Ok(CommandResult::output(output_hint)
             .save_output(output)
             .await?
-            .with_navigated_to_if_changed(new_url, initial_url))
+            .with_navigation(new_url, initial_url, new_document))
     } else {
         Ok(CommandResult::output(output_hint)
             .save_output(output)

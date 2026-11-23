@@ -98,15 +98,17 @@ pub async fn list_pages(client: &mut CdpClient, format: OutputFormat) -> Result<
 }
 
 /// Open a new page, optionally applying emulation and extra headers before navigation.
+/// `background` keeps the tab the user is looking at in front.
 pub async fn new_page(
     client: &mut CdpClient,
     url: &str,
     emulation: Option<crate::commands::emulation::EmulateParams>,
     extra_headers: Option<&str>,
+    background: bool,
 ) -> Result<CommandResult> {
     let target_id = if emulation.is_some() || extra_headers.is_some() {
         // Create blank page so emulation/headers are applied before the real URL loads
-        let target_id = client.create_target("about:blank").await?;
+        let target_id = client.create_target("about:blank", background).await?;
 
         // emulate() records overrides as the state of the persistent session's
         // tab, so they run on the new tab's persistent session, as `navigate`
@@ -143,7 +145,7 @@ pub async fn new_page(
         }
         target_id
     } else {
-        client.create_target(url).await?
+        client.create_target(url, background).await?
     };
 
     Ok(opened_page(url, &target_id))

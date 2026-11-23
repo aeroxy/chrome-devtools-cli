@@ -10,11 +10,25 @@ async fn get_element_center(
     selector: &str,
 ) -> Result<(f64, f64)> {
     let escaped = serde_json::to_string(selector)?;
+    // Mouse events go to whatever is at the point, so an element off screen
+    // or without a box would send the click elsewhere (a hidden button's
+    // centre is the page's top-left corner) while reporting success.
     let expr = format!(
         r#"(() => {{
             const el = document.querySelector({escaped});
             if (!el) return JSON.stringify({{error: "Element not found: " + {escaped}}});
-            const rect = el.getBoundingClientRect();
+            let rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) {{
+                return JSON.stringify({{error: "Element has no size, so it can't be clicked or hovered (hidden with display:none, collapsed, or empty): " + {escaped}}});
+            }}
+            if (getComputedStyle(el).visibility === 'hidden') {{
+                return JSON.stringify({{error: "Element is hidden with visibility:hidden: " + {escaped}}});
+            }}
+            const cx = rect.x + rect.width / 2, cy = rect.y + rect.height / 2;
+            if (cx < 0 || cy < 0 || cx >= innerWidth || cy >= innerHeight) {{
+                el.scrollIntoView({{block: 'center', inline: 'center', behavior: 'instant'}});
+                rect = el.getBoundingClientRect();
+            }}
             return JSON.stringify({{x: rect.x + rect.width/2, y: rect.y + rect.height/2}});
         }})()"#
     );
@@ -28,10 +42,7 @@ async fn get_element_center(
         .await?;
 
     if let Some(exception) = result.get("exceptionDetails") {
-        let text = exception["text"].as_str().unwrap_or("Unknown error");
-        let desc = exception["exception"]["description"]
-            .as_str()
-            .unwrap_or(text);
+        let desc = crate::remote_object::describe_exception(exception);
         bail!("JavaScript error evaluating element position: {desc}");
     }
 
@@ -116,10 +127,7 @@ pub async fn click(
         .await?;
 
     if let Some(exception) = result.get("exceptionDetails") {
-        let text = exception["text"].as_str().unwrap_or("Unknown error");
-        let desc = exception["exception"]["description"]
-            .as_str()
-            .unwrap_or(text);
+        let desc = crate::remote_object::describe_exception(exception);
         bail!("JavaScript error during click handling: {desc}");
     }
 
@@ -143,7 +151,16 @@ pub async fn click(
     }
 }
 
-async fn wait_for_navigation(client: &mut CdpClient, session_id: &str) -> Result<()> {
+/// Wait briefly for a navigation that an action may have started, and for it
+/// to load. Returns whether a new document committed in the main frame, which
+/// is a navigation even when the URL stays the same (a reload, a form posting
+/// back to its own page).
+///
+/// A script that sets `location.href` or submits a form only requests the
+/// navigation; it starts after the script's task ends, so the request counts
+/// as a start too, or the caller would read the old page's URL and race the
+/// load.
+pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str) -> Result<bool> {
     // Get the main frame ID to ensure we only wait for top-level navigations
     let frame_tree = client
         .send_to_target(session_id, "Page.getFrameTree", json!({}))
@@ -159,40 +176,100 @@ async fn wait_for_navigation(client: &mut CdpClient, session_id: &str) -> Result
             )
         })?
         .to_string();
+    let in_main_frame = |m: &str, p: &serde_json::Value| {
+        let main = p.get("frameId").and_then(|f| f.as_str()) == Some(&main_frame_id);
+        // A navigation into a new tab or a download leaves this page alone.
+        let same_tab = m != "Page.frameRequestedNavigation"
+            || p["disposition"].as_str().is_none_or(|d| d == "currentTab");
+        main && same_tab
+    };
 
-    let nav_events = ["Page.frameStartedLoading", "Page.navigatedWithinDocument"];
-    if let Ok((method, _)) = client
+    let started = client
         .wait_for_event_match(
-            &nav_events,
+            &[
+                "Page.frameStartedLoading",
+                "Page.navigatedWithinDocument",
+                "Page.frameRequestedNavigation",
+            ],
             std::time::Duration::from_millis(500),
+            in_main_frame,
+        )
+        .await;
+    let mut method = match started {
+        Ok((method, _)) => method,
+        Err(_) => return Ok(false),
+    };
+    if method == "Page.frameRequestedNavigation" {
+        match client
+            .wait_for_event_match(
+                &["Page.frameStartedLoading", "Page.navigatedWithinDocument"],
+                std::time::Duration::from_secs(5),
+                in_main_frame,
+            )
+            .await
+        {
+            Ok((m, _)) => method = m,
+            Err(_) => return Ok(false),
+        }
+    }
+    if method != "Page.frameStartedLoading" {
+        // Same document: the URL comparison reports it.
+        return Ok(false);
+    }
+
+    // A full navigation started on the main frame, so wait for it to finish loading
+    let _ = client
+        .wait_for_event_match(
+            &["Page.loadEventFired", "Page.frameStoppedLoading"],
+            std::time::Duration::from_secs(10),
             |m, p| {
-                if m == "Page.frameStartedLoading" || m == "Page.navigatedWithinDocument" {
+                if m == "Page.frameStoppedLoading" {
                     p.get("frameId").and_then(|f| f.as_str()) == Some(&main_frame_id)
                 } else {
-                    true
+                    true // Page.loadEventFired is page-wide
                 }
             },
         )
-        .await
-    {
-        if method == "Page.frameStartedLoading" {
-            // A full navigation started on the main frame, so wait for it to finish loading
-            let _ = client
-                .wait_for_event_match(
-                    &["Page.loadEventFired", "Page.frameStoppedLoading"],
-                    std::time::Duration::from_secs(10),
-                    |m, p| {
-                        if m == "Page.frameStoppedLoading" {
-                            p.get("frameId").and_then(|f| f.as_str()) == Some(&main_frame_id)
-                        } else {
-                            true // Page.loadEventFired is page-wide
-                        }
-                    },
-                )
-                .await;
-        }
-    }
-    Ok(())
+        .await;
+    // Loading can stop without a new document (a download, a 204 reply).
+    Ok(client.events.iter().any(|e| {
+        e["method"] == "Page.frameNavigated"
+            && e["sessionId"].as_str() == Some(session_id)
+            && e["params"]["frame"]["id"].as_str() == Some(&main_frame_id)
+    }))
+}
+
+/// IDs of the open tabs, to tell afterwards which ones an action opened.
+async fn page_ids(client: &mut CdpClient) -> Result<std::collections::HashSet<String>> {
+    Ok(client
+        .get_page_targets()
+        .await?
+        .into_iter()
+        .map(|t| t.target_id)
+        .collect())
+}
+
+/// One stderr note per tab opened since `before` (a `target=_blank` link, a
+/// `window.open` button), so the caller learns its name instead of carrying
+/// on in the old tab.
+async fn opened_pages(
+    client: &mut CdpClient,
+    before: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let Ok(pages) = client.get_page_targets().await else {
+        return Vec::new();
+    };
+    pages
+        .into_iter()
+        .filter(|p| !before.contains(&p.target_id))
+        .map(|p| {
+            format!(
+                "[opened: {} {}]",
+                crate::friendly::to_friendly(&p.target_id),
+                p.url
+            )
+        })
+        .collect()
 }
 
 /// Click at absolute page coordinates (x, y).
@@ -207,15 +284,23 @@ pub async fn click_at(
         Some(url) => url,
         None => client.current_url(session_id).await?,
     };
+    let pages_before = page_ids(client).await?;
     dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0).await?;
     dispatch_mouse(client, session_id, "mousePressed", x, y, "left", 1).await?;
     dispatch_mouse(client, session_id, "mouseReleased", x, y, "left", 1).await?;
 
-    let _ = wait_for_navigation(client, session_id).await;
+    let new_document = wait_for_navigation(client, session_id)
+        .await
+        .unwrap_or(false);
 
     let new_url = client.current_url(session_id).await?;
-    Ok(CommandResult::output(format!("Clicked at ({x}, {y})"))
-        .with_navigated_to_if_changed(new_url, initial_url))
+    let mut result = CommandResult::output(format!("Clicked at ({x}, {y})")).with_navigation(
+        new_url,
+        initial_url,
+        new_document,
+    );
+    result.notes = opened_pages(client, &pages_before).await;
+    Ok(result)
 }
 
 /// Hover over an element identified by CSS selector.
@@ -311,10 +396,7 @@ if (tagName === 'input' && (type === 'checkbox' || type === 'radio')) {{
         .await?;
 
     if let Some(exception) = result.get("exceptionDetails") {
-        let text = exception["text"].as_str().unwrap_or("Unknown error");
-        let desc = exception["exception"]["description"]
-            .as_str()
-            .unwrap_or(text);
+        let desc = crate::remote_object::describe_exception(exception);
         bail!("JavaScript error during fill handling: {desc}");
     }
 
@@ -484,10 +566,7 @@ async fn read_back_file(client: &mut CdpClient, session_id: &str, object_id: &st
         Err(e) => return ReadBack::Unread(e.to_string()),
     };
     if let Some(exception) = result.get("exceptionDetails") {
-        let text = exception["text"].as_str().unwrap_or("Unknown error");
-        let desc = exception["exception"]["description"]
-            .as_str()
-            .unwrap_or(text);
+        let desc = crate::remote_object::describe_exception(exception);
         return ReadBack::Unread(desc.to_string());
     }
     let file = &result["result"]["value"];
@@ -568,13 +647,20 @@ pub async fn type_text(
     text: &str,
     submit_key: Option<&str>,
 ) -> Result<CommandResult> {
+    // Checked before typing: a bad key found afterwards would leave the text
+    // typed, and a retry would type it twice.
+    let submit = submit_key.map(parse_key_spec).transpose()?;
     let initial_url = client.current_url(session_id).await?;
     client
         .send_to_target(session_id, "Input.insertText", json!({"text": text}))
         .await?;
 
-    if let Some(key) = submit_key {
-        press_key(client, session_id, key).await?;
+    let mut new_document = false;
+    if let Some(spec) = &submit {
+        dispatch_key(client, session_id, spec).await?;
+        new_document = wait_for_navigation(client, session_id)
+            .await
+            .unwrap_or(false);
     }
 
     let new_url = client.current_url(session_id).await?;
@@ -582,7 +668,7 @@ pub async fn type_text(
         "Typed: {text}{}",
         submit_key.map(|k| format!(" + {k}")).unwrap_or_default()
     ))
-    .with_navigated_to_if_changed(new_url, initial_url))
+    .with_navigation(new_url, initial_url, new_document))
 }
 
 /// Press a key or key combination (e.g. "Enter", "Ctrl+A").
@@ -591,66 +677,102 @@ pub async fn press_key(
     session_id: &str,
     key: &str,
 ) -> Result<CommandResult> {
+    let spec = parse_key_spec(key)?;
     let initial_url = client.current_url(session_id).await?;
-    let parts: Vec<&str> = key.split('+').collect();
-    let main_key = parts.last().ok_or_else(|| anyhow::anyhow!("Empty key"))?;
-
-    let mut modifiers: i32 = 0;
-    for &part in &parts[..parts.len().saturating_sub(1)] {
-        match part.to_lowercase().as_str() {
-            "alt" => modifiers |= 1,
-            "ctrl" | "control" => modifiers |= 2,
-            "meta" | "cmd" | "command" => modifiers |= 4,
-            "shift" => modifiers |= 8,
-            _ => bail!("Unknown modifier: {part}"),
-        }
-    }
-
-    let (key_name, code, key_code) = map_key(main_key);
-
-    client
-        .send_to_target(
-            session_id,
-            "Input.dispatchKeyEvent",
-            json!({
-                "type": "keyDown",
-                "key": key_name,
-                "code": code,
-                "windowsVirtualKeyCode": key_code,
-                "modifiers": modifiers,
-            }),
-        )
-        .await?;
-
-    client
-        .send_to_target(
-            session_id,
-            "Input.dispatchKeyEvent",
-            json!({
-                "type": "keyUp",
-                "key": key_name,
-                "code": code,
-                "windowsVirtualKeyCode": key_code,
-                "modifiers": modifiers,
-            }),
-        )
-        .await?;
-
-    let _ = wait_for_navigation(client, session_id).await;
+    let pages_before = page_ids(client).await?;
+    dispatch_key(client, session_id, &spec).await?;
+    let new_document = wait_for_navigation(client, session_id)
+        .await
+        .unwrap_or(false);
 
     let new_url = client.current_url(session_id).await?;
-    Ok(CommandResult::output(format!("Pressed: {key}"))
-        .with_navigated_to_if_changed(new_url, initial_url))
+    let mut result = CommandResult::output(format!("Pressed: {key}")).with_navigation(
+        new_url,
+        initial_url,
+        new_document,
+    );
+    result.notes = opened_pages(client, &pages_before).await;
+    Ok(result)
 }
 
-fn map_key(key: &str) -> (&str, &str, i32) {
-    match key.to_lowercase().as_str() {
+/// A parsed key or key combination, ready for `Input.dispatchKeyEvent`.
+#[derive(Debug, PartialEq)]
+struct KeySpec {
+    key: String,
+    code: String,
+    key_code: i32,
+    modifiers: i32,
+    /// What the key types, for printable keys pressed without Ctrl, Alt or
+    /// Meta; Chrome inserts nothing for a key event without it.
+    text: Option<String>,
+}
+
+const ALT: i32 = 1;
+const CTRL: i32 = 2;
+const META: i32 = 4;
+const SHIFT: i32 = 8;
+
+/// Parse `Enter`, `Ctrl+S`, `Shift+Tab`, `a`, `F5`, `Ctrl++`.
+///
+/// Unknown names are errors rather than events with an empty key code, which
+/// the page ignored while the command reported success.
+fn parse_key_spec(spec: &str) -> Result<KeySpec> {
+    let (mods, main) = if spec == "+" {
+        ("", "+")
+    } else if let Some(mods) = spec.strip_suffix("++") {
+        (mods, "+")
+    } else {
+        spec.rsplit_once('+').unwrap_or(("", spec))
+    };
+    if main.is_empty() {
+        bail!("No key after the modifiers in '{spec}' (e.g. Ctrl+A)");
+    }
+
+    let mut modifiers = 0;
+    for part in mods
+        .split('+')
+        .filter(|p| !mods.is_empty() || !p.is_empty())
+    {
+        modifiers |= match part.to_lowercase().as_str() {
+            "alt" | "option" => ALT,
+            "ctrl" | "control" => CTRL,
+            "meta" | "cmd" | "command" => META,
+            "shift" => SHIFT,
+            _ => bail!("Unknown modifier '{part}' in '{spec}'. Use Alt, Ctrl, Meta or Shift."),
+        };
+    }
+
+    let (key, code, key_code) = match named_key(main) {
+        Some(named) => named,
+        None => match single_char_key(main, modifiers & SHIFT != 0) {
+            Some(k) => k,
+            None => bail!(
+                "Unknown key '{main}' in '{spec}'. Use a key name (Enter, Tab, Escape, \
+                 Backspace, Delete, Space, ArrowUp, Home, PageDown, Insert, F1-F12) or a single \
+                 character."
+            ),
+        },
+    };
+    let printable = key.chars().count() == 1;
+    let text = (printable && modifiers & (CTRL | ALT | META) == 0).then(|| key.clone());
+    Ok(KeySpec {
+        key,
+        code,
+        key_code,
+        modifiers,
+        text,
+    })
+}
+
+fn named_key(name: &str) -> Option<(String, String, i32)> {
+    let (key, code, key_code) = match name.to_lowercase().as_str() {
         "enter" | "return" => ("Enter", "Enter", 13),
         "tab" => ("Tab", "Tab", 9),
         "escape" | "esc" => ("Escape", "Escape", 27),
         "backspace" => ("Backspace", "Backspace", 8),
-        "delete" => ("Delete", "Delete", 46),
-        "space" | " " => (" ", "Space", 32),
+        "delete" | "del" => ("Delete", "Delete", 46),
+        "insert" => ("Insert", "Insert", 45),
+        "space" => (" ", "Space", 32),
         "arrowup" | "up" => ("ArrowUp", "ArrowUp", 38),
         "arrowdown" | "down" => ("ArrowDown", "ArrowDown", 40),
         "arrowleft" | "left" => ("ArrowLeft", "ArrowLeft", 37),
@@ -659,20 +781,131 @@ fn map_key(key: &str) -> (&str, &str, i32) {
         "end" => ("End", "End", 35),
         "pageup" => ("PageUp", "PageUp", 33),
         "pagedown" => ("PageDown", "PageDown", 34),
-        "a" => ("a", "KeyA", 65),
-        "b" => ("b", "KeyB", 66),
-        "c" => ("c", "KeyC", 67),
-        "v" => ("v", "KeyV", 86),
-        "x" => ("x", "KeyX", 88),
-        "z" => ("z", "KeyZ", 90),
-        "f5" => ("F5", "F5", 116),
-        _ => (key, key, 0),
+        lower => {
+            let n: i32 = lower.strip_prefix('f')?.parse().ok()?;
+            if !(1..=12).contains(&n) {
+                return None;
+            }
+            let f = format!("F{n}");
+            return Some((f.clone(), f, 111 + n));
+        }
+    };
+    Some((key.to_string(), code.to_string(), key_code))
+}
+
+/// Letters, digits and US-layout punctuation, with the code and Windows key
+/// code Chrome expects for each.
+fn single_char_key(s: &str, shift: bool) -> Option<(String, String, i32)> {
+    let mut chars = s.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
     }
+    if c.is_ascii_alphabetic() {
+        let upper = c.to_ascii_uppercase();
+        let key = if shift { upper } else { c };
+        return Some((key.to_string(), format!("Key{upper}"), upper as i32));
+    }
+    if c.is_ascii_digit() {
+        return Some((c.to_string(), format!("Digit{c}"), c as i32));
+    }
+    let (code, key_code) = match c {
+        ' ' => ("Space", 32),
+        '-' | '_' => ("Minus", 189),
+        '=' | '+' => ("Equal", 187),
+        ',' | '<' => ("Comma", 188),
+        '.' | '>' => ("Period", 190),
+        '/' | '?' => ("Slash", 191),
+        ';' | ':' => ("Semicolon", 186),
+        '\'' | '"' => ("Quote", 222),
+        '[' | '{' => ("BracketLeft", 219),
+        ']' | '}' => ("BracketRight", 221),
+        '\\' | '|' => ("Backslash", 220),
+        '`' | '~' => ("Backquote", 192),
+        _ => return None,
+    };
+    Some((c.to_string(), code.to_string(), key_code))
+}
+
+async fn dispatch_key(client: &mut CdpClient, session_id: &str, spec: &KeySpec) -> Result<()> {
+    let mut down = json!({
+        "type": "keyDown",
+        "key": spec.key,
+        "code": spec.code,
+        "windowsVirtualKeyCode": spec.key_code,
+        "modifiers": spec.modifiers,
+    });
+    if let Some(text) = &spec.text {
+        down["text"] = json!(text);
+    }
+    client
+        .send_to_target(session_id, "Input.dispatchKeyEvent", down)
+        .await?;
+    client
+        .send_to_target(
+            session_id,
+            "Input.dispatchKeyEvent",
+            json!({
+                "type": "keyUp",
+                "key": spec.key,
+                "code": spec.code,
+                "windowsVirtualKeyCode": spec.key_code,
+                "modifiers": spec.modifiers,
+            }),
+        )
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_specs_parse_before_anything_is_sent() {
+        let enter = parse_key_spec("Enter").unwrap();
+        assert_eq!(
+            (enter.key.as_str(), enter.code.as_str(), enter.key_code),
+            ("Enter", "Enter", 13)
+        );
+        assert_eq!(enter.text, None);
+
+        let save = parse_key_spec("Ctrl+S").unwrap();
+        assert_eq!(
+            (save.code.as_str(), save.key_code, save.modifiers),
+            ("KeyS", 83, CTRL)
+        );
+        assert_eq!(save.text, None, "a shortcut types nothing");
+
+        let shift_tab = parse_key_spec("shift+tab").unwrap();
+        assert_eq!(
+            (shift_tab.key.as_str(), shift_tab.modifiers),
+            ("Tab", SHIFT)
+        );
+
+        let a = parse_key_spec("a").unwrap();
+        assert_eq!(a.text.as_deref(), Some("a"));
+        assert_eq!(parse_key_spec("Shift+a").unwrap().key, "A");
+        assert_eq!(parse_key_spec("7").unwrap().code, "Digit7");
+        assert_eq!(parse_key_spec("F12").unwrap().key_code, 123);
+        let plus = parse_key_spec("Ctrl++").unwrap();
+        assert_eq!((plus.key.as_str(), plus.modifiers), ("+", CTRL));
+        assert_eq!(parse_key_spec("+").unwrap().code, "Equal");
+    }
+
+    #[test]
+    fn bad_key_specs_are_errors() {
+        for (spec, expected) in [
+            ("Ener", "Unknown key 'Ener'"),
+            ("Foo+Enter", "Unknown modifier 'Foo'"),
+            ("Ctrl+", "No key after the modifiers"),
+            ("F13", "Unknown key 'F13'"),
+            ("é", "Unknown key"),
+        ] {
+            let err = parse_key_spec(spec).unwrap_err().to_string();
+            assert!(err.contains(expected), "{spec}: {err}");
+        }
+    }
 
     #[test]
     fn test_upload_file_resolves_a_relative_value_against_the_cli_directory() {

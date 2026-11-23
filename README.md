@@ -199,6 +199,7 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 | `navigate --forward` | Go forward |
 | `navigate --reload` | Reload page |
 | `new-page <url>` | Open new tab |
+| `new-page <url> --background` | Open new tab without bringing it to the front (the tab the user is looking at keeps focus) |
 | `close-page <index>` | Close tab by index |
 | `select-page <index>` | Bring tab to front |
 | `list-pages` | List all open tabs |
@@ -216,8 +217,12 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 | `read-page --output <path>` | Save Markdown to file |
 | `evaluate <expr> [--dialog-action <action>]` | Run JavaScript (optionally handle dialogs: accept, dismiss, or prompt text) |
 | `snapshot` | Accessibility tree dump |
+| `css-styles <selector> [--computed <prop>,...] [--ua-rules]` | CSS for the first matching element: computed values, matched rules (highest precedence first, `[overridden]` declarations tagged, `var()` values resolved, `file:line` sources), inline style, inherited rules |
 | `take-heapsnapshot --output <path>` | Capture V8 heap snapshot (streamed via CDP) |
-| `inspect-heapsnapshot-node --file-path <path> --node-id <id>` | Inspect a node in a local `.heapsnapshot` file (offline, no Chrome needed) |
+| `compare-heapsnapshots --base <path> --current <path> [--class-index N]` | Diff two snapshots per class, grouped as in the DevTools Memory panel; `--class-index` lists one class's added/deleted objects (offline) |
+| `inspect-heapsnapshot-node --file-path <path> --node-id <id>` | Show a node's class, detachedness, direct retainers and shortest retaining path from the root (offline) |
+
+The offline heap commands page their rows with `--limit` (default 50) and `--offset`, say how many rows there are in total, and cut names longer than `--max-name-length` (default 100) characters.
 
 ### Interaction
 
@@ -243,16 +248,24 @@ These commands ask the page through WebMCP first (`document.modelContext.getTool
 
 | Command | Description |
 |---------|-------------|
-| `emulate` | Get/set emulation overrides (viewport, geolocation, URL blocking) |
+| `emulate` | Get/set emulation overrides (viewport, geolocation, CSS media, URL blocking) |
 | `emulate --viewport 1280x720` | Set viewport size (per-tab, persists across navigation) |
 | `emulate --geolocation 37.77,-122.41` | Set geolocation (per-tab, persists across navigation) |
+| `emulate --media print` | Emulate the CSS media type (`print` or `screen`) |
+| `emulate --media-feature prefers-color-scheme=dark` | Emulate a CSS media feature (repeatable): `prefers-color-scheme`, `prefers-reduced-motion`, `prefers-reduced-transparency`, `prefers-contrast`, `forced-colors`, `color-gamut` |
+| `emulate --clear-media` | Clear CSS media emulation |
 | `emulate --block-url <pattern>` | Block URL pattern on subsequent requests (glob; per-tab) |
 | `emulate --unblock-url <pattern>` | Un-block a previously blocked pattern |
 | `emulate --clear-blocks` | Clear all blocked URL patterns |
-| `emulate --clear-all` | Clear all overrides (viewport, geolocation, blocks) |
+| `emulate --clear-all` | Clear all overrides (viewport, geolocation, CSS media, blocks) |
+| `configure-webauthn` | Add a virtual WebAuthn authenticator (ctap2, internal, passkey-capable) so `navigator.credentials.create()`/`get()` work without a device; again with no flags shows it and its credentials |
+| `configure-webauthn --protocol u2f --transport usb` | Choose the authenticator (`--protocol ctap2\|u2f`, `--transport internal\|usb\|nfc\|ble\|hybrid`, `--has-resident-key`, `--has-user-verification`, `--is-user-verified true\|false`) |
+| `configure-webauthn --remove` | Remove the virtual authenticator |
 | `wait-for <text> [--timeout ms]` | Wait for text to appear (default 30s) |
 
-`emulate` with no flags shows the active tab's overrides. Viewport, geolocation, and URL blocks are all **per-tab** — each page keeps its own. They persist across navigation within that tab and do **not** leak to other tabs, so you can hold (say) a mobile viewport with images blocked on one tab and a desktop baseline on another at the same time. They persist until you clear them (`--clear-viewport`, `--clear-geolocation`, `--clear-blocks`, or `--clear-all`), the tab closes, or the daemon exits.
+`emulate` with no flags shows the active tab's overrides. Viewport, geolocation, CSS media, and URL blocks are all **per-tab** — each page keeps its own. They persist across navigation within that tab and do **not** leak to other tabs, so you can hold (say) a mobile viewport with images blocked on one tab and a desktop baseline on another at the same time. They persist until you clear them (`--clear-viewport`, `--clear-geolocation`, `--clear-media`, `--clear-blocks`, or `--clear-all`), the tab closes, or the daemon exits. `--media-feature` values add to the ones already set (setting a feature again replaces its value), and unknown names or values are rejected before anything is applied, because Chrome would accept and ignore them.
+
+The virtual authenticator lives on the daemon's session for the tab, because Chrome removes it when the session that added it detaches; it therefore lasts across commands on that tab until `--remove`, the tab closes, or the daemon exits. When the CLI works on another tab and comes back, the authenticator is re-created with the same options but without the credentials registered before. Chrome only answers WebAuthn calls from the front tab, so `select-page` the tab first; `configure-webauthn` says so when the tab is in the background. Changing `--protocol`, `--transport`, `--has-resident-key`, or `--has-user-verification` replaces the authenticator and deletes its credentials; `--is-user-verified` changes in place.
 
 ### Network and console inspection
 
@@ -270,6 +283,20 @@ The daemon keeps a persistent CDP session on the active page that continuously c
 | `sw-logs --extension-id <id>` | Filter service-worker logs to one extension |
 
 A drain without a `--duration` returns instantly. Adding `--duration N` switches the command to *live mode* and blocks for `N` ms.
+
+Other page commands list the errors the page raised while they ran (uncaught exceptions and `console.error`, first line each, at most 10) on stderr as `[page error] …`, without draining them.
+
+### Network mocks
+
+| Command | Description |
+|---------|-------------|
+| `mock-network <url-glob> [--status N] [--header "Name: value"] [--body <text> \| --body-file <path>]` | Answer matching requests on this tab from the CLI instead of the network |
+| `mock-network <url-glob> --abort` | Fail matching requests with a network error |
+| `mock-network <url-glob> ... --resource-type <type>` | Only requests of one type (`Document`, `Script`, `Image`, `XHR`, `Fetch`, ...) |
+| `mock-network` | List the tab's mocks with hit counts |
+| `remove-network-mock [<url-glob>]` | Remove one mock, or all of them on the tab |
+
+Globs use `*` for any characters and `?` for one, as Chrome's Fetch domain does. The latest matching mock wins, and the HTTP cache is off while any is set so cached responses can't bypass it. Mocks live on the daemon's session for the tab: they pause while the CLI works on another tab, and end when the daemon exits. A daemon with mocks keeps reading from the browser between commands, since a request waits for its answer, so it stays up while the page keeps making requests.
 
 ### Daemon
 
@@ -312,7 +339,9 @@ Global `--block-url` and `--unblock-url` update the **active tab's** block list 
 - **Lock file**: `$TMPDIR/chrome-devtools-daemon-<uid>.lock` (Windows: `%TEMP%\chrome-devtools-daemon.lock`) — **not** keyed per instance: one lock covers all of them, because it only serializes the brief write-pid-then-bind window, while a per-instance lock would accumulate a never-removed file per browser session. Serializes daemon startup/cleanup; intentionally never removed automatically. Locks bind to the inode, not the name: deleting the file while any daemon process is still starting, running, or shutting down lets a new process lock a fresh replacement inode and bypass the serialization entirely. Only delete it once no daemon process exists at all — and there's rarely a reason to, since a leftover lock file is harmless.
 - **Idle timeout**: 5 minutes by default (auto-exits, cleans up its files). `DAEMON_IDLE_TIMEOUT_SECS` changes it — e.g. `3600` keeps an approved connection alive through gaps of up to an hour between commands, so a break doesn't cost a fresh approval. The daemon takes it from the environment of the command that spawns it, so a new value applies to the next daemon, not one already running. `0` and non-numbers fall back to the default. A longer timeout also keeps that connection usable without a prompt, by anything running as you, for longer. To keep the daemon that is already running alive, with no fixed end, run `caffeinate` instead.
 - **Cleanup**: endpoint + PID files are also removed on panics, and on Unix on SIGTERM/SIGINT; Windows Ctrl-C cleanup is best-effort only (a background daemon has no console to receive it). SIGQUIT, SIGHUP and SIGKILL skip cleanup by design — the leftover files are harmless and are reclaimed by the next daemon start.
-- **Protocol**: Length-prefixed JSON over the Unix socket / loopback TCP
+- **Protocol**: Length-prefixed JSON over the Unix socket / loopback TCP. Responses carry the daemon's version, and the CLI warns when it differs from its own (an older daemon keeps serving after an upgrade until it idles out).
+- **Peer check (Unix)**: daemon and CLI each check that the other end of the socket runs as the same user, since on Linux the socket sits in the shared `/tmp`.
+- **Call timeouts**: a CDP call on a page gives up after 180 s (`CHROME_CDP_TIMEOUT_SECS`, read when the daemon starts), stopping any running JavaScript, so one stuck page can't hold the daemon for every other caller. Calls that set a session up give up after 10 s. When the browser goes quiet for 30 s mid-call, the daemon pings it; no answer within 15 s counts as a lost connection, and the daemon exits.
 - **Spawned by**: First CLI invocation for a given endpoint (transparent to user)
 - **List**: `chrome-devtools list-daemons` — PID, browser, endpoint, uptime and state for every daemon this user owns. `--json` (or `--toon`) for machine-readable output. Reads only on-disk state, so it works when every browser has exited. On Unix, rows whose PID no longer exists are marked `stale`; on Windows liveness is not probed, so every row's state is `?` and `stale` never appears.
 - **Kill**: `chrome-devtools kill-daemon` stops only the daemon for the endpoint its flags resolve to, so `--browser edge kill-daemon` cannot stop your Chrome daemon. Add `--all` to stop every daemon for this user — which is also the only way to clear one whose browser has already exited, since a scoped kill has no endpoint left to resolve (it fails and says so). `--all` also sweeps the pre-key `chrome-devtools-daemon-<uid>.pid` name left by older versions. (Or delete the socket + PID file by hand; leave the lock file — see above.) It sends SIGTERM and returns once the signal is delivered, not once the process is gone: the daemon exits *between* requests, so one that is mid-command finishes it and answers that client first. Expect up to one command's latency, and note that a daemon wedged inside a CDP call outlives the command that stopped it.
@@ -334,6 +363,7 @@ src/
 ├── daemon.rs         # Background daemon (persistent connection)
 ├── client.rs         # Talks to daemon via Unix socket
 ├── protocol.rs       # IPC message types (DaemonRequest / DaemonResponse)
+├── remote_object.rs  # Console values and exceptions as DevTools prints them
 ├── friendly.rs       # Target ID → word-pair names
 ├── format.rs         # OutputFormat (text/json/toon) + format_structured helper
 ├── result.rs         # Command result types
@@ -347,13 +377,16 @@ src/
     ├── screenshot.rs
     ├── snapshot.rs
     ├── read_page.rs  # read-page (Readability extraction + HTML→Markdown)
-    ├── memory.rs     # take-heapsnapshot (CDP streaming) + inspect-heapsnapshot-node (offline)
+    ├── memory.rs     # take-heapsnapshot (CDP streaming) + compare-heapsnapshots / inspect-heapsnapshot-node (offline)
     ├── evaluate.rs
     ├── executor.rs   # Command dispatch + persistent-session reuse
     ├── input.rs      # click/fill/type/press/hover
-    ├── emulation.rs  # emulate (viewport/geolocation/blocklist get/set/clear)
+    ├── emulation.rs  # emulate (viewport/geolocation/CSS media/blocklist get/set/clear)
+    ├── css.rs        # css-styles (matched rules, cascade status, var() resolution, computed)
+    ├── webauthn.rs   # configure-webauthn (virtual authenticator on the persistent session)
     ├── console.rs    # console drain / live collection
     ├── network.rs    # network drain / live collection
+    ├── network_mock.rs # mock-network / remove-network-mock (Fetch domain)
     ├── sw_logs.rs    # extension service-worker log collection
     └── third_party.rs # list-3p-tools/execute-3p-tool
 ```

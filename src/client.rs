@@ -12,9 +12,17 @@ use crate::protocol::*;
 #[cfg(unix)]
 async fn connect_daemon(key: &str) -> Result<UnixStream> {
     let path = socket_path(key);
-    UnixStream::connect(&path)
+    let stream = UnixStream::connect(&path)
         .await
-        .with_context(|| format!("Failed to connect to daemon {key} at {}", path.display()))
+        .with_context(|| format!("Failed to connect to daemon {key} at {}", path.display()))?;
+    if !peer_is_this_user(&stream) {
+        bail!(
+            "The daemon socket {} is served by another user's process, so this command was not \
+             sent to it. Remove the socket if it is stale, or ask whoever owns it.",
+            path.display()
+        );
+    }
+    Ok(stream)
 }
 
 #[cfg(windows)]

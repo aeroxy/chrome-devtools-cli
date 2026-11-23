@@ -134,11 +134,12 @@ chrome-devtools --page 0 navigate https://example.com
 ## Core Capabilities
 
 - **Navigation**: `navigate`, `navigate --back`, `navigate --forward`, `navigate --reload`
-- **Page management**: `list-pages`, `new-page`, `close-page`, `select-page`
+- **Page management**: `list-pages`, `new-page` (`--background` keeps the user's tab in front), `close-page`, `select-page`
 - **Extraction**: `screenshot`, `snapshot` (accessibility tree), `evaluate` (JavaScript), `read-page` (page content as markdown), `run-script` (run local JS file), `adapter` (run site adapter)
 - **Interaction**: `click`, `fill`, `type-text`, `press-key`, `hover`, `click-at`
-- **Emulation**: `emulate` (viewport, mobile, geolocation, URL blocking)
-- **Inspection**: `console` (logs), `network` (requests), `sw-logs` (extension service workers)
+- **Emulation**: `emulate` (viewport, mobile, geolocation, CSS media type/features such as dark mode, URL blocking)
+- **Inspection**: `console` (logs), `network` (requests), `sw-logs` (extension service workers), `css-styles` (the CSS cascade for one element)
+- **Passkeys**: `configure-webauthn` (virtual WebAuthn authenticator)
 - **Third-party tools**: `list-3p-tools`, `execute-3p-tool` (WebMCP tools from `document.modelContext`, else the legacy `window.__dtmcp`)
 - **Synchronization**: `wait-for` (wait for text on page)
 - **Daemon control**: `kill-daemon`
@@ -168,12 +169,20 @@ chrome-devtools new-page https://github.com
 # stdout: Opened new page: https://github.com (target: icy-goat)
 # stderr: [target:icy-goat]  ← new tab, new target
 chrome-devtools --target icy-goat snapshot
+
+# 5. In the user's own browser, open it without taking focus from their tab
+chrome-devtools new-page --background https://github.com
 ```
 
-**Note**: The `[navigated to: ...]` and `[target:...]` lines go to **stderr**, not stdout. The stdout contains only the main command output ("Navigated to …", "Opened new page: …").
+**Note**: The `[navigated to: ...]` and `[target:...]` lines go to **stderr**, not stdout. The stdout contains only the main command output ("Navigated to …", "Opened new page: …"). Other stderr lines to act on:
 
-### Pattern 2: Emulation (Viewport & Geolocation)
-Overrides are per-tab: each page keeps its own viewport/geolocation/URL-blocks, persisting across navigation within that tab and isolated from other tabs (until cleared, the tab closes, or the daemon exits). `emulate` with no flags shows the active tab's state.
+- `[navigated to: <url>]` also appears when a click or key press reloads the page or posts a form back to the same URL, and when `evaluate --track-navigation` sets `location.href`.
+- `[opened: <name> <url>]`: a click or key press opened a new tab (a `target=_blank` link, `window.open`). Use that name for the new tab; the command's own `[target:...]` is still the old one.
+- `[page error] …`: the page threw an uncaught exception or called `console.error` while the command ran (first line of each, at most 10). The command itself did what it reports; `console --type error` has the full messages.
+- `[warning] …`: for example a full-page screenshot past Chrome's 16384px limit, or a daemon from an older version still serving this browser (leave restarting it to the human).
+
+### Pattern 2: Emulation (Viewport, Geolocation & CSS Media)
+Overrides are per-tab: each page keeps its own viewport/geolocation/CSS media/URL-blocks, persisting across navigation within that tab and isolated from other tabs (until cleared, the tab closes, or the daemon exits). `emulate` with no flags shows the active tab's state.
 
 ```bash
 # Set viewport and geolocation
@@ -188,15 +197,24 @@ chrome-devtools --target warm-squid navigate https://example.com --viewport 375x
 # Open new tab with emulation
 chrome-devtools new-page https://example.com --viewport 375x812
 
+# CSS media: dark mode, reduced motion, print styles, forced colors
+chrome-devtools --target warm-squid emulate --media-feature prefers-color-scheme=dark
+# Output: Media emulation set (prefers-color-scheme=dark)
+chrome-devtools --target warm-squid emulate --media-feature prefers-reduced-motion=reduce --media print
+# Output: Media emulation set (print; prefers-color-scheme=dark; prefers-reduced-motion=reduce)
+
 # Show current overrides
 chrome-devtools --target warm-squid emulate
-# Output: No emulation overrides active.  (or lists current blocks/viewport/etc.)
+# Output: No emulation overrides active.  (or lists current blocks/viewport/media/etc.)
 
 # Clear emulation overrides
 chrome-devtools --target warm-squid emulate --clear-all        # clears everything
 chrome-devtools --target warm-squid emulate --clear-viewport   # clears viewport only
 chrome-devtools --target warm-squid emulate --clear-geolocation
+chrome-devtools --target warm-squid emulate --clear-media      # media type and all features
 ```
+
+`--media-feature name=value` adds to the features already set (setting one again replaces its value); clear them all with `--clear-media`. Supported: `prefers-color-scheme` (light, dark), `prefers-reduced-motion` and `prefers-reduced-transparency` (reduce, no-preference), `prefers-contrast` (more, less, custom, no-preference), `forced-colors` (active, none), `color-gamut` (srgb, p3, rec2020). Anything else is rejected before any override is applied, because Chrome would silently ignore it.
 
 ### Pattern 3: URL Blocking (Network Debugging)
 Block URL patterns using simple `*` wildcards: `*.png` (all PNG files), `cdn.example.com/*` (a domain path), `*analytics*` (any URL containing "analytics"). Patterns persist in the daemon until cleared.
@@ -232,7 +250,7 @@ chrome-devtools --target warm-squid emulate --clear-all
 Two ways to fill inputs — choose based on what the site expects:
 
 - `fill` sets the value directly via `element.value = ...`. Fast, no key events. Works for text inputs, textareas, `<select>`, checkboxes, radio buttons, and file inputs (below). **Often breaks React/Vue apps** because these frameworks rely on real input events.
-- `type-text` dispatches individual keyboard events. Slower but triggers all the `input`, `compositionstart/end`, etc. events that frameworks listen for. **Use this when `fill` seems to "not work"** on interactive frameworks.
+- `type-text` inserts the text into the focused element the way typing commits it: the page gets `beforeinput` and `input` events (which frameworks listen for), but no per-key `keydown`/`keyup`. **Use this when `fill` seems to "not work"** on interactive frameworks. For a page that reacts to individual keys, use `press-key`.
 
 **File inputs (`<input type="file">`):** `fill` reads the value as a local file path, relative to the directory you run the CLI from, and gives that file to the input as if a person had picked it in the file dialog, without opening the dialog. The page then handles it as it would a picked file: an upload widget starts uploading on `change`, while a plain form sends it only when submitted.
 - Hidden inputs work. Upload widgets usually hide the real input behind a styled button, so target `input[type="file"]` rather than the button.
@@ -254,16 +272,20 @@ chrome-devtools --target warm-squid fill "input.search" "search query"
 # Upload a file: on a file input the value is a local path (relative to where you run the CLI)
 chrome-devtools --target warm-squid fill 'input[type="file"]' ./clip.mp4
 
-# Type text one char at a time (use for React/Vue/form-validation sites)
+# Type text as real input events (use for React/Vue/form-validation sites)
 chrome-devtools --target warm-squid type-text "search query" --submit-key Enter
 
 # Press a key or key combo. Examples: Enter, Tab, Escape, ArrowDown,
-# Control+A, Meta+C, Shift+Tab, Backspace, Space.
+# Control+A, Meta+C, Shift+Tab, Backspace, Space, F5. A single character
+# (a, 7, /) types it. An unknown key or modifier is an error, checked before
+# anything is typed, so `type-text ... --submit-key Ener` types nothing.
 chrome-devtools --target warm-squid press-key Enter
 chrome-devtools --target warm-squid press-key Control+A
 
 # Hover over an element
 chrome-devtools --target warm-squid hover ".menu-item"
+
+# Values that start with "-" are fine: fill '#q' -5, click-at -5 10, --geolocation -33.86,151.2
 
 # Wait for text to appear (default timeout: 30 seconds = 30000 ms)
 chrome-devtools --target warm-squid wait-for "Results" --timeout 10000
@@ -288,8 +310,8 @@ chrome-devtools --target warm-squid console
 # Filter by console type: log, warning, error, info, debug, exception
 chrome-devtools --target warm-squid console --type error --type warning
 
-# Filter network by resource type (case-sensitive): Document, Script, Stylesheet,
-# Image, Font, XHR, Fetch, Manifest, Media, WebSocket, Other
+# Filter network by resource type (case-insensitive): Document, Script, Stylesheet,
+# Image, Font, XHR, Fetch, Manifest, Media, Other
 chrome-devtools --target warm-squid network --type Fetch --type XHR
 
 # Live monitoring: blocks for N milliseconds, collecting events during that window
@@ -300,7 +322,7 @@ chrome-devtools --target warm-squid network --duration 3000
 chrome-devtools --target warm-squid console --duration 0
 ```
 
-**Valid `--type` values for `network`**: `Document`, `Script`, `Stylesheet`, `Image`, `Media`, `Font`, `WebSocket`, `Manifest`, `XHR`, `Fetch`, `Other`.
+**Valid `--type` values for `network`** (any case): `Document`, `Script`, `Stylesheet`, `Image`, `Media`, `Font`, `Manifest`, `XHR`, `Fetch`, `Other`. WebSocket connections are not listed by `network`.
 
 ### Pattern 6: JavaScript Evaluation
 
@@ -316,17 +338,26 @@ chrome-devtools --target warm-squid evaluate "fetch('/api/user').then(r => r.jso
 # Get a value as JSON (forces JSON serialization)
 chrome-devtools --target warm-squid --json evaluate "performance.navigation"
 
-# Handle a JS dialog (alert, confirm, prompt). Without --dialog-action, eval hangs.
+# Handle a JS dialog (alert, confirm, prompt). While one is open the page answers
+# nothing else, so without --dialog-action a command fails at once with
+# "A javascript dialog is open (...)".
 chrome-devtools --target warm-squid evaluate "alert('hi')" --dialog-action accept
 chrome-devtools --target warm-squid evaluate "confirm('sure?')" --dialog-action dismiss
 chrome-devtools --target warm-squid evaluate "prompt('name')" --dialog-action "my-answer"
 # Valid --dialog-action values: "accept", "dismiss", or any prompt-text string.
+
+# A dialog that is already open: handle it first, then evaluate
+chrome-devtools --target warm-squid evaluate --dialog-action dismiss "true"
 
 # Save JS output to a file
 chrome-devtools --target warm-squid evaluate "JSON.stringify(performance.timing)" -o /tmp/perf.json
 ```
 
 **Avoid `evaluate` for DOM traversal.** Use `snapshot` to read page structure and `click`/`fill` to interact.
+
+**Dialogs opened by an action.** When a `click`, `press-key`, `fill`, `hover` or `type-text` makes the page open a dialog, the command succeeds and says so: `Clicked, and the page opened a confirm dialog: "Delete?"`. **Don't repeat the action.** Handle the dialog next with `evaluate --dialog-action accept|dismiss|<text> true`. Steps after the dialog opened did not run (for `type-text`, its `--submit-key`).
+
+If a command instead fails with `got no answer from the page` and mentions a dialog this daemon did not see, the dialog opened before the daemon attached to the tab (or under an earlier session). The CLI cannot handle such a dialog: ask the human to close it, or `close-page` the tab.
 
 ### Pattern 7: Output Formats
 All commands default to human-readable text output. Use `--json` or `--toon` (compact, LLM-friendly) for structured output.
@@ -336,7 +367,7 @@ chrome-devtools list-pages                    # human-readable table (default)
 chrome-devtools list-pages --json             # JSON
 chrome-devtools list-pages --toon             # TOON (compact)
 
-chrome-devtools --target warm-squid snapshot --toon
+chrome-devtools --target warm-squid console --toon
 chrome-devtools --target warm-squid network --toon --type Fetch
 ```
 
@@ -348,10 +379,23 @@ Use snapshot instead of `evaluate document.querySelector(...)` for understanding
 ```bash
 chrome-devtools --target warm-squid snapshot
 chrome-devtools --target warm-squid snapshot --output /tmp/ax-tree.txt
-chrome-devtools --target warm-squid snapshot --toon  # compact output
 ```
 
+The text output is the compact one: an indented outline in document order, `[role] "name" #id` per node, with plain text as `"text" #id`. Wrapper nodes, line fragments and text that only repeats its parent's name are left out:
+
+```
+[RootWebArea] "Shop" #1
+  [heading] "Welcome" #3
+  [link] "Home" #5
+  [paragraph] #8
+    "Price: " #9
+```
+
+`--json` and `--toon` return Chrome's raw accessibility tree instead, many times larger; use them only for properties the outline leaves out.
+
 ### Pattern 9: Screenshots
+`--max-width`/`--max-height` are in image pixels, so they hold on HiDPI screens too. A `--full-page` capture past 16384px in either direction warns on stderr, because Chrome repeats or corrupts content beyond that: add `--max-height`.
+
 ```bash
 # Default: viewport-only PNG
 chrome-devtools --target warm-squid screenshot --output page.png
@@ -432,37 +476,123 @@ chrome-devtools --target warm-squid adapter skill/chrome-devtools/examples/hn_ad
 
 ### Pattern 15: Memory Leak Debugging (Heap Snapshots)
 
-Take two heap snapshots around a suspected leak, diff them per class, then
-drill into individual node IDs. `compare-heapsnapshots` and
-`inspect-heapsnapshot-node` are fully offline (they parse local files — no
-Chrome connection needed).
+Find what an action leaves behind: snapshot the page at rest, after doing the
+action N times, and after undoing it; compare per class; then ask one leaked
+object what keeps it alive.
+
+- **Never `cat`, `jq`, `grep` or read a `.heapsnapshot` file.** It is tens to
+  hundreds of MB of flat number arrays. `compare-heapsnapshots` and
+  `inspect-heapsnapshot-node` summarize it, offline (no Chrome connection), and
+  page their output.
+- **Take every snapshot from the same tab in the same browser session.** The
+  diff matches objects by V8 heap id, which is only stable within one session;
+  across a browser restart the diff is meaningless. The CLI warns on stderr
+  when two snapshots share no ids.
+- V8 collects garbage before it writes a snapshot, so whatever is in one is
+  still reachable.
+
+**1. Take three snapshots.** Repeat the action N times (10 here) so that a leak
+grows by a recognizable multiple of N and stands out from background churn.
 
 ```bash
-# 1. Take a baseline snapshot
 chrome-devtools --target warm-squid take-heapsnapshot --output /tmp/base.heapsnapshot
-
-# 2. Perform the leaky action in the page (click, navigate, etc.), then take a second snapshot
-chrome-devtools --target warm-squid take-heapsnapshot --output /tmp/current.heapsnapshot
-
-# 3. Diff: one row per class with added/removed counts and sizes, sorted by size delta
-chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /tmp/current.heapsnapshot
-# idx,className,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta
-# 0,Detached HTMLDivElement,120,0,120,46080,0,46080
-# ...
-
-# 4. Detail for one summary row (use the idx column): per-node-id adds/removes
-chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /tmp/current.heapsnapshot --class-index 0
-
-# 5. Inspect a specific node ID from the detail output
-chrome-devtools inspect-heapsnapshot-node --file-path /tmp/current.heapsnapshot --node-id 12345
+chrome-devtools --target warm-squid run-script /tmp/repeat.js -a n=10
+chrome-devtools --target warm-squid take-heapsnapshot --output /tmp/target.heapsnapshot
+# Undo the action: close the panel, go back to the starting view, etc.
+chrome-devtools --target warm-squid take-heapsnapshot --output /tmp/final.heapsnapshot
 ```
 
-**⚠️ Both snapshots must come from the same Chrome session.** The diff matches
-nodes by V8 heap object ID, which is only stable within a single browser
-session. Comparing snapshots taken across a Chrome restart (or from different
-profiles/machines) produces a meaningless result where nearly everything is
-reported as both added and removed — the CLI prints a warning on stderr when
-it detects this.
+`/tmp/repeat.js` drives the action with the `ctx` helpers from
+[CUSTOM_SCRIPTING.md](./CUSTOM_SCRIPTING.md); the selectors are the page's own:
+
+```javascript
+const n = ctx.args.n ?? 10;
+for (let i = 0; i < n; i++) {
+  await ctx.click('#open-dialog');
+  await ctx.waitForSelector('.dialog', 5000);
+  await ctx.click('.dialog .close');
+  await ctx.wait(300);
+}
+return `repeated ${n} times`;
+```
+
+**2. Compare base → target, then base → final.**
+
+```bash
+chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /tmp/target.heapsnapshot
+# Classes with changes, largest sizeDelta first: showing 1-3 of 3
+# idx,className,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta
+# 0,Detached <div>,10,0,10,880,0,880
+# 1,Detached <button>,10,0,10,720,0,720
+# 2,(compiled code),3,0,3,360,0,360
+
+chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /tmp/final.heapsnapshot
+# Classes with changes, largest sizeDelta first: showing 1-2 of 2
+# idx,className,addedCount,removedCount,countDelta,addedSize,removedSize,sizeDelta
+# 0,Detached <div>,10,0,10,880,0,880
+# 1,Detached <button>,10,0,10,720,0,720
+```
+
+A leak is a class whose `countDelta` is about a multiple of N in base → target
+and does not drop in base → final. Here every open/close left one dialog
+`<div>` and its `<button>` behind, while the `(compiled code)` growth was gone
+after the undo, so it was not a leak. Classes are grouped as in the DevTools
+Memory panel: `Detached <div>` is DOM no longer in the document, `Function`
+holds every closure and `system / Context` the variables they capture,
+`{a, b, c}` groups plain objects by their properties, and `(string)`,
+`(array)`, `(compiled code)`, `(object shape)` and `(system)` are by type.
+Rows are paged: the header gives the total and the `--offset` for the next
+page, `--limit` sets the page size (default 50), and names longer than
+`--max-name-length` characters (default 100) end in `…`.
+
+**3. List the leaked objects of a class** by its `idx`, largest first. `+`
+objects exist in the `--current` file and `-` objects only in `--base`, so
+inspect each in the file that has it.
+
+```bash
+chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /tmp/final.heapsnapshot --class-index 0 --limit 3
+# idx:0,className:Detached <div>,addedCount:10,removedCount:0,countDelta:10,addedSize:880,removedSize:0,sizeDelta:880
+#
+# Objects, largest selfSize first: showing 1-3 of 10; next page: --offset 3
+# op,nodeId,selfSize
+# +,101,88
+# +,103,88
+# +,105,88
+```
+
+**4. Ask one of them what keeps it alive.** `inspect-heapsnapshot-node` prints
+the node, its direct retainers (closest to the root first; weak edges excluded,
+because they do not keep anything alive) and the shortest retaining path from
+the root.
+
+```bash
+chrome-devtools inspect-heapsnapshot-node --file-path /tmp/final.heapsnapshot --node-id 105
+# nodeId,nodeName,className,type,detachedness,selfSize,distance
+# 105,"Detached <div class=""dialog"" role=""dialog"">",Detached <div>,native,detached,88,5
+#
+# Retainers, closest to the root first (weak edges excluded): showing 1-1 of 1
+# edgeName,edgeType,nodeId,nodeName,type,selfSize,distance
+# 2,element,11,(object elements),array,0,4
+#
+# Shortest retaining path from the root (5 edges, weak edges skipped):
+# edgeName,edgeType,nodeId,nodeName,type,selfSize
+# 4,shortcut,5,system / NativeContext / https://app.example,hidden,1240
+# global_object,internal,7,Window (global*) / https://app.example,object,40544
+# openDialogs,property,9,Array,object,32
+# elements,internal,11,(object elements),array,0
+# 2,element,105,"Detached <div class=""dialog"" role=""dialog"">",native,88
+```
+
+Read the path from the bottom up to the first edge the application owns: here
+`window.openDialogs` keeps every closed dialog. That edge is where the fix
+goes. A node with no retaining path is only weakly held and will be collected.
+`--json` gives the same data as objects (`retainers.items`, `retainingPath`).
+
+**Before changing code, tell the user what holds the objects and ask.** Common
+causes are event listeners never removed, closures capturing large objects,
+globals, and caches that only grow. Detached DOM in particular is sometimes an
+intentional cache (for example of a navigation view), so ask before nulling a
+reference to it.
 
 ### Pattern 16: Headless Chrome (No Login, No Human Approval)
 
@@ -586,6 +716,125 @@ first command resolved, and silently ignored later `--browser`/`--user-data-dir`
 flags. If you are reading advice that says to `kill-daemon` when switching
 browsers, it predates this.
 
+### Pattern 17: CSS Debugging (css-styles)
+
+`css-styles <selector>` answers "why does this element look like this?" for the
+first element matching the selector, in one call. Prefer it to
+`evaluate getComputedStyle(...)`: it shows which rule set each value and which
+declarations lost.
+
+```bash
+chrome-devtools --target warm-squid css-styles '#go'
+# (trimmed)
+# Element: button#go.btn.primary
+# Computed:
+#   display: inline-block;
+#   width: 38.5156px;
+#   height: 51px;
+#   background: rgb(10, 132, 255) none repeat scroll 0% 0% / auto padding-box border-box;
+#   color: rgb(255, 255, 255);
+#   padding: 16px 8px;
+#   ...
+# Rules (highest precedence first):
+#   element.style {
+#     [overridden] color: yellow;
+#   }
+#   .card .btn.primary (test.html:16) {
+#     background: var(--brand, red); /* #0a84ff */
+#     color: white !important;
+#   }
+#   .btn (test.html:15) {
+#     [overridden] background: white;
+#     padding: calc(var(--gap) * 2) var(--gap); /* calc(8px * 2) 8px */
+#   }
+# Inherited from body:
+#   body (test.html:9) {
+#     [overridden] color: var(--fg); /* #222 */
+#   }
+# (4 user-agent rule(s) hidden; --ua-rules shows them)
+
+chrome-devtools --target warm-squid css-styles '.nav a' --computed z-index,position   # extra computed values
+chrome-devtools --target warm-squid css-styles 'button' --ua-rules                    # include browser defaults
+```
+
+- **Computed** lists `display`, `width`, `height`, and what the shown rules set; a shorthand shows as one value when Chrome can write one.
+- **Rules** are highest precedence first, each with `file:line` (an inline `<style>` gives the document's line) and its enclosing `@media`/`@layer`/`@supports`/`@container`/nesting as wrapping blocks. `[overridden]` marks a declaration that applies nowhere; `[invalid]` and `[disabled]` mark ones that never could. `/* ... */` after a `var()` value is what it resolves to on that element (or, under "Inherited from", on that ancestor).
+- **Inherited from** lists only properties that inherit. A user-agent rule on the element itself (common on `button`, `input`) can block inheritance even while hidden; the computed value is the final word.
+- Not covered: pseudo-elements (`::before`), `@keyframes`, elements inside iframes or shadow roots, cascade-layer order for `!important`. Use `--json`/`--toon` for structured output.
+
+### Pattern 18: Passkeys and Security Keys (configure-webauthn)
+
+Add a virtual authenticator **before** the page calls `navigator.credentials`,
+and make sure the tab is in front: Chrome rejects WebAuthn from a background tab
+with `NotAllowedError` (`configure-webauthn` warns when the tab is hidden).
+
+```bash
+chrome-devtools select-page warm-squid
+chrome-devtools --target warm-squid configure-webauthn
+# Added a virtual authenticator.
+# Virtual authenticator: protocol=ctap2, transport=internal, hasResidentKey=true, hasUserVerification=true, isUserVerified=true
+# No credentials.
+
+# ... drive the page's "create passkey" / "sign in with passkey" buttons ...
+
+chrome-devtools --target warm-squid configure-webauthn                         # show it and its credentials
+# Credentials (1):
+# - credentialId=oBjq...FJs, rpId=localhost, discoverable=true, signCount=2, userName=alice
+chrome-devtools --target warm-squid configure-webauthn --is-user-verified false # next verification fails; credentials kept
+chrome-devtools --target warm-squid configure-webauthn --protocol u2f --transport usb   # replaces it: credentials deleted
+chrome-devtools --target warm-squid configure-webauthn --remove
+```
+
+- Omitted flags keep their current values. Defaults: `ctap2`, `internal` (a platform authenticator like Touch ID), resident keys and user verification on. `u2f` has neither.
+- The authenticator lives on the daemon's session for the tab (Chrome removes it when the session that added it detaches), so it lasts across commands on that tab until `--remove`, the tab closes, or the daemon exits.
+- **Working on another tab drops its credentials.** When the CLI comes back to the tab, it re-creates the authenticator with the same options but empty. Finish a register-then-sign-in flow on one tab.
+- `credentialId` is shown as the page sees it (`PublicKeyCredential.id`). Private keys are never printed.
+
+### Pattern 19: Network Mocks (mock-network)
+Answer a tab's requests from the CLI instead of the server, to test error states, empty lists or an API that doesn't exist yet, without touching the backend. Patterns are URL globs: `*` matches any characters, `?` one.
+
+```bash
+# JSON for every request under /api/ (later mocks win over earlier ones)
+chrome-devtools --target warm-squid mock-network '*/api/*' --body '{"items":[]}' \
+    --header 'Content-Type: application/json'
+
+# A server error, a body from a file, a failed request
+chrome-devtools --target warm-squid mock-network '*/api/save' --status 500 --body 'oops'
+chrome-devtools --target warm-squid mock-network '*/config.json' --body-file ./fixtures/config.json
+chrome-devtools --target warm-squid mock-network '*.png' --abort --resource-type Image
+
+# Mocks apply to requests made from now on: reload so the page's own requests use them
+chrome-devtools --target warm-squid navigate --reload
+
+chrome-devtools --target warm-squid mock-network                    # list mocks with hit counts
+chrome-devtools --target warm-squid remove-network-mock '*/api/*'   # remove one
+chrome-devtools --target warm-squid remove-network-mock             # remove all on the tab
+```
+
+- A mock that shows `0 hit(s)` never matched: check the pattern against the URLs `network` lists.
+- Mocks belong to the tab and to the daemon: they stop applying while the CLI works on another tab, come back when it returns, and end when the daemon exits. A daemon with mocks stays up while the page keeps making requests; run `caffeinate` in the background to keep it for longer quiet spells.
+- Cross-origin `fetch` needs CORS headers in the mock, e.g. `--header 'Access-Control-Allow-Origin: *'`.
+- The HTTP cache is off while any mock is set, so cached responses can't bypass it. Service workers can still answer requests before they reach a mock.
+
+### Pattern 20: Cookie and Login Debugging
+For "logged out after reload", "redirected to the login page", or a request that fails with 401/403:
+
+```bash
+# Cookies the page's JavaScript can see (cookieStore needs a secure origin;
+# fall back to document.cookie on http://)
+chrome-devtools --target warm-squid evaluate "cookieStore.getAll()"
+chrome-devtools --target warm-squid evaluate "document.cookie"
+
+# Watch what the reload sends and gets back: redirect hops are listed with their 3xx status
+chrome-devtools --target warm-squid navigate --reload
+chrome-devtools --target warm-squid network --type Document --type Fetch --type XHR
+```
+
+- **HttpOnly cookies are invisible to JavaScript**: missing from both reads above, and deleting them from JS fails silently. The session cookie is usually one of them.
+- Check each suspect cookie's `domain` and `path` (does it cover the failing URL?), `secure` (never sent over `http://`), `sameSite` (`Strict`/`Lax` cookies are not sent on many cross-site requests) and `expires`.
+- `network` shows URLs, methods and statuses, not headers, so it can't show `Set-Cookie` or why Chrome rejected a cookie. When that's the question, ask the human to look at the Application and Network panels in DevTools.
+- For a clean, logged-out session, use a throwaway profile (Pattern 16) rather than deleting the user's cookies.
+
 ## Complete Command Reference
 
 ### Navigation
@@ -596,7 +845,7 @@ chrome-devtools navigate <url> --extra-headers '{"Authorization":"Bearer ..."}'
 chrome-devtools navigate --back
 chrome-devtools navigate --forward
 chrome-devtools navigate --reload
-chrome-devtools new-page <url> [--viewport WxH] [--mobile]
+chrome-devtools new-page <url> [--viewport WxH] [--mobile] [--background]
 chrome-devtools close-page [index_or_target_name]
 chrome-devtools select-page [index_or_target_name]
 ```
@@ -609,14 +858,25 @@ chrome-devtools --target <name> read-page [--output <path>]
 chrome-devtools --target <name> evaluate "<js-expression>" [--dialog-action accept|dismiss|text]
 chrome-devtools --target <name> network [--duration <ms>] [--type <resource>]
 chrome-devtools --target <name> console [--duration <ms>] [--type <level>]
+chrome-devtools --target <name> css-styles "<css-selector>" [--computed <prop>,...] [--ua-rules]
 chrome-devtools sw-logs [--duration <ms>] [--extension-id <id>]
+```
+
+### Network Mocks
+```bash
+chrome-devtools --target <name> mock-network "<url-glob>" [--status N] [--header "Name: value" ...]
+    [--body "<text>" | --body-file <path>] [--resource-type <type>]
+chrome-devtools --target <name> mock-network "<url-glob>" --abort [--resource-type <type>]
+chrome-devtools --target <name> mock-network                       # list, with hit counts
+chrome-devtools --target <name> remove-network-mock ["<url-glob>"]  # one, or all on the tab
 ```
 
 ### Memory (heap snapshots)
 ```bash
 chrome-devtools --target <name> take-heapsnapshot --output <path.heapsnapshot>
 chrome-devtools compare-heapsnapshots --base <path> --current <path> [--class-index N]   # offline
-chrome-devtools inspect-heapsnapshot-node --file-path <path> --node-id <id>              # offline
+chrome-devtools inspect-heapsnapshot-node --file-path <path> --node-id <id>              # offline: retainers + path
+# both: [--limit N (default 50)] [--offset N] [--max-name-length N (default 100)]
 ```
 
 ### Interaction
@@ -640,7 +900,18 @@ chrome-devtools --target <name> emulate --unblock-url "<pattern>"          # rem
 chrome-devtools --target <name> emulate --clear-blocks
 chrome-devtools --target <name> emulate --clear-viewport
 chrome-devtools --target <name> emulate --clear-geolocation
+chrome-devtools --target <name> emulate --media print|screen
+chrome-devtools --target <name> emulate --media-feature <name>=<value> [--media-feature ...]   # e.g. prefers-color-scheme=dark
+chrome-devtools --target <name> emulate --clear-media
 chrome-devtools --target <name> emulate --clear-all                      # clears everything
+```
+
+### WebAuthn
+```bash
+chrome-devtools --target <name> configure-webauthn [--protocol ctap2|u2f] [--transport internal|usb|nfc|ble|hybrid]
+    [--has-resident-key true|false] [--has-user-verification true|false] [--is-user-verified true|false]
+chrome-devtools --target <name> configure-webauthn            # add with defaults, or show the current one
+chrome-devtools --target <name> configure-webauthn --remove
 ```
 
 ### Third-party Tools
@@ -716,6 +987,13 @@ and that the next command may need their approval again. Do not restart
 `caffeinate` in a loop, and never use it to retry a failed connection: it
 does not reconnect, and each new connection can ask the user to approve it. A
 computer sleep can still drop the connection.
+
+## Failure Handling: "got no answer from the page" / "did not answer"
+
+No command waits forever on a connected browser any more:
+
+- **`<method> got no answer from the page within Ns, though the browser answers`**: the browser is fine but this tab isn't. Usually a JavaScript dialog opened where the daemon couldn't see it (see Pattern 6), otherwise an endless loop (running JavaScript is stopped) or a hung renderer. Setup calls give up after 10s; other calls after 180s (`CHROME_CDP_TIMEOUT_SECS`, read when the daemon starts, raises that for long scripts). Don't retry in a loop: ask the human to close the dialog, or `close-page` the tab. Other tabs keep working.
+- **`The browser did not answer for 45s; the connection is treated as lost`** (after a laptop sleep, a dropped network, a remote browser that went away): the daemon exits as for any lost connection. Rerun the command once; the browser may ask the human to approve the new connection, and then the approval steps above apply.
 
 ## Failure Handling: cannot read DevToolsActivePort / "Operation not permitted"
 

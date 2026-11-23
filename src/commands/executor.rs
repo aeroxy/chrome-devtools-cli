@@ -19,6 +19,7 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
             "geolocation",
             "accuracy",
             "extra_headers",
+            "background",
         ],
         "close-page" => &["id_or_index"],
         "select-page" => &["id_or_index"],
@@ -54,8 +55,17 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
         "snapshot" => &["output"],
         "read-page" => &["output"],
         "take-heapsnapshot" => &["output"],
-        "inspect-heapsnapshot-node" => &["file_path", "node_id"],
-        "compare-heapsnapshots" => &["base", "current", "class_index"],
+        "inspect-heapsnapshot-node" => {
+            &["file_path", "node_id", "limit", "offset", "max_name_length"]
+        }
+        "compare-heapsnapshots" => &[
+            "base",
+            "current",
+            "class_index",
+            "limit",
+            "offset",
+            "max_name_length",
+        ],
         "emulate" => &[
             "viewport",
             "device_scale_factor",
@@ -66,6 +76,28 @@ pub fn known_args(cmd: &str) -> &'static [&'static str] {
             "clear_geolocation",
             "clear_all",
             "clear_blocks",
+            "media",
+            "media_feature",
+            "clear_media",
+        ],
+        "css-styles" => &["selector", "computed", "ua_rules"],
+        "mock-network" => &[
+            "pattern",
+            "status",
+            "headers",
+            "body",
+            "body_file",
+            "abort",
+            "resource_type",
+        ],
+        "remove-network-mock" => &["pattern"],
+        "configure-webauthn" => &[
+            "protocol",
+            "transport",
+            "has_resident_key",
+            "has_user_verification",
+            "is_user_verified",
+            "remove",
         ],
         "wait-for" => &["text", "timeout"],
         "list-3p-tools" => &[],
@@ -187,6 +219,9 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                     block_url: req.block_url.clone(),
                     unblock_url: req.unblock_url.clone(),
                     clear_blocks: false,
+                    media: None,
+                    media_features: vec![],
+                    clear_media: false,
                 };
                 params.validate()?;
 
@@ -201,6 +236,9 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
                     url,
                     params,
                     args.get("extra_headers").and_then(|v| v.as_str()),
+                    args.get("background")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                 )
                 .await
             }
@@ -256,7 +294,13 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     // Maintain a persistent CDP session for continuous event collection
     // (Network + Console) across commands. Skip for close/select which don't need it.
     if cmd != "close-page" && cmd != "select-page" {
-        let _ = client.ensure_persistent_session(&target_id).await;
+        if let Err(e) = client.ensure_persistent_session(&target_id).await {
+            // A blocked page answers no session, so a second one would only
+            // wait out the same timeout again.
+            if e.downcast_ref::<crate::cdp::PageUnresponsive>().is_some() {
+                return Err(e);
+            }
+        }
     }
 
     // Merge the global --block-url/--unblock-url flags (from DaemonRequest
@@ -318,20 +362,70 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         sid
     };
 
-    let result = inner_execute(client, &session_id, req).await;
+    client.dialog_action = args
+        .get("dialog_action")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let console_mark = client.console_pushed;
+    // A dialog left open by an earlier command blocks the page: handle it
+    // first, or fail now rather than wait on a page that won't answer.
+    let result = match client.settle_open_dialog(&session_id).await {
+        Ok(()) => inner_execute(client, &session_id, req)
+            .await
+            .or_else(|e| dialog_opened_by_input(cmd, e)),
+        Err(e) => Err(e),
+    };
 
     // Clean up only sessions we created here — never detach the persistent one.
     if !using_persistent {
+        client.forget_dialog(Some(&session_id));
         let _ = client.detach_from_target(&session_id).await;
     }
     client.dialog_action = None;
+
+    // Errors the page raised while this command ran, e.g. from a click
+    // handler. `console` and `network` show messages themselves.
+    let page_errors = if matches!(cmd, "console" | "network") {
+        Vec::new()
+    } else {
+        client.page_errors_since(console_mark)
+    };
 
     // Append target ID so the caller can pin subsequent commands to this page
     let name = friendly::to_friendly(&target_id);
     result.map(|mut r| {
         r.target_id = Some(name);
+        r.notes.extend(page_errors);
         r
     })
+}
+
+/// An input action that opens a dialog did what it was asked: the page reacted
+/// with a dialog, and the action's reply can't come back until it closes.
+/// Reporting that as a failure invites a retry, which would click twice.
+fn dialog_opened_by_input(cmd: &str, error: anyhow::Error) -> Result<CommandResult> {
+    let verb = match cmd {
+        "click" | "click-at" => "Clicked",
+        "hover" => "Hovered",
+        "fill" => "Filled",
+        "type-text" => "Typed",
+        "press-key" => "Pressed the key",
+        _ => return Err(error),
+    };
+    let Some(dialog) = error.downcast_ref::<crate::cdp::DialogOpen>() else {
+        return Err(error);
+    };
+    let article = if dialog.dialog_type.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
+    };
+    Ok(CommandResult::output(format!(
+        "{verb}, and the page opened {article} {} dialog: \"{}\". Steps after it opened did not run \
+         (for type-text, a --submit-key). The page is paused until the dialog is handled: run \
+         `evaluate --dialog-action accept|dismiss|<prompt text> true` on this page next.",
+        dialog.dialog_type, dialog.message
+    )))
 }
 
 /// Arguments shared by the `run-script` and `adapter` commands.
@@ -369,6 +463,18 @@ fn script_exec_args(args: &serde_json::Value) -> Result<ScriptExecArgs<'_>> {
     })
 }
 
+/// A repeatable string flag's values (a JSON array), empty when absent.
+fn string_list(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Execute a page-level command within an active session.
 async fn inner_execute(
     client: &mut CdpClient,
@@ -378,15 +484,16 @@ async fn inner_execute(
     let args = &req.args;
     let cmd = req.command.as_str();
 
-    // Enable Page domain to receive dialog events for proactive rejection
+    // Enable Page domain to receive dialog events for proactive rejection.
+    // `client.dialog_action` was set by `execute_command`.
     client
-        .send_to_target(session_id, "Page.enable", json!({}))
+        .send_to_target_within(
+            session_id,
+            "Page.enable",
+            json!({}),
+            crate::cdp::SETUP_CALL_TIMEOUT,
+        )
         .await?;
-
-    client.dialog_action = args
-        .get("dialog_action")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
 
     match cmd {
         "navigate" => {
@@ -413,6 +520,9 @@ async fn inner_execute(
                 block_url: req.block_url.clone(),
                 unblock_url: req.unblock_url.clone(),
                 clear_blocks: false,
+                media: None,
+                media_features: vec![],
+                clear_media: false,
             };
             params.validate()?;
 
@@ -579,9 +689,66 @@ async fn inner_execute(
                     .get("clear_blocks")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                media: args
+                    .get("media")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                media_features: string_list(args.get("media_feature")),
+                clear_media: args
+                    .get("clear_media")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             };
             params.validate()?;
             commands::emulation::emulate(client, session_id, params).await
+        }
+        "mock-network" => match args.get("pattern").and_then(|v| v.as_str()) {
+            None => commands::network_mock::list_network_mocks(client, req.format()),
+            Some(pattern) => {
+                let request = commands::network_mock::MockRequest {
+                    pattern,
+                    status: args
+                        .get("status")
+                        .and_then(|v| v.as_u64())
+                        .map(|s| u16::try_from(s).unwrap_or(0)),
+                    headers: string_list(args.get("headers")),
+                    body: args.get("body").and_then(|v| v.as_str()),
+                    body_file: args.get("body_file").and_then(|v| v.as_str()),
+                    abort: args.get("abort").and_then(|v| v.as_bool()).unwrap_or(false),
+                    resource_type: args.get("resource_type").and_then(|v| v.as_str()),
+                };
+                commands::network_mock::mock_network(client, session_id, request).await
+            }
+        },
+        "remove-network-mock" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str());
+            commands::network_mock::remove_network_mock(client, session_id, pattern).await
+        }
+        "css-styles" => match args.get("selector").and_then(|v| v.as_str()) {
+            Some(selector) => {
+                let opts = commands::css::CssOptions {
+                    computed: string_list(args.get("computed")),
+                    ua_rules: args
+                        .get("ua_rules")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                };
+                commands::css::css_styles(client, session_id, selector, opts, req.format()).await
+            }
+            None => bail!("selector required"),
+        },
+        "configure-webauthn" => {
+            let text = |k: &str| args.get(k).and_then(|v| v.as_str()).map(String::from);
+            let flag = |k: &str| args.get(k).and_then(|v| v.as_bool());
+            let params = commands::webauthn::WebAuthnParams {
+                protocol: text("protocol"),
+                transport: text("transport"),
+                has_resident_key: flag("has_resident_key"),
+                has_user_verification: flag("has_user_verification"),
+                is_user_verified: flag("is_user_verified"),
+                remove: flag("remove").unwrap_or(false),
+            };
+            commands::webauthn::configure_webauthn(client, session_id, params, req.format()).await
         }
         "wait-for" => match args.get("text").and_then(|v| v.as_str()) {
             Some(text) => {

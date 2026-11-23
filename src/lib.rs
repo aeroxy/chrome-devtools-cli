@@ -8,6 +8,7 @@ pub mod error;
 pub mod format;
 pub mod friendly;
 pub mod protocol;
+pub mod remote_object;
 pub mod result;
 pub mod telemetry;
 
@@ -111,7 +112,7 @@ pub enum Commands {
         #[arg(long)]
         mobile: bool,
         /// Set geolocation as lat,lon (e.g. 37.77,-122.41)
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         geolocation: Option<String>,
         /// Geolocation accuracy in meters (default: 100)
         #[arg(long)]
@@ -138,7 +139,7 @@ pub enum Commands {
         #[arg(long)]
         mobile: bool,
         /// Set geolocation as lat,lon (e.g. 37.77,-122.41)
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         geolocation: Option<String>,
         /// Geolocation accuracy in meters (default: 100)
         #[arg(long)]
@@ -146,6 +147,10 @@ pub enum Commands {
         /// Extra HTTP headers as a JSON object (e.g. '{"Authorization":"Bearer token"}')
         #[arg(long)]
         extra_headers: Option<String>,
+        /// Open the tab without bringing it to the front, so the tab the user
+        /// is looking at keeps focus
+        #[arg(long)]
+        background: bool,
     },
 
     /// Close a page/tab
@@ -185,6 +190,7 @@ pub enum Commands {
     /// Evaluate a JavaScript expression
     Evaluate {
         /// JavaScript expression
+        #[arg(allow_hyphen_values = true)]
         expression: String,
         /// Handle dialogs while execution: accept, dismiss, or string for prompt
         #[arg(long)]
@@ -201,13 +207,23 @@ pub enum Commands {
     Click { selector: String },
 
     /// Click at specific coordinates
-    ClickAt { x: f64, y: f64 },
+    ClickAt {
+        #[arg(allow_negative_numbers = true)]
+        x: f64,
+        #[arg(allow_negative_numbers = true)]
+        y: f64,
+    },
 
     /// Fill an input field by CSS selector (a file input takes a local file path)
-    Fill { selector: String, value: String },
+    Fill {
+        selector: String,
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
 
     /// Type text using keyboard (into currently focused element)
     TypeText {
+        #[arg(allow_hyphen_values = true)]
         text: String,
         /// Optional key to press after typing (e.g. Enter)
         #[arg(long)]
@@ -243,7 +259,11 @@ pub enum Commands {
         output: String,
     },
 
-    /// Inspect a specific node ID details from a local heap snapshot
+    /// Show what keeps a node of a local heap snapshot alive. Offline: parses
+    /// the file, no Chrome connection required. Prints the node (class,
+    /// detachedness, self size, distance from the root), its direct retainers
+    /// closest to the root first (paged with --limit/--offset), and one
+    /// shortest retaining path from the root, skipping weak edges.
     #[command(name = "inspect-heapsnapshot-node")]
     InspectHeapSnapshotNode {
         /// Path to the .heapsnapshot file to analyze
@@ -252,14 +272,19 @@ pub enum Commands {
         /// Node ID to inspect
         #[arg(long, short)]
         node_id: u64,
+        #[command(flatten)]
+        list: commands::memory::ListOptions,
     },
 
     /// Compare two .heapsnapshot files and report per-class added/deleted nodes.
-    /// Offline: parses local files, no Chrome connection required. Without
-    /// --class-index, prints a summary table sorted by size delta. With
-    /// --class-index N, prints the added/deleted node IDs for row N (use the
-    /// idx column from the summary). Node IDs in the detail output are
-    /// directly usable with `inspect-heapsnapshot-node --node-id`.
+    /// Offline: parses local files, no Chrome connection required. Classes are
+    /// grouped as in the DevTools Memory panel (all functions under
+    /// `Function`, `<div id=…>` under `<div>`, detached DOM under
+    /// `Detached <div>`). Without --class-index, prints a summary table
+    /// sorted by size delta. With --class-index N, prints the added/deleted
+    /// objects of row N (use the idx column from the summary), largest first.
+    /// Both are paged with --limit/--offset. Node IDs in the detail output
+    /// are directly usable with `inspect-heapsnapshot-node --node-id`.
     ///
     /// IMPORTANT: both snapshots must come from the same Chrome session —
     /// nodes are matched by V8 heap object ID, which is only stable within a
@@ -278,9 +303,11 @@ pub enum Commands {
         /// that class.
         #[arg(long)]
         class_index: Option<usize>,
+        #[command(flatten)]
+        list: commands::memory::ListOptions,
     },
 
-    /// Manage page emulation (viewport, geolocation, etc.)
+    /// Manage page emulation (viewport, geolocation, CSS media, etc.)
     Emulate {
         /// Set viewport size as WxH (e.g. 1280x720)
         #[arg(long)]
@@ -292,7 +319,7 @@ pub enum Commands {
         #[arg(long)]
         mobile: bool,
         /// Set geolocation as lat,lon (e.g. 37.77,-122.41)
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         geolocation: Option<String>,
         /// Geolocation accuracy in meters (default: 100)
         #[arg(long)]
@@ -309,12 +336,117 @@ pub enum Commands {
         /// Clear network blocklist only
         #[arg(long)]
         clear_blocks: bool,
+        /// Emulate a CSS media type: print or screen
+        #[arg(long, value_name = "print|screen")]
+        media: Option<String>,
+        /// Emulate a CSS media feature as name=value (repeatable), e.g.
+        /// prefers-color-scheme=dark, prefers-reduced-motion=reduce,
+        /// forced-colors=active. Supported: prefers-color-scheme,
+        /// prefers-reduced-motion, prefers-reduced-transparency,
+        /// prefers-contrast, forced-colors, color-gamut
+        #[arg(long, value_name = "NAME=VALUE")]
+        media_feature: Vec<String>,
+        /// Clear CSS media emulation (type and features)
+        #[arg(long)]
+        clear_media: bool,
         // Note: --block-url / --unblock-url are global flags (see `Cli`); they
         // work on `emulate` via clap's global-arg inheritance.
     },
 
+    /// Answer this tab's requests whose URL matches a pattern from the CLI
+    /// instead of the network (or fail them with --abort). The latest
+    /// matching mock wins; the HTTP cache is off while any is set. Mocks last
+    /// while the daemon runs. Without a pattern, lists the tab's mocks.
+    #[command(name = "mock-network")]
+    MockNetwork {
+        /// URL glob: * matches any characters, ? one, \ escapes (e.g. "*/api/user*")
+        pattern: Option<String>,
+        /// HTTP status of the response (default 200)
+        #[arg(long, requires = "pattern")]
+        status: Option<u16>,
+        /// Response header as "Name: value" (repeatable)
+        #[arg(long = "header", value_name = "HEADER", requires = "pattern")]
+        headers: Vec<String>,
+        /// Response body text
+        #[arg(
+            long,
+            conflicts_with = "body_file",
+            requires = "pattern",
+            allow_hyphen_values = true
+        )]
+        body: Option<String>,
+        /// File whose bytes are the response body
+        #[arg(long, requires = "pattern")]
+        body_file: Option<String>,
+        /// Fail matching requests with a network error instead
+        #[arg(long, requires = "pattern", conflicts_with_all = ["status", "headers", "body", "body_file"])]
+        abort: bool,
+        /// Only requests of this type (Document, Script, Stylesheet, Image, XHR, Fetch, ...)
+        #[arg(long, requires = "pattern")]
+        resource_type: Option<String>,
+    },
+
+    /// Remove the tab's network mocks with exactly this pattern, or all of them
+    #[command(name = "remove-network-mock")]
+    RemoveNetworkMock {
+        /// Pattern as given to mock-network; omit to remove every mock on the tab
+        pattern: Option<String>,
+    },
+
+    /// Show the CSS that applies to the first element matching a selector:
+    /// computed values, matched rules (highest precedence first, overridden
+    /// declarations tagged, var() values resolved), inline style, and
+    /// inherited rules
+    #[command(name = "css-styles")]
+    CssStyles {
+        /// CSS selector; the first match in the page's main document is used
+        selector: String,
+        /// Also show these computed properties (repeatable or comma-separated;
+        /// shorthands such as margin work too)
+        #[arg(long, value_delimiter = ',', value_name = "PROPERTY")]
+        computed: Vec<String>,
+        /// Also show rules from the browser's user-agent stylesheet
+        #[arg(long)]
+        ua_rules: bool,
+    },
+
+    /// Add a virtual WebAuthn authenticator to the page so
+    /// navigator.credentials.create()/get() succeed without a real device.
+    /// Omitted flags keep the current values; with no flags it adds one with
+    /// the defaults, or shows the current one and its credentials. Changing
+    /// protocol, transport, or key/verification support replaces the
+    /// authenticator and deletes its credentials. Run it before the page calls
+    /// navigator.credentials, and keep the tab in front (select-page): Chrome
+    /// rejects WebAuthn calls from a background tab
+    #[command(name = "configure-webauthn")]
+    ConfigureWebauthn {
+        /// Authenticator protocol: ctap2 (default) or u2f
+        #[arg(long, value_name = "ctap2|u2f")]
+        protocol: Option<String>,
+        /// internal (default; a platform authenticator like Touch ID), or a
+        /// roaming key: usb, nfc, ble, hybrid
+        #[arg(long, value_name = "TRANSPORT")]
+        transport: Option<String>,
+        /// Whether it can store discoverable credentials (passkeys). Default
+        /// true; always false for u2f
+        #[arg(long, value_name = "true|false")]
+        has_resident_key: Option<bool>,
+        /// Whether it supports user verification (PIN, biometrics). Default
+        /// true; always false for u2f
+        #[arg(long, value_name = "true|false")]
+        has_user_verification: Option<bool>,
+        /// Whether user verification succeeds; false tests a failed
+        /// verification. Default true
+        #[arg(long, value_name = "true|false")]
+        is_user_verified: Option<bool>,
+        /// Remove the virtual authenticator(s) from the page
+        #[arg(long, conflicts_with_all = ["protocol", "transport", "has_resident_key", "has_user_verification", "is_user_verified"])]
+        remove: bool,
+    },
+
     /// Wait for text to appear on the page
     WaitFor {
+        #[arg(allow_hyphen_values = true)]
         text: String,
         #[arg(long, default_value_t = 30000)]
         timeout: u64,
@@ -496,6 +628,10 @@ impl Cli {
             Commands::InspectHeapSnapshotNode { .. } => "inspect-heapsnapshot-node",
             Commands::CompareHeapsnapshots { .. } => "compare-heapsnapshots",
             Commands::Emulate { .. } => "emulate",
+            Commands::CssStyles { .. } => "css-styles",
+            Commands::MockNetwork { .. } => "mock-network",
+            Commands::RemoveNetworkMock { .. } => "remove-network-mock",
+            Commands::ConfigureWebauthn { .. } => "configure-webauthn",
             Commands::WaitFor { .. } => "wait-for",
             Commands::List3pTools => "list-3p-tools",
             Commands::Execute3pTool { .. } => "execute-3p-tool",
@@ -1205,6 +1341,7 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
             geolocation,
             accuracy,
             extra_headers,
+            background,
         } => (
             "new-page",
             json!({
@@ -1214,7 +1351,8 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
                 "mobile": mobile,
                 "geolocation": geolocation,
                 "accuracy": accuracy,
-                "extra_headers": extra_headers
+                "extra_headers": extra_headers,
+                "background": background
             }),
         ),
         Commands::ClosePage { id_or_index } => {
@@ -1276,9 +1414,61 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
             clear_geolocation,
             clear_all,
             clear_blocks,
+            media,
+            media_feature,
+            clear_media,
         } => (
             "emulate",
-            json!({"viewport": viewport, "device_scale_factor": device_scale_factor, "mobile": mobile, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all, "clear_blocks": clear_blocks}),
+            json!({"viewport": viewport, "device_scale_factor": device_scale_factor, "mobile": mobile, "geolocation": geolocation, "accuracy": accuracy, "clear_viewport": clear_viewport, "clear_geolocation": clear_geolocation, "clear_all": clear_all, "clear_blocks": clear_blocks, "media": media, "media_feature": media_feature, "clear_media": clear_media}),
+        ),
+        Commands::MockNetwork {
+            pattern,
+            status,
+            headers,
+            body,
+            body_file,
+            abort,
+            resource_type,
+        } => (
+            "mock-network",
+            json!({
+                "pattern": pattern,
+                "status": status,
+                "headers": headers,
+                "body": body,
+                "body_file": absolutize(body_file)?,
+                "abort": abort,
+                "resource_type": resource_type,
+            }),
+        ),
+        Commands::RemoveNetworkMock { pattern } => {
+            ("remove-network-mock", json!({"pattern": pattern}))
+        }
+        Commands::CssStyles {
+            selector,
+            computed,
+            ua_rules,
+        } => (
+            "css-styles",
+            json!({"selector": selector, "computed": computed, "ua_rules": ua_rules}),
+        ),
+        Commands::ConfigureWebauthn {
+            protocol,
+            transport,
+            has_resident_key,
+            has_user_verification,
+            is_user_verified,
+            remove,
+        } => (
+            "configure-webauthn",
+            json!({
+                "protocol": protocol,
+                "transport": transport,
+                "has_resident_key": has_resident_key,
+                "has_user_verification": has_user_verification,
+                "is_user_verified": is_user_verified,
+                "remove": remove
+            }),
         ),
         Commands::WaitFor { text, timeout } => {
             ("wait-for", json!({"text": text, "timeout": timeout}))
@@ -1366,7 +1556,16 @@ fn cli_cwd() -> Option<String> {
         .map(|dir| dir.to_string_lossy().into_owned())
 }
 
-fn print_output(output: &str, navigated_to: Option<&str>, target_id: Option<&str>) {
+/// Everything printed here can carry page text (console messages, titles,
+/// URLs), so control sequences are stripped before it reaches the terminal.
+fn print_output(
+    output: &str,
+    navigated_to: Option<&str>,
+    target_id: Option<&str>,
+    notes: &[String],
+) {
+    let output = format::strip_terminal_escapes(output);
+    let navigated_to = navigated_to.map(format::strip_terminal_escapes);
     if !output.is_empty() {
         print!("{output}");
         if !output.ends_with('\n') {
@@ -1380,17 +1579,43 @@ fn print_output(output: &str, navigated_to: Option<&str>, target_id: Option<&str
         // No space after the colon: README and SKILL.md document `[target:name]`.
         eprintln!("[target:{target_id}]");
     }
+    for note in notes {
+        eprintln!("{}", format::strip_terminal_escapes(note));
+    }
+}
+
+/// A daemon outlives the binary that started it: after an upgrade the old one
+/// keeps serving until it has been idle for 5 minutes (or for as long as
+/// `caffeinate` runs), and a fix or command the new CLI expects is silently
+/// missing until then. Says so, and leaves restarting to a person, since that
+/// drops the approved connection.
+fn daemon_version_warning(daemon_version: Option<&str>) -> Option<String> {
+    let ours = env!("CARGO_PKG_VERSION");
+    if daemon_version == Some(ours) {
+        return None;
+    }
+    let theirs = daemon_version.map_or("an older version".to_string(), |v| format!("version {v}"));
+    Some(format!(
+        "[warning] The daemon serving this browser runs {theirs}, but this CLI is version {ours}, \
+         so behaviour of the newer version may be missing. The daemon exits after 5 idle minutes. \
+         Restarting it sooner (`kill-daemon`) drops the approved connection and the browser may \
+         ask for approval again, so leave that decision to a person."
+    ))
 }
 
 fn print_response(resp: &protocol::DaemonResponse) {
+    if let Some(warning) = daemon_version_warning(resp.version.as_deref()) {
+        eprintln!("{warning}");
+    }
     if resp.success {
         print_output(
             &resp.output,
             resp.navigated_to.as_deref(),
             resp.target_id.as_deref(),
+            &resp.notes,
         );
     } else {
-        eprintln!("error: {}", resp.error);
+        eprintln!("error: {}", format::strip_terminal_escapes(&resp.error));
         telemetry::shutdown_logger();
         std::process::exit(resp.error_code.unwrap_or(1) as i32);
     }
@@ -1401,6 +1626,7 @@ fn print_result(result: &result::CommandResult) {
         &result.output,
         result.navigated_to.as_deref(),
         result.target_id.as_deref(),
+        &result.notes,
     );
 }
 
@@ -1651,10 +1877,16 @@ pub async fn run() -> Result<()> {
 
     // Handle inspect-heapsnapshot-node without connecting to Chrome — it's a
     // purely offline operation that parses a local .heapsnapshot file.
-    if let Commands::InspectHeapSnapshotNode { file_path, node_id } = &cli.command {
+    if let Commands::InspectHeapSnapshotNode {
+        file_path,
+        node_id,
+        list,
+    } = &cli.command
+    {
         let result = commands::memory::inspect_heapsnapshot_node_offline(
             file_path,
             *node_id,
+            *list,
             cli.output_format(),
         )
         .await?;
@@ -1668,12 +1900,14 @@ pub async fn run() -> Result<()> {
         base,
         current,
         class_index,
+        list,
     } = &cli.command
     {
         let result = commands::memory::compare_heapsnapshots_offline(
             base,
             current,
             *class_index,
+            *list,
             cli.output_format(),
         )
         .await?;
@@ -1856,6 +2090,7 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 geolocation,
                 accuracy,
                 extra_headers,
+                background,
             } => {
                 let params = commands::emulation::EmulateParams {
                     viewport: viewport.clone(),
@@ -1869,6 +2104,9 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                     block_url: cli.block_url.clone(),
                     unblock_url: cli.unblock_url.clone(),
                     clear_blocks: false,
+                    media: None,
+                    media_features: vec![],
+                    clear_media: false,
                 };
                 params.validate()?;
 
@@ -1877,7 +2115,14 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 } else {
                     None
                 };
-                commands::pages::new_page(&mut client, url, params, extra_headers.as_deref()).await
+                commands::pages::new_page(
+                    &mut client,
+                    url,
+                    params,
+                    extra_headers.as_deref(),
+                    *background,
+                )
+                .await
             }
             Commands::SwLogs {
                 duration,
@@ -1987,6 +2232,9 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 block_url: cli.block_url.clone(),
                 unblock_url: cli.unblock_url.clone(),
                 clear_blocks: false,
+                media: None,
+                media_features: vec![],
+                clear_media: false,
             };
             params.validate()?;
 
@@ -2101,6 +2349,9 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             clear_geolocation,
             clear_all,
             clear_blocks,
+            media,
+            media_feature,
+            clear_media,
         } => {
             let params = commands::emulation::EmulateParams {
                 viewport: viewport.clone(),
@@ -2115,9 +2366,90 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 block_url: cli.block_url.clone(),
                 unblock_url: cli.unblock_url.clone(),
                 clear_blocks: *clear_blocks,
+                media: media.clone(),
+                media_features: media_feature.clone(),
+                clear_media: *clear_media,
             };
             params.validate()?;
             commands::emulation::emulate(&mut client, &session_id, params).await
+        }
+        // Mocks need the daemon's long-lived session, so in direct mode these
+        // explain why they can't apply (`require_persistent_session`).
+        Commands::MockNetwork {
+            pattern,
+            status,
+            headers,
+            body,
+            body_file,
+            abort,
+            resource_type,
+        } => match pattern {
+            None => commands::network_mock::list_network_mocks(&client, cli.output_format()),
+            Some(pattern) => {
+                let request = commands::network_mock::MockRequest {
+                    pattern,
+                    status: *status,
+                    headers: headers.clone(),
+                    body: body.as_deref(),
+                    body_file: body_file.as_deref(),
+                    abort: *abort,
+                    resource_type: resource_type.as_deref(),
+                };
+                commands::network_mock::mock_network(&mut client, &session_id, request).await
+            }
+        },
+        Commands::RemoveNetworkMock { pattern } => {
+            commands::network_mock::remove_network_mock(
+                &mut client,
+                &session_id,
+                pattern.as_deref(),
+            )
+            .await
+        }
+        Commands::CssStyles {
+            selector,
+            computed,
+            ua_rules,
+        } => {
+            let opts = commands::css::CssOptions {
+                computed: computed.clone(),
+                ua_rules: *ua_rules,
+            };
+            commands::css::css_styles(
+                &mut client,
+                &session_id,
+                selector,
+                opts,
+                cli.output_format(),
+            )
+            .await
+        }
+        Commands::ConfigureWebauthn {
+            protocol,
+            transport,
+            has_resident_key,
+            has_user_verification,
+            is_user_verified,
+            remove,
+        } => {
+            // This session detaches at exit and would take an authenticator
+            // with it, so configure_webauthn refuses to add one here and says
+            // why; --remove still works.
+            let params = commands::webauthn::WebAuthnParams {
+                protocol: protocol.clone(),
+                transport: transport.clone(),
+                has_resident_key: *has_resident_key,
+                has_user_verification: *has_user_verification,
+                is_user_verified: *is_user_verified,
+                remove: *remove,
+            };
+            commands::webauthn::configure_webauthn(
+                &mut client,
+                &session_id,
+                params,
+                cli.output_format(),
+            )
+            .await
         }
         Commands::WaitFor { text, timeout } => {
             commands::pages::wait_for(&mut client, &session_id, text, *timeout).await
@@ -2222,6 +2554,7 @@ mod tests {
                 navigated_to: None,
                 target_id: None,
                 error_code,
+                ..Default::default()
             };
         let code_of = |e: &anyhow::Error| e.downcast_ref::<error::CliError>().map(|ce| ce.code());
         let alive_for = std::time::Duration::from_secs(2 * 3600 + 13 * 60);
@@ -2272,6 +2605,46 @@ mod tests {
         );
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(request.cwd.as_deref(), cwd.to_str());
+    }
+
+    #[test]
+    fn only_a_daemon_of_another_version_is_reported() {
+        assert_eq!(
+            daemon_version_warning(Some(env!("CARGO_PKG_VERSION"))),
+            None
+        );
+        let older = daemon_version_warning(None).unwrap();
+        assert!(older.contains("runs an older version"), "{older}");
+        let other = daemon_version_warning(Some("0.1.0")).unwrap();
+        assert!(other.contains("runs version 0.1.0"), "{other}");
+        assert!(other.contains("leave that decision to a person"), "{other}");
+    }
+
+    /// Text that starts with `-` is ordinary input: a southern latitude, a
+    /// negative coordinate, a price. Without this, `fill '#q' -hello` printed
+    /// help and exited 0 (clap read `-h`), so an agent saw success while nothing
+    /// was typed.
+    #[test]
+    fn values_starting_with_a_dash_reach_the_command() {
+        let args_of = |argv: &[&str]| {
+            let mut full = vec!["chrome-devtools"];
+            full.extend_from_slice(argv);
+            let cli = Cli::try_parse_from(full).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            build_request(&cli).unwrap().args
+        };
+        assert_eq!(args_of(&["fill", "#q", "-hello"])["value"], "-hello");
+        assert_eq!(args_of(&["fill", "#q", "-5"])["value"], "-5");
+        assert_eq!(args_of(&["type-text", "-hello"])["text"], "-hello");
+        assert_eq!(args_of(&["evaluate", "-1"])["expression"], "-1");
+        assert_eq!(args_of(&["wait-for", "-50% off"])["text"], "-50% off");
+        assert_eq!(args_of(&["click-at", "-5", "10"])["x"], -5.0);
+        for cmd in ["emulate", "navigate", "new-page"] {
+            let mut argv = vec![cmd, "--geolocation", "-33.86,151.2"];
+            if cmd != "emulate" {
+                argv.push("https://example.com");
+            }
+            assert_eq!(args_of(&argv)["geolocation"], "-33.86,151.2", "{cmd}");
+        }
     }
 
     #[test]

@@ -22,7 +22,7 @@ pub async fn collect_console(
         // window so they land in the buffer, then drain the buffer as the single
         // source of truth. Draining also consumes them, so a later drain can't
         // repeat them (read_events_for's own return value would double-count).
-        client.read_events_for(duration_ms).await?;
+        client.read_events_for(duration_ms, false).await?;
         client.drain_console_events()
     } else {
         // Live mode, direct/fallback: no persistent buffer. Enable Runtime on our
@@ -30,7 +30,7 @@ pub async fn collect_console(
         client
             .send_to_target(session_id, "Runtime.enable", json!({}))
             .await?;
-        let events_result = client.read_events_for(duration_ms).await;
+        let events_result = client.read_events_for(duration_ms, true).await;
         let _ = client
             .send_to_target(session_id, "Runtime.disable", json!({}))
             .await;
@@ -103,8 +103,7 @@ fn process_console_events(
                     }
                 }
                 let details = &params["exceptionDetails"];
-                let text = details["text"].as_str().unwrap_or("Unknown error");
-                let description = details["exception"]["description"].as_str().unwrap_or(text);
+                let description = crate::remote_object::describe_exception(details);
                 let timestamp = params["timestamp"].as_f64().unwrap_or(0.0);
 
                 messages.push(json!({

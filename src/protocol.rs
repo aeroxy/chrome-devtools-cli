@@ -46,7 +46,7 @@ impl DaemonRequest {
 }
 
 /// Response from daemon to CLI client.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct DaemonResponse {
     pub success: bool,
     pub output: String,
@@ -55,6 +55,36 @@ pub struct DaemonResponse {
     /// Friendly name of the page the command ran on; the CLI prints it as `[target:name]`.
     pub target_id: Option<String>,
     pub error_code: Option<u32>,
+    /// Lines for stderr beside the output: warnings, errors the page raised
+    /// while the command ran. Defaulted both ways, so CLIs and daemons of
+    /// different versions still understand each other.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    /// The daemon's version, so a CLI upgraded while an older daemon keeps
+    /// serving can say why a fix or command it expects is missing. `None` from
+    /// daemons older than this field.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// Whether the other end of a daemon socket runs as this user.
+///
+/// The socket lives in the temp directory, which on Linux is the shared
+/// `/tmp`. Its permissions follow the umask, and its name is predictable for
+/// `--port`, so another local user could connect to a daemon (and drive the
+/// browser) or create the socket first (and receive this CLI's requests:
+/// expressions, fill values, headers). Both ends check. Windows uses a
+/// loopback TCP port, which has no peer identity to check.
+#[cfg(unix)]
+pub fn peer_is_this_user(stream: &tokio::net::UnixStream) -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    stream.peer_cred().is_ok_and(|cred| cred.uid() == me)
+}
+
+#[cfg(windows)]
+pub fn peer_is_this_user(_stream: &tokio::net::TcpStream) -> bool {
+    true
 }
 
 /// Per-user filename suffix. `temp_dir()` is per-user on macOS ($TMPDIR) and
@@ -199,6 +229,9 @@ pub struct DaemonInfo {
     pub pid: u32,
     /// Unix seconds at daemon start, for the uptime column.
     pub started_unix: u64,
+    /// The daemon's version; `None` in files from daemons older than this field.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 /// Pre-uid-suffix PID file name, so `kill-daemon` can still stop a daemon
@@ -252,6 +285,17 @@ pub async fn read_msg<R: AsyncReadExt + Unpin>(r: &mut R) -> anyhow::Result<Vec<
 
 #[cfg(test)]
 mod tests {
+
+    /// The check must pass for this user's own socket, or no command would
+    /// ever reach a daemon.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_from_this_user_passes_the_peer_check() {
+        let (a, b) = tokio::net::UnixStream::pair().unwrap();
+        assert!(peer_is_this_user(&a));
+        assert!(peer_is_this_user(&b));
+    }
+
     use super::*;
 
     /// A daemon keeps serving CLIs from newer and older binaries, so a field
@@ -327,6 +371,7 @@ mod tests {
             ws_url: "ws://127.0.0.1:56912/devtools/browser/x".to_string(),
             pid: 4242,
             started_unix: 1_700_000_000,
+            version: None,
         };
         let back: DaemonInfo = serde_json::from_slice(&serde_json::to_vec(&info).unwrap()).unwrap();
         assert_eq!(back.browser, "edge");

@@ -31,7 +31,12 @@ async fn main() {
             Some(ce) => ce.code().code(),
             None => ErrorCode::Unspecified as u32,
         };
-        eprintln!("error: {e:#}");
+        // Errors can quote page text (exception messages, URLs).
+        let message = format!("{e:#}");
+        eprintln!(
+            "error: {}",
+            chrome_devtools_cli::format::strip_terminal_escapes(&message)
+        );
         std::process::exit(code as i32);
     }
 }
