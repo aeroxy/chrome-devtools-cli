@@ -31,9 +31,11 @@ pub async fn collect_sw_logs(
         .collect();
 
     if sw_targets.is_empty() {
-        return Ok(CommandResult::output(
-            "No extension service workers found.".to_string(),
-        ));
+        let note = "No extension service workers found.";
+        if !format.is_text() {
+            return structured(&[], &[note.to_string()], format);
+        }
+        return Ok(CommandResult::output(note.to_string()));
     }
 
     let mut warnings = Vec::new();
@@ -69,7 +71,12 @@ pub async fn collect_sw_logs(
     // Every attach/Runtime.enable failed: there are no sessions to collect from,
     // so block-reading for the full window would just stall the CLI for nothing.
     if sessions.is_empty() {
-        let mut err = "Failed to attach to any extension service workers.".to_string();
+        let summary = "Failed to attach to any extension service workers.";
+        if !format.is_text() {
+            warnings.insert(0, summary.to_string());
+            return structured(&[], &warnings, format);
+        }
+        let mut err = summary.to_string();
         if !warnings.is_empty() {
             err.push_str("\nDetails:\n  ");
             err.push_str(&warnings.join("\n  "));
@@ -153,12 +160,19 @@ pub async fn collect_sw_logs(
         }
         Ok(CommandResult::output(out))
     } else {
-        let value = json!({
-            "messages": messages,
-            "warnings": warnings,
-        });
-        Ok(CommandResult::output(format_structured(&value, format)?))
+        structured(&messages, &warnings, format)
     }
+}
+
+/// The `--json` / `--toon` answer. Every outcome uses it, so stdout always
+/// parses; a run that found nothing to collect from says why in `warnings`.
+fn structured(
+    messages: &[serde_json::Value],
+    warnings: &[String],
+    format: OutputFormat,
+) -> Result<CommandResult> {
+    let value = json!({"messages": messages, "warnings": warnings});
+    Ok(CommandResult::output(format_structured(&value, format)?))
 }
 
 fn extract_extension_id(url: &str) -> Option<String> {

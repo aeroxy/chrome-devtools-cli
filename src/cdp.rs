@@ -349,9 +349,13 @@ fn parse_connect_timeout(raw: Option<&str>) -> std::time::Duration {
 /// timeout). Long enough for a slow `run-script`; short enough that an endless
 /// loop or a hung renderer can't hold the daemon, which serves one request at
 /// a time, and every caller queued behind it, forever.
+/// Read once, so a bad value warns once rather than on every call.
 fn cdp_call_timeout() -> std::time::Duration {
-    let raw = std::env::var("CHROME_CDP_TIMEOUT_SECS").ok();
-    parse_timeout_secs("CHROME_CDP_TIMEOUT_SECS", raw.as_deref(), 180)
+    static LIMIT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let raw = std::env::var("CHROME_CDP_TIMEOUT_SECS").ok();
+        parse_timeout_secs("CHROME_CDP_TIMEOUT_SECS", raw.as_deref(), 180)
+    })
 }
 
 /// Limit for calls that set a session up (`Runtime.enable` and the like). They
@@ -1525,6 +1529,8 @@ fn slim_network_event(event: Value) -> Value {
                     "statusText": r["statusText"],
                     "headers": r["headers"],
                 });
+                // Which hops have wire headers, to line those up with them.
+                params["redirectHasExtraInfo"] = p["redirectHasExtraInfo"].clone();
             }
         }
         Some("Network.responseReceived") => {
@@ -1534,6 +1540,7 @@ fn slim_network_event(event: Value) -> Value {
                 "statusText": r["statusText"],
                 "headers": r["headers"],
             });
+            params["hasExtraInfo"] = p["hasExtraInfo"].clone();
         }
         // The headers as they went over the wire, Cookie and Set-Cookie
         // included, which the page's view leaves out.
@@ -1659,6 +1666,7 @@ mod tests {
             "request": {"url": "https://a.test/x", "method": "POST", "postData": "x".repeat(5000), "headers": {"a": "b"}},
             "initiator": {"stack": {"callFrames": [{"url": "big"}]}},
             "redirectResponse": {"status": 302, "statusText": "Found", "headers": {"location": "/y"}},
+            "redirectHasExtraInfo": false,
         }});
         assert_eq!(
             slim_network_event(request),
@@ -1666,6 +1674,18 @@ mod tests {
                 "requestId": "1", "type": "Fetch",
                 "request": {"url": "https://a.test/x", "method": "POST", "headers": {"a": "b"}},
                 "redirectResponse": {"status": 302, "statusText": "Found", "headers": {"location": "/y"}},
+                "redirectHasExtraInfo": false,
+            }})
+        );
+        let response = json!({"method": "Network.responseReceived", "sessionId": "S", "params": {
+            "requestId": "1", "type": "Fetch", "hasExtraInfo": true,
+            "response": {"status": 200, "statusText": "OK", "headers": {}, "timing": {"sendStart": 1}},
+        }});
+        assert_eq!(
+            slim_network_event(response),
+            json!({"method": "Network.responseReceived", "sessionId": "S", "params": {
+                "requestId": "1", "hasExtraInfo": true,
+                "response": {"status": 200, "statusText": "OK", "headers": {}},
             }})
         );
         let wire = json!({"method": "Network.requestWillBeSentExtraInfo", "sessionId": "S", "params": {

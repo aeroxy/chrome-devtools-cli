@@ -234,10 +234,86 @@ struct RawSnapshot {
     snapshot: SnapshotMeta,
     nodes: NodeArray,
     #[serde(default)]
-    edges: Vec<u32>,
+    edges: IntArray,
     #[serde(default)]
-    locations: Vec<u32>,
+    locations: IntArray,
     strings: Vec<String>,
+}
+
+/// The `edges` or `locations` array. V8 holds these fields in C++ `int`s and
+/// prints them signed, so a value it means as 2^31 or more comes out
+/// negative: a sparse array's element index past `i32::MAX`. It also writes
+/// -1 for a line or column it could not work out. Each negative value is
+/// stored as the `u32` it wraps to, the number V8 meant and what DevTools'
+/// `Uint32Array` holds, and listed in `negative`, so that each use decides
+/// whether a negative value is valid there.
+#[derive(Default)]
+struct IntArray {
+    fields: Vec<u32>,
+    /// Indices into `fields` of the values the file wrote as negative.
+    negative: Vec<usize>,
+}
+
+impl<'de> serde::Deserialize<'de> for IntArray {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Fields;
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = IntArray;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of 32-bit integers")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<IntArray, A::Error> {
+                let mut array = IntArray::default();
+                while seq.next_element_seed(Push(&mut array))?.is_some() {}
+                Ok(array)
+            }
+        }
+        d.deserialize_seq(Fields)
+    }
+}
+
+/// Appends one value to an `IntArray`, taking the number as the parser hands
+/// it over. Reading each value as an `i64` element and converting it was
+/// measurably slower on arrays of millions of values.
+struct Push<'a>(&'a mut IntArray);
+
+impl<'de> serde::de::DeserializeSeed<'de> for Push<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> std::result::Result<(), D::Error> {
+        d.deserialize_i64(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Push<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an integer from -2147483648 to 4294967295")
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<(), E> {
+        let field = u32::try_from(v)
+            .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(v), &self))?;
+        self.0.fields.push(field);
+        Ok(())
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<(), E> {
+        if v >= 0 {
+            return self.visit_u64(v as u64);
+        }
+        let field = i32::try_from(v)
+            .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(v), &self))?;
+        self.0.negative.push(self.0.fields.len());
+        self.0.fields.push(field as u32);
+        Ok(())
+    }
 }
 
 /// The `nodes` array, read as `u32`s. A value of `WIDE` or more, which V8
@@ -374,6 +450,10 @@ impl Snap {
             fields: nodes,
             wide,
         } = nodes;
+        let IntArray {
+            fields: edges,
+            negative: negative_edges,
+        } = edges;
         let meta = snapshot.meta;
         let required = |fields: &[String], name: &str, kind: &str| {
             position(fields, name).with_context(|| {
@@ -449,14 +529,28 @@ impl Snap {
         };
 
         let mut first_edge: Vec<u32> = Vec::with_capacity(node_count + 1);
-        let mut total: u64 = 0;
+        let mut total = 0usize;
         for ord in 0..node_count {
-            first_edge.push(total.min(u32::MAX as u64) as u32);
+            // Never past `edges.len()`, which fits in a u32.
+            first_edge.push(total as u32);
             if let Some(off) = edge_count_off {
-                total += nodes[ord * node_size + off] as u64 * edge_size as u64;
+                // The counts and the edge stride both come from the file, so
+                // the sum is checked at every step: a prefix that overflowed
+                // or ran past the edges array would send traversal out of it.
+                total = (nodes[ord * node_size + off] as usize)
+                    .checked_mul(edge_size)
+                    .and_then(|fields| total.checked_add(fields))
+                    .filter(|&total| total <= edges.len())
+                    .with_context(|| {
+                        format!(
+                            "Corrupt snapshot: the nodes' edge_count adds up to more than the \
+                             {} fields of the edges array; the file is truncated or malformed",
+                            edges.len()
+                        )
+                    })?;
             }
         }
-        if total != edges.len() as u64 {
+        if total != edges.len() {
             bail!(
                 "Corrupt snapshot: the nodes' edge_count adds up to {} edge fields but the \
                  edges array has {}; the file is truncated or malformed",
@@ -475,6 +569,21 @@ impl Snap {
                 required(ef, "to_node", "edge")?,
             )
         };
+        // Only an index means a number past `i32::MAX`. A negative type, node
+        // index or string index is no value V8 writes.
+        for &i in &negative_edges {
+            let (e, field) = (i - i % edge_size, i % edge_size);
+            let ty = Some(edges[e + edge_type_off]);
+            if field != edge_name_off || (ty != et.element && ty != et.hidden) {
+                bail!(
+                    "Corrupt snapshot: edge {} has {} {}, but only an element or hidden \
+                     edge's index may be negative",
+                    e / edge_size,
+                    ef[field],
+                    edges[i] as i32
+                );
+            }
+        }
         for e in (0..edges.len()).step_by(edge_size) {
             let to = edges[e + edge_to_off] as usize;
             if !to.is_multiple_of(node_size) || to >= nodes.len() {
@@ -509,7 +618,40 @@ impl Snap {
             position(lf, "line"),
             position(lf, "column"),
         ) {
-            for chunk in locations.chunks_exact(lf.len()) {
+            // -1, which V8 writes for a line or column it could not work
+            // out; versions that printed it unsigned wrote 4294967295.
+            const UNKNOWN: u32 = -1i32 as u32;
+            let IntArray {
+                fields: locations,
+                negative,
+            } = locations;
+            let stride = lf.len();
+            // A partial record would otherwise be dropped, moving its object
+            // to the class without a location.
+            if !locations.len().is_multiple_of(stride) {
+                bail!(
+                    "Corrupt snapshot: locations array length ({}) is not a multiple of its \
+                     {} location fields; the file is truncated or malformed",
+                    locations.len(),
+                    stride
+                );
+            }
+            for &i in &negative {
+                let field = i % stride;
+                if (field != l && field != c) || locations[i] != UNKNOWN {
+                    bail!(
+                        "Corrupt snapshot: location field '{}' holds {}",
+                        lf[field],
+                        locations[i] as i32
+                    );
+                }
+            }
+            for chunk in locations.chunks_exact(stride) {
+                // Where it is unknown, the object keeps no location, like
+                // one whose constructor has no script.
+                if chunk[l] == UNKNOWN || chunk[c] == UNKNOWN {
+                    continue;
+                }
                 location_map.insert(chunk[o] as usize, (chunk[s], chunk[l], chunk[c]));
             }
         }
@@ -660,33 +802,33 @@ impl Snap {
     /// the front and the back, like `{a, b, …, y, z}`, until the name nears
     /// 100 UTF-16 code units.
     fn plain_object_name(&self, ord: usize) -> String {
-        let names: Vec<String> = self
-            .edge_range(ord)
-            .filter(|&e| self.edge_is(e, self.et.property))
-            .map(|e| self.edge_name(e))
-            .filter(|name| name != "__proto__")
-            .map(|name| format_property_name(&name).into_owned())
-            .collect();
-        let (mut front, mut back): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
-        let (mut i, mut j) = (0, names.len());
+        // Walked from both ends, so an object with many properties costs only
+        // the few names that fit.
+        let mut edges = self.edge_range(ord).filter(|&e| {
+            self.edge_is(e, self.et.property) && self.string_edge_name(e) != "__proto__"
+        });
+        let (mut front, mut back): (Vec<Cow<str>>, Vec<Cow<str>>) = (Vec::new(), Vec::new());
+        let mut more = None;
         // UTF-16 code units, as DevTools counts: the braces, then each side's
         // names and the separators between them.
         let mut len = 2;
-        while i < j {
+        loop {
             let from_back = front.len() > back.len();
-            let name = &names[if from_back { j - 1 } else { i }];
+            let Some(e) = (if from_back {
+                edges.next_back()
+            } else {
+                edges.next()
+            }) else {
+                break;
+            };
+            let name = format_property_name(self.string_edge_name(e));
             let name_len = name.encode_utf16().count();
             // Always at least one property, however long.
             if !front.is_empty() && len + name_len > 100 {
+                more = Some(Cow::Borrowed("…"));
                 break;
             }
-            let side = if from_back {
-                j -= 1;
-                &mut back
-            } else {
-                i += 1;
-                &mut front
-            };
+            let side = if from_back { &mut back } else { &mut front };
             if !side.is_empty() {
                 len += 2;
             }
@@ -694,8 +836,7 @@ impl Snap {
             side.push(name);
         }
         back.reverse();
-        let more = (i < j).then_some("…");
-        let parts: Vec<&str> = front.into_iter().chain(more).chain(back).collect();
+        let parts: Vec<Cow<str>> = front.into_iter().chain(more).chain(back).collect();
         format!("{{{}}}", parts.join(", "))
     }
 
@@ -1631,8 +1772,9 @@ pub async fn compare_heapsnapshots_offline(
 /// `internal` edges, one from the key and one from the WeakMap's table, both
 /// named `<n> / part of key (<key> @<id>) -> value (<value> @<id>) pair in
 /// WeakMap (table @<id>)` with only `<n>` differing. Returns the rest, which
-/// pairs them. The names in it are any text on one line, as `.` matches in
-/// DevTools' regex.
+/// pairs them. The names in it are any text, line breaks included: V8 embeds
+/// the value's name, which can be a multiline string. DevTools' regex, whose
+/// `.` stops at a line break, takes such a pair for two unrelated edges.
 fn weak_map_pair(name: &str) -> Option<&str> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let shared = name.trim_start_matches(|c: char| c.is_ascii_digit());
@@ -1644,10 +1786,7 @@ fn weak_map_pair(name: &str) -> Option<&str> {
         .strip_suffix(')')?
         .rsplit_once(" pair in WeakMap (table @")?;
     let (key_and_value, value_id) = middle.strip_suffix(')')?.rsplit_once(" @")?;
-    if !digits(table)
-        || !digits(value_id)
-        || key_and_value.contains(['\n', '\r', '\u{2028}', '\u{2029}'])
-    {
+    if !digits(table) || !digits(value_id) {
         return None;
     }
     // `<key> @<id>) -> value (<value>`, where either name may itself
@@ -1731,8 +1870,8 @@ fn bfs_from_root(snap: &Snap) -> (Vec<u32>, Vec<u32>, HashMap<usize, usize>) {
     (dist, parent, waited)
 }
 
-/// Edges from the root to `target` along the BFS tree, or `None` when no
-/// strong path exists.
+/// Edges from the root to `target` along the BFS tree, or `None` when the
+/// BFS did not reach it.
 fn retaining_path(snap: &Snap, parent: &[u32], target: usize) -> Option<Vec<usize>> {
     let mut edges = Vec::new();
     let mut cur = target;
@@ -1810,7 +1949,8 @@ struct NodeReport {
     node: NodeInfo,
     retainers_total: usize,
     retainers: Vec<EdgeRow>,
-    /// Root first; `None` when only weak edges, or nothing, reach the node.
+    /// Root first; `None` when the traversal from the root does not reach
+    /// the node.
     path: Option<Vec<EdgeRow>>,
 }
 
@@ -1980,10 +2120,10 @@ fn format_node_report(
 
     out.push('\n');
     match &report.path {
-        None => out.push_str(
-            "Retaining path: none. Nothing reaches this node from the root except through \
-             weak edges, so it does not keep memory alive.\n",
-        ),
+        // No reason given, because the report does not know which applies:
+        // only weak edges reach the node, or a WeakMap entry whose key or
+        // table is never reached, or nothing at all.
+        None => out.push_str("Retaining path: none found.\n"),
         Some(path) if path.is_empty() => out.push_str("Retaining path: this is the root.\n"),
         Some(path) => {
             let _ = writeln!(
@@ -2430,6 +2570,30 @@ mod tests {
         for i in 0..40 {
             t.edge(long, "property", &format!("property{i:02}"), window);
         }
+        // Other edges, and `__proto__`, at both ends and between the names.
+        let mixed = t.node("object", "Object", 17, 16);
+        t.edge(window, "property", "mixed", mixed);
+        t.edge(mixed, "internal", "map", window);
+        t.edge(mixed, "property", "__proto__", window);
+        t.edge(mixed, "property", "x", window);
+        t.edge(mixed, "element", "0", window);
+        t.edge(mixed, "property", "a,b", window);
+        t.edge(mixed, "property", "__proto__", window);
+        t.edge(mixed, "hidden", "1", window);
+        // Two names from the front, then one from the back, fill the name.
+        let odd = t.node("object", "Object", 19, 16);
+        t.edge(window, "property", "odd", odd);
+        let thirty: Vec<String> = ('a'..='i')
+            .map(|c| format!("{c}{}", "_".repeat(29)))
+            .collect();
+        for name in &thirty {
+            t.edge(odd, "property", name, window);
+        }
+        // A name past the limit on its own is still shown.
+        let huge = t.node("object", "Object", 21, 16);
+        t.edge(window, "property", "huge", huge);
+        t.edge(huge, "property", &"q".repeat(150), window);
+        t.edge(huge, "property", &"r".repeat(150), window);
         let snap = t.snap();
         assert_eq!(snap.display_name(obj), "{a, b, keep, c, d, e, f, g}");
         assert_eq!(snap.display_name(empty), "{}");
@@ -2437,6 +2601,15 @@ mod tests {
             snap.display_name(long),
             "{property00, property01, property02, property03, …, \
              property36, property37, property38, property39}"
+        );
+        assert_eq!(snap.display_name(mixed), "{x, \"a,b\"}");
+        assert_eq!(
+            snap.display_name(odd),
+            format!("{{{}, {}, …, {}}}", thirty[0], thirty[1], thirty[8])
+        );
+        assert_eq!(
+            snap.display_name(huge),
+            format!("{{{}, …}}", "q".repeat(150))
         );
         // Only the displayed name changes; the class stays "Object".
         assert_eq!(assign_classes(&snap, &[]).name_of(obj), "Object");
@@ -2910,8 +3083,9 @@ mod tests {
     }
 
     /// The key and the table of a WeakMap entry each have an edge to the
-    /// value, `key_hops` and `table_hops` objects below Window.
-    fn weak_map_fixture(key_hops: usize, table_hops: usize) -> TestSnap {
+    /// value, named `value`, `key_hops` and `table_hops` objects below
+    /// Window.
+    fn weak_map_fixture(key_hops: usize, table_hops: usize, value: &str) -> TestSnap {
         let (mut t, window) = TestSnap::page();
         let chain = |t: &mut TestSnap, hops: usize, first_id: u32| {
             let mut at = window;
@@ -2927,8 +3101,9 @@ mod tests {
         let key = t.node("object", "Key", 11, 16);
         let wm = t.node("object", "WeakMap", 13, 24);
         let table = t.node("array", "", 15, 64);
-        let value = t.node("object", "Val", 17, 16);
-        let entry = "part of key (Key @11) -> value (Val @17) pair in WeakMap (table @15)";
+        let entry =
+            format!("part of key (Key @11) -> value ({value} @17) pair in WeakMap (table @15)");
+        let value = t.node("object", value, 17, 16);
         t.edge(key_holder, "property", "key", key);
         t.edge(wm_holder, "property", "wm", wm);
         t.edge(wm, "internal", "table", table);
@@ -2941,7 +3116,7 @@ mod tests {
     fn test_weak_map_value_waits_for_its_key_and_table() {
         // Key 3 hops below Window, table 2 (Window -> wm -> table): DevTools
         // waits for the key's edge, so the value is 5 from the root, not 4.
-        let snap = weak_map_fixture(2, 0).snap();
+        let snap = weak_map_fixture(2, 0, "Val").snap();
         let report = inspect_node(&snap, 17, &defaults()).unwrap();
         assert_eq!(report.node.distance, Some(5));
         let path = report.path.as_ref().unwrap();
@@ -2968,10 +3143,22 @@ mod tests {
         );
         assert!(json["retainingPath"][3].get("conditionalOn").is_none());
 
+        // The value's name, which both edge names embed, may span lines; the
+        // value still waits for the key rather than taking the table's
+        // shorter route.
+        let snap = weak_map_fixture(2, 0, "line one\nline two").snap();
+        let report = inspect_node(&snap, 17, &defaults()).unwrap();
+        assert_eq!(report.node.distance, Some(5));
+        let path = report.path.unwrap();
+        let ids: Vec<u32> = path.iter().map(|r| r.node_id).collect();
+        assert_eq!(ids, [3, 101, 103, 11, 17]);
+        let c = path[4].conditional_on.as_ref().unwrap();
+        assert_eq!((c.role, c.node_id), ("table", 15));
+
         // The other way round (key 1 hop, table 4: Window -> 2 links -> wm
         // -> table), the table's edge sets the distance and the key is the
         // condition.
-        let snap = weak_map_fixture(0, 2).snap();
+        let snap = weak_map_fixture(0, 2, "Val").snap();
         let report = inspect_node(&snap, 17, &defaults()).unwrap();
         assert_eq!(report.node.distance, Some(6));
         let path = report.path.unwrap();
@@ -2983,40 +3170,45 @@ mod tests {
         assert_eq!((c.role, c.node_id), ("key", 11));
 
         // With no way to the key, the table alone does not retain the value.
-        let mut t = weak_map_fixture(0, 0);
+        let mut t = weak_map_fixture(0, 0, "Val");
         t.nodes[1].edges.retain(|(_, name, _)| name != "key");
         let report = inspect_node(&t.snap(), 17, &defaults()).unwrap();
         assert_eq!(report.node.distance, None);
         assert!(report.path.is_none());
+        // The table's internal edge still reaches it, so the report does not
+        // claim that only weak edges do.
+        assert_eq!(report.retainers_total, 2);
+        let text = format_node_report(&report, &defaults(), OutputFormat::Text).unwrap();
+        assert!(
+            text.ends_with("\n\nRetaining path: none found.\n"),
+            "{text}"
+        );
     }
 
     #[test]
-    fn test_weak_map_edge_names_parse_like_devtools() {
+    fn test_weak_map_edge_names_parse() {
         let name = "12 / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @5)";
         assert_eq!(
             weak_map_pair(name),
             Some(" / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @5)")
         );
-        // Names may contain the separators, but not a line break, which
-        // DevTools' `.` does not match.
-        assert!(weak_map_pair(
-            "1 / part of key (a) -> value (b @1) @2) -> value (c @3) pair in WeakMap (table @4)"
-        )
-        .is_some());
-        assert!(
-            weak_map_pair("1 / part of key ( @2) -> value ( @3) pair in WeakMap (table @4)")
-                .is_some()
-        );
-        assert!(weak_map_pair(
-            "1 / part of key (a\nb @2) -> value (c @3) pair in WeakMap (table @4)"
-        )
-        .is_none());
+        // Names may contain the separators, and line breaks.
+        for name in [
+            "1 / part of key (a) -> value (b @1) @2) -> value (c @3) pair in WeakMap (table @4)",
+            "1 / part of key ( @2) -> value ( @3) pair in WeakMap (table @4)",
+            "1 / part of key (a\nb @2) -> value (c\r\n\u{2028}d @3) pair in WeakMap (table @4)",
+        ] {
+            assert!(weak_map_pair(name).is_some(), "{name}");
+        }
         for not_a_pair in [
             "part of key -> value pair in ephemeron table",
             " / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @5)",
             "1 / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @)",
             "1 / part of key (Key @x) -> value (Val @9) pair in WeakMap (table @5)",
             "1 / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @5) ",
+            "1 / part of key (Key @7\n) -> value (Val @9) pair in WeakMap (table @5)",
+            "1 / part of key (Key @7) -> value (Val @9\n) pair in WeakMap (table @5)",
+            "1 / part of key (Key @7) -> value (Val @9) pair in WeakMap\n(table @5)",
             "map",
         ] {
             assert!(weak_map_pair(not_a_pair).is_none(), "{not_a_pair}");
@@ -3151,5 +3343,161 @@ mod tests {
         )
         .unwrap();
         assert_eq!(json["location"], "7:10:1");
+    }
+
+    /// `v` with the given fields of its `array` replaced.
+    fn with_fields(
+        mut v: serde_json::Value,
+        array: &str,
+        changes: &[(usize, serde_json::Value)],
+    ) -> serde_json::Value {
+        for (at, value) in changes {
+            v[array][*at] = value.clone();
+        }
+        v
+    }
+
+    /// Loads `v` through a file, as the commands read snapshots.
+    fn load_json(v: &serde_json::Value) -> Result<Snap> {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{v}").unwrap();
+        load_snapshot(file.path().to_str().unwrap())
+    }
+
+    #[test]
+    fn test_element_indices_past_i32_max_load() {
+        let (mut t, window) = TestSnap::page();
+        let a = t.node("object", "A", 11, 8);
+        t.edge(window, "element", "0", a);
+        t.edge(window, "hidden", "0", a);
+        t.edge(window, "property", "p", a);
+        // Window's edges 1-3 follow the root's edge 0: fields 3-5, 6-8 and
+        // 9-11, each type, name_or_index, to_node. V8 prints an index of
+        // 2^31 or more as a negative int.
+        let v = with_fields(t.json(), "edges", &[(4, json!(i32::MIN)), (7, json!(-2))]);
+        let snap = load_json(&v).unwrap();
+        let names: Vec<String> = snap
+            .edge_range(window)
+            .map(|e| snap.edge_name(e).into_owned())
+            .collect();
+        assert_eq!(names, ["2147483648", "4294967294", "p"]);
+
+        // Anywhere else a negative value is corrupt.
+        for (at, edge, field) in [(3, 1, "type"), (5, 1, "to_node"), (10, 3, "name_or_index")] {
+            let v = with_fields(t.json(), "edges", &[(at, json!(-1))]);
+            let err = Snap::new(serde_json::from_value(v).unwrap()).err().unwrap();
+            assert!(
+                err.to_string().contains(&format!(
+                    "edge {edge} has {field} -1, but only an element or hidden edge's index"
+                )),
+                "{err}"
+            );
+        }
+        // So is a value no 32-bit field holds.
+        for value in [i64::from(i32::MIN) - 1, i64::from(u32::MAX) + 1] {
+            let v = with_fields(t.json(), "edges", &[(4, json!(value))]);
+            let err = serde_json::from_value::<RawSnapshot>(v).err().unwrap();
+            assert!(
+                err.to_string()
+                    .contains("expected an integer from -2147483648 to 4294967295"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_locations_leave_objects_unlocated() {
+        let (mut t, window) = TestSnap::page();
+        for i in 0..4 {
+            let foo = t.node("object", "Foo", 11 + 2 * i as u32, 20);
+            t.edge(window, "property", &format!("p{i}"), foo);
+            t.locations.push((foo, 7, 0, 4));
+        }
+        // Four fields per record: object_index, script_id, line, column. V8
+        // writes -1 for a line and column it could not work out, and older
+        // versions printed that unsigned.
+        let v = with_fields(
+            t.json(),
+            "locations",
+            &[
+                (6, json!(-1)),
+                (7, json!(-1)),
+                (10, json!(u32::MAX)),
+                (11, json!(u32::MAX)),
+            ],
+        );
+        let snap = load_json(&v).unwrap();
+        let aggs = build_class_aggregates(&snap, &assign_classes(&snap, &[]));
+        let located = ClassKey {
+            name: "Foo".into(),
+            location: Some((7, 0, 4)),
+        };
+        assert_eq!(aggs.members(&located), [(11, 20), (17, 20)]);
+        assert_eq!(aggs.members(&key("Foo")), [(13, 20), (15, 20)]);
+
+        // Any other negative location field is corrupt.
+        for (at, value, message) in [
+            (1, -1, "location field 'script_id' holds -1"),
+            (6, -2, "location field 'line' holds -2"),
+        ] {
+            let v = with_fields(t.json(), "locations", &[(at, json!(value))]);
+            let err = Snap::new(serde_json::from_value(v).unwrap()).err().unwrap();
+            assert!(err.to_string().contains(message), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_rejects_partial_location_records() {
+        let (mut t, window) = TestSnap::page();
+        let foo = t.node("object", "Foo", 11, 20);
+        t.edge(window, "property", "foo", foo);
+        t.locations.push((foo, 7, 0, 4));
+        let mut v = t.json();
+        v["locations"].as_array_mut().unwrap().pop();
+        let err = Snap::new(serde_json::from_value(v).unwrap()).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("locations array length (3) is not a multiple of its 4 location fields"),
+            "{err}"
+        );
+        // A snapshot may record no locations at all.
+        let mut v = t.json();
+        v["locations"] = json!([]);
+        assert!(load_json(&v).unwrap().locations.is_empty());
+        v.as_object_mut().unwrap().remove("locations");
+        assert!(load_json(&v).unwrap().locations.is_empty());
+    }
+
+    #[test]
+    fn test_rejects_edge_counts_that_overflow() {
+        // 65537 nodes of 2^32 - 2 edges, each edge 65536 fields long: the
+        // running total passes u64::MAX at the last node.
+        let raw = RawSnapshot {
+            snapshot: SnapshotMeta {
+                meta: MetaDetails {
+                    node_fields: ["id", "name", "self_size", "edge_count"]
+                        .map(String::from)
+                        .to_vec(),
+                    node_types: Vec::new(),
+                    edge_fields: vec![String::new(); 1 << 16],
+                    edge_types: Vec::new(),
+                    location_fields: Vec::new(),
+                },
+                root_index: 0,
+            },
+            nodes: NodeArray {
+                fields: [0, 0, 0, u32::MAX - 1].repeat((1 << 16) + 1),
+                wide: Vec::new(),
+            },
+            edges: IntArray::default(),
+            locations: IntArray::default(),
+            strings: vec![String::new()],
+        };
+        let err = Snap::new(raw).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("edge_count adds up to more than the 0 fields of the edges array"),
+            "{err}"
+        );
     }
 }

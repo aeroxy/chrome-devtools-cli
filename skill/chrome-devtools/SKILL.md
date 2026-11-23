@@ -277,7 +277,8 @@ chrome-devtools --target warm-squid type-text "search query" --submit-key Enter
 
 # Press a key or key combo. Examples: Enter, Tab, Escape, ArrowDown,
 # Control+A, Meta+C, Shift+Tab, Backspace, Space, F5. A single character
-# (a, 7, /) types it. An unknown key or modifier is an error, checked before
+# (a, 7, /) types it, and Shift shifts it as on a US keyboard (Shift+1
+# types !). An unknown key or modifier is an error, checked before
 # anything is typed, so `type-text ... --submit-key Ener` types nothing.
 chrome-devtools --target warm-squid press-key Enter
 chrome-devtools --target warm-squid press-key Control+A
@@ -597,7 +598,8 @@ chrome-devtools inspect-heapsnapshot-node --file-path /tmp/final.heapsnapshot --
 
 Read the path from the bottom up to the first edge the application owns: here
 `window.openDialogs` keeps every closed dialog. That edge is where the fix
-goes. A node with no retaining path is only weakly held and will be collected.
+goes. A node with no retaining path (`Retaining path: none found.`) is not kept
+alive and will be collected.
 A step through a WeakMap entry holds its value only while both the key and the
 WeakMap are alive, so the path goes through whichever is farther from the root
 and is followed by a line naming the other (`Step 5 is conditional: …`); the
@@ -777,7 +779,7 @@ chrome-devtools --target warm-squid css-styles 'button' --ua-rules              
 - **Computed** lists `display`, `width`, `height`, and what the shown rules set; a shorthand shows as one value when Chrome can write one.
 - **Rules** are highest precedence first, each with `file:line` (an inline `<style>` gives the document's line) and its enclosing `@media`/`@layer`/`@supports`/`@container`/nesting as wrapping blocks. `[overridden]` marks a declaration that applies nowhere; `[invalid]` and `[disabled]` mark ones that never could. `/* ... */` after a `var()` value is what it resolves to on that element (or, under "Inherited from", on that ancestor).
 - **Inherited from** lists only properties that inherit. A user-agent rule on the element itself (common on `button`, `input`) can block inheritance even while hidden; the computed value is the final word.
-- Not covered: pseudo-elements (`::before`), `@keyframes`, elements inside iframes or shadow roots, cascade-layer order for `!important`. Use `--json`/`--toon` for structured output.
+- Not covered: pseudo-elements (`::before`), `@keyframes`, elements inside iframes or shadow roots. Use `--json`/`--toon` for structured output.
 
 ### Pattern 18: Passkeys and Security Keys (configure-webauthn)
 

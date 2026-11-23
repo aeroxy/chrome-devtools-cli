@@ -288,8 +288,10 @@ pub async fn configure_webauthn(
         if let Err(e) = disabled {
             // A failed removal (a dialog, a slow page) leaves the authenticator
             // in place, so keep tracking it: forgetting it would make the next
-            // configure-webauthn add a second one instead of updating it.
-            if client.webauthn.is_some() && !authenticator_gone(&e) {
+            // configure-webauthn add a second one instead of updating it. It
+            // fails the command even when none is tracked, since another
+            // client's authenticator may still be there.
+            if !authenticator_gone(&e) {
                 return Err(e.context("Failed to remove the virtual authenticator"));
             }
         }

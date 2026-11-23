@@ -189,8 +189,14 @@ struct Decl {
 }
 
 impl Decl {
+    /// The name as the cascade and the computed style know it. CDP keeps the
+    /// authored spelling, and `COLOR` is `color`, but `--Tone` is not `--tone`.
+    fn key(&self) -> String {
+        normalize_property_name(&self.name)
+    }
+
     fn is_shorthand(&self) -> bool {
-        self.longhands.len() != 1 || self.longhands[0] != self.name
+        self.longhands.len() != 1 || self.longhands[0] != self.key()
     }
 
     fn usable(&self) -> bool {
@@ -208,10 +214,11 @@ struct Declared {
 
 impl Declared {
     fn add(&mut self, d: &Decl) {
+        let key = d.key();
         if !d.is_shorthand() {
-            self.longhands.insert(d.name.clone());
-        } else if !self.shorthands.iter().any(|(n, _)| *n == d.name) {
-            self.shorthands.push((d.name.clone(), d.longhands.clone()));
+            self.longhands.insert(key);
+        } else if !self.shorthands.iter().any(|(n, _)| *n == key) {
+            self.shorthands.push((key, d.longhands.clone()));
         }
     }
 }
@@ -252,6 +259,10 @@ struct InheritedView {
 struct PageInfo {
     element: String,
     ancestors: Vec<AncestorInfo>,
+    /// How many ancestors the page's walk reaches. It can't enter a closed
+    /// shadow root (`assignedSlot` hides the slot), so when this differs
+    /// from CDP's flat-tree count the two lists don't line up.
+    depth: usize,
     shorthands: HashMap<String, String>,
     longhands: HashMap<String, Vec<String>>,
 }
@@ -353,6 +364,8 @@ fn declarations(style: &Value, expanded: &HashMap<String, Vec<String>>) -> Vec<D
     };
     let trailing_names: Vec<&str> = trailing.iter().filter_map(|p| p["name"].as_str()).collect();
     let name_of = |p: &Value| p["name"].as_str().unwrap_or("").to_string();
+    // The longhands CDP lists are lowercase whatever the authored case.
+    let key_of = |p: &Value| normalize_property_name(p["name"].as_str().unwrap_or(""));
 
     let mut longhands: Vec<Option<Vec<String>>> = authored
         .iter()
@@ -363,8 +376,8 @@ fn declarations(style: &Value, expanded: &HashMap<String, Vec<String>>) -> Vec<D
                 .unwrap_or_default();
             if !listed.is_empty() {
                 Some(listed)
-            } else if trailing_names.contains(&p["name"].as_str().unwrap_or("")) {
-                Some(vec![name_of(p)])
+            } else if trailing_names.contains(&key_of(p).as_str()) {
+                Some(vec![key_of(p)])
             } else {
                 None
             }
@@ -374,7 +387,7 @@ fn declarations(style: &Value, expanded: &HashMap<String, Vec<String>>) -> Vec<D
     let claimed: HashSet<String> = longhands.iter().flatten().flatten().cloned().collect();
     for (p, slot) in authored.iter().zip(longhands.iter_mut()) {
         if slot.is_none() {
-            let name = name_of(p);
+            let name = key_of(p);
             if let Some(parts) = expanded.get(&name).filter(|parts| !parts.is_empty()) {
                 *slot = Some(parts.clone());
                 continue;
@@ -462,7 +475,8 @@ fn rule_source(rule: &Value, sheets: &HashMap<String, Value>) -> Option<String> 
 }
 
 /// Enclosing at-rules and nesting parents of a rule, outermost first. CDP
-/// lists each kind innermost first, and `ruleTypes` says how they interleave.
+/// lists each kind innermost first, except layers, which it lists outermost
+/// first, and `ruleTypes` says how they interleave, innermost first.
 fn conditions(rule: &Value) -> Vec<String> {
     let text = |v: &Value| v["text"].as_str().unwrap_or("").trim().to_string();
     let at = |keyword: &str, v: &Value| match text(v) {
@@ -488,7 +502,7 @@ fn conditions(rule: &Value) -> Vec<String> {
         .iter()
         .map(|s| format!("@supports {}", text(s)));
     let mut containers = items(&rule["containerQueries"]).iter().map(fmt_container);
-    let mut layers = items(&rule["layers"]).iter().map(|l| at("@layer", l));
+    let mut layers = items(&rule["layers"]).iter().rev().map(|l| at("@layer", l));
     let mut scopes = items(&rule["scopes"]).iter().map(|s| at("@scope", s));
     let mut nesting = items(&rule["nestingSelectors"])
         .iter()
@@ -632,42 +646,207 @@ fn node_blocks(
     blocks
 }
 
+/// What the cascade knows about the node whose blocks it runs over.
+#[derive(Debug, Default)]
+struct NodeFacts<'a> {
+    /// The node's custom property values. `None` when they're unknown, and
+    /// then every `var()` reference counts as having one.
+    vars: Option<&'a HashMap<String, String>>,
+    /// The node's `writing-mode` and `direction`, which say what physical
+    /// side a flow-relative longhand sets. `None` keeps the two apart.
+    flow: Option<(&'a str, &'a str)>,
+}
+
+impl NodeFacts<'_> {
+    /// The key a longhand cascades under: a flow-relative longhand and the
+    /// physical one it maps to are one property for the cascade.
+    fn key(&self, longhand: &str) -> String {
+        self.flow
+            .and_then(|(writing_mode, direction)| physical(longhand, writing_mode, direction))
+            .unwrap_or_else(|| longhand.to_string())
+    }
+
+    /// A `var()` reference with no value and no fallback makes a declaration
+    /// act as `unset`. Custom properties are left out: an unregistered one
+    /// gets the guaranteed-invalid value instead, which doesn't inherit.
+    fn invalid_at_computed_time(&self, d: &Decl) -> bool {
+        let Some(vars) = self.vars else {
+            return false;
+        };
+        let lookup = |name: &str| vars.get(name).cloned();
+        !d.name.starts_with("--")
+            && find_var(&d.value).is_some()
+            && substitute(&d.value, &lookup, 0).is_none()
+    }
+}
+
 /// Run the cascade over one node's blocks, marking each declaration that wins
 /// at least one of its longhands active. `claimed` longhands are already
 /// decided (set on the element itself, or on a nearer ancestor) and nothing
 /// here wins them. Returns the longhands decided here. A winning `inherit`
 /// or `unset` decides none: the value comes from an ancestor's declaration,
-/// so that one still applies.
+/// so that one still applies. Nor does a `var()` reference that can't
+/// resolve, which acts as `unset`.
+///
+/// A winning `revert-layer` rolls the longhand back to the next lower
+/// cascade layer, and `revert` to the user-agent origin: the first
+/// declaration there wins it, while the rest of the reverting layer stays
+/// overridden. With no such declaration it acts as `unset`.
 ///
 /// `!important` beats normal, and an important declaration is ranked by
 /// `important_order`.
-fn cascade(blocks: &mut [Block], claimed: &HashSet<String>) -> HashSet<String> {
+fn cascade(blocks: &mut [Block], claimed: &HashSet<String>, node: &NodeFacts) -> HashSet<String> {
     let mut won = HashSet::new();
     let mut decided = HashSet::new();
+    // Longhands a winning `revert-layer` or `revert` rolled back, with the
+    // first block that may still win them. That is a position in normal
+    // order even for an important one: Chrome rolls an important
+    // `revert-layer` back to the layers below it in normal order.
+    let mut rolled_back: HashMap<String, usize> = HashMap::new();
     let ranked = important_order(blocks);
     let in_order: Vec<usize> = (0..blocks.len()).collect();
+    let layer_ends = layer_ends(blocks);
+    let nowhere = blocks.len();
+    let user_agent = blocks
+        .iter()
+        .position(|b| b.origin == "user-agent")
+        .unwrap_or(nowhere);
+    // An injected sheet may be in the user origin, which `revert` from an
+    // author one stops at; with one present, where it lands is unknown.
+    let revert_known = !blocks.iter().any(|b| b.origin == "injected");
     for (important, order) in [(true, &ranked), (false, &in_order)] {
         for &bi in order {
+            // The user-agent origin has nothing lower to revert to.
+            let revert_to = if blocks[bi].origin == "user-agent" {
+                nowhere
+            } else {
+                user_agent
+            };
             // Within a block the last declaration wins.
             for d in blocks[bi].decls.iter_mut().rev() {
                 if d.important != important || !d.usable() {
                     continue;
                 }
                 let value = d.value.trim();
-                let from_parent =
-                    value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset");
+                let rollback = if value.eq_ignore_ascii_case("revert-layer") {
+                    Some(layer_ends[bi])
+                } else if value.eq_ignore_ascii_case("revert") && revert_known {
+                    Some(revert_to)
+                } else {
+                    None
+                };
+                let from_parent = value.eq_ignore_ascii_case("inherit")
+                    || value.eq_ignore_ascii_case("unset")
+                    || node.invalid_at_computed_time(d);
                 for longhand in &d.longhands {
-                    if !claimed.contains(longhand) && won.insert(longhand.clone()) {
-                        d.status = Status::Active;
+                    let key = node.key(longhand);
+                    if claimed.contains(&key)
+                        || won.contains(&key)
+                        || rolled_back.get(&key).is_some_and(|&from| bi < from)
+                    {
+                        continue;
+                    }
+                    d.status = Status::Active;
+                    if let Some(from) = rollback {
+                        rolled_back.insert(key, from);
+                    } else {
                         if !from_parent {
-                            decided.insert(longhand.clone());
+                            decided.insert(key.clone());
                         }
+                        won.insert(key);
                     }
                 }
             }
         }
     }
     decided
+}
+
+/// For each block, the first block (in normal order) of the next lower
+/// cascade layer, which a `revert-layer` in it rolls back to. As in Chrome,
+/// the style attribute, the presentational attributes and the user-agent
+/// origin are layers of their own, so the lowest author layer rolls back to
+/// the presentational attributes. CDP sorts rules by layer, so a layer's
+/// blocks are one run.
+fn layer_ends(blocks: &[Block]) -> Vec<usize> {
+    fn layer(b: &Block) -> (&str, &str) {
+        match b.origin.as_str() {
+            origin @ ("inline" | "attributes" | "user-agent") => (origin, ""),
+            _ => ("", b.layer.as_str()),
+        }
+    }
+    let mut ends = Vec::with_capacity(blocks.len());
+    for run in blocks.chunk_by(|a, b| layer(a) == layer(b)) {
+        let end = ends.len() + run.len();
+        ends.resize(end, end);
+    }
+    ends
+}
+
+/// The physical longhand a flow-relative one sets on a node with this
+/// `writing-mode` and `direction`: `margin-inline-start` is `margin-left` in
+/// horizontal left-to-right text and `margin-right` in right-to-left text.
+/// Covers margins, paddings, insets, border sides, scroll margins and
+/// paddings, and sizes, and gives `None` for anything else, such as corner
+/// radii.
+fn physical(longhand: &str, writing_mode: &str, direction: &str) -> Option<String> {
+    let opposite = |side: &'static str| match side {
+        "top" => "bottom",
+        "bottom" => "top",
+        "left" => "right",
+        _ => "left",
+    };
+    let (block_start, ltr_inline_start) = match writing_mode {
+        "horizontal-tb" => ("top", "left"),
+        "vertical-rl" | "sideways-rl" => ("right", "top"),
+        "vertical-lr" => ("left", "top"),
+        "sideways-lr" => ("left", "bottom"),
+        _ => return None,
+    };
+    let inline_start = match direction {
+        "ltr" => ltr_inline_start,
+        "rtl" => opposite(ltr_inline_start),
+        _ => return None,
+    };
+    let horizontal = writing_mode == "horizontal-tb";
+    let (prefix, size) = ["min-", "max-", ""]
+        .iter()
+        .find_map(|p| Some((*p, longhand.strip_prefix(p)?)))?;
+    let width = match size {
+        "inline-size" => Some(horizontal),
+        "block-size" => Some(!horizontal),
+        _ => None,
+    };
+    if let Some(width) = width {
+        let dimension = if width { "width" } else { "height" };
+        return Some(format!("{prefix}{dimension}"));
+    }
+    let (base, rest) = [
+        "margin",
+        "padding",
+        "inset",
+        "border",
+        "scroll-margin",
+        "scroll-padding",
+    ]
+    .iter()
+    .find_map(|b| Some((*b, longhand.strip_prefix(b)?.strip_prefix('-')?)))?;
+    let (start, rest) = match rest.split_once('-')? {
+        ("block", rest) => (block_start, rest),
+        ("inline", rest) => (inline_start, rest),
+        _ => return None,
+    };
+    let (side, suffix) = match rest.strip_prefix("start") {
+        Some(suffix) => (start, suffix),
+        None => (opposite(start), rest.strip_prefix("end")?),
+    };
+    match (base, suffix) {
+        ("inset", "") => Some(side.to_string()),
+        (_, "") | ("border", "-width" | "-style" | "-color") => {
+            Some(format!("{base}-{side}{suffix}"))
+        }
+        _ => None,
+    }
 }
 
 /// The blocks in the order their `!important` declarations take precedence.
@@ -724,8 +903,13 @@ fn find_var(s: &str) -> Option<usize> {
 /// strings.
 fn scan_args(s: &str) -> Option<(usize, Option<usize>)> {
     let (mut depth, mut quote, mut comma) = (0usize, None::<char>, None);
-    for (i, c) in s.char_indices() {
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
         match (quote, c) {
+            // An escaped character (`"a\"b"`) never ends a string or a call.
+            (_, '\\') => {
+                chars.next();
+            }
             (Some(q), _) if c == q => quote = None,
             (Some(_), _) => {}
             (None, '"' | '\'') => quote = Some(c),
@@ -815,7 +999,7 @@ fn ancestor_var_names(matched: &Value) -> Vec<Vec<String>> {
         .map(|level| {
             let mut names = Vec::new();
             for d in level_styles(level).flat_map(|s| declarations(s, &none)) {
-                if is_inherited(&d.name, &non_inheriting) {
+                if is_inherited(&d.key(), &non_inheriting) {
                     var_names(&d.value, &mut names);
                 }
             }
@@ -834,8 +1018,9 @@ fn unexpanded_shorthands(matched: &Value) -> Vec<String> {
         .flat_map(level_styles)
         .flat_map(|s| declarations(s, &none))
     {
-        if d.unexpanded && d.usable() && !names.contains(&d.name) {
-            names.push(d.name);
+        let key = d.key();
+        if d.unexpanded && d.usable() && !names.contains(&key) {
+            names.push(key);
         }
     }
     names
@@ -986,21 +1171,22 @@ fn element_props_to_read(
     };
     for (style, ancestor) in own.chain(inherited) {
         for d in declarations(style, &HashMap::new()) {
+            let key = d.key();
             if !d.usable()
-                || d.name.starts_with("--")
-                || (ancestor && !is_inherited(&d.name, &non_inheriting))
+                || key.starts_with("--")
+                || (ancestor && !is_inherited(&key, &non_inheriting))
             {
                 continue;
             }
             if d.is_shorthand() {
-                add(&d.name);
+                add(&key);
                 for part in &d.longhands {
-                    if let Some(p) = parent_shorthand(part).filter(|p| *p != d.name) {
+                    if let Some(p) = parent_shorthand(part).filter(|p| *p != key) {
                         add(p);
                     }
                 }
-            } else if !listed.contains(d.name.as_str()) {
-                add(&d.name);
+            } else if !listed.contains(key.as_str()) {
+                add(&key);
             }
         }
     }
@@ -1038,7 +1224,17 @@ fn build_report(
         sheets,
         &page.longhands,
     );
-    let mut claimed = cascade(&mut blocks, &HashSet::new());
+    let computed_value = |name: &str| {
+        computed
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let element = NodeFacts {
+        vars: Some(&element_vars),
+        flow: computed_value("writing-mode").zip(computed_value("direction")),
+    };
+    let mut claimed = cascade(&mut blocks, &HashSet::new(), &element);
     let rules = shown_blocks(
         blocks,
         Some(&element_vars),
@@ -1049,9 +1245,17 @@ fn build_report(
 
     // Ancestors, nearest first. Only inheritable declarations reach the
     // element, and only where neither it nor a nearer ancestor sets them.
+    // The page's labels and values pair with CDP's ancestors by position,
+    // which is only right when both walks took the same path.
+    let levels = items(&matched["inherited"]);
+    let ancestors: &[AncestorInfo] = if page.depth == levels.len() {
+        &page.ancestors
+    } else {
+        &[]
+    };
     let mut inherited = Vec::new();
-    for (i, level) in items(&matched["inherited"]).iter().enumerate() {
-        let info = page.ancestors.get(i);
+    for (i, level) in levels.iter().enumerate() {
+        let info = ancestors.get(i);
         let mut blocks = node_blocks(
             &level["inlineStyle"],
             &level["matchedCSSRules"],
@@ -1062,9 +1266,15 @@ fn build_report(
         for block in &mut blocks {
             block
                 .decls
-                .retain(|d| is_inherited(&d.name, &non_inheriting));
+                .retain(|d| is_inherited(&d.key(), &non_inheriting));
         }
-        let set_here = cascade(&mut blocks, &claimed);
+        // Flow-relative properties don't inherit, so only the element's own
+        // cascade maps them.
+        let ancestor = NodeFacts {
+            vars: info.map(|a| &a.vars),
+            flow: None,
+        };
+        let set_here = cascade(&mut blocks, &claimed, &ancestor);
         claimed.extend(set_here);
         let rules = shown_blocks(
             blocks,
@@ -1179,9 +1389,9 @@ fn report_json(report: &Report) -> Result<Value> {
 
 /// Labels the element and its ancestors (flat-tree parents, as CDP walks them
 /// for inherited styles), reads on each ancestor the custom properties its
-/// declarations reference, reads the element's computed `props`, and expands
-/// the shorthands in `expand` into their longhands. Runs with `this` bound to
-/// the element.
+/// declarations reference, counts the ancestors, reads the element's computed
+/// `props`, and expands the shorthands in `expand` into their longhands. Runs
+/// with `this` bound to the element.
 const PAGE_INFO_JS: &str = r#"function (varNames, props, expand) {
   const label = (el) => {
     let s = el.localName;
@@ -1203,11 +1413,13 @@ const PAGE_INFO_JS: &str = r#"function (varNames, props, expand) {
     scratch.setProperty(p, 'initial');
     longhands[p] = [...scratch];
   }
-  const out = { element: label(this), ancestors: [], shorthands, longhands };
-  let el = this;
-  for (const names of varNames) {
-    el = parent(el);
-    if (!el) break;
+  const out = { element: label(this), ancestors: [], depth: 0, shorthands, longhands };
+  // On to the root: a slot in a closed shadow root is no element's
+  // assignedSlot, so this walk can skip ancestors CDP lists, and a count
+  // that differs from CDP's is how the caller can tell.
+  for (let el = parent(this); el; el = parent(el)) {
+    const names = varNames[out.depth++];
+    if (!names) continue;
     const cs = getComputedStyle(el);
     const vars = {};
     let defined;
@@ -1471,6 +1683,7 @@ mod tests {
                 label: "body".into(),
                 vars: HashMap::from([("--fg".to_string(), "#222".to_string())]),
             }],
+            depth: 1,
             shorthands: HashMap::from([("padding".to_string(), "8px".to_string())]),
             longhands: HashMap::new(),
         }
@@ -1636,7 +1849,7 @@ Inherited from body:
     fn later_declaration_in_a_block_wins() {
         let style = authored(&[("color", "red"), ("color", "blue")], &[("color", "blue")]);
         let mut blocks = vec![block(&style)];
-        cascade(&mut blocks, &HashSet::new());
+        cascade(&mut blocks, &HashSet::new(), &NodeFacts::default());
         let status: Vec<Status> = blocks[0].decls.iter().map(|d| d.status).collect();
         assert_eq!(status, [Status::Overridden, Status::Active]);
     }
@@ -1651,7 +1864,7 @@ Inherited from body:
             json!([{"name": "padding-top"}, {"name": "padding-bottom"}]);
         let lower = authored(&[("padding-bottom", "9px")], &[("padding-bottom", "9px")]);
         let mut blocks = vec![block(&high), block(&low), block(&lower)];
-        cascade(&mut blocks, &HashSet::new());
+        cascade(&mut blocks, &HashSet::new(), &NodeFacts::default());
         assert_eq!(blocks[1].decls[0].status, Status::Active);
         assert_eq!(blocks[2].decls[0].status, Status::Overridden);
     }
@@ -2146,7 +2359,7 @@ Inherited from body:
         );
         let origins: Vec<&str> = blocks.iter().map(|b| b.origin.as_str()).collect();
         assert_eq!(origins, ["regular", "attributes", "user-agent"]);
-        cascade(&mut blocks, &HashSet::new());
+        cascade(&mut blocks, &HashSet::new(), &NodeFacts::default());
         assert_eq!(statuses(&blocks[0]), [Status::Active]);
         assert_eq!(statuses(&blocks[1]), [Status::Overridden, Status::Active]);
         assert_eq!(
@@ -2221,7 +2434,8 @@ Inherited from body:
         // CDP's computed list has every defined custom property.
         let mut list = computed();
         list.push(("--p".into(), String::new()));
-        let report = build_report(&m, &list, &sheets(), &page(), &CssOptions::default());
+        let info = PageInfo { depth: 2, ..page() };
+        let report = build_report(&m, &list, &sheets(), &info, &CssOptions::default());
         assert_eq!(report.rules[0].decls[0].resolved.as_deref(), Some("serif"));
         assert_eq!(
             report.inherited[0].rules[0].decls[0].resolved.as_deref(),
@@ -2229,5 +2443,283 @@ Inherited from body:
         );
         assert_eq!(report.inherited[1].from, "ancestor 2");
         assert_eq!(report.inherited[1].rules[0].decls[0].resolved, None);
+    }
+
+    /// `COLOR` is `color` to the cascade, to inheritance and to the computed
+    /// values, and still shows as written; `--Tone` and `--tone` are two
+    /// properties.
+    #[test]
+    fn property_names_ignore_case_except_custom_ones() {
+        use Status::{Active, Overridden};
+        let mut m = matched();
+        m["inlineStyle"] = Value::Null;
+        let decls = [
+            ("color", "red"),
+            ("COLOR", "blue"),
+            ("--Tone", "1"),
+            ("--tone", "2"),
+        ];
+        let longhands = [("color", "blue"), ("--Tone", "1"), ("--tone", "2")];
+        m["matchedCSSRules"] = json!([rule(".a", 3, authored(&decls, &longhands))]);
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] =
+            authored(&[("Font-Family", "serif")], &[("font-family", "serif")]);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(report.rules[0].decls[1].name, "COLOR");
+        assert_eq!(
+            statuses(&report.rules[0]),
+            [Overridden, Active, Active, Active]
+        );
+        let body = &report.inherited[0].rules[0].decls[0];
+        assert_eq!((body.name.as_str(), body.status), ("Font-Family", Active));
+        let names: Vec<&str> = report.computed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["display", "width", "height", "color"]);
+    }
+
+    /// `revert-layer` hands a property to the next lower layer, where the
+    /// highest declaration wins it while the rest of the reverting layer
+    /// stays overridden; below the lowest author layer come the
+    /// presentational attributes. `revert` goes straight to the user-agent
+    /// origin. With nothing there, the ancestors' value applies. An
+    /// important `revert-layer` rolls back to the layers below it in normal
+    /// order, as Chrome does, so nothing on the element applies here.
+    #[test]
+    fn revert_layer_and_revert_roll_back() {
+        use Status::{Active, Overridden};
+        let color = |v: &str| authored(&[("color", v)], &[("color", v)]);
+        let firsts =
+            |r: &Report| -> Vec<Status> { r.rules.iter().map(|b| b.decls[0].status).collect() };
+        let body_color = |r: &Report| r.inherited[0].rules[0].decls[0].status;
+        let all = || CssOptions {
+            ua_rules: true,
+            ..Default::default()
+        };
+        let mut m = matched();
+        m["inlineStyle"] = Value::Null;
+        let ua = m["matchedCSSRules"][0].clone();
+        // CDP lists rules lowest precedence first.
+        m["matchedCSSRules"] = json!([
+            ua,
+            layered(".a", 3, "base", color("red")),
+            layered(".b", 4, "theme", color("blue")),
+            layered("#a", 5, "theme", color("revert-layer")),
+        ]);
+        let report = report_for(&m, all());
+        // `#a`, `.b`, `.a`, then the user-agent rule.
+        assert_eq!(firsts(&report), [Active, Overridden, Active, Overridden]);
+
+        m["matchedCSSRules"] = json!([
+            ua,
+            layered(".a", 3, "base", color("red")),
+            rule("#a", 5, color("revert")),
+        ]);
+        let report = report_for(&m, all());
+        // `#a`, `.a`, then the user-agent rule.
+        assert_eq!(firsts(&report), [Active, Overridden, Active]);
+
+        m["attributesStyle"] = json!({"cssProperties": [{"name": "color", "value": "red"}]});
+        m["matchedCSSRules"] = json!([rule("#a", 5, color("revert-layer"))]);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(firsts(&report), [Active, Active]);
+        assert_eq!(body_color(&report), Overridden);
+        m["matchedCSSRules"] = json!([rule("#a", 5, color("revert"))]);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(firsts(&report), [Active, Overridden]);
+        assert_eq!(body_color(&report), Active);
+
+        m["attributesStyle"] = Value::Null;
+        m["matchedCSSRules"] = json!([
+            layered("#a", 3, "base", color("revert-layer !important")),
+            layered(".b", 4, "theme", color("red !important")),
+            rule(".c", 5, color("blue")),
+        ]);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(firsts(&report), [Overridden, Overridden, Active]);
+        assert_eq!(body_color(&report), Active);
+
+        // An injected sheet may be a user one, which `revert` would stop
+        // at, so `revert` is left deciding the color as any value would.
+        let mut injected = rule(".i", 2, color("green"));
+        injected["rule"]["origin"] = json!("injected");
+        m["matchedCSSRules"] = json!([injected, rule("#a", 5, color("revert"))]);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(firsts(&report), [Active, Overridden]);
+        assert_eq!(body_color(&report), Overridden);
+    }
+
+    /// A winning `var()` reference with no value and no fallback acts as
+    /// `unset`, so the ancestor's color applies and the element's earlier
+    /// one stays overridden. Not when the reference has a value, nor for a
+    /// custom property, nor on an ancestor whose values the page didn't give.
+    #[test]
+    fn unresolvable_var_acts_as_unset() {
+        use Status::{Active, Overridden};
+        let body_color = |r: &Report| r.inherited[0].rules[0].decls[0].status;
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        let decls = [("color", "blue"), ("color", "var(--missing)")];
+        m["inlineStyle"] = authored(&decls, &[("color", "var(--missing)")]);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(statuses(&report.rules[0]), [Overridden, Active]);
+        assert_eq!(body_color(&report), Active);
+
+        let mut list = computed();
+        list.push(("--missing".into(), "red".into()));
+        let report = build_report(&m, &list, &sheets(), &page(), &CssOptions::default());
+        assert_eq!(body_color(&report), Overridden);
+
+        // An unregistered custom property gets no value at all instead.
+        let custom = [("--fg", "var(--missing)")];
+        m["inlineStyle"] = authored(&custom, &custom);
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] =
+            authored(&[("--fg", "red")], &[("--fg", "red")]);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(body_color(&report), Overridden);
+
+        // The page says the body has no `--nope`, so the html element's
+        // color applies; with the page's values unknown, nothing changes.
+        m["inlineStyle"] = Value::Null;
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] =
+            authored(&[("color", "var(--nope)")], &[("color", "var(--nope)")]);
+        let html = rule(
+            "html",
+            1,
+            authored(&[("color", "purple")], &[("color", "purple")]),
+        );
+        m["inherited"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "matchedCSSRules": [html] }));
+        let html_color = |r: &Report| r.inherited[1].rules[0].decls[0].status;
+        let info = PageInfo { depth: 2, ..page() };
+        let report = build_report(&m, &computed(), &sheets(), &info, &CssOptions::default());
+        assert_eq!(html_color(&report), Active);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(html_color(&report), Overridden);
+    }
+
+    /// In horizontal left-to-right text `margin-inline-start` is
+    /// `margin-left`, so the later of the two wins; right to left, they set
+    /// different sides.
+    #[test]
+    fn flow_relative_longhands_cascade_with_their_physical_side() {
+        use Status::{Active, Overridden};
+        let mut m = matched();
+        let decls = [("margin-left", "1px"), ("margin-inline-start", "2px")];
+        m["inlineStyle"] = authored(&decls, &decls);
+        let flow = |direction: &str| {
+            let mut list = computed();
+            list.push(("writing-mode".into(), "horizontal-tb".into()));
+            list.push(("direction".into(), direction.into()));
+            build_report(&m, &list, &sheets(), &page(), &CssOptions::default())
+        };
+        assert_eq!(statuses(&flow("ltr").rules[0]), [Overridden, Active]);
+        assert_eq!(statuses(&flow("rtl").rules[0]), [Active, Active]);
+
+        let side = |longhand: &str, writing_mode: &str, direction: &str| {
+            physical(longhand, writing_mode, direction)
+        };
+        let ltr = |longhand: &str, writing_mode: &str| side(longhand, writing_mode, "ltr");
+        assert_eq!(
+            ltr("margin-inline-start", "vertical-rl").as_deref(),
+            Some("margin-top")
+        );
+        assert_eq!(
+            ltr("padding-block-start", "vertical-rl").as_deref(),
+            Some("padding-right")
+        );
+        assert_eq!(
+            ltr("padding-inline-start", "sideways-lr").as_deref(),
+            Some("padding-bottom")
+        );
+        assert_eq!(
+            ltr("inset-block-end", "vertical-lr").as_deref(),
+            Some("right")
+        );
+        assert_eq!(
+            side("border-inline-end-color", "horizontal-tb", "rtl").as_deref(),
+            Some("border-left-color")
+        );
+        assert_eq!(
+            ltr("scroll-padding-block-start", "horizontal-tb").as_deref(),
+            Some("scroll-padding-top")
+        );
+        assert_eq!(
+            ltr("max-inline-size", "vertical-rl").as_deref(),
+            Some("max-height")
+        );
+        assert_eq!(
+            ltr("block-size", "horizontal-tb").as_deref(),
+            Some("height")
+        );
+        // Physical longhands, shorthands and corner radii stay as they are.
+        assert_eq!(ltr("margin-left", "horizontal-tb"), None);
+        assert_eq!(ltr("margin-inline", "horizontal-tb"), None);
+        assert_eq!(ltr("border-start-start-radius", "horizontal-tb"), None);
+    }
+
+    /// CDP's ancestors follow the flat tree into a closed shadow root, where
+    /// the page's walk can't go. When the walk reaches a different number of
+    /// ancestors, its labels and values would belong to other elements.
+    #[test]
+    fn a_walk_that_differs_from_cdps_labels_nothing() {
+        let mut m = matched();
+        let html = rule(
+            "html",
+            1,
+            authored(&[("color", "var(--fg)")], &[("color", "var(--fg)")]),
+        );
+        m["inherited"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "matchedCSSRules": [html] }));
+        let report = report_for(&m, CssOptions::default());
+        let from: Vec<&str> = report.inherited.iter().map(|g| g.from.as_str()).collect();
+        assert_eq!(from, ["ancestor 1", "ancestor 2"]);
+        assert_eq!(report.inherited[0].rules[0].decls[0].resolved, None);
+
+        let info = PageInfo { depth: 2, ..page() };
+        let report = build_report(&m, &computed(), &sheets(), &info, &CssOptions::default());
+        assert_eq!(report.inherited[0].from, "body");
+        assert_eq!(
+            report.inherited[0].rules[0].decls[0].resolved.as_deref(),
+            Some("#222")
+        );
+    }
+
+    /// Chrome 158 lists `@layer outer { @media (min-width: 1px) { @layer
+    /// inner { … } } }` with its layers outermost first and its `ruleTypes`
+    /// innermost first.
+    #[test]
+    fn nested_layers_keep_their_order() {
+        let mut r = json!({
+            "media": [{"text": "(min-width: 1px)", "source": "mediaRule"}],
+            "layers": [{"text": "outer"}, {"text": "inner"}],
+            "ruleTypes": ["LayerRule", "MediaRule", "LayerRule"],
+        });
+        assert_eq!(
+            conditions(&r),
+            ["@layer outer", "@media (min-width: 1px)", "@layer inner"]
+        );
+        assert_eq!(layer_key(&r), "outer.inner");
+        r["ruleTypes"] = json!([]);
+        assert_eq!(
+            conditions(&r),
+            ["@layer outer", "@layer inner", "@media (min-width: 1px)"]
+        );
+    }
+
+    /// An escaped quote doesn't end a fallback string, so the `)` after it
+    /// still closes the call.
+    #[test]
+    fn escaped_quote_in_a_fallback_string() {
+        let vars = HashMap::from([("--gap".to_string(), "8px".to_string())]);
+        assert_eq!(
+            resolve_vars(r#"var(--missing, "a\"b")"#, &vars).as_deref(),
+            Some(r#""a\"b""#)
+        );
+        assert_eq!(
+            resolve_vars(r"var(--missing, 'a\'b') var(--gap)", &vars).as_deref(),
+            Some(r"'a\'b' 8px")
+        );
     }
 }
