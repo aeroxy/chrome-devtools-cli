@@ -8,11 +8,13 @@ use crate::result::CommandResult;
 /// Ask the page for its tool groups the way DevTools does: dispatch a
 /// `devtoolstooldiscovery` event whose `respondWith` hands back each group,
 /// then expose what came back as `window.__dtmcp`, which the list and execute
-/// expressions read. Pages that set `__dtmcp` themselves answer nothing and keep
-/// theirs; groups an earlier discovery installed are dropped once nothing
-/// answers, so a page that removed its listener stops listing its old tools.
+/// expressions read, and return it. Pages that set `__dtmcp` themselves answer
+/// nothing and keep theirs; groups an earlier discovery installed are dropped
+/// once nothing answers, so a page that removed its listener stops listing its
+/// old tools, unless the page has since put its own list in their place.
 /// A group missing a field, or holding a malformed tool, is skipped with a
-/// console error, and the other groups still count.
+/// console error, and the other groups still count. Only the legacy path runs
+/// this: WebMCP needs none of it, and must not fail because of it.
 const DISCOVER_TOOLS_JS: &str = r#"async () => {
     const groups = [];
     const event = new CustomEvent('devtoolstooldiscovery');
@@ -35,12 +37,16 @@ const DISCOVER_TOOLS_JS: &str = r#"async () => {
     // A listener may answer from a microtask or a zero-delay timer.
     await new Promise(r => setTimeout(r, 0));
     if (groups.length === 0) {
-        if (window.__dtmcp && window.__dtmcp.__discovered) window.__dtmcp.toolGroups = [];
-        return;
+        const dtmcp = window.__dtmcp;
+        if (dtmcp && dtmcp.__discovered && dtmcp.toolGroups === dtmcp.__discovered) {
+            dtmcp.toolGroups = [];
+        }
+        return groups;
     }
     const dtmcp = window.__dtmcp = window.__dtmcp || {};
     dtmcp.toolGroups = groups;
-    dtmcp.__discovered = true;
+    // The list itself, so a later run can tell it from one the page set.
+    dtmcp.__discovered = groups;
     if (typeof dtmcp.executeTool !== 'function') {
         dtmcp.executeTool = async (toolName, args) => {
             for (const group of dtmcp.toolGroups || []) {
@@ -50,6 +56,7 @@ const DISCOVER_TOOLS_JS: &str = r#"async () => {
             throw new Error('Tool ' + toolName + ' not found');
         };
     }
+    return groups;
 }"#;
 
 /// Tools take named parameters, so anything but a JSON object (an array, a
@@ -63,14 +70,10 @@ fn parse_tool_params(params: Option<&str>) -> Result<serde_json::Value> {
     Ok(parsed)
 }
 
-/// List third-party DevTools tools via WebMCP (`document.modelContext`) or
-/// the legacy `__dtmcp` global. WebMCP is preferred when available.
-pub async fn list_3p_tools(
-    client: &mut CdpClient,
-    session_id: &str,
-    format: OutputFormat,
-) -> Result<CommandResult> {
-    let list_expr = r#"(() => {
+/// The page-side half of `list-3p-tools`. It is handed the discovery function
+/// and calls it only once WebMCP turns out to be missing.
+fn list_tools_js() -> String {
+    let list_expr = r#"async (discover) => {
         if (document.modelContext && typeof document.modelContext.getTools === 'function') {
             return document.modelContext.getTools().then(tools => JSON.stringify({
                 api: 'modelContext',
@@ -87,6 +90,7 @@ pub async fn list_3p_tools(
                 }]
             })).catch(e => JSON.stringify({ error: e.message || String(e) }));
         }
+        await discover();
         const dtmcp = window.__dtmcp;
         if (!dtmcp) {
             return JSON.stringify({ api: 'none', groups: [] });
@@ -124,14 +128,22 @@ pub async fn list_3p_tools(
             });
         }
         return JSON.stringify({ api: 'none', groups: [] });
-    })()"#;
-    let expr = format!("(async () => {{ await ({DISCOVER_TOOLS_JS})(); return {list_expr}; }})()");
+    }"#;
+    format!("({list_expr})({DISCOVER_TOOLS_JS})")
+}
 
+/// List third-party DevTools tools via WebMCP (`document.modelContext`) or
+/// the legacy `__dtmcp` global. WebMCP is preferred when available.
+pub async fn list_3p_tools(
+    client: &mut CdpClient,
+    session_id: &str,
+    format: OutputFormat,
+) -> Result<CommandResult> {
     let result = client
         .send_to_target(
             session_id,
             "Runtime.evaluate",
-            json!({"expression": expr, "returnByValue": true, "awaitPromise": true}),
+            json!({"expression": list_tools_js(), "returnByValue": true, "awaitPromise": true}),
         )
         .await?;
 
@@ -218,23 +230,15 @@ pub async fn list_3p_tools(
     }
 }
 
-/// Execute a named third-party DevTools tool via WebMCP or legacy `__dtmcp`.
-pub async fn execute_3p_tool(
-    client: &mut CdpClient,
-    session_id: &str,
-    name: &str,
-    params: Option<&str>,
-    format: OutputFormat,
-) -> Result<CommandResult> {
-    let parsed_params = parse_tool_params(params)?;
-
+/// The page-side half of `execute-3p-tool`: the WebMCP tool of that name if
+/// there is one, then a tool discovery hands back, then the legacy `__dtmcp`.
+fn execute_tool_js(name: &str, params: &serde_json::Value) -> Result<String> {
     // Safe escaping of name and params: Re-serialize to get valid JSON literals
     let safe_name_json = serde_json::to_string(name)?;
-    let safe_params_json = serde_json::to_string(&parsed_params)?;
+    let safe_params_json = serde_json::to_string(params)?;
 
-    let expr = format!(
+    Ok(format!(
         r#"(async () => {{
-        await ({DISCOVER_TOOLS_JS})();
         const params = {safe_params_json};
         let hasModelContext = false;
         if (document.modelContext && typeof document.modelContext.getTools === 'function') {{
@@ -250,6 +254,7 @@ pub async fn execute_3p_tool(
                 return JSON.stringify({{ error: e.message || String(e) }});
             }}
         }}
+        const discovered = await ({DISCOVER_TOOLS_JS})();
         const dtmcp = window.__dtmcp;
         if (!dtmcp) {{
             const msg = hasModelContext
@@ -258,6 +263,15 @@ pub async fn execute_3p_tool(
             return JSON.stringify({{ error: msg }});
         }}
         try {{
+            // A discovered tool runs its own handler: a legacy executeTool the
+            // page set itself need not know the tools its listener answered with.
+            for (const group of discovered) {{
+                const tool = (group.tools || []).find(t => t.name === {safe_name_json});
+                if (tool) {{
+                    const result = await tool.execute(params);
+                    return JSON.stringify({{ api: 'dtmcp', result }});
+                }}
+            }}
             if (dtmcp.executeTool) {{
                 const result = await dtmcp.executeTool({safe_name_json}, params);
                 return JSON.stringify({{ api: 'dtmcp', result }});
@@ -275,7 +289,18 @@ pub async fn execute_3p_tool(
             return JSON.stringify({{ error: e.message || String(e) }});
         }}
     }})()"#
-    );
+    ))
+}
+
+/// Execute a named third-party DevTools tool via WebMCP or legacy `__dtmcp`.
+pub async fn execute_3p_tool(
+    client: &mut CdpClient,
+    session_id: &str,
+    name: &str,
+    params: Option<&str>,
+    format: OutputFormat,
+) -> Result<CommandResult> {
+    let expr = execute_tool_js(name, &parse_tool_params(params)?)?;
 
     let result = client
         .send_to_target(
@@ -338,5 +363,40 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Invalid JSON"));
+    }
+
+    /// Position of `needle` in `haystack`, which must contain it.
+    fn at(haystack: &str, needle: &str) -> usize {
+        haystack
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} missing"))
+    }
+
+    /// WebMCP answers before anything legacy runs: discovery, which touches
+    /// the page's `__dtmcp`, comes only on the legacy path, so it can't make a
+    /// working WebMCP call fail.
+    #[test]
+    fn webmcp_comes_before_discovery() {
+        let list = list_tools_js();
+        assert!(at(&list, "modelContext.getTools()") < at(&list, "await discover()"));
+        let exec = execute_tool_js("t", &json!({})).unwrap();
+        assert!(at(&exec, "modelContext.executeTool(") < at(&exec, "devtoolstooldiscovery"));
+    }
+
+    /// A discovered tool runs its own `execute`, ahead of a legacy
+    /// `executeTool` the page set itself, which need not know it.
+    #[test]
+    fn discovered_tools_run_their_own_handler() {
+        let exec = execute_tool_js("t", &json!({})).unwrap();
+        assert!(at(&exec, "of discovered)") < at(&exec, "dtmcp.executeTool("));
+    }
+
+    /// A run that gets no answer clears only the list discovery installed,
+    /// told apart by identity, never a list the page put in its place.
+    #[test]
+    fn discovery_clears_only_the_groups_it_installed() {
+        assert!(DISCOVER_TOOLS_JS.contains("dtmcp.__discovered = groups;"));
+        assert!(DISCOVER_TOOLS_JS.contains("dtmcp.toolGroups === dtmcp.__discovered"));
+        assert!(!DISCOVER_TOOLS_JS.contains("__discovered = true"));
     }
 }

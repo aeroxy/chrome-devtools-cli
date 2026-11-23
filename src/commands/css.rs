@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::cdp::CdpClient;
+use crate::cdp::{CdpClient, ConnectionLost, SETUP_CALL_TIMEOUT};
 use crate::format::{format_structured, OutputFormat};
 use crate::result::CommandResult;
 
@@ -252,8 +252,9 @@ struct InheritedView {
 /// What the page says about the element and its ancestors, which CDP's style
 /// calls don't: a readable label for each, the custom property values an
 /// ancestor's `var()` references resolve to there, the element's computed
-/// shorthands (CDP's computed style lists longhands only), and the longhands
-/// of the shorthands CDP didn't expand.
+/// shorthands (CDP's computed style lists longhands only), the longhands
+/// of the shorthands CDP didn't expand, and which values after `var()`
+/// substitution the element's properties reject.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct PageInfo {
@@ -265,6 +266,8 @@ struct PageInfo {
     depth: usize,
     shorthands: HashMap<String, String>,
     longhands: HashMap<String, Vec<String>>,
+    /// The `substituted_values` that `CSS.supports` turns down.
+    rejected: Vec<(String, String)>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -655,6 +658,9 @@ struct NodeFacts<'a> {
     /// The node's `writing-mode` and `direction`, which say what physical
     /// side a flow-relative longhand sets. `None` keeps the two apart.
     flow: Option<(&'a str, &'a str)>,
+    /// Properties with the value `var()` substitution gives them that the
+    /// page says they reject (see `substituted_values`).
+    rejected: &'a [(String, String)],
 }
 
 impl NodeFacts<'_> {
@@ -666,17 +672,24 @@ impl NodeFacts<'_> {
             .unwrap_or_else(|| longhand.to_string())
     }
 
-    /// A `var()` reference with no value and no fallback makes a declaration
-    /// act as `unset`. Custom properties are left out: an unregistered one
-    /// gets the guaranteed-invalid value instead, which doesn't inherit.
-    fn invalid_at_computed_time(&self, d: &Decl) -> bool {
-        let Some(vars) = self.vars else {
-            return false;
+    /// The value the cascade acts on: the one after `var()` substitution
+    /// where the node's custom properties are known, so that, as in Chrome,
+    /// `var(--x, inherit)` is `inherit`. `None` when the declaration is
+    /// invalid at computed-value time, which makes it act as `unset`: a
+    /// reference with no value and no fallback, or a value the property
+    /// rejects (`color: var(--size)` with `--size: 20px`). Custom properties
+    /// are left out of that: an unregistered one gets the guaranteed-invalid
+    /// value instead, which doesn't inherit.
+    fn value(&self, d: &Decl) -> Option<String> {
+        let Some(vars) = self.vars.filter(|_| find_var(&d.value).is_some()) else {
+            return Some(d.value.clone());
         };
-        let lookup = |name: &str| vars.get(name).cloned();
-        !d.name.starts_with("--")
-            && find_var(&d.value).is_some()
-            && substitute(&d.value, &lookup, 0).is_none()
+        match substituted(&d.value, vars) {
+            Some(v) if self.rejected.iter().any(|(p, r)| *p == d.key() && *r == v) => None,
+            Some(v) => Some(v),
+            None if d.name.starts_with("--") => Some(d.value.clone()),
+            None => None,
+        }
     }
 }
 
@@ -685,8 +698,9 @@ impl NodeFacts<'_> {
 /// decided (set on the element itself, or on a nearer ancestor) and nothing
 /// here wins them. Returns the longhands decided here. A winning `inherit`
 /// or `unset` decides none: the value comes from an ancestor's declaration,
-/// so that one still applies. Nor does a `var()` reference that can't
-/// resolve, which acts as `unset`.
+/// so that one still applies. Nor does a declaration that is invalid at
+/// computed-value time, which acts as `unset`. These keywords count after
+/// `var()` substitution too (see `NodeFacts::value`).
 ///
 /// A winning `revert-layer` rolls the longhand back to the next lower
 /// cascade layer, and `revert` to the user-agent origin: the first
@@ -727,17 +741,20 @@ fn cascade(blocks: &mut [Block], claimed: &HashSet<String>, node: &NodeFacts) ->
                 if d.important != important || !d.usable() {
                     continue;
                 }
-                let value = d.value.trim();
-                let rollback = if value.eq_ignore_ascii_case("revert-layer") {
+                let value = node.value(d);
+                let is = |keyword: &str| {
+                    value
+                        .as_deref()
+                        .is_some_and(|v| v.trim().eq_ignore_ascii_case(keyword))
+                };
+                let rollback = if is("revert-layer") {
                     Some(layer_ends[bi])
-                } else if value.eq_ignore_ascii_case("revert") && revert_known {
+                } else if is("revert") && revert_known {
                     Some(revert_to)
                 } else {
                     None
                 };
-                let from_parent = value.eq_ignore_ascii_case("inherit")
-                    || value.eq_ignore_ascii_case("unset")
-                    || node.invalid_at_computed_time(d);
+                let from_parent = value.is_none() || is("inherit") || is("unset");
                 for longhand in &d.longhands {
                     let key = node.key(longhand);
                     if claimed.contains(&key)
@@ -786,9 +803,8 @@ fn layer_ends(blocks: &[Block]) -> Vec<usize> {
 /// The physical longhand a flow-relative one sets on a node with this
 /// `writing-mode` and `direction`: `margin-inline-start` is `margin-left` in
 /// horizontal left-to-right text and `margin-right` in right-to-left text.
-/// Covers margins, paddings, insets, border sides, scroll margins and
-/// paddings, and sizes, and gives `None` for anything else, such as corner
-/// radii.
+/// Covers margins, paddings, insets, border sides and corner radii, scroll
+/// margins and paddings, and sizes, and gives `None` for anything else.
 fn physical(longhand: &str, writing_mode: &str, direction: &str) -> Option<String> {
     let opposite = |side: &'static str| match side {
         "top" => "bottom",
@@ -820,6 +836,26 @@ fn physical(longhand: &str, writing_mode: &str, direction: &str) -> Option<Strin
     if let Some(width) = width {
         let dimension = if width { "width" } else { "height" };
         return Some(format!("{prefix}{dimension}"));
+    }
+    // `border-start-end-radius` rounds the corner between the block-start
+    // and inline-end sides, which a physical name gives top or bottom first.
+    if let Some(corner) = longhand
+        .strip_prefix("border-")
+        .and_then(|r| r.strip_suffix("-radius"))
+    {
+        let edge = |end: &str, start: &'static str| match end {
+            "start" => Some(start),
+            "end" => Some(opposite(start)),
+            _ => None,
+        };
+        let (block, inline) = corner.split_once('-')?;
+        let (block, inline) = (edge(block, block_start)?, edge(inline, inline_start)?);
+        let (y, x) = if horizontal {
+            (block, inline)
+        } else {
+            (inline, block)
+        };
+        return Some(format!("border-{y}-{x}-radius"));
     }
     let (base, rest) = [
         "margin",
@@ -962,6 +998,43 @@ fn substitute(
     Some(out)
 }
 
+/// `value` after `var()` substitution with a node's custom property values,
+/// as the cascade judges it: `None` as for `substitute`.
+fn substituted(value: &str, vars: &HashMap<String, String>) -> Option<String> {
+    substitute(value, &|name| vars.get(name).cloned(), 0)
+}
+
+/// The element's custom property values, from its computed style, which
+/// lists each defined one, empty or not.
+fn custom_properties(computed: &[(String, String)]) -> HashMap<String, String> {
+    computed
+        .iter()
+        .filter(|(n, _)| n.starts_with("--"))
+        .cloned()
+        .collect()
+}
+
+/// The element's `var()` declarations as the page should check them: the
+/// property and its value after substitution, which the property can still
+/// reject. Only the element's: an ancestor's custom property values come
+/// from the same page call, so they aren't known in time.
+fn substituted_values(matched: &Value, vars: &HashMap<String, String>) -> Vec<(String, String)> {
+    let none = HashMap::new();
+    let mut checks: Vec<(String, String)> = Vec::new();
+    for d in level_styles(matched).flat_map(|s| declarations(s, &none)) {
+        let key = d.key();
+        if !d.usable() || key.starts_with("--") || find_var(&d.value).is_none() {
+            continue;
+        }
+        if let Some(check) = substituted(&d.value, vars).map(|v| (key, v)) {
+            if !checks.contains(&check) {
+                checks.push(check);
+            }
+        }
+    }
+    checks
+}
+
 /// `value` with its `var()` references resolved, when it has any and the
 /// result says something the authored value doesn't.
 fn resolve_vars(value: &str, vars: &HashMap<String, String>) -> Option<String> {
@@ -1026,6 +1099,23 @@ fn unexpanded_shorthands(matched: &Value) -> Vec<String> {
     names
 }
 
+/// The shorthands the page should expand: the unexpanded ones above, and
+/// the extra names asked for that CDP's computed list doesn't have, whose
+/// longhands stand in for them when Chrome can't write one value.
+fn shorthands_to_expand(
+    matched: &Value,
+    computed: &[(String, String)],
+    extra: &[String],
+) -> Vec<String> {
+    let mut names = unexpanded_shorthands(matched);
+    for e in extra {
+        if !e.starts_with("--") && !computed.iter().any(|(n, _)| n == e) && !names.contains(e) {
+            names.push(e.clone());
+        }
+    }
+    names
+}
+
 /// The blocks worth showing, with `var()` references resolved, noting what
 /// they declare. User-agent blocks are only counted unless asked for. `vars`
 /// is `None` when the node's custom properties are unknown, and then nothing
@@ -1060,11 +1150,13 @@ fn shown_blocks(
 /// The computed values worth showing: display, width and height, what the
 /// shown declarations set, and the properties asked for. A shorthand shows as
 /// one value when Chrome can serialize it (`padding: 16px 8px`) and as its
-/// longhands when it can't; custom properties show only when asked for.
+/// longhands (`members`, as the page expanded it) when it can't; custom
+/// properties show only when asked for.
 fn pick_computed(
     computed: &[(String, String)],
     declared: &Declared,
     shorthand_values: &HashMap<String, String>,
+    members: &HashMap<String, Vec<String>>,
     extra: &[String],
 ) -> Vec<(String, String)> {
     let values: HashMap<&str, &str> = computed
@@ -1107,9 +1199,14 @@ fn pick_computed(
             longhands.push(name.clone());
         } else if let Some(value) = shorthand(name) {
             push(name, value);
+        } else if let Some(parts) = members.get(name).filter(|parts| !parts.is_empty()) {
+            // Not every name that starts with it: `border` doesn't set
+            // `border-collapse` or the corner radii.
+            longhands.extend(parts.iter().cloned());
         } else if !name.starts_with("--") {
-            // A custom property has no longhands: `--theme` is not the
-            // shorthand of `--theme-accent`.
+            // Without the page's expansion, a guess from the name. A custom
+            // property has no longhands: `--theme` is not the shorthand of
+            // `--theme-accent`.
             let prefix = format!("{name}-");
             longhands.extend(
                 computed
@@ -1211,12 +1308,8 @@ fn build_report(
     let mut declared = Declared::default();
 
     // The element's own styles. Custom properties resolve against the
-    // element's computed values, which list each defined one, empty or not.
-    let element_vars: HashMap<String, String> = computed
-        .iter()
-        .filter(|(n, _)| n.starts_with("--"))
-        .cloned()
-        .collect();
+    // element's computed values.
+    let element_vars = custom_properties(computed);
     let mut blocks = node_blocks(
         &matched["inlineStyle"],
         &matched["matchedCSSRules"],
@@ -1233,6 +1326,7 @@ fn build_report(
     let element = NodeFacts {
         vars: Some(&element_vars),
         flow: computed_value("writing-mode").zip(computed_value("direction")),
+        rejected: &page.rejected,
     };
     let mut claimed = cascade(&mut blocks, &HashSet::new(), &element);
     let rules = shown_blocks(
@@ -1273,6 +1367,7 @@ fn build_report(
         let ancestor = NodeFacts {
             vars: info.map(|a| &a.vars),
             flow: None,
+            rejected: &[],
         };
         let set_here = cascade(&mut blocks, &claimed, &ancestor);
         claimed.extend(set_here);
@@ -1293,7 +1388,13 @@ fn build_report(
 
     Report {
         element: page.element.clone(),
-        computed: pick_computed(computed, &declared, &page.shorthands, &opts.computed),
+        computed: pick_computed(
+            computed,
+            &declared,
+            &page.shorthands,
+            &page.longhands,
+            &opts.computed,
+        ),
         rules,
         inherited,
         hidden_ua_rules: hidden_ua,
@@ -1390,9 +1491,10 @@ fn report_json(report: &Report) -> Result<Value> {
 /// Labels the element and its ancestors (flat-tree parents, as CDP walks them
 /// for inherited styles), reads on each ancestor the custom properties its
 /// declarations reference, counts the ancestors, reads the element's computed
-/// `props`, and expands the shorthands in `expand` into their longhands. Runs
+/// `props`, expands the shorthands in `expand` into their longhands, and says
+/// which `[property, value]` pairs in `checks` the property rejects. Runs
 /// with `this` bound to the element.
-const PAGE_INFO_JS: &str = r#"function (varNames, props, expand) {
+const PAGE_INFO_JS: &str = r#"function (varNames, props, expand, checks) {
   const label = (el) => {
     let s = el.localName;
     if (el.id) s += '#' + el.id;
@@ -1413,7 +1515,10 @@ const PAGE_INFO_JS: &str = r#"function (varNames, props, expand) {
     scratch.setProperty(p, 'initial');
     longhands[p] = [...scratch];
   }
-  const out = { element: label(this), ancestors: [], depth: 0, shorthands, longhands };
+  // CSS.supports parses as a standards-mode document does, while in quirks
+  // mode a substituted `20` is still a length, so nothing is rejected there.
+  const rejected = document.compatMode === 'BackCompat' ? [] : checks.filter(([p, v]) => !CSS.supports(p, v));
+  const out = { element: label(this), ancestors: [], depth: 0, shorthands, longhands, rejected };
   // On to the root: a slot in a closed shadow root is no element's
   // assignedSlot, so this walk can skip ancestors CDP lists, and a count
   // that differs from CDP's is how the caller can tell.
@@ -1441,6 +1546,7 @@ async fn page_info(
     var_names: &[Vec<String>],
     props: &[String],
     expand: &[String],
+    checks: &[(String, String)],
 ) -> Result<PageInfo> {
     let resolved = client
         .send_to_target(
@@ -1460,7 +1566,12 @@ async fn page_info(
             json!({
                 "objectId": object_id,
                 "functionDeclaration": PAGE_INFO_JS,
-                "arguments": [{"value": var_names}, {"value": props}, {"value": expand}],
+                "arguments": [
+                    {"value": var_names},
+                    {"value": props},
+                    {"value": expand},
+                    {"value": checks},
+                ],
                 "returnByValue": true,
             }),
         )
@@ -1566,19 +1677,49 @@ async fn collect(
 
     // What the page adds is a nicety: without it the output says
     // "ancestor N", leaves ancestor var() references unresolved, lists
-    // shorthands' computed longhands one by one, and guesses what a var()
-    // shorthand sets from its longhands' names.
+    // shorthands' computed longhands one by one, guesses what a var()
+    // shorthand sets from its longhands' names, and counts every value a
+    // var() reference resolves to as one its property accepts. A lost
+    // connection is no nicety: it must reach the daemon, which exits on it.
     let names = ancestor_var_names(&matched);
     let props = element_props_to_read(&matched, &computed, &opts.computed);
-    let expand = unexpanded_shorthands(&matched);
-    let page = page_info(client, session_id, node_id, &names, &props, &expand)
-        .await
-        .unwrap_or_else(|_| PageInfo {
+    let expand = shorthands_to_expand(&matched, &computed, &opts.computed);
+    let checks = substituted_values(&matched, &custom_properties(&computed));
+    let page = page_info(
+        client, session_id, node_id, &names, &props, &expand, &checks,
+    )
+    .await;
+    let page = match page {
+        Ok(page) => page,
+        Err(e) if e.downcast_ref::<ConnectionLost>().is_some() => return Err(e),
+        Err(_) => PageInfo {
             element: selector.to_string(),
             ..Default::default()
-        });
+        },
+    };
 
     Ok(build_report(&matched, &computed, &sheets, &page, opts))
+}
+
+/// Turn the CSS and DOM agents off again. Left on, the CSS agent keeps
+/// tracking stylesheets for the life of the tab's session, and the next
+/// css-styles would get no CSS.styleSheetAdded events to name files. CDP
+/// runs them in order, so waiting for the last one covers both, but only
+/// up to `limit`: a page that didn't answer the inspection won't answer
+/// this either, and the daemon serves nobody meanwhile. Chrome still runs
+/// them once the page is free.
+async fn disable_agents(
+    client: &mut CdpClient,
+    session_id: &str,
+    limit: std::time::Duration,
+) -> Result<()> {
+    client
+        .send_raw_no_wait(Some(session_id), "CSS.disable", json!({}))
+        .await?;
+    client
+        .send_to_target_within(session_id, "DOM.disable", json!({}), limit)
+        .await?;
+    Ok(())
 }
 
 /// Property names are case-insensitive; custom property names are not.
@@ -1607,17 +1748,16 @@ pub async fn css_styles(
         .map(|n| normalize_property_name(n))
         .collect();
     let report = collect(client, session_id, selector, &opts).await;
-    // Turn the agents off again whatever happened. Left on, the CSS agent
-    // keeps tracking stylesheets for the life of the tab's session, and the
-    // next css-styles would get no CSS.styleSheetAdded events to name files.
-    // CDP runs them in order, so waiting for the last one covers both.
-    let _ = client
-        .send_raw_no_wait(Some(session_id), "CSS.disable", json!({}))
-        .await;
-    let _ = client
-        .send_to_target(session_id, "DOM.disable", json!({}))
-        .await;
+    // Turn the agents off whatever happened. The inspection's own error
+    // comes first; after a report, only a lost connection still counts: the
+    // daemon exits on it.
+    let disabled = disable_agents(client, session_id, SETUP_CALL_TIMEOUT).await;
     let report = report?;
+    if let Err(e) = disabled {
+        if e.downcast_ref::<ConnectionLost>().is_some() {
+            return Err(e);
+        }
+    }
 
     if format.is_text() {
         Ok(CommandResult::output(format_text(&report)))
@@ -1686,6 +1826,7 @@ mod tests {
             depth: 1,
             shorthands: HashMap::from([("padding".to_string(), "8px".to_string())]),
             longhands: HashMap::new(),
+            rejected: vec![],
         }
     }
 
@@ -2028,7 +2169,13 @@ Inherited from body:
         assert_eq!(normalize_property_name("--Gap"), "--Gap");
         let extra = ["z-index".to_string(), "padding".to_string()];
         // Without a serialized shorthand, its longhands stand in.
-        let picked = pick_computed(&computed(), &declared, &HashMap::new(), &extra);
+        let picked = pick_computed(
+            &computed(),
+            &declared,
+            &HashMap::new(),
+            &HashMap::new(),
+            &extra,
+        );
         let names: Vec<&str> = picked.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
@@ -2045,7 +2192,7 @@ Inherited from body:
             ]
         );
         let shorthands = HashMap::from([("padding".to_string(), "8px".to_string())]);
-        let picked = pick_computed(&computed(), &declared, &shorthands, &extra);
+        let picked = pick_computed(&computed(), &declared, &shorthands, &HashMap::new(), &extra);
         assert_eq!(picked[4], ("padding".to_string(), "8px".to_string()));
         assert_eq!(picked.len(), 6);
     }
@@ -2062,7 +2209,7 @@ Inherited from body:
             )],
         };
         let shorthands = HashMap::from([("padding".to_string(), String::new())]);
-        let picked = pick_computed(&computed(), &declared, &shorthands, &[]);
+        let picked = pick_computed(&computed(), &declared, &shorthands, &HashMap::new(), &[]);
         let names: Vec<&str> = picked.iter().skip(3).map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["padding-left", "padding-top"]);
     }
@@ -2101,7 +2248,7 @@ Inherited from body:
             ("border-left".to_string(), String::new()),
             ("border-image".to_string(), "none".to_string()),
         ]);
-        let picked = pick_computed(&list, &declared, &values, &[]);
+        let picked = pick_computed(&list, &declared, &values, &HashMap::new(), &[]);
         assert_eq!(
             picked[3..].to_vec(),
             [
@@ -2165,7 +2312,7 @@ Inherited from body:
             shorthands: vec![],
         };
         let values = HashMap::from([("border-color".to_string(), "rgb(0, 0, 255)".to_string())]);
-        let picked = pick_computed(&computed(), &declared, &values, &[]);
+        let picked = pick_computed(&computed(), &declared, &values, &HashMap::new(), &[]);
         assert_eq!(
             picked[3],
             ("border-color".to_string(), "rgb(0, 0, 255)".to_string())
@@ -2391,7 +2538,13 @@ Inherited from body:
         let mut list = computed();
         list.push(("--theme-accent".into(), "teal".into()));
         let extra = ["--theme".to_string(), "padding".to_string()];
-        let picked = pick_computed(&list, &Declared::default(), &HashMap::new(), &extra);
+        let picked = pick_computed(
+            &list,
+            &Declared::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &extra,
+        );
         let names: Vec<&str> = picked.iter().skip(3).map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
@@ -2651,10 +2804,50 @@ Inherited from body:
             ltr("block-size", "horizontal-tb").as_deref(),
             Some("height")
         );
-        // Physical longhands, shorthands and corner radii stay as they are.
+        // Physical longhands and shorthands stay as they are.
         assert_eq!(ltr("margin-left", "horizontal-tb"), None);
         assert_eq!(ltr("margin-inline", "horizontal-tb"), None);
-        assert_eq!(ltr("border-start-start-radius", "horizontal-tb"), None);
+        assert_eq!(ltr("border-top-left-radius", "horizontal-tb"), None);
+        assert_eq!(ltr("border-radius", "horizontal-tb"), None);
+    }
+
+    /// A corner radius is named block side first, a physical one top or
+    /// bottom first. As in Chrome 158: left to right, `border-start-start-
+    /// radius` and `border-top-left-radius` are one corner and the later
+    /// wins; right to left it's the top-right corner; vertical-rl turns
+    /// start-end into bottom-right and end-start into top-left.
+    #[test]
+    fn flow_relative_corners_cascade_with_their_physical_corner() {
+        use Status::{Active, Overridden};
+        let corners = [
+            ("start-start", "horizontal-tb", "ltr", "top-left"),
+            ("start-start", "horizontal-tb", "rtl", "top-right"),
+            ("end-end", "horizontal-tb", "ltr", "bottom-right"),
+            ("start-end", "vertical-rl", "ltr", "bottom-right"),
+            ("end-start", "vertical-rl", "ltr", "top-left"),
+            ("start-start", "vertical-lr", "rtl", "bottom-left"),
+            ("start-start", "sideways-lr", "ltr", "bottom-left"),
+        ];
+        for (logical, writing_mode, direction, corner) in corners {
+            assert_eq!(
+                physical(&format!("border-{logical}-radius"), writing_mode, direction),
+                Some(format!("border-{corner}-radius")),
+                "{logical} in {writing_mode} {direction}"
+            );
+        }
+
+        let mut m = matched();
+        let decls = [
+            ("border-top-left-radius", "2px"),
+            ("border-start-start-radius", "8px"),
+            ("border-end-end-radius", "6px"),
+        ];
+        m["inlineStyle"] = authored(&decls, &decls);
+        let mut list = computed();
+        list.push(("writing-mode".into(), "horizontal-tb".into()));
+        list.push(("direction".into(), "ltr".into()));
+        let report = build_report(&m, &list, &sheets(), &page(), &CssOptions::default());
+        assert_eq!(statuses(&report.rules[0]), [Overridden, Active, Active]);
     }
 
     /// CDP's ancestors follow the flat tree into a closed shadow root, where
@@ -2708,6 +2901,122 @@ Inherited from body:
         );
     }
 
+    /// `color: var(--size)` with `--size: 20px` substitutes fine, but 20px is
+    /// no color, so Chrome treats the declaration as `unset` and the body's
+    /// color applies, not the element's earlier blue. The page is asked
+    /// about the element's substituted values only, and only says no to
+    /// some; with nothing rejected the reference decides the color.
+    #[test]
+    fn a_value_the_property_rejects_acts_as_unset() {
+        use Status::{Active, Overridden};
+        let body_color = |r: &Report| r.inherited[0].rules[0].decls[0].status;
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        let decls = [
+            ("color", "blue"),
+            ("color", "var(--size)"),
+            ("--x", "var(--size)"),
+            ("padding", "var(--size)"),
+        ];
+        m["inlineStyle"] = authored(&decls, &decls);
+        let mut list = computed();
+        list.push(("--size".into(), "20px".into()));
+        let vars = custom_properties(&list);
+        assert_eq!(
+            substituted_values(&m, &vars),
+            [
+                ("color".to_string(), "20px".to_string()),
+                ("padding".to_string(), "20px".to_string()),
+            ]
+        );
+
+        let info = PageInfo {
+            rejected: vec![("color".into(), "20px".into())],
+            ..page()
+        };
+        let report = build_report(&m, &list, &sheets(), &info, &CssOptions::default());
+        assert_eq!(
+            statuses(&report.rules[0]),
+            [Overridden, Active, Active, Active]
+        );
+        assert_eq!(body_color(&report), Active);
+
+        let report = build_report(&m, &list, &sheets(), &page(), &CssOptions::default());
+        assert_eq!(body_color(&report), Overridden);
+    }
+
+    /// Chrome 158 takes a CSS-wide keyword that `var()` substitution leaves
+    /// as that keyword: `var(--missing, inherit)` inherits, also for a
+    /// custom property, `revert-layer` rolls back, and `initial` is a value
+    /// like any other. The authored value is still what shows.
+    #[test]
+    fn keywords_count_after_substitution() {
+        use Status::{Active, Overridden};
+        let color = |v: &str| authored(&[("color", v)], &[("color", v)]);
+        let body = |r: &Report| r.inherited[0].rules[0].decls[0].status;
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = color("var(--missing, inherit)");
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(body(&report), Active);
+        assert_eq!(report.rules[0].decls[0].value, "var(--missing, inherit)");
+        assert_eq!(
+            report.rules[0].decls[0].resolved.as_deref(),
+            Some("inherit")
+        );
+
+        m["inlineStyle"] = color("var(--missing, initial)");
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(body(&report), Overridden);
+
+        m["inlineStyle"] = Value::Null;
+        m["matchedCSSRules"] = json!([
+            layered(".a", 3, "base", color("red")),
+            rule("#a", 5, color("var(--missing, revert-layer)")),
+        ]);
+        let report = report_for(&m, CssOptions::default());
+        let firsts: Vec<Status> = report.rules.iter().map(|b| b.decls[0].status).collect();
+        assert_eq!(firsts, [Active, Active]);
+        assert_eq!(body(&report), Overridden);
+
+        let tone = [("--tone", "var(--missing, inherit)")];
+        m["matchedCSSRules"] = json!([rule("#a", 5, authored(&tone, &tone))]);
+        let parent = [("--tone", "green")];
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(&parent, &parent);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(body(&report), Active);
+    }
+
+    /// `--computed border` when the sides differ lists what `border` sets,
+    /// as the page expanded it, not every computed name that starts with
+    /// `border-`; the page is asked to expand it because CDP's computed
+    /// list doesn't have it.
+    #[test]
+    fn computed_shorthand_lists_its_own_longhands() {
+        let mut list = computed();
+        for (n, v) in [
+            ("border-top-width", "3px"),
+            ("border-left-width", "1px"),
+            ("border-collapse", "collapse"),
+            ("border-top-left-radius", "0px"),
+        ] {
+            list.push((n.into(), v.into()));
+        }
+        let extra = ["border".to_string(), "z-index".to_string()];
+        assert_eq!(shorthands_to_expand(&json!({}), &list, &extra), ["border"]);
+        let values = HashMap::from([("border".to_string(), String::new())]);
+        let members = HashMap::from([(
+            "border".to_string(),
+            vec![
+                "border-top-width".to_string(),
+                "border-left-width".to_string(),
+            ],
+        )]);
+        let picked = pick_computed(&list, &Declared::default(), &values, &members, &extra);
+        let names: Vec<&str> = picked.iter().skip(3).map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["border-left-width", "border-top-width", "z-index"]);
+    }
+
     /// An escaped quote doesn't end a fallback string, so the `)` after it
     /// still closes the call.
     #[test]
@@ -2721,5 +3030,128 @@ Inherited from body:
             resolve_vars(r"var(--missing, 'a\'b') var(--gap)", &vars).as_deref(),
             Some(r"'a\'b' 8px")
         );
+    }
+
+    /// A browser that answers css-styles' calls about an element with no
+    /// styles (`.nope` matches nothing), hangs up when `close_on` arrives,
+    /// and never answers `ignore`, though it still answers liveness pings.
+    /// The task returns the methods it was sent.
+    async fn fake_browser(
+        close_on: &'static str,
+        ignore: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut seen = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                seen.push(method.clone());
+                if method == close_on {
+                    break;
+                }
+                if method == ignore {
+                    continue;
+                }
+                let result = match method.as_str() {
+                    "DOM.getDocument" => json!({"root": {"nodeId": 1}}),
+                    "DOM.querySelector" if req["params"]["selector"] == ".nope" => {
+                        json!({"nodeId": 0})
+                    }
+                    "DOM.querySelector" => json!({"nodeId": 2}),
+                    "CSS.getComputedStyleForNode" => json!({"computedStyle": []}),
+                    "DOM.resolveNode" => json!({"object": {"objectId": "o"}}),
+                    "Runtime.callFunctionOn" => json!({"result": {"value": {"element": "p"}}}),
+                    _ => json!({}),
+                };
+                let reply = json!({"id": req["id"], "result": result});
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    break;
+                }
+            }
+            seen
+        });
+        (url, task)
+    }
+
+    /// A connection lost while the page labels the element, or while the
+    /// agents are turned off, is the command's error, so the daemon exits
+    /// on it instead of reporting success over a dead connection.
+    #[tokio::test]
+    async fn a_lost_connection_is_not_a_report() {
+        for close_on in ["Runtime.callFunctionOn", "DOM.disable"] {
+            let (url, browser) = fake_browser(close_on, "").await;
+            let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
+            let result = css_styles(
+                &mut client,
+                "S",
+                "p",
+                CssOptions::default(),
+                OutputFormat::Text,
+            )
+            .await;
+            let error = result
+                .err()
+                .unwrap_or_else(|| panic!("{close_on}: a report"));
+            assert!(
+                error.downcast_ref::<ConnectionLost>().is_some(),
+                "{close_on}: {error:#}"
+            );
+            drop(client);
+            browser.await.unwrap();
+        }
+    }
+
+    /// A page that doesn't answer gets the cleanup's own short wait, not a
+    /// full call timeout, and both agents are still asked to turn off.
+    #[tokio::test]
+    async fn cleanup_waits_only_as_long_as_it_is_given() {
+        let (url, browser) = fake_browser("", "DOM.disable").await;
+        let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
+        let limit = std::time::Duration::from_millis(300);
+        let disabled = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            disable_agents(&mut client, "S", limit),
+        )
+        .await
+        .expect("the cleanup waited past its limit");
+        let error = disabled.expect_err("DOM.disable was never answered");
+        assert!(
+            error.downcast_ref::<ConnectionLost>().is_none(),
+            "{error:#}"
+        );
+        drop(client);
+        let seen = browser.await.unwrap();
+        assert!(seen.iter().any(|m| m == "CSS.disable"), "{seen:?}");
+        assert!(seen.iter().any(|m| m == "DOM.disable"), "{seen:?}");
+    }
+
+    /// The agents are turned off after a failed inspection too, and the
+    /// inspection's error is the one reported, whatever the cleanup met.
+    #[tokio::test]
+    async fn cleanup_keeps_the_inspection_error() {
+        let (url, browser) = fake_browser("DOM.disable", "").await;
+        let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
+        let result = css_styles(
+            &mut client,
+            "S",
+            ".nope",
+            CssOptions::default(),
+            OutputFormat::Text,
+        )
+        .await;
+        let error = result.err().expect("no element matches");
+        assert!(
+            error.to_string().contains("No element matches"),
+            "{error:#}"
+        );
+        drop(client);
+        let seen = browser.await.unwrap();
+        assert_eq!(seen.last().map(String::as_str), Some("DOM.disable"));
     }
 }
