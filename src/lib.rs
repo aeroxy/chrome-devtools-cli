@@ -504,6 +504,15 @@ pub enum Commands {
         /// Case-insensitive. Repeatable.
         #[arg(long)]
         r#type: Vec<String>,
+        /// Also show the headers each request was sent with, Cookie included
+        /// when Chrome reports what went over the wire (they can carry
+        /// credentials)
+        #[arg(long)]
+        request_headers: bool,
+        /// Also show each response's headers, Set-Cookie included when Chrome
+        /// reports what came over the wire
+        #[arg(long)]
+        response_headers: bool,
     },
 
     /// Collect console logs from extension service workers
@@ -1513,8 +1522,22 @@ fn build_request(cli: &Cli) -> Result<DaemonRequest> {
         Commands::Console { duration, r#type } => {
             ("console", json!({"duration": duration, "type": r#type}))
         }
-        Commands::Network { duration, r#type } => {
-            ("network", json!({"duration": duration, "type": r#type}))
+        Commands::Network {
+            duration,
+            r#type,
+            request_headers,
+            response_headers,
+        } => {
+            let mut args = json!({"duration": duration, "type": r#type});
+            // Sent only when used: a daemon from before these options rejects
+            // keys it doesn't know, which would break every network call.
+            if *request_headers {
+                args["request_headers"] = json!(true);
+            }
+            if *response_headers {
+                args["response_headers"] = json!(true);
+            }
+            ("network", args)
         }
         Commands::Cookies {
             urls,
@@ -2547,12 +2570,21 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             )
             .await
         }
-        Commands::Network { duration, r#type } => {
+        Commands::Network {
+            duration,
+            r#type,
+            request_headers,
+            response_headers,
+        } => {
             commands::network::collect_network(
                 &mut client,
                 &session_id,
                 *duration,
                 r#type.clone(),
+                commands::network::Headers {
+                    request: *request_headers,
+                    response: *response_headers,
+                },
                 cli.output_format(),
             )
             .await
@@ -2761,6 +2793,17 @@ mod tests {
         }
         let dark = args_of(&["emulate", "--media-feature", "prefers-color-scheme=dark"]);
         assert_eq!(dark["media_feature"][0], "prefers-color-scheme=dark");
+        let network = args_of(&["network"]);
+        assert!(network.get("request_headers").is_none(), "{network}");
+        assert!(network.get("response_headers").is_none(), "{network}");
+        let with_headers = args_of(&["network", "--request-headers", "--response-headers"]);
+        assert_eq!(
+            (
+                with_headers["request_headers"].clone(),
+                with_headers["response_headers"].clone()
+            ),
+            (json!(true), json!(true))
+        );
     }
 
     #[test]
