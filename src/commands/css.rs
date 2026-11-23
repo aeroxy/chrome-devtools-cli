@@ -34,6 +34,7 @@ const INHERITED: &[&str] = &[
     "-webkit-text-stroke-color",
     "-webkit-text-stroke-width",
     "-webkit-user-modify",
+    "accent-color",
     "border-collapse",
     "border-spacing",
     "caption-side",

@@ -328,27 +328,34 @@ pub async fn configure_webauthn(
         );
     }
 
+    // The old authenticator goes first, and only if it really goes does a new
+    // one follow: adding while the old one is still there would leave two,
+    // and a failed add would then leave the old one untracked.
+    if let Plan::Replace(old) = &plan {
+        let removed = client
+            .send_to_target(
+                session_id,
+                "WebAuthn.removeVirtualAuthenticator",
+                json!({"authenticatorId": old}),
+            )
+            .await;
+        if let Err(e) = removed {
+            if !authenticator_gone(&e) {
+                return Err(e.context("Failed to replace the virtual authenticator"));
+            }
+        }
+    }
+
     let applied: Result<(String, &str)> = async {
         match plan {
             Plan::Add => Ok((
                 client.add_virtual_authenticator(session_id, &next).await?,
                 "added",
             )),
-            Plan::Replace(old) => {
-                // Best effort: if it is already gone, adding the new one is all
-                // that is left to do.
-                let _ = client
-                    .send_to_target(
-                        session_id,
-                        "WebAuthn.removeVirtualAuthenticator",
-                        json!({"authenticatorId": old}),
-                    )
-                    .await;
-                Ok((
-                    client.add_virtual_authenticator(session_id, &next).await?,
-                    "replaced",
-                ))
-            }
+            Plan::Replace(_) => Ok((
+                client.add_virtual_authenticator(session_id, &next).await?,
+                "replaced",
+            )),
             Plan::SetUserVerified(id) => {
                 client
                     .send_to_target(
