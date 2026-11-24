@@ -1962,10 +1962,13 @@ fn weak_map_pair(name: &str) -> Option<&str> {
         .then_some(shared)
 }
 
-/// The key's and the table's node ids embedded in a WeakMap pair edge's name.
+/// Candidate key ids in a WeakMap pair edge's name, with the table's id.
 /// Both halves carry both ids even when only one half is still present, which
-/// is what lets a lone table retainer be marked conditional on its missing key.
-fn weak_map_pair_ids(name: &str) -> Option<(u32, u32)> {
+/// is what lets a lone table retainer be marked conditional on its missing
+/// key. V8 embeds the key's own name, which can itself read like an earlier
+/// ` @<id>) -> value (`; every numeric id before a separator is a candidate,
+/// leaving the choice to the graph (or to node metadata when alone).
+fn weak_map_pair_ids(name: &str) -> Option<(Vec<u32>, u32)> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let shared = name.trim_start_matches(|c: char| c.is_ascii_digit());
     if shared.len() == name.len() {
@@ -1979,27 +1982,67 @@ fn weak_map_pair_ids(name: &str) -> Option<(u32, u32)> {
         return None;
     }
     let (key_and_value, _) = middle.strip_suffix(')')?.rsplit_once(" @")?;
-    // The key's name may itself contain `) -> value (`, so take the first
-    // separator that has a numeric id before it.
-    let key = key_and_value
+    let keys = key_and_value
         .match_indices(") -> value (")
-        .find_map(|(i, _)| {
+        .filter_map(|(i, _)| {
             let id = key_and_value[..i].rsplit_once(" @")?.1;
             digits(id).then(|| id.parse::<u32>().ok()).flatten()
-        })?;
-    Some((key, table.parse().ok()?))
+        })
+        .collect();
+    Some((keys, table.parse().ok()?))
+}
+
+/// A lone candidate key id only identifies a node when exactly one of the
+/// candidates is a node in the snapshot. Otherwise the name is ambiguous and
+/// no node is claimed.
+fn weak_map_key_from_metadata(snap: &Snap, keys: &[u32]) -> Option<u32> {
+    let mut found = keys
+        .iter()
+        .copied()
+        .filter(|id| (0..snap.node_count).any(|ord| snap.id(ord) == *id));
+    let only = found.next()?;
+    found.next().is_none().then_some(only)
 }
 
 /// The other edge a WeakMap-pair retainer needs in order to keep the value
 /// alive. Each half names both the key and the table, so this works even when
-/// the other half is not a retainer (the missing-key case).
-fn weak_map_condition(snap: &Snap, edge: usize) -> Option<PairedEdge> {
-    let (key, table) = weak_map_pair_ids(snap.string_edge_name(edge))?;
+/// the other half is not a retainer (the missing-key case). When both halves
+/// are present their sources identify the pair's nodes; a name whose key id
+/// was confused by the key's own text cannot mislabel them then.
+fn weak_map_condition(
+    snap: &Snap,
+    edge: usize,
+    retainers: &[(usize, usize)],
+) -> Option<PairedEdge> {
+    // Only `internal` edges carry a WeakMap name. An `element` or `hidden`
+    // edge carries a numeric index, which is not a string-table offset.
+    if !snap.edge_is(edge, snap.et.internal) {
+        return None;
+    }
+    let name = snap.string_edge_name(edge);
+    let pair = weak_map_pair(name)?;
+    let (keys, table) = weak_map_pair_ids(name)?;
+    let to = snap.edge_to(edge);
     let source = snap.id(snap.edge_source(edge));
+    // Search every incoming edge: the other half may come from a node the
+    // distance walk never reached, but it still retains the value.
+    let other = retainers.iter().find_map(|&(e, _)| {
+        (e != edge
+            && snap.edge_is(e, snap.et.internal)
+            && snap.edge_to(e) == to
+            && weak_map_pair(snap.string_edge_name(e)) == Some(pair))
+        .then(|| snap.id(snap.edge_source(e)))
+        .filter(|id| *id != source)
+    });
     let (role, node_id) = if source == table {
-        ("key", key)
-    } else if source == key {
-        ("table", table)
+        // The other edge comes from the key. Without it, the key id from the
+        // name is only used when node metadata makes it unambiguous.
+        (
+            "key",
+            other.or_else(|| weak_map_key_from_metadata(snap, &keys)),
+        )
+    } else if other == Some(table) || keys.contains(&source) {
+        ("table", Some(table))
     } else {
         return None;
     };
@@ -2154,11 +2197,22 @@ struct EdgeRow {
     conditional_on: Option<PairedEdge>,
 }
 
-/// The other half of a WeakMap entry's pair of edges.
+/// The other half of a WeakMap entry's pair of edges. `node_id` is `None`
+/// when the pair is known but its other node cannot be identified from the
+/// snapshot.
 struct PairedEdge {
     /// "key" or "table": which half its source is.
     role: &'static str,
-    node_id: u32,
+    node_id: Option<u32>,
+}
+
+impl PairedEdge {
+    fn node_text(&self) -> String {
+        match self.node_id {
+            Some(id) => format!("node {id}"),
+            None => "a node the snapshot does not identify".to_string(),
+        }
+    }
 }
 
 struct NodeReport {
@@ -2226,7 +2280,7 @@ fn inspect_node(snap: &Snap, node_id: u64, opts: &ListOptions) -> Result<NodeRep
     let retainer_rows = page
         .iter()
         .map(|&(e, src)| EdgeRow {
-            conditional_on: weak_map_condition(snap, e),
+            conditional_on: weak_map_condition(snap, e, &retainers),
             ..row(e, src)
         })
         .collect();
@@ -2242,7 +2296,7 @@ fn inspect_node(snap: &Snap, node_id: u64, opts: &ListOptions) -> Result<NodeRep
                 } else {
                     "key"
                 },
-                node_id,
+                node_id: Some(node_id),
             }
         });
         EdgeRow {
@@ -2357,9 +2411,9 @@ fn format_node_report(
             let _ = writeln!(
                 out,
                 "Retainer {} is conditional: as a WeakMap entry it keeps this value alive only \
-                 while {other}, node {}, is alive too.",
+                 while {other}, {}, is alive too.",
                 i + 1,
-                c.node_id
+                c.node_text()
             );
         }
     }
@@ -2401,9 +2455,9 @@ fn format_node_report(
                     let _ = writeln!(
                         out,
                         "Step {} is conditional: as a WeakMap entry it keeps its value alive \
-                         only while {other}, node {}, is alive too.",
+                         only while {other}, {}, is alive too.",
                         i + 1,
-                        c.node_id
+                        c.node_text()
                     );
                 }
             }
@@ -3534,7 +3588,7 @@ mod tests {
         assert_eq!(ids, [3, 101, 103, 11, 17]);
         assert!(path[..4].iter().all(|r| r.conditional_on.is_none()));
         let c = path[4].conditional_on.as_ref().unwrap();
-        assert_eq!((c.role, c.node_id), ("table", 15));
+        assert_eq!((c.role, c.node_id), ("table", Some(15)));
         // Both halves are still listed as retainers, and each says what else
         // has to stay alive for it to retain the value.
         assert_eq!(report.retainers_total, 2);
@@ -3543,7 +3597,7 @@ mod tests {
             .iter()
             .map(|r| r.conditional_on.as_ref().map(|c| (c.role, c.node_id)))
             .collect();
-        assert_eq!(conds, [Some(("key", 11)), Some(("table", 15))]);
+        assert_eq!(conds, [Some(("key", Some(11))), Some(("table", Some(15)))]);
 
         let text = format_node_report(&report, &defaults(), OutputFormat::Text).unwrap();
         assert!(text.contains(
@@ -3586,7 +3640,7 @@ mod tests {
         let ids: Vec<u32> = path.iter().map(|r| r.node_id).collect();
         assert_eq!(ids, [3, 101, 103, 11, 17]);
         let c = path[4].conditional_on.as_ref().unwrap();
-        assert_eq!((c.role, c.node_id), ("table", 15));
+        assert_eq!((c.role, c.node_id), ("table", Some(15)));
 
         // The other way round (key 1 hop, table 4: Window -> 2 links -> wm
         // -> table), the table's edge sets the distance and the key is the
@@ -3600,7 +3654,7 @@ mod tests {
             "3 / part of key (Key @11) -> value (Val @17) pair in WeakMap (table @15)"
         );
         let c = path[5].conditional_on.as_ref().unwrap();
-        assert_eq!((c.role, c.node_id), ("key", 11));
+        assert_eq!((c.role, c.node_id), ("key", Some(11)));
 
         // With no way to the key, the table alone does not retain the value.
         let mut t = weak_map_fixture(0, 0, "Val");
@@ -3622,7 +3676,7 @@ mod tests {
                 .conditional_on
                 .as_ref()
                 .map(|c| (c.role, c.node_id)),
-            Some(("key", 11))
+            Some(("key", Some(11)))
         );
         let text = format_node_report(&report, &opts, OutputFormat::Text).unwrap();
         assert!(
@@ -3645,6 +3699,68 @@ mod tests {
         );
     }
 
+    /// A key whose own name contains ` @3) -> value (` gives the parser a
+    /// false key id. With both halves present their sources settle it; alone,
+    /// competing real node ids leave the condition unresolved.
+    #[test]
+    fn an_ambiguous_weak_map_key_name_uses_graph_evidence() {
+        let fixture = |entry: &str, key_edge: bool| {
+            let (mut t, window) = TestSnap::page();
+            let key = t.node("object", "a @3) -> value (b", 7, 16);
+            let wm = t.node("object", "WeakMap", 13, 24);
+            let table = t.node("array", "", 5, 64);
+            let value = t.node("object", "Val", 17, 16);
+            t.edge(window, "property", "key", key);
+            t.edge(window, "property", "wm", wm);
+            t.edge(wm, "internal", "table", table);
+            if key_edge {
+                t.edge(key, "internal", &format!("1 / {entry}"), value);
+            }
+            t.edge(table, "internal", &format!("3 / {entry}"), value);
+            t.snap()
+        };
+        let entry =
+            "part of key (a @3) -> value (b @7) -> value (Val @17) pair in WeakMap (table @5)";
+        let snap = fixture(entry, true);
+        let report = inspect_node(&snap, 17, &defaults()).unwrap();
+        let conds: Vec<_> = report
+            .retainers
+            .iter()
+            .map(|r| r.conditional_on.as_ref().map(|c| (c.role, c.node_id)))
+            .collect();
+        // Node 3 is Window, but 7 is the key edge's source.
+        assert!(conds.contains(&Some(("key", Some(7)))), "{conds:?}");
+        assert!(conds.contains(&Some(("table", Some(5)))), "{conds:?}");
+
+        // With just the table's edge, both candidates are real nodes (3 is
+        // Window), so neither can be claimed.
+        let snap = fixture(entry, false);
+        let report = inspect_node(&snap, 17, &defaults()).unwrap();
+        assert_eq!(
+            report.retainers[0]
+                .conditional_on
+                .as_ref()
+                .map(|c| (c.role, c.node_id)),
+            Some(("key", None))
+        );
+        let text = format_node_report(&report, &defaults(), OutputFormat::Text).unwrap();
+        assert!(text.contains("while its key, a node the snapshot does not identify, is alive"));
+
+        // When only the real id names a node, metadata resolves the lone
+        // table's key without another edge.
+        let entry =
+            "part of key (a @99) -> value (b @7) -> value (Val @17) pair in WeakMap (table @5)";
+        let snap = fixture(entry, false);
+        let report = inspect_node(&snap, 17, &defaults()).unwrap();
+        assert_eq!(
+            report.retainers[0]
+                .conditional_on
+                .as_ref()
+                .map(|c| (c.role, c.node_id)),
+            Some(("key", Some(7)))
+        );
+    }
+
     #[test]
     fn test_weak_map_edge_names_parse() {
         let name = "12 / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @5)";
@@ -3652,12 +3768,20 @@ mod tests {
             weak_map_pair(name),
             Some(" / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @5)")
         );
-        assert_eq!(weak_map_pair_ids(name), Some((7, 5)));
+        assert_eq!(weak_map_pair_ids(name), Some((vec![7], 5)));
         assert_eq!(
             weak_map_pair_ids(
                 "1 / part of key (a) -> value (b @1) @2) -> value (c @3) pair in WeakMap (table @4)"
             ),
-            Some((2, 4))
+            Some((vec![2], 4))
+        );
+        // A key name that itself has a ` @<id>) -> value (` keeps both
+        // candidates; the graph, not the first one, decides which is the key.
+        assert_eq!(
+            weak_map_pair_ids(
+                "7 / part of key (a @3) -> value (b @7) -> value (Val @17) pair in WeakMap (table @5)"
+            ),
+            Some((vec![3, 7], 5))
         );
         // Names may contain the separators, and line breaks.
         for name in [
@@ -3926,6 +4050,13 @@ mod tests {
             .map(|e| snap.edge_name(e).into_owned())
             .collect();
         assert_eq!(names, ["2147483648", "4294967294", "p"]);
+        // Inspecting the retained node must keep those indices as edge names,
+        // not read them as offsets into the string table.
+        let report = inspect_node(&snap, 11, &defaults()).unwrap();
+        assert_eq!(report.retainers_total, 3);
+        assert_eq!(report.retainers[0].edge_name.as_str(), "2147483648");
+        assert_eq!(report.retainers[1].edge_name.as_str(), "4294967294");
+        assert!(report.retainers.iter().all(|r| r.conditional_on.is_none()));
 
         // Anywhere else a negative value is corrupt.
         for (at, edge, field) in [(3, 1, "type"), (5, 1, "to_node"), (10, 3, "name_or_index")] {

@@ -205,7 +205,7 @@ chrome-devtools --target warm-squid emulate --media-feature prefers-reduced-moti
 
 # Show current overrides (the viewport, geolocation and media set above)
 chrome-devtools --target warm-squid emulate
-# Output: Viewport: 1920x1080 (scale: 1, mobile: false)
+# Output: Viewport: 375x812 (scale: 1, mobile: true)
 #         Geolocation: 40.71, -74 (acc: 100m)
 #         Media: print; prefers-color-scheme=dark; prefers-reduced-motion=reduce
 # After --clear-all, the same command prints: No emulation overrides active.
@@ -386,7 +386,7 @@ chrome-devtools --target warm-squid evaluate "JSON.stringify(performance.timing)
 
 A dialog that opens while the command is only getting ready fails it instead, because the action never happened: `Moving the pointer there opened a dialog, so the click was not sent` (a mouseover handler) or `Focusing or clearing the field opened a dialog, so the value was not entered` (`fill`). Handle the dialog, then run the command again.
 
-If a command instead fails with `got no answer from the page` and mentions a dialog this daemon did not see, the dialog opened before the daemon attached to the tab (or under an earlier session). The CLI cannot handle such a dialog: ask the human to close it, or `close-page` the tab.
+If a command instead fails with `got no answer from the page` and mentions a dialog this daemon did not see, treat an unseen dialog as one possible cause, not a conclusion from the message alone: an endless loop or a hung renderer gets the same text. Such a dialog would have opened before the daemon attached to the tab (or under an earlier session), so the CLI cannot handle it — ask the human to close it, or `close-page` the tab, if one really is open.
 
 ### Pattern 7: Output Formats
 All commands default to human-readable text output. Use `--json` or `--toon` (compact, LLM-friendly) for structured output.
@@ -423,7 +423,7 @@ The text output is the compact one: an indented outline in document order, `[rol
 `--json` and `--toon` return Chrome's raw accessibility tree instead, many times larger; use them only for properties the outline leaves out.
 
 ### Pattern 9: Screenshots
-`--max-width`/`--max-height` are in image pixels, so they hold on HiDPI screens and at any browser zoom too. A `--full-page` capture past 16384px in either direction warns on stderr, because Chrome repeats or corrupts content beyond that. Use `--max-width` for a wide capture and `--max-height` for a tall one, or both when both dimensions exceed the limit: each flag caps its own dimension and scales the image uniformly, so `--max-height` alone will not shrink an over-wide capture.
+`--max-width`/`--max-height` are in image pixels, so they hold on HiDPI screens and at any browser zoom too. A `--full-page` capture past 16384px in either direction warns on stderr, because Chrome repeats or corrupts content beyond that. Use `--max-width` for a wide capture and `--max-height` for a tall one, or both when both dimensions exceed the limit: the smaller required ratio wins and both dimensions scale down together. `--max-height` alone *does* reduce the width of a very tall capture, but it does not guarantee a width limit — a wide, short capture may still exceed one. Pass both flags when both dimensions need explicit caps.
 
 ```bash
 # Default: viewport-only PNG
@@ -1057,7 +1057,7 @@ computer sleep can still drop the connection.
 
 No command waits forever on a connected browser any more:
 
-- **`<method> got no answer from the page within Ns, though the browser answers`**: the browser is fine but this tab isn't. Usually a JavaScript dialog opened where the daemon couldn't see it (see Pattern 6), otherwise an endless loop (a stop is requested for the running JavaScript) or a hung renderer. Setup calls give up after 10s; other calls after 180s (`CHROME_CDP_TIMEOUT_SECS`, read when the daemon starts, raises that for long scripts). Don't retry in a loop: ask the human to close the dialog, or `close-page` the tab. Other tabs keep working.
+- **`<method> got no answer from the page within Ns, though the browser answers`**: the browser is fine but this tab isn't. An unseen JavaScript dialog (see Pattern 6) is one possible cause, but the same text also covers an endless loop or a hung renderer — don't infer a dialog from the message alone. Only page-scoped `Runtime.*` calls request a stop for the running JavaScript when they time out; calls such as `DOM.getDocument` do not, so a stuck script there is not freed by the timeout. Setup calls give up after 10s; other calls after 180s (`CHROME_CDP_TIMEOUT_SECS`, read when the daemon starts, raises that for long scripts). Don't retry in a loop: check for a dialog, ask the human to close it if one is open, or `close-page` the tab. Other tabs keep working.
 - **`The browser did not answer a check within 15s; the connection is treated as lost`**, or **`Writing to the browser did not finish within 180s`** (after a laptop sleep, a dropped network, a remote browser that went away): the daemon exits as for any lost connection. Reconnect with a read-only command such as `list-pages`; the browser may ask the human to approve the new connection, and then the approval steps above apply. Before repeating a command that changes the page (a click that submits a form, a fill), check whether it already took effect: the browser may have run it before the connection dropped.
 
 ## Failure Handling: cannot read DevToolsActivePort / "Operation not permitted"

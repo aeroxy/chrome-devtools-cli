@@ -17,6 +17,7 @@ use anyhow::Result;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::json;
+use std::ffi::OsString;
 
 #[derive(Parser)]
 #[command(
@@ -478,9 +479,12 @@ pub enum Commands {
         r#type: Vec<String>,
     },
 
-    /// Show the cookies Chrome stores for the page's URL, HttpOnly and
-    /// partitioned ones included, read over the daemon's connection. The
-    /// table leaves values out; --header, --json and --toon print them
+    /// Show the cookies Chrome stores for the page's URL, HttpOnly included,
+    /// read over the daemon's connection. Partitioned cookies are returned
+    /// only when their partition matches the queried URL treated as the
+    /// top-level site: one partitioned under another embedding site may be
+    /// omitted, so its absence does not prove Chrome has no cookie for that
+    /// iframe. The table leaves values out; --header, --json and --toon print them
     Cookies {
         /// URL to read the cookies for (repeatable); defaults to the page's URL
         #[arg(long = "url", value_name = "URL")]
@@ -1709,34 +1713,61 @@ fn token_supplies_expression(token: &str) -> bool {
     !token.starts_with('-') || token[1..].parse::<f64>().is_ok()
 }
 
+/// The filename in clap's attached `-oout.json` / `-o=out.json` form. A lone
+/// `-offset` is JavaScript, not an output option, and `-o` already takes a
+/// separate value token.
+fn attached_output_path(token: &str) -> Option<String> {
+    token
+        .strip_prefix("-o")
+        // Clap accepts both `-oout.json` and `-o=out.json`; keep the filename,
+        // not the separator.
+        .map(|p| p.strip_prefix('=').unwrap_or(p))
+        .filter(|p| !p.is_empty() && !p.starts_with('-'))
+        .map(str::to_string)
+}
+
+/// Flags whose value is a separate token, so a scan for the expression must
+/// step over both. The other flags after `evaluate` (`--track-navigation`,
+/// `--json`, `--toon`) are booleans.
+fn takes_value_token(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--ws-endpoint"
+            | "--port"
+            | "--user-data-dir"
+            | "--browser"
+            | "--channel"
+            | "--page"
+            | "-p"
+            | "--target"
+            | "-t"
+            | "--block-url"
+            | "--unblock-url"
+            | "--dialog-action"
+            | "--output"
+            | "-o"
+    )
+}
+
 /// `-oout.json` is clap's attached short-option form, but the expression's
 /// `allow_hyphen_values` makes clap take that token as the expression and the
 /// real expression as an extra argument. Split it before parsing, but only for
 /// the `evaluate` subcommand: after `--`, an `evaluate` token is raw script
 /// data, and `evaluate -- -1` must pass a literal leading dash through.
-fn normalize_cli_args(args: &mut Vec<String>) {
+fn normalize_cli_args(args: &mut Vec<OsString>) {
     let mut i = 1; // args[0] is the program name
     while i < args.len() {
-        let arg = args[i].as_str();
+        // A non-text token (a path or value) cannot be an option or the
+        // subcommand; pass it to Clap unchanged instead of panicking on UTF-8.
+        let Some(arg) = args[i].to_str() else {
+            return;
+        };
         if arg == "--" {
             return;
         }
         // Global options can precede the subcommand. Skip the ones whose
         // value is a separate token so it isn't taken for the subcommand.
-        if matches!(
-            arg,
-            "--ws-endpoint"
-                | "--port"
-                | "--user-data-dir"
-                | "--browser"
-                | "--channel"
-                | "--page"
-                | "-p"
-                | "--target"
-                | "-t"
-                | "--block-url"
-                | "--unblock-url"
-        ) {
+        if takes_value_token(arg) {
             i += 2;
             continue;
         }
@@ -1745,26 +1776,48 @@ fn normalize_cli_args(args: &mut Vec<String>) {
             continue;
         }
         if arg == "evaluate" {
-            // A lone `-o...` token is the expression (allow_hyphen_values), not
-            // an attached output option. Split it only when a separate token
-            // follows that is the expression, not a flag such as
-            // `--track-navigation` (which would leave no expression at all).
-            if args
-                .get(i + 2)
-                .is_some_and(|next| token_supplies_expression(next))
-            {
-                let path = args
-                    .get(i + 1)
-                    .and_then(|a| a.strip_prefix("-o"))
-                    // Clap accepts both `-oout.json` and `-o=out.json`; keep the
-                    // filename, not the separator.
-                    .map(|p| p.strip_prefix('=').unwrap_or(p))
-                    .filter(|p| !p.is_empty() && !p.starts_with('-'))
-                    .map(str::to_string);
-                if let Some(path) = path {
-                    args[i + 1] = "-o".to_string();
-                    args.insert(i + 2, path);
+            // The attached `-o` need not be the token right after `evaluate`:
+            // a flag such as `--track-navigation` can come first, and another
+            // flag can sit between it and the expression. Find that first
+            // attached form, then the expression that follows it. A lone
+            // `-offset` with no expression after it stays JavaScript.
+            let mut candidate = None;
+            let mut j = i + 1;
+            while j < args.len() {
+                let Some(token) = args[j].to_str() else {
+                    break;
+                };
+                if token == "--" {
+                    // The expression after the separator is passed through
+                    // verbatim (`evaluate -oout.json -- -offset`), but an
+                    // attached `-o` before it still has to be split.
+                    if let Some((idx, path)) = candidate {
+                        if j + 1 < args.len() {
+                            args[idx] = OsString::from("-o");
+                            args.insert(idx + 1, OsString::from(path));
+                        }
+                    }
+                    break;
                 }
+                if takes_value_token(token) && j + 1 < args.len() {
+                    j += 2;
+                    continue;
+                }
+                if candidate.is_none() {
+                    if let Some(path) = attached_output_path(token) {
+                        candidate = Some((j, path));
+                        j += 1;
+                        continue;
+                    }
+                }
+                if token_supplies_expression(token) {
+                    if let Some((idx, path)) = candidate {
+                        args[idx] = OsString::from("-o");
+                        args.insert(idx + 1, OsString::from(path));
+                    }
+                    break;
+                }
+                j += 1;
             }
         }
         return; // the first positional is the subcommand, whatever it is
@@ -1772,7 +1825,7 @@ fn normalize_cli_args(args: &mut Vec<String>) {
 }
 
 pub async fn run() -> Result<()> {
-    let mut raw_args: Vec<String> = std::env::args().collect();
+    let mut raw_args: Vec<OsString> = std::env::args_os().collect();
     normalize_cli_args(&mut raw_args);
     let cli = match Cli::try_parse_from(raw_args) {
         Ok(c) => c,
@@ -2878,8 +2931,8 @@ mod tests {
     #[test]
     fn attached_output_option_is_not_the_expression() {
         let normalize = |argv: &[&str]| {
-            let mut full = vec!["chrome-devtools".to_string()];
-            full.extend(argv.iter().map(|s| s.to_string()));
+            let mut full = vec![OsString::from("chrome-devtools")];
+            full.extend(argv.iter().map(OsString::from));
             normalize_cli_args(&mut full);
             build_request(&Cli::try_parse_from(full).unwrap())
                 .unwrap()
@@ -2911,10 +2964,43 @@ mod tests {
         assert!(negative["output"].as_str().unwrap().ends_with("out.json"));
         // The explicit `--` form still passes a leading dash through.
         assert_eq!(normalize(&["evaluate", "--", "-1"])["expression"], "-1");
+        // A flag before the attached `-o`, or between it and the expression,
+        // must not stop the rewrite.
+        for argv in [
+            vec!["evaluate", "--track-navigation", "-oout.json", "1 + 1"],
+            vec!["evaluate", "-oout.json", "--track-navigation", "1 + 1"],
+        ] {
+            let args = normalize(&argv);
+            assert_eq!(args["expression"], "1 + 1", "{argv:?}");
+            assert!(
+                args["output"].as_str().unwrap().ends_with("out.json"),
+                "{argv:?}"
+            );
+            assert_eq!(args["track_navigation"], true, "{argv:?}");
+        }
+        // A leading-dash expression after `--` is passed through, but the
+        // attached `-o` before it is still split.
+        let args = normalize(&["evaluate", "-oout.json", "--", "-offset"]);
+        assert_eq!(args["expression"], "-offset");
+        assert!(args["output"].as_str().unwrap().ends_with("out.json"));
         // Global options before the subcommand must not hide it.
         let args = normalize(&["--target", "warm-squid", "evaluate", "-oout.json", "1 + 1"]);
         assert_eq!(args["expression"], "1 + 1");
         assert!(args["output"].as_str().unwrap().ends_with("out.json"));
+    }
+
+    /// The normalizer inspects only text tokens; non-UTF-8 names and values
+    /// reach Clap unchanged instead of panicking on `std::env::args()`.
+    #[test]
+    #[cfg(unix)]
+    fn normalization_preserves_non_utf8_arguments() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![b'/', 0xff]);
+        let mut full = vec![bad.clone(), OsString::from("list-daemons"), bad.clone()];
+        normalize_cli_args(&mut full);
+        assert_eq!(full[0], bad);
+        assert_eq!(full[1], OsString::from("list-daemons"));
+        assert_eq!(full[2], bad);
     }
 
     /// A token after `--` belongs to the script, not to the CLI: `evaluate`
@@ -2922,8 +3008,8 @@ mod tests {
     #[test]
     fn arguments_after_the_separator_are_never_rewritten() {
         let normalize = |argv: &[&str]| {
-            let mut full = vec!["chrome-devtools".to_string()];
-            full.extend(argv.iter().map(|s| s.to_string()));
+            let mut full = vec![OsString::from("chrome-devtools")];
+            full.extend(argv.iter().map(OsString::from));
             normalize_cli_args(&mut full);
             Cli::try_parse_from(full).unwrap().command
         };

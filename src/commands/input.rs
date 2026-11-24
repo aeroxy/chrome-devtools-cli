@@ -215,6 +215,37 @@ fn mark_submit_key_dialog(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// A dialog that opened while reading the URL back, after the text was
+/// inserted. The generic `type-text` dialog report cannot tell that phase from
+/// an interruption during insertion, so report it here: the text (and a
+/// submit key, if requested) already went through.
+fn readback_dialog_result(
+    text: &str,
+    submit_key: Option<&str>,
+    dialog: &crate::cdp::DialogOpen,
+) -> CommandResult {
+    let key = submit_key.map(|k| format!(" + {k}")).unwrap_or_default();
+    let article = if dialog.dialog_type.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
+    };
+    let after = if submit_key.is_some() {
+        " The text and submit key were already sent; the dialog interrupted the URL check, so \
+         the key's outcome is unconfirmed — do not press it again."
+    } else {
+        " The text was inserted; the dialog interrupted the URL check."
+    };
+    CommandResult::output(format!(
+        "Typed: {text}{key}, and the page opened {article} {} dialog: \"{}\".{after} {} If the \
+         daemon could not attach to this tab, no later command can handle the dialog: ask the \
+         human to close it.",
+        dialog.dialog_type,
+        dialog.message,
+        crate::commands::executor::HANDLE_DIALOG_NEXT
+    ))
+}
+
 /// Click an element identified by CSS selector.
 pub async fn click(
     client: &mut CdpClient,
@@ -357,6 +388,80 @@ pub(crate) async fn main_frame_id(client: &mut CdpClient, session_id: &str) -> R
         })
 }
 
+/// A page that stopped answering or lost the connection during a follow-up
+/// check must be reported, not turned into an ordinary "no navigation" and
+/// followed by another full-budget page call. A plain no-event timeout stays
+/// normal.
+fn is_page_stall(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<crate::cdp::ConnectionLost>().is_some()
+        || error
+            .downcast_ref::<crate::cdp::PageUnresponsive>()
+            .is_some()
+}
+
+/// Interpret a navigation check made after an action that has already run.
+fn navigation_after_input(result: Result<bool>, action: &'static str) -> Result<bool> {
+    match result {
+        Ok(navigated) => Ok(navigated),
+        Err(e) if is_page_stall(&e) => Err(e.context(format!(
+            "The {action} already ran, but the navigation check could not finish"
+        ))),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Whether an event is this session's load completion. `Page.loadEventFired`
+/// carries no frame or session ID in its params, so check the envelope's
+/// session ID; `frameStoppedLoading` still has to name the main frame.
+fn load_completion_matches(
+    event: &serde_json::Value,
+    session_id: &str,
+    main_frame_id: &str,
+) -> bool {
+    event["sessionId"].as_str() == Some(session_id)
+        && match event["method"].as_str() {
+            Some("Page.loadEventFired") => true,
+            Some("Page.frameStoppedLoading") => {
+                event["params"]["frameId"].as_str() == Some(main_frame_id)
+            }
+            _ => false,
+        }
+}
+
+/// Wait for this session's load completion. A stale session left attached by
+/// a failed detach can otherwise end the wait with its own load event before
+/// this tab commits.
+async fn wait_for_load_in_session(
+    client: &mut CdpClient,
+    session_id: &str,
+    main_frame_id: &str,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(idx) = client
+            .events
+            .iter()
+            .position(|e| load_completion_matches(e, session_id, main_frame_id))
+        {
+            client.events.remove(idx);
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(()); // an ordinary no-event timeout is not a failure
+        }
+        let text = tokio::time::timeout(remaining, client.read_text())
+            .await
+            .map_err(|_| {
+                anyhow!("Timeout waiting for any event [\"Page.loadEventFired\", \"Page.frameStoppedLoading\"]")
+            })??;
+        let event: serde_json::Value = serde_json::from_str(&text)?;
+        if event.get("method").is_some() {
+            client.push_event(event);
+        }
+    }
+}
+
 pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str) -> Result<bool> {
     let main_frame_id = main_frame_id(client, session_id).await?;
     let in_main_frame = |m: &str, p: &serde_json::Value| {
@@ -380,6 +485,7 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
         .await;
     let mut method = match started {
         Ok((method, _)) => method,
+        Err(e) if is_page_stall(&e) => return Err(e),
         Err(_) => return Ok(false),
     };
     if method == "Page.frameRequestedNavigation" {
@@ -392,6 +498,7 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
             .await
         {
             Ok((m, _)) => method = m,
+            Err(e) if is_page_stall(&e) => return Err(e),
             Err(_) => return Ok(false),
         }
     }
@@ -417,20 +524,10 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
             .retain(|e| e["method"] != "Page.loadEventFired");
     }
 
-    // A full navigation started on the main frame, so wait for it to finish loading
-    let _ = client
-        .wait_for_event_match(
-            &["Page.loadEventFired", "Page.frameStoppedLoading"],
-            std::time::Duration::from_secs(10),
-            |m, p| {
-                if m == "Page.frameStoppedLoading" {
-                    p.get("frameId").and_then(|f| f.as_str()) == Some(&main_frame_id)
-                } else {
-                    true // Page.loadEventFired is page-wide
-                }
-            },
-        )
-        .await;
+    // A full navigation started on the main frame, so wait for it to finish
+    // loading. A transport failure here is reported; an ordinary timeout just
+    // leaves the commit check below to decide.
+    wait_for_load_in_session(client, session_id, &main_frame_id).await?;
     // Loading can stop without a new document (a download, a 204 reply).
     Ok(main_frame_committed(
         &client.events,
@@ -698,9 +795,8 @@ async fn click_point(
     dispatch_mouse(client, session_id, "mousePressed", x, y, "left", 1).await?;
     dispatch_mouse(client, session_id, "mouseReleased", x, y, "left", 1).await?;
 
-    let new_document = wait_for_navigation(client, session_id)
-        .await
-        .unwrap_or(false);
+    let new_document =
+        navigation_after_input(wait_for_navigation(client, session_id).await, "click")?;
 
     let new_url = client.current_url(session_id).await?;
     let mut result = CommandResult::output(format!("Clicked at ({x}, {y})")).with_navigation(
@@ -1123,17 +1219,21 @@ pub async fn type_text(
         dispatch_key(client, session_id, spec)
             .await
             .map_err(mark_submit_key_dialog)?;
-        new_document = wait_for_navigation(client, session_id)
-            .await
-            .unwrap_or(false);
+        new_document = navigation_after_input(
+            wait_for_navigation(client, session_id).await,
+            "text and submit key",
+        )?;
     }
 
-    let new_url = match submit {
-        Some(_) => client
-            .current_url(session_id)
-            .await
-            .map_err(mark_submit_key_dialog)?,
-        None => client.current_url(session_id).await?,
+    let new_url = match client.current_url(session_id).await {
+        Ok(url) => url,
+        Err(e) if e.downcast_ref::<crate::cdp::DialogOpen>().is_some() => {
+            // The insertion (and the submit key, if any) succeeded; only the
+            // URL readback was interrupted.
+            let dialog = e.downcast_ref::<crate::cdp::DialogOpen>().unwrap();
+            return Ok(readback_dialog_result(text, submit_key, dialog));
+        }
+        Err(e) => return Err(e),
     };
     Ok(CommandResult::output(format!(
         "Typed: {text}{}",
@@ -1155,9 +1255,8 @@ pub async fn press_key(
     // gets buffered from here on came after the key press.
     client.clear_events();
     dispatch_key(client, session_id, &spec).await?;
-    let new_document = wait_for_navigation(client, session_id)
-        .await
-        .unwrap_or(false);
+    let new_document =
+        navigation_after_input(wait_for_navigation(client, session_id).await, "key press")?;
 
     let new_url = client.current_url(session_id).await?;
     let mut result = CommandResult::output(format!("Pressed: {key}")).with_navigation(
@@ -1362,6 +1461,90 @@ async fn dispatch_key(client: &mut CdpClient, session_id: &str, spec: &KeySpec) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The action has already run, so a typed failure from the follow-up page
+    /// call must be reported with that context instead of spending another
+    /// full page-call budget on `current_url`.
+    #[test]
+    fn a_stalled_navigation_check_after_an_input_is_propagated() {
+        let stalled = navigation_after_input(
+            Err(anyhow::anyhow!(crate::cdp::PageUnresponsive(
+                "no answer".into()
+            ))),
+            "click",
+        );
+        let err = stalled.unwrap_err();
+        assert!(err.downcast_ref::<crate::cdp::PageUnresponsive>().is_some());
+        assert!(err.to_string().contains("click already ran"));
+
+        let lost = navigation_after_input(
+            Err(anyhow::anyhow!(crate::cdp::ConnectionLost("closed".into()))),
+            "key press",
+        );
+        let err = lost.unwrap_err();
+        assert!(err.downcast_ref::<crate::cdp::ConnectionLost>().is_some());
+        assert!(err.to_string().contains("key press already ran"));
+
+        assert!(navigation_after_input(Ok(true), "click").unwrap());
+        assert!(!navigation_after_input(Ok(false), "click").unwrap());
+        // A plain no-event timeout is still an ordinary miss.
+        assert!(!navigation_after_input(
+            Err(anyhow::anyhow!("Timeout waiting for any event")),
+            "click"
+        )
+        .unwrap());
+    }
+
+    /// Only the acting session's load event may complete the navigation wait.
+    #[test]
+    fn load_completion_is_scoped_to_the_acting_session() {
+        let load = |session, method: &str, frame| {
+            serde_json::json!({"sessionId": session, "method": method,
+                "params": {"frameId": frame}})
+        };
+        assert!(load_completion_matches(
+            &load("s2", "Page.loadEventFired", "OTHER"),
+            "s2",
+            "MAIN"
+        ));
+        assert!(load_completion_matches(
+            &load("s2", "Page.frameStoppedLoading", "MAIN"),
+            "s2",
+            "MAIN"
+        ));
+        // The stale session's event cannot end this wait.
+        assert!(!load_completion_matches(
+            &load("s1", "Page.loadEventFired", "MAIN"),
+            "s2",
+            "MAIN"
+        ));
+        // A different frame's stop is not this navigation's completion.
+        assert!(!load_completion_matches(
+            &load("s2", "Page.frameStoppedLoading", "OTHER"),
+            "s2",
+            "MAIN"
+        ));
+    }
+
+    /// A dialog after insertion belongs to the URL readback, not the insertion
+    /// or the submit key.
+    #[test]
+    fn a_readback_dialog_does_not_claim_the_submit_key_was_skipped() {
+        let dialog = crate::cdp::DialogOpen {
+            dialog_type: "alert".into(),
+            message: "later".into(),
+        };
+        let none = readback_dialog_result("hi", None, &dialog).output;
+        assert!(none.contains("text was inserted"));
+        assert!(none.contains("URL check"));
+        assert!(!none.contains("did not run"));
+        assert!(!none.contains("before the submit key"));
+
+        let with_key = readback_dialog_result("hi", Some("Enter"), &dialog).output;
+        assert!(with_key.contains("text and submit key were already sent"));
+        assert!(with_key.contains("URL check"));
+        assert!(!with_key.contains("did not run"));
+    }
 
     #[test]
     fn key_specs_parse_before_anything_is_sent() {

@@ -171,6 +171,15 @@ fn is_browser_level(cmd: &str) -> bool {
     )
 }
 
+/// A CDP error reply proves Chrome refused the request, so the daemon's stored
+/// state still matches the browser and the prior list can be restored. Any
+/// other failure (a dialog that held the call, a stalled page, a lost socket)
+/// leaves the outcome unknown: the request may already have been written and
+/// applied, so restoring `previous` would claim a rollback that never happened.
+fn browser_refused_request(error: &anyhow::Error) -> bool {
+    error.to_string().starts_with("CDP error in ")
+}
+
 /// Execute a single command from a [`DaemonRequest`].
 ///
 /// Handles target resolution, session attachment, dialog configuration,
@@ -365,8 +374,12 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         }
         client.blocklist.retain(|b| !req.unblock_url.contains(b));
         if let Err(e) = client.apply_network_rules().await {
-            // Never keep a rule Chrome did not receive.
-            client.blocklist = previous;
+            // Only a CDP refusal proves the rule was not applied. Otherwise
+            // the write may have succeeded without a reply; keep the new list
+            // rather than claim a rollback the browser may not have made.
+            if browser_refused_request(&e) {
+                client.blocklist = previous;
+            }
             client.dialog_action = None;
             return Err(e);
         }
@@ -1686,6 +1699,34 @@ mod tests {
         assert!(
             !client.blocklist.contains(&"*.png".to_string()),
             "the rule Chrome never got is not kept"
+        );
+        calls_made(client, browser).await;
+    }
+
+    /// A rule whose reply never arrived may already be in Chrome (the dialog
+    /// opens after the write). Restoring `previous` would claim a rollback the
+    /// browser never made, so the daemon keeps the new list.
+    #[tokio::test]
+    async fn an_unconfirmed_blocklist_rule_is_not_rolled_back() {
+        let (mut client, browser) = fake_browser(|method, params| {
+            if method == "Network.setBlockedURLs"
+                && params["urls"]
+                    .as_array()
+                    .is_some_and(|urls| urls.iter().any(|u| u == "*.png"))
+            {
+                dialog("later")
+            } else {
+                usual(method, params)
+            }
+        })
+        .await;
+        let mut blocklisted = request("evaluate", json!({"expression": "'done'"}));
+        blocklisted.block_url = vec!["*.png".into()];
+        let error = failure(execute_command(&mut client, &blocklisted).await);
+        assert!(is_dialog(&error), "{error:#}");
+        assert!(
+            client.blocklist.contains(&"*.png".to_string()),
+            "the rule may be in Chrome, so no rollback may be claimed"
         );
         calls_made(client, browser).await;
     }
