@@ -30,11 +30,13 @@ pub async fn collect_console(
         client
             .send_to_target(session_id, "Runtime.enable", json!({}))
             .await?;
-        let events_result = client.read_events_for(duration_ms, true).await;
+        // read_events_for returns an error only when the connection is lost,
+        // so skip the cleanup write on failure instead of stalling on a dead socket.
+        let events = client.read_events_for(duration_ms, true).await?;
         let _ = client
             .send_to_target(session_id, "Runtime.disable", json!({}))
             .await;
-        events_result?
+        events
     };
 
     let messages = process_console_events(&events, &type_filter);

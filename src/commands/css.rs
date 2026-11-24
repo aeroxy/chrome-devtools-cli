@@ -877,11 +877,14 @@ fn cascade(
                     {
                         continue;
                     }
-                    // `inherit` always takes the parent's value. `unset` and
-                    // a value invalid at computed-value time do so only for
-                    // properties that inherit by default: on the others the
-                    // initial value is used here.
-                    let needs_parent = if is("inherit") {
+                    // `inherit` always takes the parent's value, and
+                    // `color: currentColor` is defined to behave as `inherit`
+                    // (for other properties like `border-color`, `currentColor`
+                    // uses this element's own `color`). `unset` and a value
+                    // invalid at computed-value time inherit only for
+                    // properties that inherit by default.
+                    let explicit_inherit = is("inherit") || (key == "color" && is("currentcolor"));
+                    let needs_parent = if explicit_inherit {
                         true
                     } else if value.is_none() || is("unset") {
                         is_inherited(&key, non_inheriting)
@@ -910,7 +913,7 @@ fn cascade(
                             // value for a longhand a nearer element inherits:
                             // no more distant ancestor supplies it. `inherit`
                             // keeps looking further up instead.
-                            if stop_on_unset.contains(&key) && !is("inherit") {
+                            if stop_on_unset.contains(&key) && !explicit_inherit {
                                 decided.insert(key.clone());
                             }
                         } else {
@@ -1749,23 +1752,28 @@ struct AnimatedProperties {
     transitions: HashSet<String>,
 }
 
-impl AnimatedProperties {
-    fn keys(&self) -> impl Iterator<Item = &String> {
-        self.animations.iter().chain(self.transitions.iter())
-    }
-}
-
 /// The properties whose value this node takes from a running effect rather
 /// than from its static declarations. A transition outranks even `!important`;
 /// an animation does not, so where an important declaration won here it is that
 /// declaration which supplies the inherited value.
-fn supplying_effects(blocks: &[Block], animated: &AnimatedProperties) -> HashSet<String> {
-    let important_in_use: HashSet<&str> = blocks
+fn supplying_effects(
+    blocks: &[Block],
+    animated: &AnimatedProperties,
+    flow: Option<(&str, &str)>,
+    all: &HashSet<String>,
+) -> HashSet<String> {
+    let mut important_in_use: HashSet<String> = HashSet::new();
+    for d in blocks
         .iter()
         .flat_map(|b| b.decls.iter())
         .filter(|d| d.important && matches!(d.status, Status::Active | Status::Indeterminate))
-        .flat_map(|d| d.longhands.iter().map(String::as_str))
-        .collect();
+    {
+        if d.key() == "all" {
+            important_in_use.extend(all.iter().cloned());
+        } else {
+            important_in_use.extend(d.longhands.iter().map(|l| mapped_key(l, flow)));
+        }
+    }
     animated
         .transitions
         .iter()
@@ -1773,7 +1781,7 @@ fn supplying_effects(blocks: &[Block], animated: &AnimatedProperties) -> HashSet
             animated
                 .animations
                 .iter()
-                .filter(|key| !important_in_use.contains(key.as_str())),
+                .filter(|key| !important_in_use.contains(*key)),
         )
         .cloned()
         .collect()
@@ -1823,7 +1831,7 @@ fn element_cascade(
         inheriting: Some(&registered_inheriting(matched)),
     };
     let all = all_properties(computed, &blocks);
-    let (mut claimed, inherited_keys) = cascade(
+    let (mut claimed, mut inherited_keys) = cascade(
         &mut blocks,
         &HashSet::new(),
         &element,
@@ -1833,10 +1841,13 @@ fn element_cascade(
         animated,
     );
     // A running transition or animation supplies these properties on the
-    // element even when it has no static declaration for them. Claim them
-    // against its ancestors so their declarations are not reported as active
-    // when the effect, not the inherited value, is what the browser uses.
-    claimed.extend(animated.keys().cloned());
+    // element even when it has no static declaration for them. Claim only the
+    // ones the effect actually supplies: an `!important` declaration on the
+    // element (such as `color: inherit !important`) defeats an animation, while
+    // transitions outrank `!important`.
+    let supplied = supplying_effects(&blocks, animated, element.flow, &all);
+    claimed.extend(supplied.iter().cloned());
+    inherited_keys.retain(|k| !supplied.contains(k));
     (blocks, claimed, inherited_keys)
 }
 
@@ -1982,13 +1993,16 @@ fn build_report_with_animated(
         // An effect on this ancestor supplies the value the element inherits,
         // so a declaration further up is not in use. Keep the inheritance path
         // when an animation was displaced by an important declaration here.
-        claimed.extend(supplying_effects(&blocks, ancestor_animated));
+        let supplied = supplying_effects(&blocks, ancestor_animated, flow, &inherited_all);
+        claimed.extend(supplied.iter().cloned());
         // A longhand decided here no longer reaches from a further ancestor.
         // A non-inherited one stays eligible only while the parent takes it
         // from its own parent; otherwise the parent's initial value is what
         // the element inherits.
         inherited_keys.retain(|k| {
-            !set_here.contains(k) && (is_inherited(k, &non_inheriting) || more_parent.contains(k))
+            !set_here.contains(k)
+                && !supplied.contains(k)
+                && (is_inherited(k, &non_inheriting) || more_parent.contains(k))
         });
         inherited_keys.extend(more_parent);
         let rules = shown_blocks(
@@ -3962,6 +3976,72 @@ Note: Matched rules, computed values and page details are read in separate reque
             }),
             Status::Indeterminate
         );
+    }
+
+    /// `color: inherit !important` defeats an animation on `color`, so the
+    /// parent's color stays active; a transition still outranks `!important`.
+    #[test]
+    fn important_inherit_keeps_parent_active_against_animation() {
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = authored(
+            &[("color", "inherit !important")],
+            &[("color", "inherit !important")],
+        );
+        let parent_status = |effect: AnimatedProperties| {
+            let report = build_report_with_animated(
+                &m,
+                &computed(),
+                &sheets(),
+                &page(),
+                &CssOptions::default(),
+                &AnimatedStyles {
+                    element: effect,
+                    ..Default::default()
+                },
+                None,
+            );
+            report.inherited[0].rules[0]
+                .decls
+                .iter()
+                .find(|d| d.name == "color")
+                .unwrap()
+                .status
+        };
+        assert_eq!(
+            parent_status(AnimatedProperties {
+                animations: HashSet::from(["color".into()]),
+                ..Default::default()
+            }),
+            Status::Active
+        );
+        assert_eq!(
+            parent_status(AnimatedProperties {
+                transitions: HashSet::from(["color".into()]),
+                ..Default::default()
+            }),
+            Status::Overridden
+        );
+    }
+
+    /// `color: currentColor` inherits the parent's color, whereas
+    /// `border-color: currentColor` uses the element's own color.
+    #[test]
+    fn current_color_inherits_only_for_color() {
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = authored(
+            &[("color", "currentColor"), ("border-color", "currentColor")],
+            &[("color", "currentColor"), ("border-color", "currentColor")],
+        );
+        let report = build_report(&m, &computed(), &sheets(), &page(), &CssOptions::default());
+        let parent_color = report.inherited[0].rules[0]
+            .decls
+            .iter()
+            .find(|d| d.name == "color")
+            .unwrap()
+            .status;
+        assert_eq!(parent_color, Status::Active);
     }
 
     /// An ancestor's logical longhand reaches an explicitly inheriting child

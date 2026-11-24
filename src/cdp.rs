@@ -235,12 +235,11 @@ pub struct CdpClient {
     /// `fetch_may_be_enabled` cannot decide this: a different session may have
     /// set it. A session that failed before the write needs no such record.
     fetch_enable_sent_sessions: std::collections::HashSet<String>,
-    /// Mock policy of sessions left intercepting by a failed detach, keyed by
-    /// that session. Returning to its tab moves the tab's mocks into the active
-    /// list; a late pause from the old session still needs its own policy or
-    /// `reply_to_paused` would let the request through unmocked.
-    interceptor_mocks:
-        std::collections::HashMap<String, Vec<crate::commands::network_mock::NetworkMock>>,
+    /// Target ID of each session left intercepting by a failed detach. A late
+    /// pause on that session always resolves its mocks through its tab's live
+    /// or saved list — never a stale copy — so mock additions and removals on
+    /// the tab apply immediately and hit counts stay in one place.
+    retained_session_targets: std::collections::HashMap<String, String>,
     /// `Fetch.requestPaused` events not yet answered. The page's request
     /// waits until they are, so every read answers them first.
     paused_requests: std::collections::VecDeque<Value>,
@@ -533,7 +532,7 @@ impl CdpClient {
             fetch_may_be_enabled: false,
             sessions_may_intercept: std::collections::HashSet::new(),
             fetch_enable_sent_sessions: std::collections::HashSet::new(),
-            interceptor_mocks: std::collections::HashMap::new(),
+            retained_session_targets: std::collections::HashMap::new(),
             paused_requests: std::collections::VecDeque::new(),
             emulation_saved: std::collections::HashMap::new(),
         })
@@ -589,13 +588,9 @@ impl CdpClient {
             // A detach does not close an open dialog, and only the session
             // that saw it can settle it. Keep the dialog on that session while
             // the detach is in flight: a close arriving meanwhile is applied
-            // to the session, so the tab must not inherit a stale record. The
-            // dialog is saved for the tab only if it is still open afterwards,
-            // where a later session can report or handle it.
-            let dialog_target = old_target
-                .as_deref()
-                .filter(|_| self.open_dialog_for(old_session).is_some())
-                .map(str::to_string);
+            // to the session, and a dialog opening during the wait is recorded
+            // too. Save for the tab only if a dialog is open afterwards.
+            let dialog_target = old_target.clone();
             match self
                 .send("Target.detachFromTarget", json!({"sessionId": old_session}))
                 .await
@@ -614,13 +609,15 @@ impl CdpClient {
                 }
                 Err(_) => {
                     // A failed detach can leave the old tab's Fetch interception
-                    // and paused requests alive. Remember it so a later tab's
-                    // successful detach cannot end the idle reads it still
-                    // needs. Answer its paused requests now, while the active
-                    // mocks still belong to that tab: once they are replaced
-                    // below, a URL match would send another tab's mock to this
-                    // page (and count its hit).
+                    // and paused requests alive. Remember it and its target so
+                    // later tabs keep idle reads on and resolve its mocks from
+                    // its tab's live/saved list. Answer its paused requests now
+                    // before switching the active tab's state.
                     self.sessions_may_intercept.insert(old_session.clone());
+                    if let Some(ref target) = old_target {
+                        self.retained_session_targets
+                            .insert(old_session.clone(), target.clone());
+                    }
                     self.answer_paused_requests().await?;
                 }
             }
@@ -690,13 +687,12 @@ impl CdpClient {
         // saved state starts clean — overrides from other tabs don't leak in.
         let restored = self.emulation_saved.remove(target_id).unwrap_or_default();
         // A session whose detach failed can still intercept on its old tab.
-        // Returning here consumes the tab's saved state for the new session;
-        // keep the old session's mock policy under its own id so a late pause
-        // from it is answered from that list, not allowed through unmocked.
+        // Link it to this target so late pauses keep using the tab's current
+        // mock list (active here, or saved once we switch away again).
         if let Some(sid) = restored.session_id.as_deref() {
             if self.sessions_may_intercept.contains(sid) {
-                self.interceptor_mocks
-                    .insert(sid.to_string(), restored.network_mocks.clone());
+                self.retained_session_targets
+                    .insert(sid.to_string(), target_id.to_string());
             }
         }
         self.blocklist = restored.blocklist;
@@ -781,10 +777,8 @@ impl CdpClient {
             let fetch_was_enabled = self.fetch_enable_sent_sessions.remove(session_id);
             if fetch_was_enabled && !connection_lost {
                 self.sessions_may_intercept.insert(session_id.to_string());
-                if let Some(state) = self.emulation_saved.get(failed_target_id) {
-                    self.interceptor_mocks
-                        .insert(session_id.to_string(), state.network_mocks.clone());
-                }
+                self.retained_session_targets
+                    .insert(session_id.to_string(), failed_target_id.to_string());
             }
         }
 
@@ -813,6 +807,15 @@ impl CdpClient {
     pub fn forget_target(&mut self, target_id: &str) {
         self.emulation_saved.remove(target_id);
         self.orphan_dialogs.remove(target_id);
+        let retained: Vec<String> = self
+            .retained_session_targets
+            .iter()
+            .filter(|(_, tid)| tid.as_str() == target_id)
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        for sid in retained {
+            self.session_ended(&sid);
+        }
         if self.persistent_target_id.as_deref() == Some(target_id) {
             let session = self.persistent_session.clone();
             self.forget_dialog(session.as_deref());
@@ -998,6 +1001,11 @@ impl CdpClient {
 
     pub(crate) fn push_event(&mut self, event: Value) {
         self.note_dialog_event(&event);
+        if event["method"] == "Target.detachedFromTarget" {
+            if let Some(sid) = event["params"]["sessionId"].as_str() {
+                self.session_ended(sid);
+            }
+        }
         if event["method"] == "Fetch.requestPaused" {
             self.paused_requests.push_back(event);
             return;
@@ -1808,12 +1816,20 @@ impl CdpClient {
         &self,
         session: Option<&str>,
     ) -> &[crate::commands::network_mock::NetworkMock] {
-        // A session whose mocks were stashed during a tab switch (the outgoing
-        // tab after a failed detach) can still pause requests while the new
-        // session is being attached, when `persistent_session` is still None.
-        // Its saved list is the source of truth for that session; the active
-        // list belongs to the outgoing tab only before the stash.
+        // A retained session from a failed detach resolves through its target's
+        // authoritative mock list — saved if stashed (including mid-switch or
+        // mid-cleanup), active if that tab is active — before the generic
+        // `persistent_session.is_none()` fallback can hijack it.
         if let Some(session) = session {
+            if let Some(target_id) = self.retained_session_targets.get(session) {
+                if let Some(state) = self.emulation_saved.get(target_id) {
+                    return &state.network_mocks;
+                }
+                if self.persistent_target_id.as_deref() == Some(target_id.as_str()) {
+                    return &self.network_mocks;
+                }
+                return &[];
+            }
             if let Some(state) = self
                 .emulation_saved
                 .values()
@@ -1828,13 +1844,6 @@ impl CdpClient {
         {
             return &self.network_mocks;
         }
-        // Back here on the old tab, its saved state was consumed by the new
-        // session; a still-intercepting older session has its own record.
-        if let Some(session) = session {
-            if let Some(mocks) = self.interceptor_mocks.get(session) {
-                return mocks;
-            }
-        }
         &[]
     }
 
@@ -1845,9 +1854,16 @@ impl CdpClient {
         session: Option<&str>,
         index: usize,
     ) -> Option<&mut crate::commands::network_mock::NetworkMock> {
-        // Use the same list [`Self::mocks_for_session`] chose, so an
-        // attach-window pause credits the hit to the outgoing tab's saved mock.
         if let Some(session) = session {
+            if let Some(target_id) = self.retained_session_targets.get(session).cloned() {
+                if let Some(state) = self.emulation_saved.get_mut(&target_id) {
+                    return state.network_mocks.get_mut(index);
+                }
+                if self.persistent_target_id.as_deref() == Some(target_id.as_str()) {
+                    return self.network_mocks.get_mut(index);
+                }
+                return None;
+            }
             if let Some(state) = self
                 .emulation_saved
                 .values_mut()
@@ -1861,11 +1877,6 @@ impl CdpClient {
             || self.persistent_session.as_deref() == session
         {
             return self.network_mocks.get_mut(index);
-        }
-        if let Some(session) = session {
-            if let Some(mocks) = self.interceptor_mocks.get_mut(session) {
-                return mocks.get_mut(index);
-            }
         }
         None
     }
@@ -1899,12 +1910,22 @@ impl CdpClient {
     /// failed `Fetch.disable`: there the same session may still intercept.
     fn session_ended(&mut self, session_id: &str) {
         self.sessions_may_intercept.remove(session_id);
-        self.interceptor_mocks.remove(session_id);
+        self.retained_session_targets.remove(session_id);
         self.fetch_enable_sent_sessions.remove(session_id);
-        // Only stop reading when no other session may still be intercepting:
-        // a failed detach on an earlier tab leaves its Fetch domain live even
-        // though this tab's detach succeeded.
-        if self.sessions_may_intercept.is_empty() {
+        for saved in self.emulation_saved.values_mut() {
+            if saved.session_id.as_deref() == Some(session_id) {
+                saved.session_id = None;
+            }
+        }
+        // `fetch_may_be_enabled` belongs to the active persistent session: only
+        // clear it when that session ended (or none is active) and no other
+        // retained session may still be intercepting.
+        if self
+            .persistent_session
+            .as_deref()
+            .is_none_or(|active| active == session_id)
+            && self.sessions_may_intercept.is_empty()
+        {
             self.fetch_may_be_enabled = false;
         }
         self.paused_requests
@@ -3704,7 +3725,9 @@ mod tests {
                     _ => json!({"id": call["id"], "result": {}}),
                 };
                 calls.push(call);
-                ws.send(Message::Text(reply.to_string())).await.unwrap();
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    break;
+                }
             }
             calls
         });
@@ -3799,7 +3822,9 @@ mod tests {
                     _ => json!({"id": call["id"], "result": {}}),
                 };
                 calls.push(call);
-                ws.send(Message::Text(reply.to_string())).await.unwrap();
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    break;
+                }
             }
             calls
         });
@@ -4154,7 +4179,14 @@ mod tests {
             .expect_err("setup fails after Fetch.enable");
         assert!(err.to_string().contains("refused"), "{err:#}");
         assert!(client.sessions_may_intercept.contains("S-new"));
-        assert_eq!(client.interceptor_mocks["S-new"].len(), 1);
+        assert_eq!(
+            client
+                .retained_session_targets
+                .get("S-new")
+                .map(String::as_str),
+            Some("T-new")
+        );
+        assert_eq!(client.mocks_for_session(Some("S-new")).len(), 1);
         assert!(client.wants_idle_reads());
         drop(client);
         chrome.await.unwrap();
@@ -4219,7 +4251,9 @@ mod tests {
                     _ => json!({"id": call["id"], "result": {}}),
                 };
                 calls.push(call);
-                ws.send(Message::Text(reply.to_string())).await.unwrap();
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    break;
+                }
             }
             calls
         });
@@ -4249,7 +4283,7 @@ mod tests {
             .await
             .expect("return to the old tab");
         assert!(!client.emulation_saved.contains_key("T-old"));
-        assert_eq!(client.interceptor_mocks["S-old"][0].hits, 0);
+        assert_eq!(client.network_mocks[0].hits, 0);
 
         client.push_event(json!({
             "method": "Fetch.requestPaused", "sessionId": "S-old",
@@ -4260,7 +4294,36 @@ mod tests {
             .answer_paused_requests()
             .await
             .expect("the late request is answered");
-        assert_eq!(client.interceptor_mocks["S-old"][0].hits, 1);
+        assert_eq!(client.network_mocks[0].hits, 1);
+
+        // Removing the mock on the active tab keeps the retained session in
+        // step: a subsequent pause from S-old passes through instead of using
+        // a stale copy, and no hit is counted.
+        client.network_mocks.clear();
+        client.push_event(json!({
+            "method": "Fetch.requestPaused", "sessionId": "S-old",
+            "params": {"requestId": "R2", "request": {"url": "https://a.test/"},
+                       "resourceType": "Fetch"}
+        }));
+        client
+            .answer_paused_requests()
+            .await
+            .expect("removed mock lets the retained session continue");
+
+        // When Chrome later reports the old session detached, its interception
+        // state is dropped without clearing another live session's flag.
+        client.fetch_may_be_enabled = true;
+        client.push_event(json!({
+            "method": "Target.detachedFromTarget",
+            "params": {"sessionId": "S-old"}
+        }));
+        assert!(!client.sessions_may_intercept.contains("S-old"));
+        assert!(!client.retained_session_targets.contains_key("S-old"));
+        assert!(
+            client.fetch_may_be_enabled,
+            "detaching S-old must not clear the active session's fetch flag"
+        );
+
         drop(client);
         let calls = chrome.await.unwrap();
         let answered = calls
@@ -4271,6 +4334,14 @@ mod tests {
         assert_eq!(
             answered["params"]["body"],
             base64::engine::general_purpose::STANDARD.encode("old")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call["method"] == "Fetch.continueRequest"
+                    && call["sessionId"] == "S-old"
+                    && call["params"]["requestId"] == "R2"),
+            "removed mock must continue instead of fulfilling: {calls:?}"
         );
     }
 }

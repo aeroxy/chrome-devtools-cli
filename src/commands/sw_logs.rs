@@ -84,7 +84,9 @@ pub async fn collect_sw_logs(
         return Ok(CommandResult::output(err));
     }
 
-    let events_result = client.read_events_for(duration_ms, true).await;
+    // read_events_for returns an error only when the connection is lost, so
+    // skip cleanup writes on a dead socket instead of stalling on them.
+    let events = client.read_events_for(duration_ms, true).await?;
 
     for (_, session_id) in &sessions {
         let _ = client
@@ -92,8 +94,6 @@ pub async fn collect_sw_logs(
             .await;
         let _ = client.detach_from_target(session_id).await;
     }
-
-    let events = events_result?;
 
     let mut messages = Vec::new();
     for event in &events {

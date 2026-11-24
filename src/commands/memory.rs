@@ -1522,9 +1522,9 @@ struct HeapSnapshotClassDiff {
     removed_count: usize,
     added_size: u64,
     removed_size: u64,
-    /// Size change of objects whose id and class are in both snapshots. An
-    /// object that only grew has no added/removed row, but still grew the heap.
-    retained_size_delta: i64,
+    /// Net byte change (`added_size - removed_size + retained_size_delta`),
+    /// checked against `i64` in `diff_snapshots`.
+    size_delta: i64,
 }
 
 impl HeapSnapshotClassDiff {
@@ -1532,9 +1532,8 @@ impl HeapSnapshotClassDiff {
         self.added_count as i64 - self.removed_count as i64
     }
 
-    /// Exact: `diff_snapshots` keeps both totals below 2^63.
     fn size_delta(&self) -> i64 {
-        (self.added_size as i64 - self.removed_size as i64).saturating_add(self.retained_size_delta)
+        self.size_delta
     }
 }
 
@@ -1610,16 +1609,16 @@ fn diff_snapshots(base: &Aggregates, current: &Aggregates) -> Result<Vec<HeapSna
             },
             |_, from, to| retained_size_delta += i128::from(to) - i128::from(from),
         );
-        let retained_size_delta = i64::try_from(retained_size_delta).with_context(|| {
+        let retained_size_delta_i64 = i64::try_from(retained_size_delta).with_context(|| {
             format!(
                 "Corrupt snapshot: retained objects of class '{}' changed size by 2^63 bytes or \
                  more",
                 key.name
             )
         })?;
-        if added_count > 0 || removed_count > 0 || retained_size_delta != 0 {
-            // `size_delta` subtracts the totals as i64s. Only a corrupt file
-            // reaches 2^63 bytes.
+        if added_count > 0 || removed_count > 0 || retained_size_delta_i64 != 0 {
+            // Keep both totals below 2^63 and reject a combined net delta
+            // outside i64 instead of clamping it.
             let total = |size: u128, objects: &str| {
                 u64::try_from(size)
                     .ok()
@@ -1632,13 +1631,23 @@ fn diff_snapshots(base: &Aggregates, current: &Aggregates) -> Result<Vec<HeapSna
                         )
                     })
             };
+            let added_size = total(added_size, "the current snapshot's added")?;
+            let removed_size = total(removed_size, "the base snapshot's removed")?;
+            let combined = i128::from(added_size) - i128::from(removed_size) + retained_size_delta;
+            let size_delta = i64::try_from(combined).with_context(|| {
+                format!(
+                    "Corrupt snapshot: class '{}' net size delta ({combined} bytes) is outside \
+                     the signed 64-bit range",
+                    key.name
+                )
+            })?;
             diffs.push(HeapSnapshotClassDiff {
                 key: key.clone(),
                 added_count,
                 removed_count,
-                added_size: total(added_size, "the current snapshot's added")?,
-                removed_size: total(removed_size, "the base snapshot's removed")?,
-                retained_size_delta,
+                added_size,
+                removed_size,
+                size_delta,
             });
         }
     }
@@ -3578,6 +3587,20 @@ mod tests {
             compute_class_node_detail(&base, &current, &diffs[0].key),
             []
         );
+
+        // Exact i64::MAX succeeds; exceeding it via retained + added rejects
+        // as corrupt instead of saturating to i64::MAX.
+        let max_growth = (1u64 << 63) - 1;
+        let exact_base = objects(&[(11, "Big", 1)]);
+        let exact_cur = objects(&[(11, "Big", 1 + max_growth)]);
+        let exact = diff_snapshots(&exact_base, &exact_cur).unwrap();
+        assert_eq!(exact[0].size_delta(), i64::MAX);
+
+        let overflow_cur = objects(&[(11, "Big", 1 + max_growth), (12, "Big", 1)]);
+        let err = diff_snapshots(&exact_base, &overflow_cur)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Corrupt snapshot:"), "{err}");
     }
 
     /// A store whose size was moved onto its sole owner has no counted class
