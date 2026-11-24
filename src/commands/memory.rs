@@ -82,6 +82,7 @@ async fn take_heapsnapshot_within(
         .await
         .context("Failed to enable HeapProfiler via CDP")?;
 
+    client.heap_capture = true;
     let snapshot_result = async {
         // Send the takeHeapSnapshot command without blocking so we can process chunks as they stream in
         let msg_id = client.send_raw_no_wait(
@@ -150,6 +151,7 @@ async fn take_heapsnapshot_within(
         Ok::<(), anyhow::Error>(())
     }
     .await;
+    client.heap_capture = false;
 
     snapshot_result?;
 
@@ -4609,6 +4611,71 @@ mod tests {
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "earlier");
+        drop(client);
+        browser.abort();
+    }
+
+    /// A quiet spell makes the capture ping the browser, and a chunk that
+    /// arrives before the ping's reply is the capture's all the same:
+    /// dropping it would write an incomplete snapshot.
+    #[tokio::test]
+    async fn test_take_heapsnapshot_keeps_chunks_read_by_a_liveness_check() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let browser = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let chunk = |i: u32| {
+                Message::Text(
+                    json!({
+                        "method": "HeapProfiler.addHeapSnapshotChunk",
+                        "params": { "chunk": i.to_string() },
+                        "sessionId": "S",
+                    })
+                    .to_string(),
+                )
+            };
+            let mut capture = None;
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let reply = |id: &serde_json::Value| {
+                    Message::Text(json!({ "id": id, "result": {} }).to_string())
+                };
+                match req["method"].as_str() {
+                    // One chunk, then quiet until the capture checks in.
+                    Some("HeapProfiler.takeHeapSnapshot") => {
+                        ws.send(chunk(0)).await.unwrap();
+                        capture = Some(req["id"].clone());
+                    }
+                    // The rest arrives just ahead of the check's reply.
+                    Some("Browser.getVersion") => {
+                        ws.send(chunk(1)).await.unwrap();
+                        ws.send(reply(&req["id"])).await.unwrap();
+                        if let Some(id) = capture.take() {
+                            ws.send(reply(&id)).await.unwrap();
+                        }
+                    }
+                    _ => ws.send(reply(&req["id"])).await.unwrap(),
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("s.heapsnapshot");
+        let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
+        take_heapsnapshot_within(
+            &mut client,
+            "S",
+            output.to_str().unwrap(),
+            OutputFormat::Text,
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "01");
+        assert!(!client.heap_capture);
         drop(client);
         browser.abort();
     }

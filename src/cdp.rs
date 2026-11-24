@@ -179,6 +179,11 @@ pub struct CdpClient {
     /// Ids of calls that are waiting for a reply. A reply to any other id is
     /// fire-and-forget and dropped, not parked in `deferred_replies` forever.
     awaiting_replies: std::collections::HashSet<u64>,
+    /// A `take-heapsnapshot` capture is reading its chunks. A liveness ping
+    /// in the middle of it sets the chunks it reads aside for the capture,
+    /// in order, instead of handing them to `push_event`, which drops them as
+    /// left over from a capture given up on.
+    pub(crate) heap_capture: bool,
     /// Set once an input command has sent its action to the page. A dialog
     /// that interrupts the command after that is the action's doing; before
     /// it, the action never ran.
@@ -514,6 +519,7 @@ impl CdpClient {
             open_dialogs: Vec::new(),
             orphan_dialogs: std::collections::HashMap::new(),
             awaiting_replies: std::collections::HashSet::new(),
+            heap_capture: false,
             input_sent: false,
             events: std::collections::VecDeque::new(),
             unread: std::collections::VecDeque::new(),
@@ -1008,6 +1014,8 @@ impl CdpClient {
     pub(crate) fn forget_abandoned_calls(&mut self) {
         self.awaiting_replies.clear();
         self.deferred_replies.clear();
+        // Nor is a capture still reading.
+        self.heap_capture = false;
     }
 
     pub(crate) fn push_event(&mut self, event: Value) {
@@ -1544,6 +1552,11 @@ impl CdpClient {
                 // Closings wait with openings, so the next reader sees them in
                 // wire order and a dialog closed meanwhile isn't left open.
                 Some("Page.javascriptDialogOpening" | "Page.javascriptDialogClosed") => {
+                    self.unread.push_back(text)
+                }
+                // The capture reads these itself; losing one would leave its
+                // file incomplete.
+                Some("HeapProfiler.addHeapSnapshotChunk") if self.heap_capture => {
                     self.unread.push_back(text)
                 }
                 Some(_) => self.push_event(msg),
