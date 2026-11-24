@@ -1766,7 +1766,7 @@ impl CdpClient {
     }
 
     /// [`Self::settle_open_dialog`] as part of `call`, within its limit.
-    async fn settle_dialog_within(
+    pub(crate) async fn settle_dialog_within(
         &mut self,
         session_id: &str,
         call: &str,
