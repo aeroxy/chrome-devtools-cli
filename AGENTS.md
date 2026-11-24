@@ -106,7 +106,8 @@ the call pings the browser (`check_alive`, which `caffeinate` uses too): no
 answer within 15s is `ConnectionLost` and the daemon exits. A ping can
 therefore stretch a call past its limit by up to 15s, and a reply that
 arrives during that ping is still returned. Otherwise the call ends with
-`PageUnresponsive`, and a `Runtime.*` call has its script stopped. The
+`PageUnresponsive`, and a `Runtime.*` call has a stop requested for its
+script (Chrome does not confirm it). The
 daemon serves one request at a time, so this bound is what keeps one stuck
 page from blocking every caller.
 
@@ -115,7 +116,10 @@ announces the dialog once, only to sessions that had `Page` enabled, and only
 those can handle it (a new session gets "No dialog is showing"). So
 `note_dialog_event` records it from whichever read sees it (`open_dialog`),
 and every call on that session first handles it with the command's
-`--dialog-action` or fails with the typed `DialogOpen` at once. Handling
+`--dialog-action` or fails with the typed `DialogOpen` at once. The dialog
+holds up only its page, so without a `--dialog-action` a browser-level call
+that reads it (`list-pages`, `new-page`, the page lookup every command starts
+with) only records it and still waits for its own reply. Handling
 counts against the limit of the call it holds up (`handle_dialog_helper` gets
 that call's clock): a dialog that opens after the limit is left open and
 recorded, and the call fails with `DialogOpen` (`dialog_past_limit`).

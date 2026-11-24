@@ -138,7 +138,7 @@ chrome-devtools --page 0 navigate https://example.com
 - **Extraction**: `screenshot`, `snapshot` (accessibility tree), `evaluate` (JavaScript), `read-page` (page content as markdown), `run-script` (run local JS file), `adapter` (run site adapter)
 - **Interaction**: `click`, `fill`, `type-text`, `press-key`, `hover`, `click-at`
 - **Emulation**: `emulate` (viewport, mobile, geolocation, CSS media type/features such as dark mode, URL blocking)
-- **Inspection**: `console` (logs), `network` (requests), `cookies` (what the page would send, HttpOnly included), `sw-logs` (extension service workers), `css-styles` (the CSS cascade for one element)
+- **Inspection**: `console` (logs), `network` (requests), `cookies` (the page's cookies, HttpOnly included), `sw-logs` (extension service workers), `css-styles` (the CSS cascade for one element)
 - **Passkeys**: `configure-webauthn` (virtual WebAuthn authenticator)
 - **Third-party tools**: `list-3p-tools`, `execute-3p-tool` (WebMCP tools from `document.modelContext`, else the legacy `window.__dtmcp`)
 - **Synchronization**: `wait-for` (wait for text on page)
@@ -350,8 +350,8 @@ chrome-devtools --target warm-squid evaluate "fetch('/api/user').then(r => r.jso
 chrome-devtools --target warm-squid --json evaluate "performance.navigation"
 
 # Handle a JS dialog (alert, confirm, prompt). While one is open the page answers
-# nothing else, so without --dialog-action a command fails at once with
-# "A javascript dialog is open (...)".
+# nothing else, so without --dialog-action a command on that page fails at once
+# with "A javascript dialog is open (...)".
 chrome-devtools --target warm-squid evaluate "alert('hi')" --dialog-action accept
 chrome-devtools --target warm-squid evaluate "confirm('sure?')" --dialog-action dismiss
 chrome-devtools --target warm-squid evaluate "prompt('name')" --dialog-action "my-answer"
@@ -520,7 +520,9 @@ grows by a recognizable multiple of N and stands out from background churn.
 chrome-devtools --target warm-squid take-heapsnapshot --output /tmp/base.heapsnapshot
 chrome-devtools --target warm-squid run-script /tmp/repeat.js -a n=10
 chrome-devtools --target warm-squid take-heapsnapshot --output /tmp/target.heapsnapshot
-# Undo the action: close the panel, go back to the starting view, etc.
+# Undo what the action leaves in place (close a panel it opened, go back to the
+# starting view). repeat.js below closes each dialog itself, so here there is
+# nothing to undo and the third snapshot is simply a later one.
 chrome-devtools --target warm-squid take-heapsnapshot --output /tmp/final.heapsnapshot
 ```
 
@@ -558,7 +560,7 @@ chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /t
 A leak is a class whose `countDelta` is about a multiple of N in base → target
 and does not drop in base → final. Here every open/close left one dialog
 `<div>` and its `<button>` behind, while the `(compiled code)` growth was gone
-after the undo, so it was not a leak. Classes are grouped as in the DevTools
+by the final snapshot, so it was not a leak. Classes are grouped as in the DevTools
 Memory panel: `Detached <div>` is DOM no longer in the document, `Function`
 holds every closure and `system / Context` the variables they capture,
 `{a, b, c}` groups plain objects by their properties, and `(string)`,
@@ -858,7 +860,7 @@ chrome-devtools --target warm-squid remove-network-mock             # remove all
 For "logged out after reload", "redirected to the login page", or a request that fails with 401/403:
 
 ```bash
-# The cookies Chrome would send to the page's URL, HttpOnly and partitioned ones
+# The cookies Chrome stores for the page's URL, HttpOnly and partitioned ones
 # included: names, domains, paths, expiry and flags, values hidden
 chrome-devtools --target warm-squid cookies
 chrome-devtools --target warm-squid cookies --url https://example.com/api/
@@ -877,8 +879,9 @@ chrome-devtools --target warm-squid network --type Document --type Fetch --type 
 ```
 
 - **Use `cookies`, not `evaluate "document.cookie"`**: page JavaScript can't see HttpOnly cookies (the session cookie is usually one), and deleting them from JS fails silently. `cookies` reads them over the daemon's approved connection, so the browser asks for no new approval; don't open your own DevTools connection for them.
-- **Values are credentials.** The default table shows only their lengths. Print them (`--header`, `--json`) only when a tool needs them, and don't echo them back to the user or into files without a reason.
+- **Values are credentials.** The default table shows only their lengths. Print them (`--header`, `--json`, `--toon`) only when a tool needs them, and don't echo them back to the user or into files without a reason.
 - `cookies` answers for the page's own site. A partitioned cookie that a cross-site iframe on the page set isn't included.
+- It looks cookies up by URL, so it lists a `SameSite` cookie that a cross-site request to that URL wouldn't carry. What one request actually sent is in `network --request-headers`.
 - Check each suspect cookie's `domain` and `path` (does it cover the failing URL?), `secure` (never sent over `http://`), `sameSite` (`Strict`/`Lax` cookies are not sent on many cross-site requests) and `expires`.
 - `network --request-headers --response-headers` shows which cookies a request actually carried and which `Set-Cookie` headers came back, but not why Chrome rejected a cookie. When that's the question, ask the human to look at the Application and Network panels in DevTools.
 - For a clean, logged-out session, use a throwaway profile (Pattern 16) rather than deleting the user's cookies.
@@ -905,7 +908,7 @@ chrome-devtools --target <name> snapshot
 chrome-devtools --target <name> read-page [--output <path>]
 chrome-devtools --target <name> evaluate "<js-expression>" [--dialog-action accept|dismiss|text]
 chrome-devtools --target <name> network [--duration <ms>] [--type <resource>] [--request-headers] [--response-headers]
-chrome-devtools --target <name> cookies [--url <url>]... [--name <name>]... [--header]   # values only with --header/--json
+chrome-devtools --target <name> cookies [--url <url>]... [--name <name>]... [--header]   # values only with --header/--json/--toon
 chrome-devtools --target <name> console [--duration <ms>] [--type <level>]
 chrome-devtools --target <name> css-styles "<css-selector>" [--computed <prop>,...] [--ua-rules]
 chrome-devtools sw-logs [--duration <ms>] [--extension-id <id>]
@@ -1041,8 +1044,8 @@ computer sleep can still drop the connection.
 
 No command waits forever on a connected browser any more:
 
-- **`<method> got no answer from the page within Ns, though the browser answers`**: the browser is fine but this tab isn't. Usually a JavaScript dialog opened where the daemon couldn't see it (see Pattern 6), otherwise an endless loop (running JavaScript is stopped) or a hung renderer. Setup calls give up after 10s; other calls after 180s (`CHROME_CDP_TIMEOUT_SECS`, read when the daemon starts, raises that for long scripts). Don't retry in a loop: ask the human to close the dialog, or `close-page` the tab. Other tabs keep working.
-- **`The browser did not answer a check within 15s; the connection is treated as lost`**, or **`Writing to the browser did not finish within 180s`** (after a laptop sleep, a dropped network, a remote browser that went away): the daemon exits as for any lost connection. Rerun the command once; the browser may ask the human to approve the new connection, and then the approval steps above apply.
+- **`<method> got no answer from the page within Ns, though the browser answers`**: the browser is fine but this tab isn't. Usually a JavaScript dialog opened where the daemon couldn't see it (see Pattern 6), otherwise an endless loop (a stop is requested for the running JavaScript) or a hung renderer. Setup calls give up after 10s; other calls after 180s (`CHROME_CDP_TIMEOUT_SECS`, read when the daemon starts, raises that for long scripts). Don't retry in a loop: ask the human to close the dialog, or `close-page` the tab. Other tabs keep working.
+- **`The browser did not answer a check within 15s; the connection is treated as lost`**, or **`Writing to the browser did not finish within 180s`** (after a laptop sleep, a dropped network, a remote browser that went away): the daemon exits as for any lost connection. Reconnect with a read-only command such as `list-pages`; the browser may ask the human to approve the new connection, and then the approval steps above apply. Before repeating a command that changes the page (a click that submits a form, a fill), check whether it already took effect: the browser may have run it before the connection dropped.
 
 ## Failure Handling: cannot read DevToolsActivePort / "Operation not permitted"
 

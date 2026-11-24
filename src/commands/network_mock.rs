@@ -18,8 +18,8 @@ use crate::result::CommandResult;
 
 #[derive(Debug, Clone)]
 pub struct NetworkMock {
-    /// URL glob as Chrome's Fetch domain reads it: `*` any characters, `?` one,
-    /// `\` escapes.
+    /// URL glob, as [`glob_match`] reads it: `*` any characters, `?` one, `\`
+    /// escapes.
     pub pattern: String,
     pub resource_type: Option<String>,
     pub action: MockAction,
@@ -193,8 +193,8 @@ fn reason_phrase(status: u16) -> &'static str {
         .unwrap_or("Mocked")
 }
 
-/// Match `text` against a Fetch-domain URL glob: `*` is any run of
-/// characters, `?` exactly one, `\` makes the next character literal.
+/// Match `text` against a mock's URL glob: `*` is any run of characters, `?`
+/// exactly one, `\` makes the next character literal.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
@@ -232,12 +232,36 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     p[pi..].iter().all(|&c| c == '*')
 }
 
+/// What Chrome pauses for `pattern`: the glob with each `?` widened to `*`.
+/// Chrome's own matcher keeps the first place a run of characters fits, and
+/// does not go back for a later one when the `?` after it then fails to
+/// match, so requests the glob matches would go to the network unpaused
+/// (`*a?b` misses `.../aacb`, verified on Chrome 158). With only `*` the
+/// first fit is always right, so Chrome pauses at least what the glob
+/// matches, and [`reply_to_paused`] sends the rest on.
+fn chrome_url_pattern(pattern: &str) -> String {
+    let mut widened = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                widened.push(c);
+                widened.extend(chars.next());
+            }
+            '?' => widened.push('*'),
+            _ => widened.push(c),
+        }
+    }
+    widened
+}
+
 /// The `Fetch.enable` patterns for a set of mocks.
 fn fetch_patterns(mocks: &[NetworkMock]) -> Value {
     let patterns: Vec<Value> = mocks
         .iter()
         .map(|m| {
-            let mut p = json!({"urlPattern": m.pattern, "requestStage": "Request"});
+            let url_pattern = chrome_url_pattern(&m.pattern);
+            let mut p = json!({"urlPattern": url_pattern, "requestStage": "Request"});
             if let Some(t) = &m.resource_type {
                 p["resourceType"] = json!(t);
             }
@@ -306,6 +330,7 @@ pub async fn apply_mocks(client: &mut CdpClient, session_id: &str) -> Result<()>
         client
             .send_to_target(session_id, "Fetch.disable", json!({}))
             .await?;
+        client.fetch_may_be_enabled = false;
         client
             .send_to_target(
                 session_id,
@@ -323,6 +348,9 @@ pub async fn apply_mocks(client: &mut CdpClient, session_id: &str) -> Result<()>
             json!({"cacheDisabled": true}),
         )
         .await?;
+    // Assume the worst until Chrome confirms it is off: a blocked disable
+    // must not stop the daemon from answering paused requests.
+    client.fetch_may_be_enabled = true;
     client
         .send_to_target(session_id, "Fetch.enable", patterns)
         .await?;
@@ -360,7 +388,12 @@ pub async fn mock_network(
         // A mock Chrome refused must not linger, or every later change would
         // resend it and fail too: go back to what applied before.
         client.network_mocks = previous;
-        let _ = apply_mocks(client, session_id).await;
+        if let Err(rollback) = apply_mocks(client, session_id).await {
+            // The disable can be blocked by a dialog, leaving Chrome
+            // intercepting. `fetch_may_be_enabled` keeps idle reads on; say
+            // so rather than hide the failure.
+            return Err(e.context(format!("Could not roll back the mock: {rollback}")));
+        }
         return Err(e);
     }
     Ok(CommandResult::output(format!(
@@ -474,6 +507,20 @@ mod tests {
             action,
             hits: 0,
         }
+    }
+
+    /// Chrome puts `a` at the first one and finds no `?b` after it, so it
+    /// would never pause this request the glob matches.
+    #[test]
+    fn chrome_pauses_everything_the_glob_matches() {
+        let patterns = fetch_patterns(&[
+            mock("https://a.test/*a?b", MockAction::Abort),
+            mock(r"*\?v=?", MockAction::Abort),
+        ]);
+        assert!(glob_match("https://a.test/*a?b", "https://a.test/aacb"));
+        assert_eq!(patterns["patterns"][0]["urlPattern"], "https://a.test/*a*b");
+        // An escaped `?` is the URL's own and stays as it is.
+        assert_eq!(patterns["patterns"][1]["urlPattern"], r"*\?v=*");
     }
 
     #[test]

@@ -227,49 +227,55 @@ async fn do_reload(
     Ok(result.save_output(output).await?.with_navigated_to(url))
 }
 
-/// Which document is showing: its time origin and URL. A reload keeps the URL
-/// but starts a document with a new time origin.
+/// Which document is showing, by the browser's loader ID for the main frame.
+/// A reload keeps the URL, and the page can replace `performance` (and its
+/// time origin), so neither page-provided value can tell the two documents
+/// apart. The loader ID is Chrome's, from the frame tree.
 pub struct DocumentMark {
-    time_origin: f64,
-    url: String,
+    loader_id: String,
 }
 
-/// Read with `returnByValue`, which serializes outside the page: a page can
-/// replace `JSON.stringify`, and the load would then never look complete.
-const DOCUMENT_STATE_JS: &str = "[document.readyState, performance.timeOrigin, location.href]";
+/// The main frame's loader ID from a `Page.getFrameTree` reply.
+fn loader_id_from_tree(tree: &serde_json::Value) -> Result<String> {
+    tree["frameTree"]["frame"]["loaderId"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("Could not read the document's loader ID: {tree}"))
+}
+
+/// Chrome's identity for the current document, independent of page scripts.
+async fn document_loader_id(client: &mut CdpClient, session_id: &str) -> Result<String> {
+    let tree = client
+        .send_to_target(session_id, "Page.getFrameTree", json!({}))
+        .await?;
+    loader_id_from_tree(&tree)
+}
 
 pub async fn document_mark(client: &mut CdpClient, session_id: &str) -> Result<DocumentMark> {
-    let result = client
-        .send_to_target(
-            session_id,
-            "Runtime.evaluate",
-            json!({"expression": DOCUMENT_STATE_JS, "returnByValue": true}),
-        )
-        .await?;
-    let (_, time_origin, url) = parse_document_state(&result)
-        .ok_or_else(|| anyhow::anyhow!("Could not read the page's document state: {result}"))?;
-    Ok(DocumentMark { time_origin, url })
+    Ok(DocumentMark {
+        loader_id: document_loader_id(client, session_id).await?,
+    })
 }
 
-/// The fields of [`DOCUMENT_STATE_JS`]; `None` unless all three are there, so
-/// a document that can't be identified never counts as a new one.
-fn parse_document_state(result: &serde_json::Value) -> Option<(String, f64, String)> {
-    let state = &result["result"]["value"];
-    Some((
-        state[0].as_str()?.to_string(),
-        state[1].as_f64()?,
-        state[2].as_str()?.to_string(),
-    ))
+/// A navigation can destroy the context between probes; that is a reason to
+/// poll again, not to fail the wait.
+fn transient_context_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("Execution context was destroyed") || msg.contains("Cannot find context")
 }
 
 /// Whether `wait_for_load`'s probe shows the load done: readyState
 /// "complete", in a document other than `previous` when there is one.
-fn load_finished(result: &serde_json::Value, previous: Option<&DocumentMark>) -> bool {
+fn load_finished(
+    result: &serde_json::Value,
+    previous: Option<&DocumentMark>,
+    loader_id: Option<&str>,
+) -> bool {
     match previous {
         None => result["result"]["value"] == "complete",
-        Some(p) => parse_document_state(result).is_some_and(|(state, origin, url)| {
-            state == "complete" && (p.time_origin != origin || p.url != url)
-        }),
+        Some(p) => {
+            result["result"]["value"] == "complete" && loader_id.is_some_and(|id| id != p.loader_id)
+        }
     }
 }
 
@@ -293,19 +299,28 @@ pub async fn wait_for_load(
             anyhow::bail!("Timeout ({timeout_ms}ms) waiting for page readyState=complete");
         }
 
-        // Only a wait that has a document to tell apart reads the mark: a
-        // page can replace `performance`, and its time origin with it.
-        let expression = if previous.is_some() {
-            DOCUMENT_STATE_JS
+        // The document identity comes from Chrome, not the page: a page can
+        // replace `performance`, and a reload can keep the same URL.
+        let loader = if previous.is_some() {
+            match document_loader_id(client, session_id).await {
+                Ok(id) => Some(id),
+                Err(e) if transient_context_error(&e) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e.context(format!("wait_for_load failed for session {session_id}")))
+                }
+            }
         } else {
-            "document.readyState"
+            None
         };
         let result = client
             .send_to_target(
                 session_id,
                 "Runtime.evaluate",
                 json!({
-                    "expression": expression,
+                    "expression": "document.readyState",
                     "returnByValue": true,
                 }),
             )
@@ -313,18 +328,14 @@ pub async fn wait_for_load(
 
         match result {
             Ok(val) => {
-                if load_finished(&val, previous) {
+                if load_finished(&val, previous, loader.as_deref()) {
                     return Ok(());
                 }
             }
+            Err(e) if transient_context_error(&e) => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("Execution context was destroyed")
-                    || msg.contains("Cannot find context")
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    continue;
-                }
                 // Context rather than a new error, so a lost connection keeps
                 // its type and the daemon still exits on it.
                 return Err(e.context(format!("wait_for_load failed for session {session_id}")));
@@ -375,46 +386,34 @@ mod tests {
         )));
     }
 
-    /// The state comes back as an array by value; the page's JSON.stringify,
-    /// replaced or not, is never involved.
+    /// Only readyState still comes from the page, read by value; the page's
+    /// JSON.stringify, replaced or not, is never involved.
     #[test]
-    fn document_state_is_read_by_value() {
-        let state = json!({"result": {"type": "object", "subtype": "array",
-            "value": ["complete", 1732371234567.125, "https://a.test/"]}});
-        assert_eq!(
-            parse_document_state(&state),
-            Some((
-                "complete".to_string(),
-                1732371234567.125,
-                "https://a.test/".to_string()
-            ))
-        );
-        let stringified = json!({"result": {"type": "string",
-            "value": "[\"complete\",1732371234567.125,\"https://a.test/\"]"}});
-        assert_eq!(parse_document_state(&stringified), None);
-        let no_origin = json!({"result": {"value": ["complete", null, "https://a.test/"]}});
-        assert_eq!(parse_document_state(&no_origin), None);
-    }
-
-    /// A page that replaced `performance` has no time origin to read, and an
-    /// ordinary load needs none: only a reload has an old document to rule out.
-    #[test]
-    fn only_a_reload_needs_the_document_mark() {
+    fn a_load_needs_only_readystate_by_value() {
         let state = |s: &str| json!({"result": {"type": "string", "value": s}});
-        assert!(load_finished(&state("complete"), None));
-        assert!(!load_finished(&state("interactive"), None));
+        assert!(load_finished(&state("complete"), None, None));
+        assert!(!load_finished(&state("interactive"), None, None));
 
         let old = DocumentMark {
-            time_origin: 1000.5,
-            url: "https://a.test/".into(),
+            loader_id: "old".into(),
         };
-        let mark =
-            |origin: f64| json!({"result": {"value": ["complete", origin, "https://a.test/"]}});
-        assert!(
-            !load_finished(&mark(1000.5), Some(&old)),
-            "the old document"
-        );
-        assert!(load_finished(&mark(2000.25), Some(&old)));
-        assert!(!load_finished(&state("complete"), Some(&old)));
+        assert!(!load_finished(&state("complete"), Some(&old), Some("old")));
+        assert!(load_finished(&state("complete"), Some(&old), Some("new")));
+        assert!(!load_finished(
+            &state("interactive"),
+            Some(&old),
+            Some("new")
+        ));
+        // Without a new identity the old document may still be showing.
+        assert!(!load_finished(&state("complete"), Some(&old), None));
+    }
+
+    /// A page that replaces `performance` or rewrites its URL cannot fake a
+    /// reload: the identity comes from Chrome's frame tree.
+    #[test]
+    fn a_reload_identity_is_browser_reported() {
+        let tree = json!({"frameTree": {"frame": {"id": "MAIN", "loaderId": "L2"}}});
+        assert_eq!(loader_id_from_tree(&tree).unwrap(), "L2");
+        assert!(loader_id_from_tree(&json!({"frameTree": {}})).is_err());
     }
 }

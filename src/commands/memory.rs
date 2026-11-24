@@ -532,7 +532,14 @@ impl Snap {
 
         let mut first_edge: Vec<u32> = Vec::with_capacity(node_count + 1);
         let mut total = 0usize;
+        let mut seen_ids: HashSet<u32> = HashSet::with_capacity(node_count);
         for ord in 0..node_count {
+            // Two records with one ID would be counted in a comparison but
+            // inspected as the same object, with only the last one's size.
+            let id = nodes[ord * node_size + id_off];
+            if !seen_ids.insert(id) {
+                bail!("Corrupt snapshot: duplicate node ID {id} at node {ord}");
+            }
             // Never past `edges.len()`, which fits in a u32.
             first_edge.push(total as u32);
             if let Some(off) = edge_count_off {
@@ -625,12 +632,19 @@ impl Snap {
 
         let lf = &meta.location_fields;
         let mut location_map = HashMap::new();
-        if let (Some(o), Some(s), Some(l), Some(c)) = (
+        let loc = (
             position(lf, "object_index"),
             position(lf, "script_id"),
             position(lf, "line"),
             position(lf, "column"),
-        ) {
+        );
+        if loc.0.is_some() && loc.1.is_some() && loc.2.is_some() && loc.3.is_some() {
+            let (o, s, l, c) = (
+                loc.0.unwrap(),
+                loc.1.unwrap(),
+                loc.2.unwrap(),
+                loc.3.unwrap(),
+            );
             // -1, which V8 writes for a line or column it could not work
             // out; versions that printed it unsigned wrote 4294967295.
             const UNKNOWN: u32 = -1i32 as u32;
@@ -673,6 +687,14 @@ impl Snap {
                 }
                 location_map.insert(at, (chunk[s], chunk[l], chunk[c]));
             }
+        } else if !locations.fields.is_empty() {
+            // A file that declares records but omits a field would have every
+            // record dropped here, merging unrelated constructors below.
+            bail!(
+                "Corrupt snapshot: {} location records but the snapshot omits a required \
+                 location field",
+                locations.fields.len()
+            );
         }
 
         let mut snap = Snap {
@@ -1865,6 +1887,18 @@ pub async fn compare_heapsnapshots_offline(
 /// pairs them. The names in it are any text, line breaks included: V8 embeds
 /// the value's name, which can be a multiline string. DevTools' regex, whose
 /// `.` stops at a line break, takes such a pair for two unrelated edges.
+/// DevTools skips the descriptor links of a `(map descriptors)` array when
+/// ranking paths: maps share those arrays, so a link valid for one map is not
+/// necessarily the right retainer for another.
+fn skip_descriptor_link(snap: &Snap, ord: usize, e: usize) -> bool {
+    if !snap.is(ord, snap.nt.array) || snap.raw_name(ord) != "(map descriptors)" {
+        return false;
+    }
+    snap.edge_name(e)
+        .parse::<usize>()
+        .is_ok_and(|i| i >= 2 && i % 3 == 1)
+}
+
 fn weak_map_pair(name: &str) -> Option<&str> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let shared = name.trim_start_matches(|c: char| c.is_ascii_digit());
@@ -1931,7 +1965,10 @@ fn bfs_from_root(snap: &Snap) -> (Vec<u32>, Vec<u32>, HashMap<usize, usize>) {
             *head += 1;
             for e in snap.edge_range(ord) {
                 let to = snap.edge_to(e);
-                if snap.edge_is(e, snap.et.weak) || dist[to] != NONE {
+                if snap.edge_is(e, snap.et.weak)
+                    || dist[to] != NONE
+                    || skip_descriptor_link(snap, ord, e)
+                {
                     continue;
                 }
                 if snap.edge_is(e, snap.et.internal) {

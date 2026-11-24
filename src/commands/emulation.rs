@@ -256,7 +256,14 @@ pub(crate) async fn emulate_tab(
         actions.push("Geolocation cleared".to_string());
     }
 
-    if params.clear_all || params.clear_media {
+    // `--clear-all` only needs a media call when there is something to
+    // clear: a dialog opening after the other resets must not turn an
+    // otherwise successful clear into a failure. An explicit `--clear-media`
+    // always sends it.
+    let saved_has_media = saved_tab
+        .and_then(|t| client.emulation_saved.get(t))
+        .is_some_and(|s| s.media.is_some());
+    if params.clear_media || (params.clear_all && (client.media.is_some() || saved_has_media)) {
         client
             .send_to_target(
                 session_id,

@@ -478,7 +478,7 @@ pub enum Commands {
         r#type: Vec<String>,
     },
 
-    /// Show the cookies Chrome would send to the page's URL, HttpOnly and
+    /// Show the cookies Chrome stores for the page's URL, HttpOnly and
     /// partitioned ones included, read over the daemon's connection. The
     /// table leaves values out; --header, --json and --toon print them
     Cookies {
@@ -1702,8 +1702,28 @@ fn print_result(result: &result::CommandResult, output_format: format::OutputFor
     );
 }
 
+/// `-oout.json` is clap's attached short-option form, but the expression's
+/// `allow_hyphen_values` makes clap take that token as the expression and the
+/// real expression as an extra argument. Split it before parsing. `evaluate
+/// -- -1` is left alone, so a literal leading dash still reaches the page.
+fn normalize_cli_args(args: &mut Vec<String>) {
+    if let Some(i) = args.iter().position(|a| a == "evaluate") {
+        let path = args
+            .get(i + 1)
+            .and_then(|arg| arg.strip_prefix("-o"))
+            .filter(|p| !p.is_empty() && !p.starts_with('-'))
+            .map(str::to_string);
+        if let Some(path) = path {
+            args[i + 1] = "-o".to_string();
+            args.insert(i + 2, path);
+        }
+    }
+}
+
 pub async fn run() -> Result<()> {
-    let cli = match Cli::try_parse() {
+    let mut raw_args: Vec<String> = std::env::args().collect();
+    normalize_cli_args(&mut raw_args);
+    let cli = match Cli::try_parse_from(raw_args) {
         Ok(c) => c,
         Err(e) => {
             if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
@@ -2751,6 +2771,24 @@ mod tests {
             }
             assert_eq!(args_of(&argv)["geolocation"], "-33.86,151.2", "{cmd}");
         }
+    }
+
+    /// Attached `-o` is still the output option next to an expression.
+    #[test]
+    fn attached_output_option_is_not_the_expression() {
+        let normalize = |argv: &[&str]| {
+            let mut full = vec!["chrome-devtools".to_string()];
+            full.extend(argv.iter().map(|s| s.to_string()));
+            normalize_cli_args(&mut full);
+            build_request(&Cli::try_parse_from(full).unwrap())
+                .unwrap()
+                .args
+        };
+        let args = normalize(&["evaluate", "-oout.json", "1 + 1"]);
+        assert_eq!(args["expression"], "1 + 1");
+        assert!(args["output"].as_str().unwrap().ends_with("out.json"));
+        // The explicit `--` form still passes a leading dash through.
+        assert_eq!(normalize(&["evaluate", "--", "-1"])["expression"], "-1");
     }
 
     #[test]
