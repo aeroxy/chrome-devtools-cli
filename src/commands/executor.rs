@@ -189,6 +189,8 @@ fn browser_refused_blocked_urls(error: &anyhow::Error) -> bool {
 /// and target ID enrichment on success.
 pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Result<CommandResult> {
     let cmd = req.command.as_str();
+    // No call of an earlier request is still waiting by now.
+    client.forget_abandoned_calls();
 
     // Event-collecting commands drain the buffer via read_events_for,
     // so they can capture events that arrived between commands, and a
@@ -931,7 +933,14 @@ async fn inner_execute(
                 is_user_verified: flag("is_user_verified"),
                 remove: flag("remove").unwrap_or(false),
             };
-            commands::webauthn::configure_webauthn(client, session_id, params, req.format()).await
+            commands::webauthn::configure_webauthn(
+                client,
+                session_id,
+                Some(target_id),
+                params,
+                req.format(),
+            )
+            .await
         }
         "wait-for" => match args.get("text").and_then(|v| v.as_str()) {
             Some(text) => {
@@ -1154,6 +1163,50 @@ mod tests {
     ) -> Vec<String> {
         drop(client);
         browser.await.unwrap()
+    }
+
+    /// Removing the authenticator from a one-off session (the daemon could
+    /// not attach its own) also drops the one saved for the tab, which the
+    /// next attach would otherwise re-create.
+    #[tokio::test]
+    async fn removing_from_a_one_off_session_clears_the_saved_authenticator() {
+        let (mut client, browser) = fake_browser(|_, _| reply(json!({}))).await;
+        let saved = crate::cdp::VirtualAuthenticator {
+            id: "A1".into(),
+            options: crate::cdp::AuthenticatorOptions {
+                protocol: "ctap2".into(),
+                transport: "internal".into(),
+                has_resident_key: true,
+                has_user_verification: true,
+                is_user_verified: true,
+            },
+        };
+        client.emulation_saved.insert(
+            "T2".into(),
+            crate::cdp::TabEmulation {
+                webauthn: Some(saved.clone()),
+                ..Default::default()
+            },
+        );
+        client.webauthn = Some(saved);
+        let params = commands::webauthn::WebAuthnParams {
+            remove: true,
+            ..Default::default()
+        };
+        let removed = commands::webauthn::configure_webauthn(
+            &mut client,
+            "ONE-OFF",
+            Some("T2"),
+            params,
+            crate::format::OutputFormat::Text,
+        )
+        .await
+        .unwrap();
+        assert_eq!(removed.output, "Removed the virtual authenticator.");
+        assert!(client.emulation_saved["T2"].webauthn.is_none());
+        // The persistent session's own authenticator, on T1, stays.
+        assert!(client.webauthn.is_some());
+        calls_made(client, browser).await;
     }
 
     fn request(command: &str, args: Value) -> DaemonRequest {

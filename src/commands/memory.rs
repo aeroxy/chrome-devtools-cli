@@ -18,6 +18,19 @@ pub async fn take_heapsnapshot(
     output: &str,
     format: crate::format::OutputFormat,
 ) -> Result<CommandResult> {
+    let limit = crate::cdp::cdp_call_timeout();
+    take_heapsnapshot_within(client, session_id, output, format, limit).await
+}
+
+/// [`take_heapsnapshot`], giving up once no part of the snapshot has arrived
+/// for `limit`.
+async fn take_heapsnapshot_within(
+    client: &mut CdpClient,
+    session_id: &str,
+    output: &str,
+    format: crate::format::OutputFormat,
+    limit: std::time::Duration,
+) -> Result<CommandResult> {
     // Write to a temp file in the same directory so a failed/partial stream
     // never leaves a corrupt file at the final output path. The temp file is
     // renamed to `output` only after the snapshot completes successfully.
@@ -80,8 +93,23 @@ pub async fn take_heapsnapshot(
         .context("Failed to trigger non-blocking HeapProfiler.takeHeapSnapshot command")?;
 
         use tokio::io::AsyncWriteExt;
+        // The capture is given up like any call that gets no answer, with
+        // the same liveness checks while the socket is quiet, but its clock
+        // restarts with every chunk: a big heap takes as long as it takes
+        // while it keeps coming, and one that stops coming is a stuck page or
+        // a lost connection, not a slow capture.
+        let mut started = tokio::time::Instant::now();
+        let mut checked = false;
         loop {
-            let text = client.read_text()
+            let text = client
+                .read_text_for_call(
+                    msg_id,
+                    "HeapProfiler.takeHeapSnapshot",
+                    Some(session_id),
+                    started,
+                    limit,
+                    &mut checked,
+                )
                 .await
                 .context("Failed to read WebSocket stream message during heap snapshot chunk collection")?;
             let event: serde_json::Value = serde_json::from_str(&text)
@@ -105,6 +133,8 @@ pub async fn take_heapsnapshot(
                         .await
                         .context("Failed to write snapshot chunk bytes to output file")?;
                 }
+                started = tokio::time::Instant::now();
+                checked = false;
             } else if event.get("method").is_some() {
                 // Route through push_event so Network/Runtime events land in
                 // network_events/console_events (capped) instead of the generic
@@ -4511,6 +4541,99 @@ mod tests {
         v["snapshot"]["node_count"] = json!(3);
         v["snapshot"]["edge_count"] = json!(2);
         assert!(Snap::new(serde_json::from_value(v).unwrap()).is_ok());
+    }
+
+    /// A browser that answers every call but `HeapProfiler.takeHeapSnapshot`,
+    /// for which it sends `chunks`, `gap` apart, then the reply if `finish`.
+    async fn fake_heap_browser(
+        chunks: usize,
+        gap: std::time::Duration,
+        finish: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let browser = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if req["method"] == "HeapProfiler.takeHeapSnapshot" {
+                    for i in 0..chunks {
+                        tokio::time::sleep(gap).await;
+                        let chunk = json!({
+                            "method": "HeapProfiler.addHeapSnapshotChunk",
+                            "params": { "chunk": i.to_string() },
+                            "sessionId": "S",
+                        });
+                        let _ = ws.send(Message::Text(chunk.to_string())).await;
+                    }
+                    if !finish {
+                        continue;
+                    }
+                }
+                let reply = json!({ "id": req["id"], "result": {} });
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        (url, browser)
+    }
+
+    /// A capture that stops arriving, from a browser that still answers, is
+    /// given up like any call: the daemon would otherwise wait forever and
+    /// serve nobody. The file at the output path is left as it was.
+    #[tokio::test]
+    async fn test_take_heapsnapshot_gives_up_when_the_chunks_stop() {
+        let (url, browser) = fake_heap_browser(1, std::time::Duration::ZERO, false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("s.heapsnapshot");
+        std::fs::write(&output, "earlier").unwrap();
+        let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
+        let started = std::time::Instant::now();
+        let err = take_heapsnapshot_within(
+            &mut client,
+            "S",
+            output.to_str().unwrap(),
+            OutputFormat::Text,
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        .err()
+        .expect("a capture that stops arriving must be given up");
+        assert!(
+            err.downcast_ref::<crate::cdp::PageUnresponsive>().is_some(),
+            "{err:#}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "earlier");
+        drop(client);
+        browser.abort();
+    }
+
+    /// The clock restarts with each chunk, so a capture that keeps coming
+    /// can take longer than the limit in all.
+    #[tokio::test]
+    async fn test_take_heapsnapshot_keeps_going_while_chunks_arrive() {
+        let gap = std::time::Duration::from_millis(300);
+        let (url, browser) = fake_heap_browser(4, gap, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("s.heapsnapshot");
+        let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
+        take_heapsnapshot_within(
+            &mut client,
+            "S",
+            output.to_str().unwrap(),
+            OutputFormat::Text,
+            std::time::Duration::from_millis(700),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "0123");
+        drop(client);
+        browser.abort();
     }
 
     /// Disabling the heap profiler makes V8 forget its object ids, so the
