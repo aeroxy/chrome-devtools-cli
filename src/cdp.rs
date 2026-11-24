@@ -171,11 +171,6 @@ pub struct CdpClient {
     /// field directly; opening or closing one session's dialog must not lose
     /// another's.
     open_dialogs: Vec<OpenDialog>,
-    /// Dialogs left open on a tab whose session detached. A detach does not
-    /// close a JavaScript dialog, but only the session that saw it can settle
-    /// it, so the record follows the tab until a later session on it can
-    /// report or handle the dialog.
-    orphan_dialogs: std::collections::HashMap<String, DialogOpen>,
     /// Ids of calls that are waiting for a reply. A reply to any other id is
     /// fire-and-forget and dropped, not parked in `deferred_replies` forever.
     awaiting_replies: std::collections::HashSet<u64>,
@@ -517,7 +512,6 @@ impl CdpClient {
             dialog_action: None,
             open_dialog: None,
             open_dialogs: Vec::new(),
-            orphan_dialogs: std::collections::HashMap::new(),
             awaiting_replies: std::collections::HashSet::new(),
             heap_capture: false,
             input_sent: false,
@@ -591,12 +585,6 @@ impl CdpClient {
         // so the outgoing tab's state can be saved with it below.
         let old_session = self.persistent_session.take();
         if let Some(ref old_session) = old_session {
-            // A detach does not close an open dialog, and only the session
-            // that saw it can settle it. Keep the dialog on that session while
-            // the detach is in flight: a close arriving meanwhile is applied
-            // to the session, and a dialog opening during the wait is recorded
-            // too. Save for the tab only if a dialog is open afterwards.
-            let dialog_target = old_target.clone();
             match self
                 .send("Target.detachFromTarget", json!({"sessionId": old_session}))
                 .await
@@ -627,9 +615,12 @@ impl CdpClient {
                     self.answer_paused_requests().await?;
                 }
             }
-            if let (Some(target), Some(open)) = (dialog_target, self.open_dialog_for(old_session)) {
-                self.orphan_dialogs.insert(target, open.dialog);
-            }
+            // Only the session that saw a dialog open can settle it, so the
+            // record ends with it, including one noted during the detach. A
+            // later session on the tab could not use it: a page the dialog
+            // blocks answers none of that session's setup calls (they fail as
+            // PageUnresponsive), and a page that answers them is not blocked.
+            // Verified on Chrome 158.
             self.forget_dialog(Some(old_session.as_str()));
             self.persistent_target_id = None;
             self.events
@@ -725,14 +716,6 @@ impl CdpClient {
             }
         }
 
-        // Only after setup succeeds: adopting earlier would make the setup
-        // calls themselves fail behind the dialog. The command that asked for
-        // this tab now sees the dialog on its session and can report or settle
-        // it before touching the page.
-        if let Some(dialog) = self.orphan_dialogs.remove(target_id) {
-            self.set_dialog_for_session(&session_id, dialog);
-        }
-
         Ok(())
     }
 
@@ -812,7 +795,6 @@ impl CdpClient {
     /// persistent session so the next command attaches cleanly.
     pub fn forget_target(&mut self, target_id: &str) {
         self.emulation_saved.remove(target_id);
-        self.orphan_dialogs.remove(target_id);
         let retained: Vec<String> = self
             .retained_session_targets
             .iter()
@@ -1755,18 +1737,6 @@ impl CdpClient {
                     .filter(|d| d.session_id.as_deref() == Some(session_id))
             })
             .cloned()
-    }
-
-    /// Record a dialog previously seen on another session of this tab as open
-    /// on `session_id`, so the next call settles or reports it at once.
-    fn set_dialog_for_session(&mut self, session_id: &str, dialog: DialogOpen) {
-        self.open_dialogs
-            .retain(|d| d.session_id.as_deref() != Some(session_id));
-        self.open_dialogs.push(OpenDialog {
-            session_id: Some(session_id.to_string()),
-            dialog,
-        });
-        self.open_dialog = self.open_dialogs.last().cloned();
     }
 
     /// Forget the open dialog if it belongs to `session_id`: it was handled,
@@ -4110,14 +4080,18 @@ mod tests {
         assert_eq!(calls, ["Runtime.evaluate", "Page.handleJavaScriptDialog"]);
     }
 
-    /// Detaching the session that saw a dialog does not close it. The record
-    /// follows its tab, so returning to that tab fails at once (or settles it
-    /// with an action) instead of waiting out a call deadline.
+    /// Detaching the session that saw a dialog does not close it, but no later
+    /// session can use the record: Chrome 158 answers none of a new session's
+    /// setup calls while the dialog is open, so a setup that succeeds means a
+    /// person closed it meanwhile. The next call must not be failed for it.
     #[tokio::test]
-    async fn an_open_dialog_survives_a_session_switch() {
+    async fn a_dialog_closed_while_its_tab_was_left_is_not_reported_on_return() {
         let (mut client, chrome) = fake_chrome(|call| {
             let result = match call["method"].as_str() {
-                Some("Target.attachToTarget") => json!({"sessionId": "S2"}),
+                Some("Target.attachToTarget") if call["params"]["targetId"] == "T2" => {
+                    json!({"sessionId": "S2"})
+                }
+                Some("Target.attachToTarget") => json!({"sessionId": "S3"}),
                 _ => json!({}),
             };
             (
@@ -4130,86 +4104,25 @@ mod tests {
         client.persistent_target_id = Some("T1".into());
         client.note_dialog_event(&json!({
             "method": "Page.javascriptDialogOpening", "sessionId": "S1",
-            "params": {"type": "alert", "message": "still open"}
+            "params": {"type": "alert", "message": "closed by a person"}
         }));
 
         client
             .ensure_persistent_session("T2")
             .await
             .expect("switch to the other tab");
-        assert!(client.open_dialog_for("S1").is_none(), "S1 detached");
-        assert_eq!(client.orphan_dialogs["T1"].message, "still open");
-        assert!(client.open_dialog_for("S2").is_none(), "T2 has no dialog");
-
+        assert!(client.open_dialog.is_none(), "the record ended with S1");
         client
             .ensure_persistent_session("T1")
             .await
-            .expect("return to the first tab");
-        assert_eq!(
-            client.open_dialog_for("S2").map(|d| d.dialog.message),
-            Some("still open".to_string())
-        );
-        let error = client
-            .settle_open_dialog("S2")
-            .await
-            .expect_err("the dialog is reported at once");
-        assert!(error.downcast_ref::<DialogOpen>().is_some(), "{error:#}");
-        drop(client);
-        chrome.await.unwrap();
-    }
-
-    /// A close arriving while the detach is in flight must invalidate the tab's
-    /// saved record too: a later session there would otherwise report a dialog
-    /// that no longer blocks the page.
-    #[tokio::test]
-    async fn a_dialog_closed_during_detach_does_not_follow_the_tab() {
-        let (mut client, chrome) = fake_chrome(|call| {
-            let messages = match call["method"].as_str() {
-                Some("Target.detachFromTarget") if call["params"]["sessionId"] == "S1" => vec![
-                    json!({
-                        "method": "Page.javascriptDialogClosed",
-                        "sessionId": "S1",
-                        "params": {}
-                    }),
-                    json!({"id": call["id"], "result": {}}),
-                ],
-                Some("Target.attachToTarget") if call["params"]["targetId"] == "T2" => {
-                    vec![json!({"id": call["id"], "result": {"sessionId": "S2"}})]
-                }
-                Some("Target.attachToTarget") => {
-                    vec![json!({"id": call["id"], "result": {"sessionId": "S3"}})]
-                }
-                _ => vec![json!({"id": call["id"], "result": {}})],
-            };
-            (std::time::Duration::ZERO, messages)
-        })
-        .await;
-        client.persistent_session = Some("S1".into());
-        client.persistent_target_id = Some("T1".into());
-        client.note_dialog_event(&json!({
-            "method": "Page.javascriptDialogOpening", "sessionId": "S1",
-            "params": {"type": "alert", "message": "closed meanwhile"}
-        }));
-
+            .expect("the page answers the new session's setup");
         client
-            .ensure_persistent_session("T2")
-            .await
-            .expect("switch to the other tab");
-        assert!(
-            !client.orphan_dialogs.contains_key("T1"),
-            "the close during detach invalidated the saved dialog"
-        );
-        client
-            .ensure_persistent_session("T1")
-            .await
-            .expect("return to the first tab");
-        assert!(client.open_dialog_for("S3").is_none());
-        client
-            .settle_open_dialog("S3")
+            .send_to_target("S3", "DOM.getDocument", json!({}))
             .await
             .expect("no stale dialog blocks the page");
         drop(client);
-        chrome.await.unwrap();
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls.last().map(String::as_str), Some("DOM.getDocument"));
     }
 
     /// A failed setup whose Fetch.enable reached Chrome but whose detach did

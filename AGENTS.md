@@ -97,7 +97,10 @@ at most once, then stop and ask a human rather than looping or calling
 
 Every CDP call waits on `read_text_for_call` (`cdp.rs`), so nothing waits
 forever on a connected browser. The call's limit, 180s by default
-(`CHROME_CDP_TIMEOUT_SECS`) or `SETUP_CALL_TIMEOUT` (10s) for domain enables,
+(`CHROME_CDP_TIMEOUT_SECS`) or `SETUP_CALL_TIMEOUT` (10s) for session setup
+(`Network.enable`, `Runtime.enable`, `Page.enable`, the blocklist write) and
+css-styles' cleanup, while other enables (`WebAuthn.enable`
+restoring an authenticator, `HeapProfiler.enable`, `Fetch.enable`) get the default,
 counts from before a dialog left open is handled and the request written;
 the write itself is bounded by both the call's remaining budget and the
 configured default write limit, whichever is smaller (a setup call with 7s

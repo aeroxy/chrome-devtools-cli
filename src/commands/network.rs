@@ -86,12 +86,13 @@ fn process_network_events(
     // hops not seen here may still be, and nothing tells them apart.
     let mut wire_request: HashMap<&str, Vec<&serde_json::Value>> = HashMap::new();
     let mut wire_response: HashMap<&str, Vec<&serde_json::Value>> = HashMap::new();
-    // Request and response wire headers are announced separately: the final
-    // hop's `hasExtraInfo` says only whether its response had wire headers,
-    // not its request's. Keeping the two per-hop flag lists apart stops a
-    // cache-served response from hiding the request's wire headers.
-    let mut hop_has_request_wire: HashMap<&str, Vec<bool>> = HashMap::new();
-    let mut hop_has_response_wire: HashMap<&str, Vec<bool>> = HashMap::new();
+    // One flag per hop covers both directions: Chrome sends both wire events
+    // for a hop that reached the server (a 304 revalidation included) and
+    // neither for one the cache answered, whose `hasExtraInfo` is then false
+    // (verified on Chrome 158). A cached last hop counted as owing a request
+    // event would make the chain look incomplete, and its redirects would
+    // lose their wire Cookie headers to the page's view.
+    let mut hop_has_wire: HashMap<&str, Vec<bool>> = HashMap::new();
     let mut begun_earlier: HashSet<&str> = HashSet::new();
     for event in events {
         let params = &event["params"];
@@ -99,9 +100,9 @@ fn process_network_events(
             continue;
         };
         // A redirect hop's wire headers are announced on the next hop's
-        // request (`redirectHasExtraInfo`); a response's on its own
-        // `responseReceived` (`hasExtraInfo`, omitted when there are none).
-        // The first hop's request is unmarked, so assume it has them.
+        // request (`redirectHasExtraInfo`), the last hop's on its
+        // `responseReceived` (`hasExtraInfo`). Until then a hop counts as
+        // having them.
         let flag = |name: &str, default: bool| params[name].as_bool().unwrap_or(default);
         match event["method"].as_str() {
             Some("Network.requestWillBeSentExtraInfo") => {
@@ -112,27 +113,21 @@ fn process_network_events(
                 .or_default()
                 .push(&params["headers"]),
             Some("Network.requestWillBeSent") => {
-                let requests = hop_has_request_wire.entry(id).or_default();
-                let responses = hop_has_response_wire.entry(id).or_default();
+                let flags = hop_has_wire.entry(id).or_default();
                 if params.get("redirectResponse").is_some() {
-                    match (requests.last_mut(), responses.last_mut()) {
-                        (Some(request), Some(response)) => {
-                            let has_extra = flag("redirectHasExtraInfo", true);
-                            *request = has_extra;
-                            *response = has_extra;
-                        }
+                    match flags.last_mut() {
+                        Some(redirected) => *redirected = flag("redirectHasExtraInfo", true),
                         // The redirect began before this batch: its headers
                         // may have been dropped by an earlier drain.
-                        _ => {
+                        None => {
                             begun_earlier.insert(id);
                         }
                     }
                 }
-                requests.push(true);
-                responses.push(true);
+                flags.push(true);
             }
             Some("Network.responseReceived") => {
-                if let Some(last) = hop_has_response_wire.get_mut(id).and_then(|h| h.last_mut()) {
+                if let Some(last) = hop_has_wire.get_mut(id).and_then(|h| h.last_mut()) {
                     *last = flag("hasExtraInfo", false);
                 }
             }
@@ -145,12 +140,10 @@ fn process_network_events(
     // hop would fall back to its page view. Trust the wire only where every
     // hop Chrome says has ExtraInfo still has an event; otherwise use the
     // page's view for the whole chain instead of guessing a hop.
-    let complete_wire = |wire: &HashMap<&str, Vec<&serde_json::Value>>,
-                         hops: &HashMap<&str, Vec<bool>>|
-     -> HashSet<String> {
+    let complete_wire = |wire: &HashMap<&str, Vec<&serde_json::Value>>| -> HashSet<String> {
         wire.iter()
             .filter(|(id, events)| {
-                let expected = hops
+                let expected = hop_has_wire
                     .get(*id)
                     .map_or(0, |h| h.iter().filter(|&&w| w).count());
                 events.len() >= expected
@@ -158,10 +151,9 @@ fn process_network_events(
             .map(|(id, _)| (*id).to_string())
             .collect()
     };
-    let request_wire_complete = complete_wire(&wire_request, &hop_has_request_wire);
-    let response_wire_complete = complete_wire(&wire_response, &hop_has_response_wire);
+    let request_wire_complete = complete_wire(&wire_request);
+    let response_wire_complete = complete_wire(&wire_response);
     let pick = |wire: &HashMap<&str, Vec<&serde_json::Value>>,
-                has_wire_map: &HashMap<&str, Vec<bool>>,
                 id: &str,
                 hop: usize,
                 page_view: &serde_json::Value,
@@ -169,7 +161,7 @@ fn process_network_events(
         if begun_earlier.contains(id) || !complete.contains(id) {
             return page_view.clone();
         }
-        let has_wire = has_wire_map.get(id).map_or(&[][..], Vec::as_slice);
+        let has_wire = hop_has_wire.get(id).map_or(&[][..], Vec::as_slice);
         let index = (has_wire.get(hop) != Some(&false))
             .then(|| has_wire.iter().take(hop).filter(|&&w| w).count());
         index
@@ -214,7 +206,6 @@ fn process_network_events(
                             if headers.response {
                                 prev["responseHeaders"] = pick(
                                     &wire_response,
-                                    &hop_has_response_wire,
                                     &request_id,
                                     hop.saturating_sub(1),
                                     &redirect["headers"],
@@ -248,7 +239,6 @@ fn process_network_events(
                 if headers.request {
                     entry["requestHeaders"] = pick(
                         &wire_request,
-                        &hop_has_request_wire,
                         &request_id,
                         hop,
                         &params["request"]["headers"],
@@ -271,7 +261,6 @@ fn process_network_events(
                         let hop = hops.get(&request_id).map_or(0, |n| n.saturating_sub(1));
                         req["responseHeaders"] = pick(
                             &wire_response,
-                            &hop_has_response_wire,
                             &request_id,
                             hop,
                             &params["response"]["headers"],
@@ -298,7 +287,6 @@ fn process_network_events(
                             .unwrap_or_else(|| json!({}));
                         req["responseHeaders"] = pick(
                             &wire_response,
-                            &hop_has_response_wire,
                             &request_id,
                             hop,
                             &page_view,
@@ -436,10 +424,13 @@ mod tests {
                 "Network.requestWillBeSentExtraInfo",
                 json!({"requestId": "1", "headers": {"cookie": "pre=1; sid=s1"}}),
             ),
-            // No wire event for the last response (from the cache, say).
+            event(
+                "Network.responseReceivedExtraInfo",
+                json!({"requestId": "1", "headers": {"content-type": "text/html", "wire": "1"}}),
+            ),
             event(
                 "Network.responseReceived",
-                json!({"requestId": "1",
+                json!({"requestId": "1", "hasExtraInfo": true,
                 "response": {"status": 200, "statusText": "OK", "headers": {"content-type": "text/html"}}}),
             ),
         ];
@@ -458,7 +449,7 @@ mod tests {
         assert_eq!(out[1]["requestHeaders"], json!({"cookie": "pre=1; sid=s1"}));
         assert_eq!(
             out[1]["responseHeaders"],
-            json!({"content-type": "text/html"})
+            json!({"content-type": "text/html", "wire": "1"})
         );
 
         let plain = process_network_events(&events, &[], Headers::default());
@@ -515,6 +506,59 @@ mod tests {
         assert_eq!(out[0]["responseHeaders"], json!({"page": "0"}));
         assert_eq!(out[1]["requestHeaders"], json!({"wire": "1"}));
         assert_eq!(out[1]["responseHeaders"], json!({"wire": "1"}));
+    }
+
+    /// A 302 sent over the wire to a response the HTTP cache answers: Chrome
+    /// 158 sends the 302's wire events and none for the cached hop, whose
+    /// `hasExtraInfo` is false. The 302 keeps the Cookie it went out with,
+    /// and the cached hop shows what the page saw.
+    #[test]
+    fn a_redirect_to_a_cached_response_keeps_its_wire_headers() {
+        let event =
+            |method: &str, params: serde_json::Value| json!({"method": method, "params": params});
+        let events = vec![
+            event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "1", "type": "Fetch",
+                "request": {"url": "https://a.test/r", "method": "GET", "headers": {"page": "r"}}}),
+            ),
+            event(
+                "Network.requestWillBeSentExtraInfo",
+                json!({"requestId": "1", "headers": {"cookie": "sid=s1"}}),
+            ),
+            event(
+                "Network.responseReceivedExtraInfo",
+                json!({"requestId": "1", "headers": {"location": "/final", "wire": "r"}}),
+            ),
+            event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "1", "type": "Fetch",
+                "request": {"url": "https://a.test/final", "method": "GET", "headers": {"page": "final"}},
+                "redirectResponse": {"status": 302, "statusText": "Found", "headers": {"location": "/final"}},
+                "redirectHasExtraInfo": true}),
+            ),
+            event(
+                "Network.responseReceived",
+                json!({"requestId": "1", "hasExtraInfo": false,
+                "response": {"status": 200, "statusText": "OK", "headers": {"page": "final"},
+                    "fromDiskCache": true}}),
+            ),
+        ];
+        let both = Headers {
+            request: true,
+            response: true,
+        };
+        let out = process_network_events(&events, &[], both);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["status"], 302);
+        assert_eq!(out[0]["requestHeaders"], json!({"cookie": "sid=s1"}));
+        assert_eq!(
+            out[0]["responseHeaders"],
+            json!({"location": "/final", "wire": "r"})
+        );
+        assert_eq!(out[1]["status"], 200);
+        assert_eq!(out[1]["requestHeaders"], json!({"page": "final"}));
+        assert_eq!(out[1]["responseHeaders"], json!({"page": "final"}));
     }
 
     /// A drain that starts partway through a redirect chain (an earlier one
