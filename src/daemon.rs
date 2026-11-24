@@ -645,13 +645,17 @@ where
     // Fatal means Chrome's WebSocket is gone: exit the daemon so it can be
     // respawned cleanly next time.
     if is_fatal {
-        // A bare transport error doesn't tell the caller (often an agent) that
-        // the daemon is gone. A read-only reconnect comes first: the original
-        // action may already have taken effect before the connection dropped.
-        response.error.push_str(&lost_connection_advice(browser));
-        // The code, not the text above, is how `caffeinate` tells that its
-        // connection died from any other failed check.
-        response.error_code = Some(ErrorCode::WebSocketDisconnected as u32);
+        // A command can succeed yet lose the socket while detaching its
+        // one-off session. It keeps its success output; advice belongs only on
+        // an error response, where a bare transport error would not tell the
+        // caller (often an agent) that the daemon is gone. A read-only
+        // reconnect comes first: the action may have taken effect already.
+        if !response.success {
+            response.error.push_str(&lost_connection_advice(browser));
+            // The code, not the text above, is how `caffeinate` tells that its
+            // connection died from any other failed check.
+            response.error_code = Some(ErrorCode::WebSocketDisconnected as u32);
+        }
     }
 
     if let Ok(resp_bytes) = serde_json::to_vec(&with_version(response)) {
@@ -704,6 +708,7 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> (DaemonR
             if cmd_name != "caffeinate" {
                 telemetry::log_command(cmd_name, duration, true, result.error_code);
             }
+            let connection_lost = result.connection_lost;
             let response = DaemonResponse {
                 success: true,
                 output: result.output,
@@ -714,7 +719,7 @@ async fn handle_request(client: &mut CdpClient, req: &DaemonRequest) -> (DaemonR
                 notes: result.notes,
                 ..Default::default()
             };
-            (response, false)
+            (response, connection_lost)
         }
         Err(e) => {
             let duration = start.elapsed();

@@ -1753,15 +1753,28 @@ fn token_supplies_expression(token: &str, after_output: bool) -> bool {
 
 /// The filename in clap's attached `-oout.json` / `-o=out.json` form. A lone
 /// `-offset` is JavaScript, not an output option, and `-o` already takes a
-/// separate value token.
+/// separate value token. The explicit `-o=` form may carry a dash-prefixed
+/// filename; without it a leading dash means the token is JavaScript.
 fn attached_output_path(token: &str) -> Option<String> {
-    token
+    let path = token
         .strip_prefix("-o")
         // Clap accepts both `-oout.json` and `-o=out.json`; keep the filename,
         // not the separator.
-        .map(|p| p.strip_prefix('=').unwrap_or(p))
-        .filter(|p| !p.is_empty() && !p.starts_with('-'))
-        .map(str::to_string)
+        .map(|p| p.strip_prefix('=').unwrap_or(p))?;
+    let explicit = token.starts_with("-o=");
+    (!path.is_empty() && (explicit || !path.starts_with('-'))).then(|| path.to_string())
+}
+
+/// Split an attached `-o` before clap sees it. An explicit `-o=-name.json`
+/// must become `--output=-name.json`: a dash-prefixed value after a bare `-o`
+/// would be read as the expression instead of the output path.
+fn apply_attached_output(args: &mut Vec<OsString>, idx: usize, path: &str) {
+    if path.starts_with('-') {
+        args[idx] = OsString::from(format!("--output={path}"));
+    } else {
+        args[idx] = OsString::from("-o");
+        args.insert(idx + 1, OsString::from(path));
+    }
 }
 
 /// Flags whose value is a separate token, so a scan for the expression must
@@ -1819,7 +1832,7 @@ fn normalize_cli_args(args: &mut Vec<OsString>) {
             // flag can sit between it and the expression. Find that first
             // attached form, then the expression that follows it. A lone
             // `-offset` with no expression after it stays JavaScript.
-            let mut candidate = None;
+            let mut candidate: Option<(usize, String)> = None;
             let mut j = i + 1;
             while j < args.len() {
                 let Some(token) = args[j].to_str() else {
@@ -1831,8 +1844,7 @@ fn normalize_cli_args(args: &mut Vec<OsString>) {
                     // attached `-o` before it still has to be split.
                     if let Some((idx, path)) = candidate {
                         if j + 1 < args.len() {
-                            args[idx] = OsString::from("-o");
-                            args.insert(idx + 1, OsString::from(path));
+                            apply_attached_output(args, idx, path.as_str());
                         }
                     }
                     break;
@@ -1850,8 +1862,7 @@ fn normalize_cli_args(args: &mut Vec<OsString>) {
                 }
                 if token_supplies_expression(token, candidate.is_some()) {
                     if let Some((idx, path)) = candidate {
-                        args[idx] = OsString::from("-o");
-                        args.insert(idx + 1, OsString::from(path));
+                        apply_attached_output(args, idx, path.as_str());
                     }
                     break;
                 }
@@ -3050,6 +3061,19 @@ mod tests {
         let args = normalize(&["evaluate", "-oout.json", "--", "-offset"]);
         assert_eq!(args["expression"], "-offset");
         assert!(args["output"].as_str().unwrap().ends_with("out.json"));
+        // An explicit `-o=` keeps a dash-prefixed filename: clap would take
+        // `-o=-result.json` as the expression and reject the real one.
+        let dash_path = normalize(&["evaluate", "-o=-result.json", "1 + 1"]);
+        assert_eq!(dash_path["expression"], "1 + 1");
+        assert!(dash_path["output"]
+            .as_str()
+            .unwrap()
+            .ends_with("-result.json"));
+        // A bare `-o-offset` without `=` is still JavaScript.
+        assert_eq!(
+            normalize(&["evaluate", "-o-offset"])["expression"],
+            "-o-offset"
+        );
         // Global options before the subcommand must not hide it.
         let args = normalize(&["--target", "warm-squid", "evaluate", "-oout.json", "1 + 1"]);
         assert_eq!(args["expression"], "1 + 1");

@@ -326,6 +326,24 @@ fn same_document(before: Option<&str>, after: Option<&str>) -> bool {
     before.is_some() && before == after
 }
 
+/// A CDP call given the remaining budget can still spend extra time on a
+/// liveness check and a termination write after its own limit. Bound the whole
+/// probe so a silent page cannot hold the daemon past the navigation deadline.
+async fn probe_within_deadline<T, F, E>(
+    remaining: std::time::Duration,
+    timed_out: E,
+    probe: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+    E: Fn() -> anyhow::Error,
+{
+    match tokio::time::timeout(remaining, probe).await {
+        Ok(result) => result,
+        Err(_) => Err(timed_out()),
+    }
+}
+
 /// A navigation can destroy the context between probes; that is a reason to
 /// poll again, not to fail the wait.
 fn transient_context_error(e: &anyhow::Error) -> bool {
@@ -428,8 +446,10 @@ async fn wait_for_load_until(
         if remaining.is_zero() {
             return Err(timed_out());
         }
-        let result = client
-            .send_to_target_within(
+        let result = probe_within_deadline(
+            remaining,
+            &timed_out,
+            client.send_to_target_within(
                 session_id,
                 "Runtime.evaluate",
                 json!({
@@ -437,8 +457,9 @@ async fn wait_for_load_until(
                     "returnByValue": true,
                 }),
                 remaining,
-            )
-            .await;
+            ),
+        )
+        .await;
 
         match result {
             Ok(val) => {
@@ -525,6 +546,26 @@ mod tests {
         assert!(!same_document(Some("L2"), Some("L3")));
         assert!(!same_document(Some("L2"), None));
         assert!(!same_document(None, None));
+    }
+
+    /// A readiness probe that hangs cannot hold the daemon past the navigation
+    /// budget, even when its own CDP call is still doing liveness recovery.
+    #[tokio::test]
+    async fn a_readiness_probe_is_bounded_by_the_navigation_deadline() {
+        let started = tokio::time::Instant::now();
+        let slow_probe = async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok::<(), anyhow::Error>(())
+        };
+        let err = probe_within_deadline(
+            std::time::Duration::from_millis(10),
+            || anyhow::anyhow!("late"),
+            slow_probe,
+        )
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(err.to_string(), "late");
     }
 
     /// What Chrome 158 sent before replying to `Page.navigateToHistoryEntry`.

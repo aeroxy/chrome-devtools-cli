@@ -17,6 +17,10 @@ pub struct CommandResult {
     /// Lines for stderr beside the output (warnings, page errors), so they
     /// never mix into output that is data, such as a base64 screenshot.
     pub notes: Vec<String>,
+    /// The command succeeded, but a cleanup write found the connection gone.
+    /// The daemon retires its socket after returning this result; the caller
+    /// keeps the success and is not told to repeat the action.
+    pub connection_lost: bool,
 }
 
 impl CommandResult {

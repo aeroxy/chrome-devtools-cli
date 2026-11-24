@@ -171,6 +171,11 @@ pub struct CdpClient {
     /// field directly; opening or closing one session's dialog must not lose
     /// another's.
     open_dialogs: Vec<OpenDialog>,
+    /// Dialogs left open on a tab whose session detached. A detach does not
+    /// close a JavaScript dialog, but only the session that saw it can settle
+    /// it, so the record follows the tab until a later session on it can
+    /// report or handle the dialog.
+    orphan_dialogs: std::collections::HashMap<String, DialogOpen>,
     /// Ids of calls that are waiting for a reply. A reply to any other id is
     /// fire-and-forget and dropped, not parked in `deferred_replies` forever.
     awaiting_replies: std::collections::HashSet<u64>,
@@ -224,6 +229,12 @@ pub struct CdpClient {
     /// interception state of one that is still live. Idle reads stay on while
     /// any such session remains.
     sessions_may_intercept: std::collections::HashSet<String>,
+    /// Mock policy of sessions left intercepting by a failed detach, keyed by
+    /// that session. Returning to its tab moves the tab's mocks into the active
+    /// list; a late pause from the old session still needs its own policy or
+    /// `reply_to_paused` would let the request through unmocked.
+    interceptor_mocks:
+        std::collections::HashMap<String, Vec<crate::commands::network_mock::NetworkMock>>,
     /// `Fetch.requestPaused` events not yet answered. The page's request
     /// waits until they are, so every read answers them first.
     paused_requests: std::collections::VecDeque<Value>,
@@ -496,6 +507,7 @@ impl CdpClient {
             dialog_action: None,
             open_dialog: None,
             open_dialogs: Vec::new(),
+            orphan_dialogs: std::collections::HashMap::new(),
             awaiting_replies: std::collections::HashSet::new(),
             input_sent: false,
             events: std::collections::VecDeque::new(),
@@ -514,6 +526,7 @@ impl CdpClient {
             network_mocks: Vec::new(),
             fetch_may_be_enabled: false,
             sessions_may_intercept: std::collections::HashSet::new(),
+            interceptor_mocks: std::collections::HashMap::new(),
             paused_requests: std::collections::VecDeque::new(),
             emulation_saved: std::collections::HashMap::new(),
         })
@@ -566,6 +579,16 @@ impl CdpClient {
         // so the outgoing tab's state can be saved with it below.
         let old_session = self.persistent_session.take();
         if let Some(ref old_session) = old_session {
+            // A detach does not close an open dialog, and only the session
+            // that saw it can settle it. Keep the record for the tab so a
+            // later session on it reports the dialog at once, or handles it
+            // once it can answer `Page.handleJavaScriptDialog`.
+            if let (Some(old_target), Some(open)) =
+                (old_target.as_deref(), self.open_dialog_for(old_session))
+            {
+                self.orphan_dialogs
+                    .insert(old_target.to_string(), open.dialog.clone());
+            }
             self.forget_dialog(Some(old_session.as_str()));
             match self
                 .send("Target.detachFromTarget", json!({"sessionId": old_session}))
@@ -656,6 +679,16 @@ impl CdpClient {
         // if this tab has none), then apply it to the new session. A tab with no
         // saved state starts clean — overrides from other tabs don't leak in.
         let restored = self.emulation_saved.remove(target_id).unwrap_or_default();
+        // A session whose detach failed can still intercept on its old tab.
+        // Returning here consumes the tab's saved state for the new session;
+        // keep the old session's mock policy under its own id so a late pause
+        // from it is answered from that list, not allowed through unmocked.
+        if let Some(sid) = restored.session_id.as_deref() {
+            if self.sessions_may_intercept.contains(sid) {
+                self.interceptor_mocks
+                    .insert(sid.to_string(), restored.network_mocks.clone());
+            }
+        }
         self.blocklist = restored.blocklist;
         self.viewport = restored.viewport;
         self.geolocation = restored.geolocation;
@@ -678,6 +711,14 @@ impl CdpClient {
             if let Err(e) = crate::commands::network_mock::apply_mocks(self, &session_id).await {
                 return Err(self.fail_setup(&session_id, target_id, true, e).await);
             }
+        }
+
+        // Only after setup succeeds: adopting earlier would make the setup
+        // calls themselves fail behind the dialog. The command that asked for
+        // this tab now sees the dialog on its session and can report or settle
+        // it before touching the page.
+        if let Some(dialog) = self.orphan_dialogs.remove(target_id) {
+            self.set_dialog_for_session(&session_id, dialog);
         }
 
         Ok(())
@@ -746,6 +787,7 @@ impl CdpClient {
     /// persistent session so the next command attaches cleanly.
     pub fn forget_target(&mut self, target_id: &str) {
         self.emulation_saved.remove(target_id);
+        self.orphan_dialogs.remove(target_id);
         if self.persistent_target_id.as_deref() == Some(target_id) {
             let session = self.persistent_session.clone();
             self.forget_dialog(session.as_deref());
@@ -876,15 +918,21 @@ impl CdpClient {
                 error,
                 write_attempted: false,
             })?;
-        self.send_to_target(
-            session_id,
+        // The pre-write dialog guard can reject this before anything reaches
+        // Chrome. Only report an attempted write once it is on the wire; a
+        // refused write leaves the stored list safe to roll back.
+        let mut wrote = false;
+        self.send_raw_within_reported(
             "Network.setBlockedURLs",
             json!({"urls": self.blocklist}),
+            Some(session_id),
+            cdp_call_timeout(),
+            &mut wrote,
         )
         .await
         .map_err(|error| ApplyRulesError {
             error,
-            write_attempted: true,
+            write_attempted: wrote,
         })?;
         Ok(())
     }
@@ -1073,6 +1121,22 @@ impl CdpClient {
         session_id: Option<&str>,
         limit: std::time::Duration,
     ) -> Result<Value> {
+        let mut wrote = false;
+        self.send_raw_within_reported(method, params, session_id, limit, &mut wrote)
+            .await
+    }
+
+    /// [`Self::send_raw_within`], also reporting whether the request reached
+    /// the write. A dialog the pre-write guard settled or rejected would
+    /// otherwise look like a request Chrome may have applied.
+    async fn send_raw_within_reported(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        limit: std::time::Duration,
+        wrote: &mut bool,
+    ) -> Result<Value> {
         // The deadline covers all the call waits on: a dialog left open, the
         // write, the reply, and the dialogs handled while waiting for it.
         let started = tokio::time::Instant::now();
@@ -1106,6 +1170,7 @@ impl CdpClient {
                 limit.as_secs()
             )));
         }
+        *wrote = true;
         let id = self
             .send_raw_no_wait_within(
                 session_id,
@@ -1118,9 +1183,12 @@ impl CdpClient {
         // Unregister on every exit, including errors, or a late reply would
         // be parked in `deferred_replies` for a call that has stopped waiting.
         let result = async {
+            // A message a deadline ping queued is read here and its owner loops
+            // again; the check it made must count for the whole call.
+            let mut checked = false;
             loop {
                 let resp_text = self
-                    .read_text_for_call(id, method, session_id, started, limit)
+                    .read_text_for_call(id, method, session_id, started, limit, &mut checked)
                     .await?;
                 let resp: Value = serde_json::from_str(&resp_text)?;
                 self.note_dialog_event(&resp);
@@ -1258,6 +1326,7 @@ impl CdpClient {
                 .await?;
             self.awaiting_replies.insert(id);
             let result = async {
+                let mut checked = false;
                 loop {
                     let resp_text = self
                         .read_text_for_call(
@@ -1266,6 +1335,7 @@ impl CdpClient {
                             session_id,
                             started,
                             limit,
+                            &mut checked,
                         )
                         .await?;
                     let resp: Value = serde_json::from_str(&resp_text)?;
@@ -1440,10 +1510,10 @@ impl CdpClient {
         session_id: Option<&str>,
         started: tokio::time::Instant,
         limit: std::time::Duration,
+        // Owned by the caller's read loop, so a ping that queued a message the
+        // owner then handles does not earn another check on re-entry.
+        checked: &mut bool,
     ) -> Result<String> {
-        // The loop goes round only after a check answered, so at the limit
-        // that check has already been made.
-        let mut checked = false;
         loop {
             // A dialog handler that drained the socket may have set this
             // call's reply aside. It belongs to us, not to the handler.
@@ -1455,8 +1525,9 @@ impl CdpClient {
             if remaining.is_zero() {
                 // Whose fault: a lost connection exits the daemon, a stuck
                 // page must not.
-                if self.unread.is_empty() && !checked {
+                if self.unread.is_empty() && !*checked {
                     self.check_alive().await?;
+                    *checked = true;
                 }
                 // What a liveness ping set aside arrived in time, the awaited
                 // reply perhaps among it.
@@ -1507,7 +1578,7 @@ impl CdpClient {
                 Ok(read) => return read,
                 Err(_) => {
                     self.check_alive().await?;
-                    checked = true;
+                    *checked = true;
                 }
             }
         }
@@ -1613,6 +1684,18 @@ impl CdpClient {
             .cloned()
     }
 
+    /// Record a dialog previously seen on another session of this tab as open
+    /// on `session_id`, so the next call settles or reports it at once.
+    fn set_dialog_for_session(&mut self, session_id: &str, dialog: DialogOpen) {
+        self.open_dialogs
+            .retain(|d| d.session_id.as_deref() != Some(session_id));
+        self.open_dialogs.push(OpenDialog {
+            session_id: Some(session_id.to_string()),
+            dialog,
+        });
+        self.open_dialog = self.open_dialogs.last().cloned();
+    }
+
     /// Forget the open dialog if it belongs to `session_id`: it was handled,
     /// closed, or its session is gone (only that session could handle it).
     /// Other sessions' records are left alone.
@@ -1713,6 +1796,13 @@ impl CdpClient {
         {
             return &self.network_mocks;
         }
+        // Back here on the old tab, its saved state was consumed by the new
+        // session; a still-intercepting older session has its own record.
+        if let Some(session) = session {
+            if let Some(mocks) = self.interceptor_mocks.get(session) {
+                return mocks;
+            }
+        }
         &[]
     }
 
@@ -1739,6 +1829,11 @@ impl CdpClient {
             || self.persistent_session.as_deref() == session
         {
             return self.network_mocks.get_mut(index);
+        }
+        if let Some(session) = session {
+            if let Some(mocks) = self.interceptor_mocks.get_mut(session) {
+                return mocks.get_mut(index);
+            }
         }
         None
     }
@@ -1772,6 +1867,7 @@ impl CdpClient {
     /// failed `Fetch.disable`: there the same session may still intercept.
     fn session_ended(&mut self, session_id: &str) {
         self.sessions_may_intercept.remove(session_id);
+        self.interceptor_mocks.remove(session_id);
         // Only stop reading when no other session may still be intercepting:
         // a failed detach on an earlier tab leaves its Fetch domain live even
         // though this tab's detach succeeded.
@@ -2594,6 +2690,43 @@ mod tests {
         })
     }
 
+    /// A dialog set aside before the rule write is refused by the pre-write
+    /// guard: Chrome never got `Network.setBlockedURLs`, so the caller must
+    /// be told no write was attempted.
+    #[tokio::test]
+    async fn a_pre_write_dialog_refusal_reports_no_rule_write() {
+        let (mut client, chrome) = fake_chrome(|_call| {
+            (
+                std::time::Duration::ZERO,
+                vec![json!({"id": _call["id"], "result": {}})],
+            )
+        })
+        .await;
+        client.persistent_session = Some("S".into());
+        client
+            .unread
+            .push_back(opening("before the write").to_string());
+        let error = client
+            .apply_network_rules_reported()
+            .await
+            .expect_err("the dialog blocks the rule write");
+        assert!(
+            error.error.downcast_ref::<DialogOpen>().is_some(),
+            "{:#}",
+            error.error
+        );
+        assert!(
+            !error.write_attempted,
+            "a pre-write refusal never reached Chrome"
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert!(
+            !calls.iter().any(|c| c == "Network.setBlockedURLs"),
+            "{calls:?}"
+        );
+    }
+
     /// A dialog handler drains the socket while the call it held up finishes.
     /// That call's reply must not be discarded with the unrelated messages, or
     /// it waits out its limit after the dialog is already gone.
@@ -2749,6 +2882,41 @@ mod tests {
                 vec![json!({"id": call["id"], "result": {}})],
             ),
             // The page never answers.
+            _ => (std::time::Duration::ZERO, Vec::new()),
+        })
+        .await;
+        let error = client
+            .send_to_target_within(
+                "S",
+                "DOM.getDocument",
+                json!({}),
+                std::time::Duration::from_millis(500),
+            )
+            .await
+            .expect_err("the page never answers");
+        assert!(
+            error.downcast_ref::<PageUnresponsive>().is_some(),
+            "{error:#}"
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls, ["DOM.getDocument", "Browser.getVersion"]);
+    }
+
+    /// A message the final ping set aside is handled by the owner, which
+    /// re-enters the read. That check still counts for the call; otherwise
+    /// each queued message earns another liveness ping past the limit.
+    #[tokio::test]
+    async fn a_queued_message_after_the_final_check_does_not_ping_again() {
+        let (mut client, chrome) = fake_chrome(|call| match call["method"].as_str() {
+            Some("Browser.getVersion") => (
+                std::time::Duration::ZERO,
+                vec![
+                    json!({"method": "Page.javascriptDialogClosed", "sessionId": "S",
+                           "params": {}}),
+                    json!({"id": call["id"], "result": {}}),
+                ],
+            ),
             _ => (std::time::Duration::ZERO, Vec::new()),
         })
         .await;
@@ -3809,5 +3977,137 @@ mod tests {
         drop(client);
         let calls = chrome.await.unwrap();
         assert_eq!(calls, ["Runtime.evaluate", "Page.handleJavaScriptDialog"]);
+    }
+
+    /// Detaching the session that saw a dialog does not close it. The record
+    /// follows its tab, so returning to that tab fails at once (or settles it
+    /// with an action) instead of waiting out a call deadline.
+    #[tokio::test]
+    async fn an_open_dialog_survives_a_session_switch() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let result = match call["method"].as_str() {
+                Some("Target.attachToTarget") => json!({"sessionId": "S2"}),
+                _ => json!({}),
+            };
+            (
+                std::time::Duration::ZERO,
+                vec![json!({"id": call["id"], "result": result})],
+            )
+        })
+        .await;
+        client.persistent_session = Some("S1".into());
+        client.persistent_target_id = Some("T1".into());
+        client.note_dialog_event(&json!({
+            "method": "Page.javascriptDialogOpening", "sessionId": "S1",
+            "params": {"type": "alert", "message": "still open"}
+        }));
+
+        client
+            .ensure_persistent_session("T2")
+            .await
+            .expect("switch to the other tab");
+        assert!(client.open_dialog_for("S1").is_none(), "S1 detached");
+        assert_eq!(client.orphan_dialogs["T1"].message, "still open");
+        assert!(client.open_dialog_for("S2").is_none(), "T2 has no dialog");
+
+        client
+            .ensure_persistent_session("T1")
+            .await
+            .expect("return to the first tab");
+        assert_eq!(
+            client.open_dialog_for("S2").map(|d| d.dialog.message),
+            Some("still open".to_string())
+        );
+        let error = client
+            .settle_open_dialog("S2")
+            .await
+            .expect_err("the dialog is reported at once");
+        assert!(error.downcast_ref::<DialogOpen>().is_some(), "{error:#}");
+        drop(client);
+        chrome.await.unwrap();
+    }
+
+    /// After returning to a tab whose old session failed to detach, a late
+    /// pause from that session must use its own mock policy. Consuming the
+    /// tab's saved mocks for the new session must not let the request through
+    /// unmocked.
+    #[tokio::test]
+    async fn a_late_pause_after_returning_uses_the_old_sessions_mocks() {
+        use base64::Engine;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut calls = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: Value = serde_json::from_str(&text).unwrap();
+                let method = call["method"].as_str().unwrap_or_default().to_string();
+                let reply = match method.as_str() {
+                    "Target.detachFromTarget" if call["params"]["sessionId"] == "S-old" => {
+                        json!({"id": call["id"], "error": {"code": -32000, "message": "busy"}})
+                    }
+                    "Target.attachToTarget" if call["params"]["targetId"] == "T-old" => {
+                        json!({"id": call["id"], "result": {"sessionId": "S-old-2"}})
+                    }
+                    "Target.attachToTarget" => {
+                        json!({"id": call["id"], "result": {"sessionId": "S-new"}})
+                    }
+                    _ => json!({"id": call["id"], "result": {}}),
+                };
+                calls.push(call);
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+            calls
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        let mock = |body: &str| crate::commands::network_mock::NetworkMock {
+            pattern: "*".into(),
+            resource_type: None,
+            action: crate::commands::network_mock::MockAction::Fulfill {
+                status: 200,
+                headers: vec![],
+                body: body.as_bytes().to_vec(),
+            },
+            hits: 0,
+        };
+        client.persistent_session = Some("S-old".into());
+        client.persistent_target_id = Some("T-old".into());
+        client.network_mocks = vec![mock("old")];
+
+        client
+            .ensure_persistent_session("T-new")
+            .await
+            .expect("switch despite the failed detach");
+        client
+            .ensure_persistent_session("T-old")
+            .await
+            .expect("return to the old tab");
+        assert!(!client.emulation_saved.contains_key("T-old"));
+        assert_eq!(client.interceptor_mocks["S-old"][0].hits, 0);
+
+        client.push_event(json!({
+            "method": "Fetch.requestPaused", "sessionId": "S-old",
+            "params": {"requestId": "R", "request": {"url": "https://a.test/"},
+                       "resourceType": "Fetch"}
+        }));
+        client
+            .answer_paused_requests()
+            .await
+            .expect("the late request is answered");
+        assert_eq!(client.interceptor_mocks["S-old"][0].hits, 1);
+        drop(client);
+        let calls = chrome.await.unwrap();
+        let answered = calls
+            .iter()
+            .find(|call| call["method"] == "Fetch.fulfillRequest")
+            .expect("the paused request was mocked");
+        assert_eq!(answered["sessionId"], "S-old");
+        assert_eq!(
+            answered["params"]["body"],
+            base64::engine::general_purpose::STANDARD.encode("old")
+        );
     }
 }

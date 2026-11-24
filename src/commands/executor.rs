@@ -171,13 +171,16 @@ fn is_browser_level(cmd: &str) -> bool {
     )
 }
 
-/// A CDP error reply proves Chrome refused the request, so the daemon's stored
-/// state still matches the browser and the prior list can be restored. Any
-/// other failure (a dialog that held the call, a stalled page, a lost socket)
-/// leaves the outcome unknown: the request may already have been written and
-/// applied, so restoring `previous` would claim a rollback that never happened.
-fn browser_refused_request(error: &anyhow::Error) -> bool {
-    error.to_string().starts_with("CDP error in ")
+/// A CDP refusal of the rule write itself proves Chrome never applied the new
+/// list, so the prior one can be restored. A `Page.handleJavaScriptDialog`
+/// error says nothing about the rule: the handler can read a successful
+/// `Network.setBlockedURLs` reply before its own error, so restoring here
+/// would claim a rollback Chrome never made. Dialogs, stalled pages and lost
+/// sockets likewise leave the outcome unknown.
+fn browser_refused_blocked_urls(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .starts_with("CDP error in Network.setBlockedURLs:")
 }
 
 /// Execute a single command from a [`DaemonRequest`].
@@ -380,7 +383,7 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
             // proves the same. Once the write may have reached Chrome its
             // outcome is unknown: keep the new list rather than claim a
             // rollback the browser may not have made.
-            if !e.write_attempted || browser_refused_request(&e.error) {
+            if !e.write_attempted || browser_refused_blocked_urls(&e.error) {
                 client.blocklist = previous;
             }
             client.dialog_action = None;
@@ -437,9 +440,15 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     };
 
     // Clean up only sessions we created here — never detach the persistent one.
+    let mut connection_lost_on_detach = false;
     if !using_persistent {
         client.forget_dialog(Some(&session_id));
-        let _ = client.detach_from_target(&session_id).await;
+        if let Err(e) = client.detach_from_target(&session_id).await {
+            // The action already succeeded: keep its result, but tell the
+            // daemon to retire the dead socket so the next command reconnects
+            // instead of failing on a connection unrelated to it.
+            connection_lost_on_detach = e.downcast_ref::<crate::cdp::ConnectionLost>().is_some();
+        }
     }
     client.dialog_action = None;
 
@@ -462,12 +471,36 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
 
     // Append target ID so the caller can pin subsequent commands to this page
     let name = friendly::to_friendly(&target_id);
-    result.map(|mut r| {
-        r.target_id = Some(name);
-        r.notes.extend(page_errors);
-        r.notes.extend(heap_ids_note);
-        r
-    })
+    let mut notes = page_errors;
+    notes.extend(heap_ids_note);
+    match result {
+        Ok(mut r) => {
+            r.target_id = Some(name);
+            r.notes.extend(notes);
+            r.connection_lost = connection_lost_on_detach;
+            Ok(r)
+        }
+        Err(e) => {
+            // A page error that preceded the failure is still worth seeing on
+            // stderr; `page_errors_since` left the event buffered for `console`.
+            // Context keeps the typed error downcastable for the daemon.
+            let e = if notes.is_empty() {
+                e
+            } else {
+                e.context(format!(
+                    "Page errors while this command ran:\n{}",
+                    notes.join("\n")
+                ))
+            };
+            if connection_lost_on_detach {
+                Err(e.context(crate::cdp::ConnectionLost(
+                    "The connection was lost while detaching the command's session".into(),
+                )))
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// What to do about a dialog an input opened, when the daemon ran it on its
@@ -501,13 +534,22 @@ pub(crate) fn dialog_opened_by_input(
     if !input_sent {
         return Err(error);
     }
-    let verb = match cmd {
-        "click" | "click-at" => "Clicked",
-        "hover" => "Hovered",
-        "fill" => "Filled",
-        "type-text" => "Typed",
-        "press-key" => "Pressed the key",
-        _ => return Err(error),
+    // A dialog from `mousePressed` stopped the click before `mouseReleased`
+    // was sent: the press may have acted, but the click handler did not run.
+    let press_only = error
+        .downcast_ref::<crate::commands::input::PressOnlyDialog>()
+        .copied();
+    let verb = if let Some(press) = press_only {
+        format!("Pressed at ({}, {})", press.x, press.y)
+    } else {
+        match cmd {
+            "click" | "click-at" => "Clicked".to_string(),
+            "hover" => "Hovered".to_string(),
+            "fill" => "Filled".to_string(),
+            "type-text" => "Typed".to_string(),
+            "press-key" => "Pressed the key".to_string(),
+            _ => return Err(error),
+        }
     };
     let Some(dialog) = error.downcast_ref::<crate::cdp::DialogOpen>() else {
         return Err(error);
@@ -519,7 +561,10 @@ pub(crate) fn dialog_opened_by_input(
     };
     // The submit key's own handler can open the dialog, in which case the key
     // was pressed: telling the caller it was skipped invites a second press.
-    let after = if cmd == "type-text" {
+    let after = if press_only.is_some() {
+        " The press reached the page but the click did not finish; do not click again, since the \
+         press handler may already have run."
+    } else if cmd == "type-text" {
         if error
             .downcast_ref::<crate::commands::input::SubmitKeyDialog>()
             .is_some()
@@ -1150,11 +1195,21 @@ mod tests {
         assert_eq!(mouse_events.count(), 1, "{calls:?}");
     }
 
-    /// The press starts the click, as it does a person's: a dialog from it, or
-    /// from the click handler, is the click's outcome, and a retry would repeat it.
+    /// A dialog from the press reaches the page but stops the click before
+    /// `mouseReleased`; a dialog from the release is the completed click's
+    /// outcome. Neither should be retried blindly.
     #[tokio::test]
-    async fn a_dialog_from_pressing_or_clicking_reports_the_click() {
-        for step in ["mousePressed", "mouseReleased"] {
+    async fn a_dialog_from_pressing_or_clicking_reports_what_finished() {
+        for (step, expected) in [
+            (
+                "mousePressed",
+                "Pressed at (5, 5), and the page opened an alert dialog",
+            ),
+            (
+                "mouseReleased",
+                "Clicked, and the page opened an alert dialog",
+            ),
+        ] {
             let (mut client, browser) = fake_browser(move |method, params| match method {
                 "Input.dispatchMouseEvent" if params["type"] == step => dialog("clicked"),
                 _ => usual(method, params),
@@ -1165,12 +1220,17 @@ mod tests {
                     .await
                     .expect("the page got the click");
             assert!(
-                result
-                    .output
-                    .starts_with("Clicked, and the page opened an alert dialog: \"clicked\"."),
+                result.output.starts_with(expected),
                 "{step}: {}",
                 result.output
             );
+            if step == "mousePressed" {
+                assert!(
+                    result.output.contains("click did not finish"),
+                    "{}",
+                    result.output
+                );
+            }
             calls_made(client, browser).await;
         }
     }
@@ -1458,7 +1518,7 @@ mod tests {
 
     /// Chrome tells only the session that saw a dialog open, and the one-off
     /// session is gone once the command ends, so the report must not send the
-    /// caller to `--dialog-action`. It still reports the click.
+    /// caller to `--dialog-action`. It still reports the press.
     #[tokio::test]
     async fn a_dialog_from_an_input_on_a_one_off_session_is_left_to_a_person() {
         let (mut client, browser) =
@@ -1474,7 +1534,12 @@ mod tests {
         assert!(
             result
                 .output
-                .starts_with("Clicked, and the page opened an alert dialog: \"clicked\"."),
+                .starts_with("Pressed at (5, 5), and the page opened an alert dialog:"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("click did not finish"),
             "{}",
             result.output
         );
@@ -1608,6 +1673,34 @@ mod tests {
         // stays a failure.
         assert!(dialog_opened_by_input("click", false, opened(), DIRECT_DIALOG_NEXT).is_err());
         assert!(dialog_opened_by_input("evaluate", true, opened(), DIRECT_DIALOG_NEXT).is_err());
+    }
+
+    /// A press-only dialog is reported as a press, and the recovery guidance
+    /// still comes from the mode running the command.
+    #[test]
+    fn a_press_only_dialog_keeps_the_modes_guidance() {
+        let opened = || {
+            anyhow::Error::new(crate::cdp::DialogOpen {
+                dialog_type: "alert".into(),
+                message: "hi".into(),
+            })
+            .context(crate::commands::input::PressOnlyDialog { x: 5.0, y: 10.0 })
+        };
+        let daemon =
+            dialog_opened_by_input("click-at", true, opened(), HANDLE_DIALOG_NEXT).unwrap();
+        assert!(daemon
+            .output
+            .starts_with("Pressed at (5, 10), and the page opened"));
+        assert!(daemon.output.contains("click did not finish"));
+        assert!(!daemon.output.contains("Clicked"));
+        assert!(daemon.output.contains("run `evaluate --dialog-action"));
+
+        let direct =
+            dialog_opened_by_input("click-at", true, opened(), DIRECT_DIALOG_NEXT).unwrap();
+        assert!(!direct.output.contains("--dialog-action"));
+        assert!(direct
+            .output
+            .contains("no later command can handle the dialog"));
     }
 
     /// A dialog from the submit key's own handler must not be reported as a
@@ -1760,6 +1853,117 @@ mod tests {
             !calls.iter().any(|c| c == "Network.setBlockedURLs@S1"),
             "the rule write was never reached: {calls:?}"
         );
+    }
+
+    /// Only a refusal of the rule write itself proves the old list is still
+    /// in force. A dialog handler's CDP error can arrive after a successful
+    /// write and must not roll it back.
+    #[test]
+    fn only_a_rule_refusal_counts_as_a_browser_refusal() {
+        let rule = anyhow!("CDP error in Network.setBlockedURLs: {{\"code\": -32000}}");
+        let handler = anyhow!("CDP error in Page.handleJavaScriptDialog: {{\"code\": -32000}}");
+        assert!(browser_refused_blocked_urls(&rule));
+        assert!(!browser_refused_blocked_urls(&handler));
+    }
+
+    /// `console.error` before an exception must reach stderr with the failure,
+    /// without draining the event that `console` still reports.
+    #[tokio::test]
+    async fn a_page_error_before_a_failed_command_is_kept() {
+        let (mut client, browser) = fake_browser(|method, params| {
+            if method == "Runtime.evaluate" {
+                Answer {
+                    events: vec![json!({
+                        "method": "Runtime.consoleAPICalled",
+                        "sessionId": "S1",
+                        "params": {"type": "error", "args": [
+                            {"type": "string", "value": "save rejected"}
+                        ]}
+                    })],
+                    reply: Some(json!({"result": {"exceptionDetails": {"text": "boom"}}})),
+                }
+            } else {
+                usual(method, params)
+            }
+        })
+        .await;
+        let error = failure(
+            execute_command(
+                &mut client,
+                &request("evaluate", json!({"expression": "1"})),
+            )
+            .await,
+        );
+        assert!(format!("{error:#}").contains("save rejected"), "{error:#}");
+        assert!(
+            !client.console_events.is_empty(),
+            "the event is still buffered for `console`"
+        );
+        calls_made(client, browser).await;
+    }
+
+    /// A connection lost while detaching the one-off session must not undo the
+    /// action's success. The daemon retires the socket from the result flag.
+    #[tokio::test]
+    async fn a_one_off_detach_losing_the_connection_keeps_the_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let detaches = AtomicUsize::new(0);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let browser = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: Value = serde_json::from_str(&text).unwrap();
+                let method = call["method"].as_str().unwrap_or_default();
+                if method == "Target.detachFromTarget"
+                    && detaches.fetch_add(1, Ordering::SeqCst) == 1
+                {
+                    // The failed setup's cleanup detach is answered; the
+                    // action's own detach loses the socket.
+                    ws.send(Message::Close(None)).await.unwrap();
+                    break;
+                }
+                let mut reply = match method {
+                    "Target.getTargets" => json!({"result": {"targetInfos": [
+                        {"targetId": "T1", "type": "page", "title": "", "url": "https://a.test/"}
+                    ]}}),
+                    "Target.attachToTarget" => json!({"result": {"sessionId": "S2"}}),
+                    "Network.enable" => {
+                        json!({"error": {"code": -32000, "message": "Not allowed"}})
+                    }
+                    "Runtime.evaluate"
+                        if call["params"]["expression"] == "window.location.href" =>
+                    {
+                        json!({"result": {"result": {"type": "string", "value": "https://a.test/"}}})
+                    }
+                    "Runtime.evaluate" => {
+                        json!({"result": {"result": {"type": "string", "value": "done"}}})
+                    }
+                    _ => json!({"result": {}}),
+                };
+                reply["id"] = call["id"].clone();
+                reply["sessionId"] = json!(call["sessionId"].as_str().unwrap_or_default());
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        client.persistent_session = None;
+        client.persistent_target_id = None;
+        let result = execute_command(
+            &mut client,
+            &request("evaluate", json!({"expression": "1"})),
+        )
+        .await
+        .expect("the action succeeded before the detach lost the connection");
+        assert_eq!(result.output, "done");
+        assert!(
+            result.connection_lost,
+            "the daemon must retire the dead socket"
+        );
+        browser.await.unwrap();
     }
 
     /// The daemon's session is what keeps heap object IDs stable across
