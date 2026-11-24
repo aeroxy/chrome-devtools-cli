@@ -49,6 +49,34 @@ pub fn parse_geolocation(raw: &str) -> Result<(f64, f64)> {
     Ok((lat, lon))
 }
 
+/// The largest width or height `Emulation.setDeviceMetricsOverride` accepts.
+/// Verified on Chrome 158, which refuses a larger one.
+const MAX_VIEWPORT_SIDE: u32 = 10_000_000;
+
+/// Parse `--viewport WxH`. `validate` runs this, so a size Chrome would refuse
+/// fails before `--clear-media` or any other reset has been sent.
+pub fn parse_viewport(raw: &str) -> Result<(u32, u32)> {
+    let lower = raw.to_lowercase();
+    let parts: Vec<&str> = lower.split('x').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("Viewport must be in WxH format (e.g. 1280x720)");
+    }
+    let side = |name: &str, part: &str| -> Result<u32> {
+        let value: u32 = part
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("Invalid {name}: {part}"))?;
+        if value == 0 {
+            anyhow::bail!("Invalid {name}: {value} (must be > 0)");
+        }
+        if value > MAX_VIEWPORT_SIDE {
+            anyhow::bail!("Invalid {name}: {value} (must be at most {MAX_VIEWPORT_SIDE})");
+        }
+        Ok(value)
+    };
+    Ok((side("width", parts[0])?, side("height", parts[1])?))
+}
+
 /// Parse one `--media-feature name=value`, checked against [`MEDIA_FEATURES`].
 pub fn parse_media_feature(raw: &str) -> Result<(String, String)> {
     let (name, value) = raw.split_once('=').ok_or_else(|| {
@@ -256,6 +284,9 @@ impl EmulateParams {
         if let Some(geolocation) = &self.geolocation {
             parse_geolocation(geolocation)?;
         }
+        if let Some(viewport) = &self.viewport {
+            parse_viewport(viewport)?;
+        }
         if self.mobile && self.viewport.is_none() {
             anyhow::bail!("--mobile requires --viewport");
         }
@@ -437,25 +468,7 @@ pub(crate) async fn emulate_tab(
 
     // 2. Handle setting viewport
     if let Some(viewport_str) = params.viewport {
-        let viewport_lower = viewport_str.to_lowercase();
-        let parts: Vec<&str> = viewport_lower.split('x').collect();
-        if parts.len() != 2 {
-            anyhow::bail!("Viewport must be in WxH format (e.g. 1280x720)");
-        }
-        let w: u32 = parts[0]
-            .trim()
-            .parse()
-            .map_err(|_| anyhow!("Invalid width: {}", parts[0]))?;
-        let h: u32 = parts[1]
-            .trim()
-            .parse()
-            .map_err(|_| anyhow!("Invalid height: {}", parts[1]))?;
-        if w == 0 {
-            anyhow::bail!("Invalid width: {} (must be > 0)", w);
-        }
-        if h == 0 {
-            anyhow::bail!("Invalid height: {} (must be > 0)", h);
-        }
+        let (w, h) = parse_viewport(&viewport_str)?;
         let dsf = params.device_scale_factor.unwrap_or(1.0);
 
         client
@@ -646,6 +659,44 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// `--clear-media` is sent before the viewport is set, so a size Chrome
+    /// would refuse must fail validation, or the command would clear the media
+    /// override and only then report the bad viewport.
+    #[test]
+    fn validate_checks_the_viewport_before_anything_is_applied() {
+        for (raw, expected) in [
+            ("800x600", (800, 600)),
+            (" 1280 X 720 ", (1280, 720)),
+            ("10000000x1", (10_000_000, 1)),
+        ] {
+            assert_eq!(parse_viewport(raw).unwrap(), expected, "{raw}");
+        }
+        for (raw, reason) in [
+            ("800x0", "Invalid height: 0 (must be > 0)"),
+            ("0x600", "Invalid width: 0 (must be > 0)"),
+            ("800", "WxH format"),
+            ("800x600x2", "WxH format"),
+            ("widex600", "Invalid width: wide"),
+            ("800x-600", "Invalid height: -600"),
+            ("800x99999999999", "Invalid height: 99999999999"),
+            (
+                "10000001x600",
+                "Invalid width: 10000001 (must be at most 10000000)",
+            ),
+        ] {
+            let mut p = params();
+            p.clear_media = true;
+            p.viewport = Some(raw.into());
+            let err = p.validate().unwrap_err().to_string();
+            assert!(err.contains(reason), "{raw}: {err}");
+        }
+        // A valid size still goes with the clear: the command does both.
+        let mut p = params();
+        p.clear_media = true;
+        p.viewport = Some("800x600".into());
+        assert!(p.validate().is_ok());
     }
 
     /// `--geolocation` takes values that start with `-`, so clap takes a flag
