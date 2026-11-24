@@ -445,11 +445,20 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     let mut connection_lost_on_detach = false;
     if !using_persistent {
         client.forget_dialog(Some(&session_id));
-        if let Err(e) = client.detach_from_target(&session_id).await {
-            // The action already succeeded: keep its result, but tell the
-            // daemon to retire the dead socket so the next command reconnects
-            // instead of failing on a connection unrelated to it.
-            connection_lost_on_detach = e.downcast_ref::<crate::cdp::ConnectionLost>().is_some();
+        // A connection the command already lost is unusable: a detach written
+        // to it can wait out another write or liveness budget before the
+        // daemon gets the error that retires it.
+        let lost = result
+            .as_ref()
+            .is_err_and(|e| e.downcast_ref::<crate::cdp::ConnectionLost>().is_some());
+        if !lost {
+            if let Err(e) = client.detach_from_target(&session_id).await {
+                // The action already succeeded: keep its result, but tell the
+                // daemon to retire the dead socket so the next command
+                // reconnects instead of failing on a connection unrelated to it.
+                connection_lost_on_detach =
+                    e.downcast_ref::<crate::cdp::ConnectionLost>().is_some();
+            }
         }
     }
     client.dialog_action = None;
@@ -2030,6 +2039,72 @@ mod tests {
             "the daemon must retire the dead socket"
         );
         browser.await.unwrap();
+    }
+
+    /// A command that lost the connection leaves its one-off session alone:
+    /// a detach written to that socket could only wait out another budget
+    /// before the daemon gets the error that retires it.
+    #[tokio::test]
+    async fn a_one_off_session_is_not_detached_after_the_connection_is_lost() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let browser = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut calls = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: Value = serde_json::from_str(&text).unwrap();
+                let method = call["method"].as_str().unwrap_or_default();
+                calls.push(method.to_string());
+                let url_read = call["params"]["expression"] == "window.location.href";
+                let mut reply = match method {
+                    "Target.getTargets" => json!({"result": {"targetInfos": [
+                        {"targetId": "T1", "type": "page", "title": "", "url": "https://a.test/"}
+                    ]}}),
+                    "Target.attachToTarget" => json!({"result": {"sessionId": "S2"}}),
+                    "Network.enable" => {
+                        json!({"error": {"code": -32000, "message": "Not allowed"}})
+                    }
+                    "Runtime.evaluate" if url_read => {
+                        json!({"result": {"result": {"type": "string", "value": "https://a.test/"}}})
+                    }
+                    "Runtime.evaluate" => {
+                        // The command's own call: the client can no longer
+                        // read (a frame that is not UTF-8), but what it writes
+                        // still arrives here, as on a connection gone quiet.
+                        use tokio::io::AsyncWriteExt;
+                        ws.get_mut().write_all(&[0x81, 0x01, 0xFF]).await.unwrap();
+                        calls.push("connection lost".into());
+                        continue;
+                    }
+                    _ => json!({"result": {}}),
+                };
+                reply["id"] = call["id"].clone();
+                reply["sessionId"] = json!(call["sessionId"].as_str().unwrap_or_default());
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+            calls
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        let error = failure(
+            execute_command(
+                &mut client,
+                &request("evaluate", json!({"expression": "1"})),
+            )
+            .await,
+        );
+        assert!(
+            error.downcast_ref::<crate::cdp::ConnectionLost>().is_some(),
+            "{error:#}"
+        );
+        let calls = calls_made(client, browser).await;
+        assert_eq!(
+            calls.last().map(String::as_str),
+            Some("connection lost"),
+            "nothing was written after the loss: {calls:?}"
+        );
     }
 
     /// The daemon's session is what keeps heap object IDs stable across

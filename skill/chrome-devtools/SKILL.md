@@ -590,18 +590,22 @@ the page size (default 50), and names longer than `--max-name-length`
 characters (default 100) end in `…`.
 
 **3. List the retained objects of a class** by its `idx`, largest first. `+`
-objects exist in the `--current` file and `-` objects only in `--base`, so
-inspect each in the file that has it.
+objects entered the class and are in the `--current` file; `-` objects left it
+and are in `--base`. `alsoIn` names the other file when the same id is there
+too, under another class: the object changed class (a node that got detached,
+say) rather than being allocated or freed. Inspect each object in the file
+that has it under this class.
 
 ```bash
 chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /tmp/final.heapsnapshot --class-index 0 --limit 3
 # idx:0,className:Detached <div>,location:,addedCount:10,removedCount:0,countDelta:10,addedSize:880,removedSize:0,sizeDelta:880
 #
 # Objects, largest selfSize first: showing 1-3 of 10; next page: --offset 3
-# op,nodeId,selfSize
-# +,101,88
-# +,103,88
-# +,105,88
+# + = entered this class, - = left it; an id present in the other capture is a class change, not an allocation or deletion.
+# op,nodeId,selfSize,alsoIn
+# +,101,88,-
+# +,103,88,-
+# +,105,88,-
 ```
 
 **4. Ask one of them what keeps it alive.** `inspect-heapsnapshot-node` prints
