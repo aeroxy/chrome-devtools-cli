@@ -194,7 +194,8 @@ async fn wait_for_event_from_session<F>(
 where
     F: FnMut(&serde_json::Value) -> bool,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
     loop {
         if let Some(idx) = client.events.iter().position(&mut matches) {
             if let Some(event) = client.events.remove(idx) {
@@ -219,7 +220,17 @@ where
                 && event["sessionId"].as_str() == Some(session_id);
             client.push_event(event);
             if dialog_here {
-                client.settle_open_dialog(session_id).await?;
+                // Within what is left of this wait: a handler that stops
+                // answering must not hold the daemon, and every caller queued
+                // behind it, for a call's full limit.
+                client
+                    .settle_dialog_within(
+                        session_id,
+                        "Page.handleJavaScriptDialog",
+                        started,
+                        timeout,
+                    )
+                    .await?;
             }
         }
     }
@@ -718,6 +729,47 @@ mod tests {
         drop(client);
         let calls = browser.await.unwrap();
         assert!(handled_dialogs(&calls).is_empty(), "{calls:?}");
+    }
+
+    /// Answering the dialog counts against the wait's own deadline, so a page
+    /// that never answers the handling call can't hold the daemon for a
+    /// call's full limit.
+    #[tokio::test]
+    async fn settling_a_dialog_stays_within_the_wait() {
+        let (mut client, browser) = fake_browser(|call| {
+            match call["method"].as_str().unwrap_or_default() {
+                "Page.navigateToHistoryEntry" => vec![json!({
+                    "method": "Page.javascriptDialogOpening", "sessionId": "S1",
+                    "params": {"type": "beforeunload", "message": ""}
+                })],
+                // Never answered.
+                "Page.handleJavaScriptDialog" => vec![],
+                _ => vec![json!({"id": call["id"], "result": {}})],
+            }
+        })
+        .await;
+        client.dialog_action = Some("accept".into());
+        client
+            .send_raw_no_wait(Some("S1"), "Page.navigateToHistoryEntry", json!({}))
+            .await
+            .unwrap();
+        let wait = wait_for_event_from_session(
+            &mut client,
+            "S1",
+            std::time::Duration::from_millis(500),
+            |e| e["method"] == "Page.frameNavigated",
+        );
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+            .await
+            .expect("settling the dialog ends with the wait")
+            .expect_err("nothing answers the dialog");
+        assert!(
+            crate::cdp::is_connection_or_page_failure(&error)
+                || error.downcast_ref::<crate::cdp::DialogOpen>().is_some(),
+            "{error:#}"
+        );
+        drop(client);
+        browser.abort();
     }
 
     /// A dialog on another session is that page's: the wait records it but
