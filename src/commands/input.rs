@@ -546,11 +546,13 @@ pub async fn fill(
     }
 
     // Focusing and clearing the field only get it ready: a dialog a focus or
-    // input handler opens means the value was never entered.
+    // input handler opens means the value was never entered. The check is
+    // repeated first, as for the kinds above: typing into what has become a
+    // select would report a fill that set nothing.
     let prepare_expr = format!(
         r#"(() => {{
-            const el = document.querySelector({escaped_sel});
-            if (!el) return 'not_found';
+            {classify}
+            if (kind !== 'text') return kind;
             el.focus();
             el.value = '';
             el.dispatchEvent(new Event('input', {{bubbles: true}}));
@@ -574,8 +576,9 @@ pub async fn fill(
         let desc = crate::remote_object::describe_exception(exception);
         bail!("JavaScript error during fill handling: {desc}");
     }
-    if result["result"]["value"] == "not_found" {
-        bail!("Element not found: {selector}");
+    match result["result"]["value"].as_str().unwrap_or("error") {
+        "ready" => {}
+        refused => return Err(fill_refusal(refused, selector, value)),
     }
 
     client.input_sent = true;
@@ -917,7 +920,7 @@ fn parse_key_spec(spec: &str) -> Result<KeySpec> {
 
     let (key, code, key_code) = match named_key(main) {
         Some(named) => named,
-        None => match single_char_key(main, modifiers & SHIFT != 0) {
+        None => match single_char_key(main, modifiers) {
             Some(k) => k,
             None => bail!(
                 "Unknown key '{main}' in '{spec}'. Use a key name (Enter, Tab, Escape, \
@@ -968,15 +971,25 @@ fn named_key(name: &str) -> Option<(String, String, i32)> {
 
 /// Letters, digits and US-layout punctuation, with the code and Windows key
 /// code Chrome expects for each.
-fn single_char_key(s: &str, shift: bool) -> Option<(String, String, i32)> {
+fn single_char_key(s: &str, modifiers: i32) -> Option<(String, String, i32)> {
     let mut chars = s.chars();
     let c = chars.next()?;
     if chars.next().is_some() {
         return None;
     }
+    let shift = modifiers & SHIFT != 0;
     if c.is_ascii_alphabetic() {
         let upper = c.to_ascii_uppercase();
-        let key = if shift { upper } else { c };
+        // Chrome hands the page this key as given, and a keyboard gives a
+        // shortcut's letter in lowercase unless Shift is held: pages check
+        // `e.ctrlKey && e.key === 'a'`. A bare letter types as written.
+        let key = if shift {
+            upper
+        } else if modifiers & (CTRL | ALT | META) != 0 {
+            c.to_ascii_lowercase()
+        } else {
+            c
+        };
         return Some((key.to_string(), format!("Key{upper}"), upper as i32));
     }
     // Shift+1 types "!" on a US layout, and the page reads that as the key.
@@ -1111,6 +1124,34 @@ mod tests {
         );
         assert_eq!(parse_key_spec("Shift+!").unwrap().key, "!");
         assert_eq!(parse_key_spec("Ctrl+Shift+=").unwrap().key, "+");
+    }
+
+    /// The letter of a shortcut reaches the page as a keyboard sends it.
+    #[test]
+    fn letter_shortcuts_send_the_key_a_keyboard_would() {
+        for (spec, key, text) in [
+            ("Ctrl+A", "a", None),
+            ("ctrl+a", "a", None),
+            ("Meta+V", "v", None),
+            ("Alt+F", "f", None),
+            ("Ctrl+Shift+A", "A", None),
+            ("Ctrl+Shift+a", "A", None),
+            ("Shift+a", "A", Some("A")),
+            ("A", "A", Some("A")),
+            ("a", "a", Some("a")),
+        ] {
+            let parsed = parse_key_spec(spec).unwrap();
+            let expected_code = format!("Key{}", key.to_ascii_uppercase());
+            assert_eq!(
+                (
+                    parsed.key.as_str(),
+                    parsed.code.as_str(),
+                    parsed.text.as_deref()
+                ),
+                (key, expected_code.as_str(), text),
+                "{spec}"
+            );
+        }
     }
 
     #[test]

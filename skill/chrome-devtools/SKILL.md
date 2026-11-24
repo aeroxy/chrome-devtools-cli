@@ -216,7 +216,7 @@ chrome-devtools --target warm-squid emulate --clear-media      # media type and 
 
 `--media-feature name=value` adds to the features already set (setting one again replaces its value); clear them all with `--clear-media`. Supported: `prefers-color-scheme` (light, dark), `prefers-reduced-motion` and `prefers-reduced-transparency` (reduce, no-preference), `prefers-contrast` (more, less, custom, no-preference), `forced-colors` (active, none), `color-gamut` (srgb, p3, rec2020). Anything else is rejected before any override is applied, because Chrome would silently ignore it.
 
-CSS media needs the daemon's session for the tab, as network mocks do: without the daemon, or when it could not attach to the tab, `--media` and `--media-feature` fail, because the override would end with the command.
+CSS media needs the daemon's session for the tab, as network mocks do: without the daemon, or when it could not attach to the tab, `--media` and `--media-feature` fail, because the override would end with the command. When it could not attach, the tab's media override isn't applied but the daemon still keeps it for the tab: `emulate` shows it as `saved for this tab, not applied`, and `--clear-media` clears it.
 
 ### Pattern 3: URL Blocking (Network Debugging)
 Block URL patterns using simple `*` wildcards: `*.png` (all PNG files), `cdn.example.com/*` (a domain path), `*analytics*` (any URL containing "analytics"). Patterns persist in the daemon until cleared.
@@ -333,7 +333,7 @@ chrome-devtools --target warm-squid console --duration 0
 
 **Valid `--type` values for `network`** (any case): `Document`, `Script`, `Stylesheet`, `Image`, `Media`, `Font`, `Manifest`, `XHR`, `Fetch`, `Other`. WebSocket connections are not listed by `network`.
 
-**Headers** (`--request-headers`, `--response-headers`) are what went over the wire when Chrome reports that, so `Cookie` and `Set-Cookie` are included; for a response from the cache or a service worker you get the page's view, which leaves those two out. Each redirect hop shows its own, so a login's 302 shows the `Set-Cookie` it answered with. A header sent more than once prints one line per value. They can carry credentials (`Cookie`, `Authorization`, `Set-Cookie`): ask for them only when you need them.
+**Headers** (`--request-headers`, `--response-headers`) are what went over the wire when Chrome reports that, so `Cookie` and `Set-Cookie` are included; for a response from the cache or a service worker you get the page's view, which leaves those two out. Each redirect hop shows its own, so a login's 302 shows the `Set-Cookie` it answered with; a chain whose first request an earlier drain took shows the page's view throughout. A header sent more than once prints one line per value. They can carry credentials (`Cookie`, `Authorization`, `Set-Cookie`): ask for them only when you need them.
 
 ### Pattern 6: JavaScript Evaluation
 
@@ -359,6 +359,10 @@ chrome-devtools --target warm-squid evaluate "prompt('name')" --dialog-action "m
 
 # A dialog that is already open: handle it first, then evaluate
 chrome-devtools --target warm-squid evaluate --dialog-action dismiss "true"
+# Dialogs are answered only within the command's time limit (180s), so a page
+# that keeps opening them can't hold it longer: it then fails with "... ran past
+# its 180s limit, so this dialog is left open", and that dialog stays open. A
+# page that opens them in a loop needs `close-page`.
 
 # Save JS output to a file
 chrome-devtools --target warm-squid evaluate "JSON.stringify(performance.timing)" -o /tmp/perf.json
@@ -366,7 +370,7 @@ chrome-devtools --target warm-squid evaluate "JSON.stringify(performance.timing)
 
 **Avoid `evaluate` for DOM traversal.** Use `snapshot` to read page structure and `click`/`fill` to interact.
 
-**Dialogs opened by an action.** When a `click`, `press-key`, `fill`, `hover` or `type-text` makes the page open a dialog, the command succeeds and says so: `Clicked, and the page opened a confirm dialog: "Delete?"`. **Don't repeat the action.** Handle the dialog next with `evaluate --dialog-action accept|dismiss|<text> true`. Steps after the dialog opened did not run (for `type-text`, its `--submit-key`). If the CLI warned that it ran without the daemon, no later command can handle the dialog: ask the human to close it, or `close-page` the tab.
+**Dialogs opened by an action.** When a `click`, `press-key`, `fill`, `hover` or `type-text` makes the page open a dialog, the command succeeds and says so: `Clicked, and the page opened a confirm dialog: "Delete?"`. **Don't repeat the action.** Handle the dialog next with `evaluate --dialog-action accept|dismiss|<text> true`. Steps after the dialog opened did not run (for `type-text`, its `--submit-key`). If the CLI warned that it ran without the daemon, or the report says the daemon could not attach to the tab, no later command can handle the dialog: ask the human to close it, or `close-page` the tab.
 
 A dialog that opens while the command is only getting ready fails it instead, because the action never happened: `Moving the pointer there opened a dialog, so the click was not sent` (a mouseover handler) or `Focusing or clearing the field opened a dialog, so the value was not entered` (`fill`). Handle the dialog, then run the command again.
 
@@ -497,10 +501,15 @@ object what keeps it alive.
   hundreds of MB of flat number arrays. `compare-heapsnapshots` and
   `inspect-heapsnapshot-node` summarize it, offline (no Chrome connection), and
   page their output.
-- **Take every snapshot from the same tab in the same browser session.** The
-  diff matches objects by V8 heap id, which is only stable within one session;
-  across a browser restart the diff is meaningless. The CLI warns on stderr
-  when two snapshots share no ids.
+- **Take every snapshot of a series from one tab through one daemon, with no
+  command for another tab in between.** The diff matches objects by V8 heap
+  id, and V8 keeps the ids only while the daemon's session stays on the tab.
+  A command for another tab moves that session, the daemon exits after 5 idle
+  minutes (`caffeinate` in the background keeps it up), and another debugger
+  leaving the tab, such as a closed DevTools window, resets the ids as well.
+  The next snapshot then numbers every object afresh and the diff silently
+  pairs unrelated objects: the CLI warns on stderr only when two snapshots
+  share no ids at all.
 - V8 collects garbage before it writes a snapshot, so whatever is in one is
   still reachable.
 
@@ -761,7 +770,7 @@ chrome-devtools --target warm-squid css-styles '#go'
 #   color: rgb(255, 255, 255);
 #   padding: 16px 8px;
 #   ...
-# Rules (highest precedence first):
+# Rules (normal precedence order, highest first):
 #   element.style {
 #     [overridden] color: yellow;
 #   }
@@ -784,7 +793,7 @@ chrome-devtools --target warm-squid css-styles 'button' --ua-rules              
 ```
 
 - **Computed** lists `display`, `width`, `height`, and what the shown rules set; a shorthand shows as one value when Chrome can write one.
-- **Rules** are highest precedence first, each with `file:line` (an inline `<style>` gives the document's line) and its enclosing `@media`/`@layer`/`@supports`/`@container`/nesting as wrapping blocks. `[overridden]` marks a declaration that applies nowhere; `[invalid]` and `[disabled]` mark ones that never could. `/* ... */` after a `var()` value is what it resolves to on that element (or, under "Inherited from", on that ancestor).
+- **Rules** are in normal precedence order, highest first. An `!important` declaration can beat one in a rule above it (`color: white !important` beats `element.style` here), so the tags, not the order, say what applies. Each has `file:line` (an inline `<style>` gives the document's line) and its enclosing `@media`/`@layer`/`@supports`/`@container`/nesting as wrapping blocks. `[overridden]` marks a declaration that applies nowhere; `[invalid]` and `[disabled]` mark ones that never could. `/* ... */` after a `var()` value is what it resolves to on that element (or, under "Inherited from", on that ancestor). An empty comment in it, written `/**\/` there, keeps apart tokens that would otherwise read as one, as Chrome does: `var(--size)px` with `--size: 20` resolves to `20/**\/px`, the number 20 and then `px`, which is no length.
 - **Inherited from** lists only properties that inherit. A user-agent rule on the element itself (common on `button`, `input`) can block inheritance even while hidden; the computed value is the final word.
 - Not covered: pseudo-elements (`::before`), `@keyframes`, elements inside iframes or shadow roots. Use `--json`/`--toon` for structured output.
 
@@ -838,6 +847,7 @@ chrome-devtools --target warm-squid remove-network-mock             # remove all
 ```
 
 - A mock that shows `0 hit(s)` never matched: check the pattern against the URLs `network` lists.
+- Body text that starts with a dash goes attached, as in `--body=-1`: `--body -1` is an error, so `--body` can't take the next flag (`--abort`) as its text.
 - `--body-file` must be a regular file of at most 64 MiB. The daemon reads it, and would wait on a pipe or a device (`<(...)`, `/dev/stdin`), so those fail: save the body to a file first.
 - Mocks belong to the tab and to the daemon: they stop applying while the CLI works on another tab, come back when it returns, and end when the daemon exits. A daemon with mocks stays up while the page keeps making requests; run `caffeinate` in the background to keep it for longer quiet spells.
 - Cross-origin `fetch` needs CORS headers in the mock, e.g. `--header 'Access-Control-Allow-Origin: *'`.
@@ -854,7 +864,7 @@ chrome-devtools --target warm-squid cookies
 chrome-devtools --target warm-squid cookies --url https://example.com/api/
 
 # With values, for a tool that needs the session (a tunnel client, curl):
-# one Cookie header, or every field as JSON
+# one Cookie header (for one URL: the page's or a single --url), or every field as JSON
 chrome-devtools --target warm-squid cookies --header
 chrome-devtools --target warm-squid cookies --name sid --header
 chrome-devtools --target warm-squid --json cookies

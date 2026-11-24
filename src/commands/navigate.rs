@@ -262,6 +262,17 @@ fn parse_document_state(result: &serde_json::Value) -> Option<(String, f64, Stri
     ))
 }
 
+/// Whether `wait_for_load`'s probe shows the load done: readyState
+/// "complete", in a document other than `previous` when there is one.
+fn load_finished(result: &serde_json::Value, previous: Option<&DocumentMark>) -> bool {
+    match previous {
+        None => result["result"]["value"] == "complete",
+        Some(p) => parse_document_state(result).is_some_and(|(state, origin, url)| {
+            state == "complete" && (p.time_origin != origin || p.url != url)
+        }),
+    }
+}
+
 /// Poll until document.readyState is "complete" or the timeout expires.
 ///
 /// With `previous`, the document must also have changed from that one first.
@@ -282,12 +293,19 @@ pub async fn wait_for_load(
             anyhow::bail!("Timeout ({timeout_ms}ms) waiting for page readyState=complete");
         }
 
+        // Only a wait that has a document to tell apart reads the mark: a
+        // page can replace `performance`, and its time origin with it.
+        let expression = if previous.is_some() {
+            DOCUMENT_STATE_JS
+        } else {
+            "document.readyState"
+        };
         let result = client
             .send_to_target(
                 session_id,
                 "Runtime.evaluate",
                 json!({
-                    "expression": DOCUMENT_STATE_JS,
+                    "expression": expression,
                     "returnByValue": true,
                 }),
             )
@@ -295,11 +313,8 @@ pub async fn wait_for_load(
 
         match result {
             Ok(val) => {
-                if let Some((state, origin, url)) = parse_document_state(&val) {
-                    let changed = previous.is_none_or(|p| p.time_origin != origin || p.url != url);
-                    if state == "complete" && changed {
-                        return Ok(());
-                    }
+                if load_finished(&val, previous) {
+                    return Ok(());
                 }
             }
             Err(e) => {
@@ -379,5 +394,27 @@ mod tests {
         assert_eq!(parse_document_state(&stringified), None);
         let no_origin = json!({"result": {"value": ["complete", null, "https://a.test/"]}});
         assert_eq!(parse_document_state(&no_origin), None);
+    }
+
+    /// A page that replaced `performance` has no time origin to read, and an
+    /// ordinary load needs none: only a reload has an old document to rule out.
+    #[test]
+    fn only_a_reload_needs_the_document_mark() {
+        let state = |s: &str| json!({"result": {"type": "string", "value": s}});
+        assert!(load_finished(&state("complete"), None));
+        assert!(!load_finished(&state("interactive"), None));
+
+        let old = DocumentMark {
+            time_origin: 1000.5,
+            url: "https://a.test/".into(),
+        };
+        let mark =
+            |origin: f64| json!({"result": {"value": ["complete", origin, "https://a.test/"]}});
+        assert!(
+            !load_finished(&mark(1000.5), Some(&old)),
+            "the old document"
+        );
+        assert!(load_finished(&mark(2000.25), Some(&old)));
+        assert!(!load_finished(&state("complete"), Some(&old)));
     }
 }

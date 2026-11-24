@@ -908,15 +908,17 @@ impl CdpClient {
         session_id: Option<&str>,
         limit: std::time::Duration,
     ) -> Result<Value> {
+        // The deadline covers all the call waits on: a dialog left open, the
+        // write, the reply, and the dialogs handled while waiting for it.
+        let started = tokio::time::Instant::now();
         // A page with a dialog open answers nothing until the dialog closes,
         // and Chrome announced it only once, possibly to an earlier read.
         if method != "Page.handleJavaScriptDialog" {
             if let Some(sid) = session_id {
-                self.settle_open_dialog(sid).await?;
+                self.settle_dialog_within(sid, method, started, limit)
+                    .await?;
             }
         }
-        // The deadline covers the write as well as the wait for the reply.
-        let started = tokio::time::Instant::now();
         let id = self.send_raw_no_wait(session_id, method, params).await?;
 
         loop {
@@ -932,8 +934,15 @@ impl CdpClient {
             {
                 let dialog_session = resp["sessionId"].as_str().map(str::to_string);
                 if let Some(action) = self.dialog_action.clone() {
-                    self.handle_dialog_helper(dialog_session.as_deref().or(session_id), action)
-                        .await?;
+                    self.handle_dialog_helper(
+                        dialog_session.as_deref().or(session_id),
+                        action,
+                        dialog_from_event(&resp),
+                        method,
+                        started,
+                        limit,
+                    )
+                    .await?;
                     continue;
                 }
                 bail!(dialog_from_event(&resp));
@@ -955,12 +964,24 @@ impl CdpClient {
         }
     }
 
+    /// Answer `dialog` with `action`, within the limit of the call it held up
+    /// (`call`, timed from `started`).
     fn handle_dialog_helper<'a>(
         &'a mut self,
         session_id: Option<&'a str>,
         action: String,
+        dialog: DialogOpen,
+        call: &'a str,
+        started: tokio::time::Instant,
+        limit: std::time::Duration,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            // A page that opens another dialog for each one answered would
+            // otherwise hold the call, and every caller queued behind it,
+            // forever.
+            if started.elapsed() >= limit {
+                return Err(dialog_past_limit(call, limit, dialog));
+            }
             let mut handler_params = json!({});
             match action.as_str() {
                 "accept" => {
@@ -978,8 +999,6 @@ impl CdpClient {
             let id = self
                 .send_raw_no_wait(session_id, "Page.handleJavaScriptDialog", handler_params)
                 .await?;
-            let started = tokio::time::Instant::now();
-            let limit = cdp_call_timeout();
 
             loop {
                 let resp_text = self
@@ -991,8 +1010,15 @@ impl CdpClient {
                 if resp.get("method").and_then(|v| v.as_str())
                     == Some("Page.javascriptDialogOpening")
                 {
-                    self.handle_dialog_helper(session_id, action.clone())
-                        .await?;
+                    self.handle_dialog_helper(
+                        session_id,
+                        action.clone(),
+                        dialog_from_event(&resp),
+                        call,
+                        started,
+                        limit,
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -1124,12 +1150,15 @@ impl CdpClient {
         started: tokio::time::Instant,
         limit: std::time::Duration,
     ) -> Result<String> {
+        // The loop goes round only after a check answered, so at the limit
+        // that check has already been made.
+        let mut checked = false;
         loop {
             let remaining = limit.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 // Whose fault: a lost connection exits the daemon, a stuck
                 // page must not.
-                if self.unread.is_empty() {
+                if self.unread.is_empty() && !checked {
                     self.check_alive().await?;
                 }
                 // What a liveness ping set aside arrived in time, the awaited
@@ -1165,7 +1194,10 @@ impl CdpClient {
             }
             match tokio::time::timeout(remaining.min(QUIET_BEFORE_CHECK), self.read_text()).await {
                 Ok(read) => return read,
-                Err(_) => self.check_alive().await?,
+                Err(_) => {
+                    self.check_alive().await?;
+                    checked = true;
+                }
             }
         }
     }
@@ -1216,6 +1248,20 @@ impl CdpClient {
     /// talks to the page, which answers nothing while it is open: handle it
     /// with the command's `--dialog-action`, or fail now.
     pub async fn settle_open_dialog(&mut self, session_id: &str) -> Result<()> {
+        let started = tokio::time::Instant::now();
+        let call = "Page.handleJavaScriptDialog";
+        self.settle_dialog_within(session_id, call, started, cdp_call_timeout())
+            .await
+    }
+
+    /// [`Self::settle_open_dialog`] as part of `call`, within its limit.
+    async fn settle_dialog_within(
+        &mut self,
+        session_id: &str,
+        call: &str,
+        started: tokio::time::Instant,
+        limit: std::time::Duration,
+    ) -> Result<()> {
         let Some(open) = self
             .open_dialog
             .clone()
@@ -1224,7 +1270,17 @@ impl CdpClient {
             return Ok(());
         };
         match self.dialog_action.clone() {
-            Some(action) => self.handle_dialog_helper(Some(session_id), action).await,
+            Some(action) => {
+                self.handle_dialog_helper(
+                    Some(session_id),
+                    action,
+                    open.dialog,
+                    call,
+                    started,
+                    limit,
+                )
+                .await
+            }
             None => Err(open.dialog.into()),
         }
     }
@@ -1640,6 +1696,20 @@ fn dialog_from_event(event: &Value) -> DialogOpen {
     }
 }
 
+/// A dialog that opens once the call's time is up is left open, and
+/// recorded, so the next command handles it with its own --dialog-action or
+/// fails at once. Still a [`DialogOpen`], so an input that set the dialogs
+/// off reports that it ran rather than invite a second click. Stopping the
+/// script would not help: Chrome 158 does not act on `Runtime.terminateExecution`
+/// while a script is going from one alert to the next.
+fn dialog_past_limit(call: &str, limit: std::time::Duration, dialog: DialogOpen) -> anyhow::Error {
+    anyhow::Error::new(dialog).context(format!(
+        "{call} ran past its {}s limit, so this dialog is left open (`close-page` closes a tab \
+         that keeps opening them)",
+        limit.as_secs()
+    ))
+}
+
 fn is_no_dialog_error(error: &Value) -> bool {
     error["message"]
         .as_str()
@@ -2011,6 +2081,153 @@ mod tests {
         );
         drop(client);
         chrome.await.unwrap();
+    }
+
+    /// A browser for one client. Each call it gets is answered with the
+    /// messages `answer` makes from it, sent after `answer`'s delay. The task
+    /// yields the methods called, in order.
+    async fn fake_chrome(
+        answer: impl Fn(&Value) -> (std::time::Duration, Vec<Value>) + Send + 'static,
+    ) -> (CdpClient, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut calls = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: Value = serde_json::from_str(&text).unwrap();
+                calls.push(call["method"].as_str().unwrap_or_default().to_string());
+                let (delay, messages) = answer(&call);
+                tokio::time::sleep(delay).await;
+                for message in messages {
+                    if ws.send(Message::Text(message.to_string())).await.is_err() {
+                        return calls;
+                    }
+                }
+            }
+            calls
+        });
+        let client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        (client, chrome)
+    }
+
+    fn opening(message: &str) -> Value {
+        json!({
+            "method": "Page.javascriptDialogOpening",
+            "sessionId": "S",
+            "params": {"type": "alert", "message": message}
+        })
+    }
+
+    /// The check that the last quiet read ends in is the final one: checking
+    /// again would stretch the call by another 15s at most.
+    #[tokio::test]
+    async fn a_call_at_its_limit_checks_the_browser_once() {
+        let (mut client, chrome) = fake_chrome(|call| match call["method"].as_str() {
+            Some("Browser.getVersion") => (
+                std::time::Duration::from_millis(200),
+                vec![json!({"id": call["id"], "result": {}})],
+            ),
+            // The page never answers.
+            _ => (std::time::Duration::ZERO, Vec::new()),
+        })
+        .await;
+        let error = client
+            .send_to_target_within(
+                "S",
+                "DOM.getDocument",
+                json!({}),
+                std::time::Duration::from_millis(500),
+            )
+            .await
+            .expect_err("the page never answers");
+        assert!(
+            error.downcast_ref::<PageUnresponsive>().is_some(),
+            "{error:#}"
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls, ["DOM.getDocument", "Browser.getVersion"]);
+    }
+
+    /// `while (true) alert()`: Chrome replies to each answer, then the script
+    /// opens the next alert. Answering them all would hold the call forever.
+    #[tokio::test]
+    async fn dialogs_handled_count_against_the_calls_limit() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let reply = json!({"id": call["id"], "sessionId": "S", "result": {}});
+            let closed = json!({"method": "Page.javascriptDialogClosed", "sessionId": "S",
+                "params": {"result": true, "userInput": ""}});
+            let messages = match call["method"].as_str() {
+                Some("Runtime.evaluate") => vec![opening("again")],
+                Some("Page.handleJavaScriptDialog") => vec![closed, reply, opening("again")],
+                Some("Browser.getVersion") => vec![json!({"id": call["id"], "result": {}})],
+                _ => Vec::new(),
+            };
+            (std::time::Duration::ZERO, messages)
+        })
+        .await;
+        client.dialog_action = Some("accept".into());
+        let call = client.send_to_target_within(
+            "S",
+            "Runtime.evaluate",
+            json!({}),
+            std::time::Duration::from_secs(1),
+        );
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+            .await
+            .expect("the call ends at its limit")
+            .expect_err("the script never returns");
+        assert!(error.downcast_ref::<DialogOpen>().is_some(), "{error:#}");
+        assert!(
+            format!("{error:#}").starts_with(
+                "Runtime.evaluate ran past its 1s limit, so this dialog is left open (`close-page` \
+                 closes a tab that keeps opening them): A javascript dialog is open (alert: again)"
+            ),
+            "{error:#}"
+        );
+        // The next command on the page handles it or fails at once.
+        let left_open = client.open_dialog.as_ref().map(|d| d.session_id.as_deref());
+        assert_eq!(left_open, Some(Some("S")));
+        drop(client);
+        chrome.await.unwrap();
+    }
+
+    /// A dialog left open by an earlier command is handled within the limit
+    /// of the call that finds it, not one of its own.
+    #[tokio::test]
+    async fn settling_an_open_dialog_counts_against_the_calls_limit() {
+        let (mut client, chrome) = fake_chrome(|call| match call["method"].as_str() {
+            Some("Browser.getVersion") => (
+                std::time::Duration::ZERO,
+                vec![json!({"id": call["id"], "result": {}})],
+            ),
+            // Neither the answer to the dialog nor the call itself comes back.
+            _ => (std::time::Duration::ZERO, Vec::new()),
+        })
+        .await;
+        client.note_dialog_event(&opening("earlier"));
+        client.dialog_action = Some("accept".into());
+        let call = client.send_to_target_within(
+            "S",
+            "DOM.getDocument",
+            json!({}),
+            std::time::Duration::from_secs(1),
+        );
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+            .await
+            .expect("the call ends at its limit")
+            .expect_err("nothing answers");
+        assert!(
+            error.downcast_ref::<PageUnresponsive>().is_some(),
+            "{error:#}"
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls, ["Page.handleJavaScriptDialog", "Browser.getVersion"]);
     }
 
     /// Chrome sends each CDP message as one frame, and a page can make one

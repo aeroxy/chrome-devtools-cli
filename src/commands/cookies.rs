@@ -23,9 +23,7 @@ pub async fn cookies(
     header: bool,
     format: OutputFormat,
 ) -> Result<CommandResult> {
-    if header && !format.is_text() {
-        bail!("--header prints a Cookie header, so it can't be combined with --json or --toon");
-    }
+    check_header_args(header, urls, format)?;
     let urls = if urls.is_empty() {
         vec![client.current_url(session_id).await?]
     } else {
@@ -58,19 +56,38 @@ pub async fn cookies(
     Ok(CommandResult::output(cookie_table(&cookies, &urls)))
 }
 
+/// A Cookie header is what one request carries. Cookies scoped to different
+/// paths or hosts never travel together, so a header built from several URLs'
+/// cookies would be one Chrome sends to none of them.
+fn check_header_args(header: bool, urls: &[String], format: OutputFormat) -> Result<()> {
+    if !header {
+        return Ok(());
+    }
+    if !format.is_text() {
+        bail!("--header prints a Cookie header, so it can't be combined with --json or --toon");
+    }
+    if urls.len() > 1 {
+        bail!("--header builds the Cookie header for one URL, so pass at most one --url (none means the page's URL)");
+    }
+    Ok(())
+}
+
 /// `name=value; name2=value2`, ready to send as a `Cookie` header. Longer
-/// paths first, as browsers order them (RFC 6265, 5.4).
+/// paths first, as browsers order them (RFC 6265, 5.4). A nameless cookie
+/// (`Set-Cookie: AAA`) goes as its bare value, which is how Chrome sends it.
 fn cookie_header(cookies: &[&Value]) -> String {
     let mut sorted = cookies.to_vec();
     sorted.sort_by_key(|c| std::cmp::Reverse(c["path"].as_str().unwrap_or("").len()));
     sorted
         .iter()
         .map(|c| {
-            format!(
-                "{}={}",
-                c["name"].as_str().unwrap_or(""),
-                c["value"].as_str().unwrap_or("")
-            )
+            let name = c["name"].as_str().unwrap_or("");
+            let value = c["value"].as_str().unwrap_or("");
+            if name.is_empty() {
+                value.to_string()
+            } else {
+                format!("{name}={value}")
+            }
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -210,5 +227,31 @@ mod tests {
         let deep = cookie("b", "2", "/app/x");
         assert_eq!(cookie_header(&[&root, &deep]), "b=2; a=1");
         assert_eq!(cookie_header(&[]), "");
+    }
+
+    /// A cookie set without a name (`Set-Cookie: AAA`) goes as its bare
+    /// value, as Chrome sends it.
+    #[test]
+    fn a_nameless_cookie_goes_as_its_value() {
+        let nameless = cookie("", "AAA", "/");
+        let named = cookie("b", "2", "/");
+        assert_eq!(cookie_header(&[&nameless, &named]), "AAA; b=2");
+    }
+
+    /// The header is for one URL, the page's or a single `--url`; the table
+    /// and the structured output take any number.
+    #[test]
+    fn a_header_is_for_one_url() {
+        let urls =
+            |n: usize| -> Vec<String> { (0..n).map(|i| format!("https://a.test/{i}/")).collect() };
+        for n in [0, 1] {
+            assert!(check_header_args(true, &urls(n), OutputFormat::Text).is_ok());
+        }
+        let err = check_header_args(true, &urls(2), OutputFormat::Text).unwrap_err();
+        assert!(err.to_string().contains("at most one --url"), "{err}");
+        for format in [OutputFormat::Text, OutputFormat::Json, OutputFormat::Toon] {
+            assert!(check_header_args(false, &urls(2), format).is_ok());
+        }
+        assert!(check_header_args(true, &urls(1), OutputFormat::Json).is_err());
     }
 }

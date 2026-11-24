@@ -389,9 +389,15 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     // first, or fail now rather than wait on a page that won't answer.
     let result = match client.settle_open_dialog(&session_id).await {
         Ok(()) => {
-            let result = inner_execute(client, &session_id, req).await;
-            result
-                .or_else(|e| dialog_opened_by_input(cmd, client.input_sent, e, HANDLE_DIALOG_NEXT))
+            let result = inner_execute(client, &session_id, &target_id, req).await;
+            // Only the session that saw a dialog open can handle it, and a
+            // one-off session is detached below.
+            let next = if using_persistent {
+                HANDLE_DIALOG_NEXT
+            } else {
+                ONE_OFF_DIALOG_NEXT
+            };
+            result.or_else(|e| dialog_opened_by_input(cmd, client.input_sent, e, next))
         }
         Err(e) => Err(e),
     };
@@ -420,8 +426,9 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     })
 }
 
-/// What to do about a dialog an input opened, when the daemon ran it: its
-/// session saw the dialog open, and only such a session can handle it.
+/// What to do about a dialog an input opened, when the daemon ran it on its
+/// own session for the tab: that session saw the dialog open, and only such a
+/// session can handle it.
 pub(crate) const HANDLE_DIALOG_NEXT: &str = "The page is paused until the dialog is handled: \
      run `evaluate --dialog-action accept|dismiss|<prompt text> true` on this page next.";
 
@@ -429,6 +436,12 @@ pub(crate) const HANDLE_DIALOG_NEXT: &str = "The page is paused until the dialog
 /// with the command, and Chrome tells no later session about the dialog.
 pub(crate) const DIRECT_DIALOG_NEXT: &str = "This ran without the daemon, so no later command \
      can handle the dialog: a person has to close it, or `close-page` closes the tab.";
+
+/// The same when the daemon could not attach its own session to the tab: the
+/// one-off session it ran the input on is detached when the command ends.
+const ONE_OFF_DIALOG_NEXT: &str = "The daemon could not attach to this tab, so the command ran \
+     on a session of its own that has ended, and no later command can handle the dialog: a \
+     person has to close it, or `close-page` closes the tab.";
 
 /// An input action that opens a dialog did what it was asked: the page reacted
 /// with a dialog, and the action's reply can't come back until it closes.
@@ -514,10 +527,11 @@ fn string_list(value: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Execute a page-level command within an active session.
+/// Execute a page-level command within an active session on `target_id`.
 async fn inner_execute(
     client: &mut CdpClient,
     session_id: &str,
+    target_id: &str,
     req: &DaemonRequest,
 ) -> Result<CommandResult> {
     let args = &req.args;
@@ -566,7 +580,8 @@ async fn inner_execute(
             params.validate()?;
 
             if params.has_emulation() {
-                commands::emulation::emulate(client, session_id, params).await?;
+                commands::emulation::emulate_tab(client, session_id, Some(target_id), params)
+                    .await?;
             }
 
             commands::navigate::navigate(
@@ -739,7 +754,7 @@ async fn inner_execute(
                     .unwrap_or(false),
             };
             params.validate()?;
-            commands::emulation::emulate(client, session_id, params).await
+            commands::emulation::emulate_tab(client, session_id, Some(target_id), params).await
         }
         "mock-network" => match args.get("pattern").and_then(|v| v.as_str()) {
             None => commands::network_mock::list_network_mocks(client, req.format()),
@@ -911,8 +926,9 @@ mod tests {
     use serde_json::Value;
     use tokio_tungstenite::tungstenite::Message;
 
-    /// What the fake browser does with one call: send `events`, then the reply,
-    /// or no reply at all, as a page blocked by a dialog gives none.
+    /// What the fake browser does with one call: send `events`, then the reply
+    /// (its `result` or `error`), or no reply at all, as a page blocked by a
+    /// dialog gives none.
     struct Answer {
         events: Vec<Value>,
         reply: Option<Value>,
@@ -921,7 +937,15 @@ mod tests {
     fn reply(result: Value) -> Answer {
         Answer {
             events: Vec::new(),
-            reply: Some(result),
+            reply: Some(json!({"result": result})),
+        }
+    }
+
+    /// The call refused, as Chrome refuses one with an ordinary CDP error.
+    fn cdp_error(message: &str) -> Answer {
+        Answer {
+            events: Vec::new(),
+            reply: Some(json!({"error": {"code": -32000, "message": message}})),
         }
     }
 
@@ -979,8 +1003,9 @@ mod tests {
                 for event in answer.events {
                     ws.send(Message::Text(event.to_string())).await.unwrap();
                 }
-                if let Some(result) = answer.reply {
-                    let reply = json!({"id": call["id"], "sessionId": session, "result": result});
+                if let Some(mut reply) = answer.reply {
+                    reply["id"] = call["id"].clone();
+                    reply["sessionId"] = json!(session);
                     ws.send(Message::Text(reply.to_string())).await.unwrap();
                 }
             }
@@ -1248,7 +1273,7 @@ mod tests {
                 } else {
                     Vec::new()
                 },
-                reply: Some(json!({"targetInfos": targets})),
+                reply: Some(json!({"result": {"targetInfos": targets}})),
             },
             "Runtime.evaluate" if params["expression"] == "'done'" => value("done"),
             _ => usual(method, params),
@@ -1306,6 +1331,152 @@ mod tests {
                 .any(|c| c.starts_with("Page.handleJavaScriptDialog")),
             "{calls:?}"
         );
+    }
+
+    /// The page turns the text field into a select once `fill` has looked at
+    /// it: the step that types repeats the check before touching the field.
+    #[tokio::test]
+    async fn a_field_no_longer_text_is_not_typed_into() {
+        let (mut client, browser) = fake_browser(|method, params| {
+            let expr = params["expression"].as_str().unwrap_or_default();
+            let rechecked = |e: &str| {
+                let check = e.find("if (kind !== 'text') return kind;");
+                check.is_some_and(|c| e.find("el.focus()").is_some_and(|f| c < f))
+            };
+            match method {
+                "Runtime.evaluate" if fill_check(expr) => value("text"),
+                "Runtime.evaluate" if rechecked(expr) => value("select"),
+                "Runtime.evaluate" if expr.contains("el.focus()") => value("ready"),
+                _ => usual(method, params),
+            }
+        })
+        .await;
+        let fill = request("fill", json!({"selector": "#q", "value": "hello"}));
+        let error = failure(execute_command(&mut client, &fill).await);
+        assert_eq!(
+            error.to_string(),
+            "The page changed the element before it could be filled: #q"
+        );
+        let calls = calls_made(client, browser).await;
+        assert!(
+            !calls.iter().any(|c| c.starts_with("Input.insertText")),
+            "{calls:?}"
+        );
+    }
+
+    /// A browser whose tab T1 refuses the daemon's own session (an ordinary
+    /// CDP error while setting it up), so commands on T1 run on a one-off
+    /// session, S2 again here, that is detached when they end.
+    fn persistent_setup_refused(
+        answer: impl Fn(&str, &Value) -> Option<Answer> + Send + 'static,
+    ) -> impl Fn(&str, &Value) -> Answer + Send + 'static {
+        move |method, params| match method {
+            "Network.enable" => cdp_error("Not allowed"),
+            _ => answer(method, params).unwrap_or_else(|| usual(method, params)),
+        }
+    }
+
+    async fn without_the_daemons_session(
+        answer: impl Fn(&str, &Value) -> Answer + Send + 'static,
+    ) -> (CdpClient, tokio::task::JoinHandle<Vec<String>>) {
+        let (mut client, browser) = fake_browser(answer).await;
+        client.persistent_session = None;
+        client.persistent_target_id = None;
+        (client, browser)
+    }
+
+    /// Chrome tells only the session that saw a dialog open, and the one-off
+    /// session is gone once the command ends, so the report must not send the
+    /// caller to `--dialog-action`. It still reports the click.
+    #[tokio::test]
+    async fn a_dialog_from_an_input_on_a_one_off_session_is_left_to_a_person() {
+        let (mut client, browser) =
+            without_the_daemons_session(persistent_setup_refused(|method, params| {
+                (method == "Input.dispatchMouseEvent" && params["type"] == "mousePressed")
+                    .then(|| dialog("clicked"))
+            }))
+            .await;
+        let click = request("click-at", json!({"x": 5, "y": 5}));
+        let result = execute_command(&mut client, &click)
+            .await
+            .expect("the page got the click");
+        assert!(
+            result
+                .output
+                .starts_with("Clicked, and the page opened an alert dialog: \"clicked\"."),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.ends_with(
+                "no later command can handle the dialog: a person has to close it, or \
+                 `close-page` closes the tab."
+            ),
+            "{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("--dialog-action"),
+            "{}",
+            result.output
+        );
+        let calls = calls_made(client, browser).await;
+        // The daemon's own session, refused, then the one-off one.
+        assert!(
+            calls.contains(&"Network.enable@S2".to_string()),
+            "{calls:?}"
+        );
+        let attaches = calls.iter().filter(|c| *c == "Target.attachToTarget@");
+        assert_eq!(attaches.count(), 2, "{calls:?}");
+    }
+
+    fn print_saved_for_t1(client: &mut CdpClient) {
+        client.emulation_saved.insert(
+            "T1".into(),
+            crate::cdp::TabEmulation {
+                media: Some(crate::cdp::MediaOverride {
+                    media: Some("print".into()),
+                    features: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// T1's media override waits for the daemon's next session on the tab,
+    /// which would put it back: clearing it on a one-off session clears that.
+    #[tokio::test]
+    async fn clearing_media_on_a_one_off_session_clears_what_the_tab_keeps() {
+        let (mut client, browser) =
+            without_the_daemons_session(persistent_setup_refused(|_, _| None)).await;
+        print_saved_for_t1(&mut client);
+        let clear = request("emulate", json!({"clear_media": true}));
+        let result = execute_command(&mut client, &clear).await.expect("cleared");
+        assert_eq!(result.output, "Media emulation cleared");
+        let saved = client.emulation_saved.get("T1");
+        assert!(saved.is_none_or(|s| s.media.is_none()), "{saved:?}");
+        let calls = calls_made(client, browser).await;
+        assert!(
+            calls.contains(&"Emulation.setEmulatedMedia@S2".to_string()),
+            "{calls:?}"
+        );
+    }
+
+    /// Nothing applies T1's override on a one-off session, but the daemon
+    /// still keeps it: the report must say so rather than "no overrides".
+    #[tokio::test]
+    async fn a_one_off_session_reports_the_tabs_saved_media_as_not_applied() {
+        let (mut client, browser) =
+            without_the_daemons_session(persistent_setup_refused(|_, _| None)).await;
+        print_saved_for_t1(&mut client);
+        let status = request("emulate", json!({}));
+        let result = execute_command(&mut client, &status).await.expect("status");
+        assert_eq!(
+            result.output,
+            "Media: print (saved for this tab, not applied: the daemon could not attach to it \
+             this time)"
+        );
+        calls_made(client, browser).await;
     }
 
     /// Without the daemon, the session that saw the dialog open ends with the

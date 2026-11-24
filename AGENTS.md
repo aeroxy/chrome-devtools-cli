@@ -98,8 +98,9 @@ at most once, then stop and ask a human rather than looping or calling
 Every CDP call waits on `read_text_for_call` (`cdp.rs`), so nothing waits
 forever on a connected browser. The call's limit, 180s by default
 (`CHROME_CDP_TIMEOUT_SECS`) or `SETUP_CALL_TIMEOUT` (10s) for domain enables,
-counts from before the request is written; the write itself is bounded by
-the default limit and a write that doesn't finish retires the connection.
+counts from before a dialog left open is handled and the request written;
+the write itself is bounded by the default limit and a write that doesn't
+finish retires the connection.
 Whenever the socket is quiet for 30s, and once more when the limit runs out,
 the call pings the browser (`check_alive`, which `caffeinate` uses too): no
 answer within 15s is `ConnectionLost` and the daemon exits. A ping can
@@ -114,12 +115,21 @@ announces the dialog once, only to sessions that had `Page` enabled, and only
 those can handle it (a new session gets "No dialog is showing"). So
 `note_dialog_event` records it from whichever read sees it (`open_dialog`),
 and every call on that session first handles it with the command's
-`--dialog-action` or fails with the typed `DialogOpen` at once. An input
+`--dialog-action` or fails with the typed `DialogOpen` at once. Handling
+counts against the limit of the call it holds up (`handle_dialog_helper` gets
+that call's clock): a dialog that opens after the limit is left open and
+recorded, and the call fails with `DialogOpen` (`dialog_past_limit`).
+Otherwise `while (true) alert()` with `--dialog-action accept` can hold the
+call for as long as each check at the limit reads the next dialog before its
+own reply, which a browser behind a proxy or across a network does; and
+`Runtime.terminateExecution` does not stop such a loop on Chrome 158. An input
 command whose own action opened the dialog reports success
 (`dialog_opened_by_input` in `executor.rs`), since retrying would repeat the
-click. A dialog the daemon never saw can't be handled at all; the setup
-timeout turns that into a `PageUnresponsive` error within 10s instead of a
-180s wait per call.
+click. Only the session that saw the dialog open can handle it, so on a
+one-off session (the daemon could not attach to the tab) the report says no
+later command can. A dialog the daemon never saw can't be handled at all;
+the setup timeout turns that into a `PageUnresponsive` error within 10s
+instead of a 180s wait per call.
 
 ### Stderr Notes
 
@@ -215,8 +225,13 @@ LLM-friendly) produce structured output. Mutually exclusive.
 intercepted early in `run()` before any Chrome connection or daemon spawn.
 `inspect-heapsnapshot-node` and `compare-heapsnapshots` parse local
 `.heapsnapshot` files purely offline. Note that snapshot diffing matches nodes
-by V8 heap object ID, which is only stable within a single Chrome session —
-both snapshots must come from the same session to produce a meaningful diff.
+by V8 heap object ID, which V8 forgets whenever a session on the page turns its
+heap profiler off, as every session does when it detaches. `take-heapsnapshot`
+therefore leaves the profiler on, and two snapshots diff meaningfully only if
+the daemon's session stayed on that tab between them. A command for another
+tab, the daemon exiting, or another client detaching from the tab renumbers
+every object, and the renumbered ids overlap the old ones, so the
+no-shared-ids warning cannot catch it.
 
 `kill-daemon` drops the daemon's already-approved Chrome connection, so it's
 guarded (`kill_daemon_decision` in `lib.rs`): interactive (TTY) callers get a
