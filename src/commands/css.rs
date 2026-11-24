@@ -1414,6 +1414,16 @@ fn resolve_queried_vars(
 
 /// Custom property names a value references, fallbacks included.
 fn var_names(value: &str, out: &mut Vec<String>) {
+    var_names_within(value, out, 0);
+}
+
+/// [`var_names`] down to the fallback depth [`substitute`] follows: a page's
+/// CSS sets how deep the nesting goes, and a name deeper than that can't be
+/// resolved anyway.
+fn var_names_within(value: &str, out: &mut Vec<String>, depth: usize) {
+    if depth > 16 {
+        return;
+    }
     let mut rest = value;
     while let Some((_, args_at)) = find_var(rest) {
         let args = &rest[args_at..];
@@ -1424,7 +1434,7 @@ fn var_names(value: &str, out: &mut Vec<String>) {
             out.push(name.into_owned());
         }
         if let Some(fallback) = fallback {
-            var_names(fallback, out);
+            var_names_within(fallback, out, depth + 1);
         }
         rest = &args[close + 1..];
     }
@@ -3003,6 +3013,21 @@ Note: Matched rules, computed values and page details are read in separate reque
         let mut names = Vec::new();
         var_names("var(--a, var(--b, 1px)) var( --c )", &mut names);
         assert_eq!(names, ["--a", "--b", "--c"]);
+
+        // A page can nest fallbacks as deep as it likes; the walk stops where
+        // substitution does, instead of recursing until the stack runs out.
+        let depth = 100_000;
+        let nested = format!(
+            "{}1px{}",
+            (0..depth)
+                .map(|i| format!("var(--v{i}, "))
+                .collect::<String>(),
+            ")".repeat(depth)
+        );
+        let mut names = Vec::new();
+        var_names(&nested, &mut names);
+        assert_eq!(names.len(), 17);
+        assert_eq!(names[16], "--v16");
     }
 
     #[test]

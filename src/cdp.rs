@@ -403,7 +403,7 @@ fn parse_connect_timeout(raw: Option<&str>) -> std::time::Duration {
 /// loop or a hung renderer can't hold the daemon, which serves one request at
 /// a time, and every caller queued behind it, forever.
 /// Read once, so a bad value warns once rather than on every call.
-fn cdp_call_timeout() -> std::time::Duration {
+pub(crate) fn cdp_call_timeout() -> std::time::Duration {
     static LIMIT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
         let raw = std::env::var("CHROME_CDP_TIMEOUT_SECS").ok();
@@ -999,7 +999,27 @@ impl CdpClient {
         std::mem::take(&mut self.console_events).into()
     }
 
+    /// Forget calls that stopped waiting without cleaning up after
+    /// themselves: a caller's own timeout (`probe_within_deadline` in
+    /// navigate.rs) drops a call mid-wait, with its id still in
+    /// `awaiting_replies`, and its late reply would then sit in
+    /// `deferred_replies` for the life of the daemon. Run between daemon
+    /// requests, when no call is waiting, so every entry left is such a one.
+    pub(crate) fn forget_abandoned_calls(&mut self) {
+        self.awaiting_replies.clear();
+        self.deferred_replies.clear();
+    }
+
     pub(crate) fn push_event(&mut self, event: Value) {
+        // Only take-heapsnapshot reads these, straight off the socket. One it
+        // gave up on keeps streaming, and its chunks, the whole heap, must not
+        // fill the buffers or crowd out the events later commands wait for.
+        if matches!(
+            event["method"].as_str(),
+            Some("HeapProfiler.addHeapSnapshotChunk" | "HeapProfiler.reportHeapSnapshotProgress")
+        ) {
+            return;
+        }
         self.note_dialog_event(&event);
         if event["method"] == "Target.detachedFromTarget" {
             if let Some(sid) = event["params"]["sessionId"].as_str() {
@@ -1543,7 +1563,7 @@ impl CdpClient {
     /// and the next command reconnects). An answer means the page, not the
     /// connection, is slow, and the call is only given up at `limit`, leaving
     /// the daemon and its approved connection in place.
-    async fn read_text_for_call(
+    pub(crate) async fn read_text_for_call(
         &mut self,
         id: u64,
         method: &str,
@@ -3592,6 +3612,46 @@ mod tests {
                 "Network.setBlockedURLs"
             ]
         );
+    }
+
+    /// A caller's own timeout can drop a call mid-wait, leaving its id
+    /// awaited, so its late reply is parked for an owner that is gone. Each
+    /// daemon request starts by forgetting both.
+    #[tokio::test]
+    async fn calls_dropped_mid_wait_are_forgotten_by_the_next_request() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let delay = if call["method"] == "Slow.call" {
+                300
+            } else {
+                0
+            };
+            (
+                std::time::Duration::from_millis(delay),
+                vec![json!({"id": call["id"], "sessionId": "S", "result": {}})],
+            )
+        })
+        .await;
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.send_to_target("S", "Slow.call", json!({})),
+        )
+        .await;
+        assert!(dropped.is_err(), "the caller gave up first");
+        client
+            .send_to_target_within(
+                "S",
+                "DOM.getDocument",
+                json!({}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("the next call gets its own reply");
+        assert_eq!(client.deferred_replies.len(), 1, "the late reply is parked");
+        client.forget_abandoned_calls();
+        assert!(client.deferred_replies.is_empty());
+        assert!(client.awaiting_replies.is_empty());
+        drop(client);
+        chrome.await.unwrap();
     }
 
     /// Fire-and-forget writes never register an awaited id, so their replies

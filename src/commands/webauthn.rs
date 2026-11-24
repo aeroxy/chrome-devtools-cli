@@ -248,6 +248,15 @@ fn check_supported(params: &WebAuthnParams, options: &AuthenticatorOptions) -> R
     Ok(())
 }
 
+/// Drop the authenticator saved for the tab `target_id`, saying whether there
+/// was one.
+fn forget_saved(client: &mut CdpClient, target_id: Option<&str>) -> bool {
+    target_id
+        .and_then(|t| client.emulation_saved.get_mut(t))
+        .and_then(|saved| saved.webauthn.take())
+        .is_some()
+}
+
 /// Whether Chrome's error says the authenticator no longer exists, rather than
 /// that this one call failed. These are Chrome's own messages, not page text.
 fn authenticator_gone(e: &anyhow::Error) -> bool {
@@ -285,9 +294,12 @@ async fn is_background_tab(client: &mut CdpClient, session_id: &str) -> Result<b
 /// detaches, so it is added on the daemon's persistent session for the tab,
 /// which stays attached between commands. The tab's emulation state records it
 /// so that it is re-created when the CLI comes back from another tab.
+/// `target_id` names the tab, whose saved state `--remove` clears too when
+/// this runs on a one-off session.
 pub async fn configure_webauthn(
     client: &mut CdpClient,
     session_id: &str,
+    target_id: Option<&str>,
     params: WebAuthnParams,
     format: OutputFormat,
 ) -> Result<CommandResult> {
@@ -309,7 +321,15 @@ pub async fn configure_webauthn(
                 return Err(e.context("Failed to remove the virtual authenticator"));
             }
         }
-        let had_one = client.webauthn.take().is_some();
+        // On a one-off session (the daemon could not attach its own) the
+        // tab's authenticator waits in its saved state, and would be
+        // re-created on the next attach unless that goes too.
+        let persistent = client.persistent_session.as_deref() == Some(session_id);
+        let had_one = if persistent {
+            client.webauthn.take().is_some()
+        } else {
+            forget_saved(client, target_id)
+        };
         return if format.is_text() {
             Ok(CommandResult::output(if had_one {
                 "Removed the virtual authenticator."

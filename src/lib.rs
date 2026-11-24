@@ -2778,9 +2778,11 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 is_user_verified: *is_user_verified,
                 remove: *remove,
             };
+            // Without the daemon there is no saved state to clear.
             commands::webauthn::configure_webauthn(
                 &mut client,
                 &session_id,
+                None,
                 params,
                 cli.output_format(),
             )
