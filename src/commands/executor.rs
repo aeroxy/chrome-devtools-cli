@@ -501,9 +501,24 @@ pub(crate) fn dialog_opened_by_input(
     } else {
         "a"
     };
+    // The submit key's own handler can open the dialog, in which case the key
+    // was pressed: telling the caller it was skipped invites a second press.
+    let after = if cmd == "type-text" {
+        if error
+            .downcast_ref::<crate::commands::input::SubmitKeyDialog>()
+            .is_some()
+        {
+            " The dialog opened while the submit key was being pressed, so its outcome is \
+             unconfirmed; do not press it again."
+        } else {
+            " The dialog opened during text insertion, before the submit key was sent \
+             (--submit-key did not run)."
+        }
+    } else {
+        " Steps after it opened did not run."
+    };
     Ok(CommandResult::output(format!(
-        "{verb}, and the page opened {article} {} dialog: \"{}\". Steps after it opened did not run \
-         (for type-text, a --submit-key). {next}",
+        "{verb}, and the page opened {article} {} dialog: \"{}\".{after} {next}",
         dialog.dialog_type, dialog.message
     )))
 }
@@ -785,7 +800,19 @@ async fn inner_execute(
             commands::emulation::emulate_tab(client, session_id, Some(target_id), params).await
         }
         "mock-network" => match args.get("pattern").and_then(|v| v.as_str()) {
-            None => commands::network_mock::list_network_mocks(client, req.format()),
+            None => {
+                // A one-off session has no saved mocks. Listing its empty
+                // vector would falsely say this tab has none when the daemon
+                // merely failed to attach and can restore them later.
+                if client.persistent_session.as_deref() != Some(session_id) {
+                    anyhow::bail!(
+                        "Listing network mocks needs the daemon's long-lived session for this \
+                         tab, which this command is not running in (no daemon, or it could not \
+                         attach). Run it again once the daemon is up."
+                    );
+                }
+                commands::network_mock::list_network_mocks(client, req.format())
+            }
             Some(pattern) => {
                 let request = commands::network_mock::MockRequest {
                     pattern,
@@ -1458,6 +1485,24 @@ mod tests {
         assert_eq!(attaches.count(), 2, "{calls:?}");
     }
 
+    /// A one-off session has no saved mocks. Reporting its empty active list
+    /// would falsely answer "no mocks" for a tab whose mocks the daemon still
+    /// holds and can restore on its next attach.
+    #[tokio::test]
+    async fn listing_mocks_without_the_daemon_does_not_report_an_empty_list() {
+        let (mut client, browser) =
+            without_the_daemons_session(persistent_setup_refused(|_, _| None)).await;
+        let list = request("mock-network", json!({}));
+        let error = failure(execute_command(&mut client, &list).await);
+        assert!(
+            error
+                .to_string()
+                .contains("needs the daemon's long-lived session"),
+            "{error:#}"
+        );
+        calls_made(client, browser).await;
+    }
+
     fn print_saved_for_t1(client: &mut CdpClient) {
         client.emulation_saved.insert(
             "T1".into(),
@@ -1521,9 +1566,8 @@ mod tests {
         assert_eq!(
             daemon.output,
             "Clicked, and the page opened a confirm dialog: \"Delete?\". Steps after it opened did \
-             not run (for type-text, a --submit-key). The page is paused until the dialog is \
-             handled: run `evaluate --dialog-action accept|dismiss|<prompt text> true` on this \
-             page next."
+             not run. The page is paused until the dialog is handled: run `evaluate \
+             --dialog-action accept|dismiss|<prompt text> true` on this page next."
         );
         let direct = dialog_opened_by_input("fill", true, opened(), DIRECT_DIALOG_NEXT).unwrap();
         assert!(
@@ -1548,6 +1592,47 @@ mod tests {
         // stays a failure.
         assert!(dialog_opened_by_input("click", false, opened(), DIRECT_DIALOG_NEXT).is_err());
         assert!(dialog_opened_by_input("evaluate", true, opened(), DIRECT_DIALOG_NEXT).is_err());
+    }
+
+    /// A dialog from the submit key's own handler must not be reported as a
+    /// skipped key, or the caller would press it a second time.
+    #[test]
+    fn a_submit_key_dialog_does_not_say_the_key_was_skipped() {
+        let opened = || {
+            anyhow::Error::new(crate::cdp::DialogOpen {
+                dialog_type: "alert".into(),
+                message: "Submitted".into(),
+            })
+        };
+        let during_insertion =
+            dialog_opened_by_input("type-text", true, opened(), HANDLE_DIALOG_NEXT).unwrap();
+        assert!(
+            during_insertion
+                .output
+                .contains("(--submit-key did not run)"),
+            "{}",
+            during_insertion.output
+        );
+
+        let from_key = dialog_opened_by_input(
+            "type-text",
+            true,
+            opened().context(crate::commands::input::SubmitKeyDialog),
+            HANDLE_DIALOG_NEXT,
+        )
+        .unwrap();
+        assert!(
+            from_key
+                .output
+                .contains("so its outcome is unconfirmed; do not press it again"),
+            "{}",
+            from_key.output
+        );
+        assert!(
+            !from_key.output.contains("did not run"),
+            "{}",
+            from_key.output
+        );
     }
 
     /// A page dialog and `--block-url` in one command: the dialog must be

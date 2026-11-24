@@ -132,8 +132,10 @@ command whose own action opened the dialog reports success
 click. Only the session that saw the dialog open can handle it, so on a
 one-off session (the daemon could not attach to the tab) the report says no
 later command can. A dialog the daemon never saw can't be handled at all;
-the setup timeout turns that into a `PageUnresponsive` error within 10s
-instead of a 180s wait per call.
+the 10s setup timeout is the setup call's budget, not a promise that the error
+reaches the caller that soon: a liveness ping can add up to 15s, and a
+`Runtime.*` setup call can spend another 10s writing `Runtime.terminateExecution`,
+before the call reports `PageUnresponsive` rather than waiting 180s.
 
 ### Stderr Notes
 

@@ -155,6 +155,14 @@ pub struct CdpClient {
     /// that page can handle it or fail at once instead of waiting on a page
     /// that will not answer.
     pub open_dialog: Option<OpenDialog>,
+    /// Open dialogs per session, in the order Chrome announced them.
+    /// `open_dialog` mirrors the newest one for callers that read the public
+    /// field directly; opening or closing one session's dialog must not lose
+    /// another's.
+    open_dialogs: Vec<OpenDialog>,
+    /// Ids of calls that are waiting for a reply. A reply to any other id is
+    /// fire-and-forget and dropped, not parked in `deferred_replies` forever.
+    awaiting_replies: std::collections::HashSet<u64>,
     /// Set once an input command has sent its action to the page. A dialog
     /// that interrupts the command after that is the action's doing; before
     /// it, the action never ran.
@@ -467,6 +475,8 @@ impl CdpClient {
             next_id: 1,
             dialog_action: None,
             open_dialog: None,
+            open_dialogs: Vec::new(),
+            awaiting_replies: std::collections::HashSet::new(),
             input_sent: false,
             events: std::collections::VecDeque::new(),
             unread: std::collections::VecDeque::new(),
@@ -571,9 +581,10 @@ impl CdpClient {
                 .send_to_target_within(&session_id, method, json!({}), SETUP_CALL_TIMEOUT)
                 .await
             {
-                self.cleanup_failed_session(&session_id, target_id, false)
+                let cleanup = self
+                    .cleanup_failed_session(&session_id, target_id, false)
                     .await;
-                return Err(e);
+                return Err(cleanup.err().unwrap_or(e));
             }
         }
 
@@ -588,23 +599,29 @@ impl CdpClient {
         self.webauthn = restored.webauthn;
         self.network_mocks = restored.network_mocks;
 
-        if let Err(e) = self.apply_network_rules_internal(&session_id).await {
-            self.cleanup_failed_session(&session_id, target_id, true)
+        if let Err(e) = self
+            .apply_network_rules_on_enabled_session(&session_id)
+            .await
+        {
+            let cleanup = self
+                .cleanup_failed_session(&session_id, target_id, true)
                 .await;
-            return Err(e);
+            return Err(cleanup.err().unwrap_or(e));
         }
 
         if let Err(e) = self.apply_emulation_internal(&session_id).await {
-            self.cleanup_failed_session(&session_id, target_id, true)
+            let cleanup = self
+                .cleanup_failed_session(&session_id, target_id, true)
                 .await;
-            return Err(e);
+            return Err(cleanup.err().unwrap_or(e));
         }
 
         if !self.network_mocks.is_empty() {
             if let Err(e) = crate::commands::network_mock::apply_mocks(self, &session_id).await {
-                self.cleanup_failed_session(&session_id, target_id, true)
+                let cleanup = self
+                    .cleanup_failed_session(&session_id, target_id, true)
                     .await;
-                return Err(e);
+                return Err(cleanup.err().unwrap_or(e));
             }
         }
 
@@ -618,7 +635,7 @@ impl CdpClient {
         session_id: &str,
         failed_target_id: &str,
         state_loaded: bool,
-    ) {
+    ) -> Result<()> {
         if state_loaded {
             // Stash the state of the tab we failed to initialize so it's not lost.
             // It's currently in the active fields.
@@ -641,6 +658,10 @@ impl CdpClient {
         let detached = self
             .send("Target.detachFromTarget", json!({"sessionId": session_id}))
             .await;
+        let connection_lost = detached
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.downcast_ref::<ConnectionLost>().is_some());
         if detached.is_ok() {
             self.session_ended(session_id);
         }
@@ -654,6 +675,14 @@ impl CdpClient {
         self.console_events.clear();
         self.events
             .retain(|event| event["sessionId"].as_str() != Some(session_id));
+
+        // A lost connection has to reach the daemon, which retires it. Every
+        // other cleanup failure keeps the original setup error instead.
+        if connection_lost {
+            detached.map(|_| ())
+        } else {
+            Ok(())
+        }
     }
 
     /// Drop any stored emulation state for a target (e.g. when its tab closes).
@@ -771,6 +800,22 @@ impl CdpClient {
             session_id,
             "Network.setBlockedURLs",
             json!({"urls": self.blocklist}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Setup path only: `Network.enable` already ran with the bounded setup
+    /// budget, so sending it again here would spend the ordinary call budget
+    /// on a page that stopped answering in between. Only the blocklist is
+    /// left to apply, within the same setup budget. Callers that have not
+    /// enabled the domain keep using [`Self::apply_network_rules_internal`].
+    async fn apply_network_rules_on_enabled_session(&mut self, session_id: &str) -> Result<()> {
+        self.send_to_target_within(
+            session_id,
+            "Network.setBlockedURLs",
+            json!({"urls": self.blocklist}),
+            SETUP_CALL_TIMEOUT,
         )
         .await?;
         Ok(())
@@ -951,6 +996,9 @@ impl CdpClient {
         // and Chrome announced it only once, possibly to an earlier read.
         if method != "Page.handleJavaScriptDialog" {
             if let Some(sid) = session_id {
+                // A liveness ping can leave the opening in `unread`. Note it
+                // before writing so this call settles or reports it first.
+                self.note_queued_dialogs_for(sid);
                 self.settle_dialog_within(sid, method, started, limit)
                     .await?;
             }
@@ -974,64 +1022,93 @@ impl CdpClient {
                 remaining.min(cdp_call_timeout()),
             )
             .await?;
-
-        loop {
-            let resp_text = self
-                .read_text_for_call(id, method, session_id, started, limit)
-                .await?;
-            let resp: Value = serde_json::from_str(&resp_text)?;
-            self.note_dialog_event(&resp);
-
-            // Proactively handle or fail if a dialog is opened during execution
-            if resp.get("method").and_then(|v| v.as_str()) == Some("Page.javascriptDialogOpening")
-                && method != "Page.handleJavaScriptDialog"
-            {
-                let dialog_session = resp["sessionId"].as_str().map(str::to_string);
-                if let Some(action) = self.dialog_action.clone() {
-                    self.handle_dialog_helper(
-                        dialog_session.as_deref().or(session_id),
-                        action,
-                        dialog_from_event(&resp),
-                        method,
-                        started,
-                        limit,
-                    )
+        self.awaiting_replies.insert(id);
+        // Unregister on every exit, including errors, or a late reply would
+        // be parked in `deferred_replies` for a call that has stopped waiting.
+        let result = async {
+            loop {
+                let resp_text = self
+                    .read_text_for_call(id, method, session_id, started, limit)
                     .await?;
-                    continue;
-                }
-                // A dialog holds up its page, not the browser: a browser-level
-                // call still gets its reply, and failing it would report a tab
-                // `new-page` opened as not opened. The dialog, recorded above,
-                // is for the next call on its page.
-                if session_id.is_some() {
-                    if self.take_queued_dialog_close(session_id) {
-                        // The opening and its closing were set aside together
-                        // by a ping; the dialog is gone, so keep reading for
-                        // this call's reply.
+                let resp: Value = serde_json::from_str(&resp_text)?;
+                self.note_dialog_event(&resp);
+
+                // Proactively handle or fail if a dialog is opened during execution
+                if resp.get("method").and_then(|v| v.as_str())
+                    == Some("Page.javascriptDialogOpening")
+                    && method != "Page.handleJavaScriptDialog"
+                {
+                    let dialog_session = resp["sessionId"].as_str().map(str::to_string);
+                    let same_session = dialog_session
+                        .as_deref()
+                        .is_none_or(|s| Some(s) == session_id);
+                    // The persistent session belongs to one target. A call on
+                    // a one-off session is only made when that target is a
+                    // different one (or the session is gone), so a dialog on
+                    // the persistent session is another page's: recorded above
+                    // for that page, and this call keeps waiting.
+                    let other_page = !same_session
+                        && self.persistent_session.as_deref() == dialog_session.as_deref()
+                        && session_id.is_some();
+                    if other_page {
                         continue;
                     }
-                    bail!(dialog_from_event(&resp));
+                    if same_session {
+                        if let Some(action) = self.dialog_action.clone() {
+                            self.handle_dialog_helper(
+                                dialog_session.as_deref().or(session_id),
+                                action,
+                                dialog_from_event(&resp),
+                                method,
+                                started,
+                                limit,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                    // A dialog holds up its page, not the browser: a browser-level
+                    // call still gets its reply, and failing it would report a tab
+                    // `new-page` opened as not opened. The dialog, recorded above,
+                    // is for the next call on its page. A page call fails at once
+                    // rather than wait out a dialog it cannot handle — a stale
+                    // session tag on this page must not borrow its --dialog-action.
+                    if session_id.is_some() {
+                        if self.take_queued_dialog_close(dialog_session.as_deref().or(session_id)) {
+                            // The opening and its closing were set aside together
+                            // by a ping; the dialog is gone, so keep reading for
+                            // this call's reply.
+                            continue;
+                        }
+                        bail!(dialog_from_event(&resp));
+                    }
                 }
-            }
 
-            if resp.get("id").and_then(|v| v.as_u64()) == Some(id) {
-                if let Some(error) = resp.get("error") {
-                    bail!(
-                        "CDP error in {method}: {}",
-                        serde_json::to_string_pretty(error)?
-                    );
+                if resp.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                    if let Some(error) = resp.get("error") {
+                        bail!(
+                            "CDP error in {method}: {}",
+                            serde_json::to_string_pretty(error)?
+                        );
+                    }
+                    return Ok(resp.get("result").cloned().unwrap_or(Value::Null));
+                } else if resp.get("method").is_some() {
+                    // Store events for later consumption
+                    self.push_event(resp);
+                } else if let Some(other_id) = resp.get("id").and_then(|v| v.as_u64()) {
+                    // A reply to another call still waiting on it: the dialog
+                    // handler may have read it while draining the socket. Keep
+                    // it for its owner; fire-and-forget replies need no slot.
+                    if self.awaiting_replies.contains(&other_id) {
+                        self.deferred_replies.push_back((other_id, resp_text));
+                    }
                 }
-                return Ok(resp.get("result").cloned().unwrap_or(Value::Null));
-            } else if resp.get("method").is_some() {
-                // Store events for later consumption
-                self.push_event(resp);
-            } else if let Some(other_id) = resp.get("id").and_then(|v| v.as_u64()) {
-                // A reply to a different call: the dialog handler may have
-                // read it while draining the socket. Keep it for its owner.
-                self.deferred_replies.push_back((other_id, resp_text));
+                // Skip other unrelated responses
             }
-            // Skip other unrelated responses
         }
+        .await;
+        self.awaiting_replies.remove(&id);
+        result
     }
 
     /// Answer `dialog` with `action`, within the limit of the call it held up
@@ -1078,60 +1155,73 @@ impl CdpClient {
                     remaining.min(cdp_call_timeout()),
                 )
                 .await?;
+            self.awaiting_replies.insert(id);
+            let result = async {
+                loop {
+                    let resp_text = self
+                        .read_text_for_call(
+                            id,
+                            "Page.handleJavaScriptDialog",
+                            session_id,
+                            started,
+                            limit,
+                        )
+                        .await?;
+                    let resp: Value = serde_json::from_str(&resp_text)?;
+                    self.note_dialog_event(&resp);
 
-            loop {
-                let resp_text = self
-                    .read_text_for_call(
-                        id,
-                        "Page.handleJavaScriptDialog",
-                        session_id,
-                        started,
-                        limit,
-                    )
-                    .await?;
-                let resp: Value = serde_json::from_str(&resp_text)?;
-                self.note_dialog_event(&resp);
-
-                if resp.get("method").and_then(|v| v.as_str())
-                    == Some("Page.javascriptDialogOpening")
-                {
-                    self.handle_dialog_helper(
-                        session_id,
-                        action.clone(),
-                        dialog_from_event(&resp),
-                        call,
-                        started,
-                        limit,
-                    )
-                    .await?;
-                    continue;
-                }
-
-                if resp.get("id").and_then(|v| v.as_u64()) == Some(id) {
-                    if let Some(error) = resp.get("error") {
-                        // Closed meanwhile, by a person or the page navigating
-                        // away: the goal is met either way.
-                        if is_no_dialog_error(error) {
-                            self.forget_dialog(session_id);
-                            return Ok(());
+                    if resp.get("method").and_then(|v| v.as_str())
+                        == Some("Page.javascriptDialogOpening")
+                    {
+                        let other_session = resp["sessionId"].as_str();
+                        if other_session.is_some_and(|s| session_id.is_some_and(|sid| s != sid)) {
+                            // Another session's dialog: recorded above for its
+                            // own page, not ours to answer with this action.
+                            continue;
                         }
-                        // The dialog is still open: keep tracking it, or later
-                        // calls would wait behind it with no way to settle it.
-                        bail!(
-                            "CDP error in Page.handleJavaScriptDialog: {}",
-                            serde_json::to_string_pretty(error)?
-                        );
+                        self.handle_dialog_helper(
+                            session_id,
+                            action.clone(),
+                            dialog_from_event(&resp),
+                            call,
+                            started,
+                            limit,
+                        )
+                        .await?;
+                        continue;
                     }
-                    self.forget_dialog(session_id);
-                    return Ok(());
-                } else if resp.get("method").is_some() {
-                    self.push_event(resp);
-                } else if let Some(other_id) = resp.get("id").and_then(|v| v.as_u64()) {
-                    // The call this dialog held up can finish while we wait
-                    // for the handler's own reply. Hand its reply back to it.
-                    self.deferred_replies.push_back((other_id, resp_text));
+
+                    if resp.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                        if let Some(error) = resp.get("error") {
+                            // Closed meanwhile, by a person or the page navigating
+                            // away: the goal is met either way.
+                            if is_no_dialog_error(error) {
+                                self.forget_dialog(session_id);
+                                return Ok(());
+                            }
+                            // The dialog is still open: keep tracking it, or later
+                            // calls would wait behind it with no way to settle it.
+                            bail!(
+                                "CDP error in Page.handleJavaScriptDialog: {}",
+                                serde_json::to_string_pretty(error)?
+                            );
+                        }
+                        self.forget_dialog(session_id);
+                        return Ok(());
+                    } else if resp.get("method").is_some() {
+                        self.push_event(resp);
+                    } else if let Some(other_id) = resp.get("id").and_then(|v| v.as_u64()) {
+                        // The call this dialog held up can finish while we wait
+                        // for the handler's own reply. Hand its reply back to it.
+                        if self.awaiting_replies.contains(&other_id) {
+                            self.deferred_replies.push_back((other_id, resp_text));
+                        }
+                    }
                 }
             }
+            .await;
+            self.awaiting_replies.remove(&id);
+            result
         })
     }
 
@@ -1284,7 +1374,7 @@ impl CdpClient {
                         {
                             Ok(_) => stopped = " (a stop was requested for its running JavaScript)",
                             Err(e) if e.downcast_ref::<ConnectionLost>().is_some() => {
-                                return Err(e)
+                                return Err(e);
                             }
                             Err(_) => {}
                         }
@@ -1333,15 +1423,47 @@ impl CdpClient {
     fn note_dialog_event(&mut self, msg: &Value) {
         match msg["method"].as_str() {
             Some("Page.javascriptDialogOpening") => {
-                self.open_dialog = Some(OpenDialog {
+                let dialog = OpenDialog {
                     session_id: msg["sessionId"].as_str().map(str::to_string),
                     dialog: dialog_from_event(msg),
-                });
+                };
+                // A new opening supersedes an older one on the same session;
+                // every other session keeps its own record.
+                self.open_dialogs
+                    .retain(|d| d.session_id != dialog.session_id);
+                self.open_dialogs.push(dialog.clone());
+                self.open_dialog = Some(dialog);
             }
             Some("Page.javascriptDialogClosed") => {
                 self.forget_dialog(msg["sessionId"].as_str());
             }
             _ => {}
+        }
+    }
+
+    /// Apply dialog transitions a liveness ping set aside for `session_id`
+    /// before the next command writes to that page. Only messages for that
+    /// session are removed; everything else stays in `unread` in wire order,
+    /// so other callers still get their replies and events.
+    fn note_queued_dialogs_for(&mut self, session_id: &str) {
+        let mut i = 0;
+        while i < self.unread.len() {
+            let is_transition = serde_json::from_str::<Value>(&self.unread[i])
+                .ok()
+                .is_some_and(|m| {
+                    matches!(
+                        m["method"].as_str(),
+                        Some("Page.javascriptDialogOpening" | "Page.javascriptDialogClosed")
+                    ) && m["sessionId"].as_str() == Some(session_id)
+                });
+            if is_transition {
+                let text = self.unread.remove(i).unwrap();
+                if let Ok(msg) = serde_json::from_str::<Value>(&text) {
+                    self.note_dialog_event(&msg);
+                }
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -1364,15 +1486,34 @@ impl CdpClient {
         false
     }
 
+    /// The open dialog on `session_id`, if any. The public field is a mirror
+    /// of the newest dialog; a caller writing it directly (as `css_styles`
+    /// does) still has to be believed.
+    fn open_dialog_for(&self, session_id: &str) -> Option<OpenDialog> {
+        self.open_dialogs
+            .iter()
+            .rev()
+            .find(|d| d.session_id.as_deref() == Some(session_id))
+            .or_else(|| {
+                self.open_dialog
+                    .as_ref()
+                    .filter(|d| d.session_id.as_deref() == Some(session_id))
+            })
+            .cloned()
+    }
+
     /// Forget the open dialog if it belongs to `session_id`: it was handled,
     /// closed, or its session is gone (only that session could handle it).
+    /// Other sessions' records are left alone.
     pub fn forget_dialog(&mut self, session_id: Option<&str>) {
+        self.open_dialogs
+            .retain(|d| d.session_id.as_deref() != session_id);
         if self
             .open_dialog
             .as_ref()
             .is_some_and(|d| d.session_id.as_deref() == session_id)
         {
-            self.open_dialog = None;
+            self.open_dialog = self.open_dialogs.last().cloned();
         }
     }
 
@@ -1382,6 +1523,7 @@ impl CdpClient {
     pub async fn settle_open_dialog(&mut self, session_id: &str) -> Result<()> {
         let started = tokio::time::Instant::now();
         let call = "Page.handleJavaScriptDialog";
+        self.note_queued_dialogs_for(session_id);
         self.settle_dialog_within(session_id, call, started, cdp_call_timeout())
             .await
     }
@@ -1397,18 +1539,12 @@ impl CdpClient {
         // A ping may have set the closing aside with the opening. Only apply
         // it once that opening is the one we are tracking; consuming the
         // closing first would leave a still-queued opening to fail this call.
-        if self
-            .open_dialog
-            .as_ref()
-            .is_some_and(|d| d.session_id.as_deref() == Some(session_id))
-        {
+        let mut open = self.open_dialog_for(session_id);
+        if open.is_some() {
             self.take_queued_dialog_close(Some(session_id));
+            open = self.open_dialog_for(session_id);
         }
-        let Some(open) = self
-            .open_dialog
-            .clone()
-            .filter(|d| d.session_id.as_deref() == Some(session_id))
-        else {
+        let Some(open) = open else {
             return Ok(());
         };
         match self.dialog_action.clone() {
@@ -2627,5 +2763,300 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(!msg.contains("secret"), "{msg}");
         assert!(msg.contains(&format!("127.0.0.1:{port}")), "{msg}");
+    }
+
+    /// Setup can fail with an ordinary page error while the detach meant to
+    /// clean it up finds the connection gone. The daemon retires a connection
+    /// only on a typed `ConnectionLost`, so cleanup's error must win here.
+    #[tokio::test]
+    async fn a_connection_lost_while_cleaning_up_fails_the_setup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: Value = serde_json::from_str(&text).unwrap();
+                let id = call["id"].clone();
+                match call["method"].as_str().unwrap_or_default() {
+                    "Target.attachToTarget" => {
+                        ws.send(Message::Text(
+                            json!({"id": id, "result": {"sessionId": "S"}}).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    "Network.enable" => {
+                        // A CDP refusal, not a lost connection.
+                        ws.send(Message::Text(
+                            json!({"id": id, "error": {"code": -32601, "message": "no"}})
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    "Target.detachFromTarget" => {
+                        ws.close(None).await.unwrap();
+                        return;
+                    }
+                    other => panic!("unexpected call: {other}"),
+                }
+            }
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        let error = client
+            .ensure_persistent_session("T")
+            .await
+            .expect_err("setup fails");
+        assert!(
+            error.downcast_ref::<ConnectionLost>().is_some(),
+            "cleanup's lost connection must reach the daemon: {error:#}"
+        );
+        assert!(
+            client.persistent_session.is_none(),
+            "the failed session is gone"
+        );
+        chrome.await.unwrap();
+    }
+
+    /// A dialog on the persistent session is another page's when this command
+    /// ran on a one-off session. It is recorded for that page, and B's call
+    /// still gets its reply; B's --dialog-action is not spent on it.
+    #[tokio::test]
+    async fn another_pages_dialog_does_not_interrupt_the_call() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let reply = json!({"id": call["id"], "sessionId": "B", "result": {"value": 7}});
+            let opening = json!({"method": "Page.javascriptDialogOpening", "sessionId": "A",
+                                 "params": {"type": "alert", "message": "on A"}});
+            (std::time::Duration::ZERO, vec![opening, reply])
+        })
+        .await;
+        client.persistent_session = Some("A".into());
+        client.persistent_target_id = Some("T1".into());
+        client.dialog_action = Some("accept".into());
+        let result = client
+            .send_to_target_within(
+                "B",
+                "DOM.getDocument",
+                json!({}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("B's call is not held up by A's dialog");
+        assert_eq!(result["value"], 7);
+        assert_eq!(
+            client.open_dialog_for("A").map(|d| d.dialog.message),
+            Some("on A".to_string())
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls, ["DOM.getDocument"], "A's dialog was not answered");
+    }
+
+    /// A stale session tag on this page must fail the call at once (or the
+    /// input would wait out its whole deadline), but must not apply the
+    /// call's --dialog-action to a dialog another session has to handle.
+    #[tokio::test]
+    async fn another_sessions_dialog_does_not_borrow_this_calls_action() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let reply = json!({"id": call["id"], "sessionId": "B", "result": {"value": 7}});
+            let opening = json!({"method": "Page.javascriptDialogOpening", "sessionId": "A",
+                                 "params": {"type": "alert", "message": "on A"}});
+            (std::time::Duration::ZERO, vec![opening, reply])
+        })
+        .await;
+        client.dialog_action = Some("accept".into());
+        let error = client
+            .send_to_target_within(
+                "B",
+                "DOM.getDocument",
+                json!({}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect_err("a dialog on this page pauses the call");
+        assert!(error.downcast_ref::<DialogOpen>().is_some(), "{error:#}");
+        assert_eq!(
+            client.open_dialog_for("A").map(|d| d.dialog.message),
+            Some("on A".to_string())
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls, ["DOM.getDocument"], "A's dialog was not answered");
+    }
+
+    /// Each session has its own dialog: closing or settling one leaves the
+    /// other's record intact, and only that session's dialog is settled.
+    #[tokio::test]
+    async fn dialogs_are_tracked_per_session() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            (
+                std::time::Duration::ZERO,
+                vec![json!({"id": call["id"], "result": {}})],
+            )
+        })
+        .await;
+        let opening = |session: &str, message: &str| {
+            json!({"method": "Page.javascriptDialogOpening", "sessionId": session,
+                   "params": {"type": "alert", "message": message}})
+        };
+        client.note_dialog_event(&opening("A", "a"));
+        client.note_dialog_event(&opening("B", "b"));
+        assert_eq!(client.open_dialog_for("A").unwrap().dialog.message, "a");
+        assert_eq!(client.open_dialog_for("B").unwrap().dialog.message, "b");
+        client.note_dialog_event(&json!({
+            "method": "Page.javascriptDialogClosed", "sessionId": "B", "params": {}
+        }));
+        assert!(client.open_dialog_for("B").is_none());
+        assert_eq!(client.open_dialog_for("A").unwrap().dialog.message, "a");
+        assert_eq!(
+            client.open_dialog.as_ref().unwrap().session_id.as_deref(),
+            Some("A"),
+            "the public mirror still points at a dialog that is open"
+        );
+        client
+            .settle_open_dialog("B")
+            .await
+            .expect("B has no dialog to settle");
+        let error = client
+            .settle_open_dialog("A")
+            .await
+            .expect_err("A's dialog is still open");
+        assert!(error.downcast_ref::<DialogOpen>().is_some(), "{error:#}");
+        drop(client);
+        chrome.await.unwrap();
+    }
+
+    /// `css_styles` writes the public field directly. That record must still
+    /// be honored by the guarded send and settled by the dialog helpers.
+    #[tokio::test]
+    async fn a_directly_set_open_dialog_is_still_honored() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            (
+                std::time::Duration::ZERO,
+                vec![json!({"id": call["id"], "result": {}})],
+            )
+        })
+        .await;
+        client.open_dialog = Some(OpenDialog {
+            session_id: Some("S".into()),
+            dialog: DialogOpen {
+                dialog_type: "alert".into(),
+                message: "direct".into(),
+            },
+        });
+        assert_eq!(
+            client.open_dialog_for("S").unwrap().dialog.message,
+            "direct"
+        );
+        let error = client
+            .settle_open_dialog("S")
+            .await
+            .expect_err("a directly set dialog is still open");
+        assert!(error.downcast_ref::<DialogOpen>().is_some(), "{error:#}");
+        client.forget_dialog(Some("S"));
+        assert!(client.open_dialog.is_none());
+        drop(client);
+        chrome.await.unwrap();
+    }
+
+    /// A `caffeinate` ping may leave the opening in `unread`. It has to be
+    /// applied before the page request, without losing an unrelated reply
+    /// that was queued ahead of it.
+    #[tokio::test]
+    async fn a_ping_queued_dialog_is_settled_before_the_page_request() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            (
+                std::time::Duration::ZERO,
+                vec![json!({"id": call["id"], "result": {}})],
+            )
+        })
+        .await;
+        client.dialog_action = Some("accept".into());
+        client.awaiting_replies.insert(99);
+        client
+            .unread
+            .push_back(json!({"id": 99, "sessionId": "B", "result": {"value": 1}}).to_string());
+        client.unread.push_back(opening("hi").to_string());
+        client
+            .send_to_target("S", "DOM.getDocument", json!({}))
+            .await
+            .expect("the queued dialog was settled first");
+        assert!(
+            client.deferred_replies.iter().any(|(id, _)| *id == 99),
+            "the unrelated reply is kept for its owner"
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls, ["Page.handleJavaScriptDialog", "DOM.getDocument"]);
+    }
+
+    /// Setup already enabled Network with the short setup budget. Enabling it
+    /// again here would put the rest of setup on the ordinary call budget.
+    #[tokio::test]
+    async fn setup_does_not_re_enable_network_with_the_ordinary_budget() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let result = if call["method"].as_str() == Some("Target.attachToTarget") {
+                json!({"sessionId": "S"})
+            } else {
+                json!({})
+            };
+            (
+                std::time::Duration::ZERO,
+                vec![json!({"id": call["id"], "result": result})],
+            )
+        })
+        .await;
+        client
+            .ensure_persistent_session("T")
+            .await
+            .expect("setup succeeds");
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(
+            calls,
+            [
+                "Target.attachToTarget",
+                "Network.enable",
+                "Runtime.enable",
+                "Network.setBlockedURLs"
+            ]
+        );
+    }
+
+    /// Fire-and-forget writes never register an awaited id, so their replies
+    /// must not accumulate in `deferred_replies` for the life of the daemon.
+    #[tokio::test]
+    async fn replies_to_fire_and_forget_writes_are_not_parked() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            (
+                std::time::Duration::ZERO,
+                vec![json!({"id": call["id"], "sessionId": "S", "result": {}})],
+            )
+        })
+        .await;
+        client
+            .send_raw_no_wait(Some("S"), "DOM.enable", json!({}))
+            .await
+            .expect("the write succeeds");
+        client
+            .send_to_target_within(
+                "S",
+                "DOM.getDocument",
+                json!({}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("the awaited call gets its own reply");
+        assert!(
+            client.deferred_replies.is_empty(),
+            "{:?}",
+            client.deferred_replies
+        );
+        assert!(client.awaiting_replies.is_empty());
+        drop(client);
+        chrome.await.unwrap();
     }
 }

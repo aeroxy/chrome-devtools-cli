@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -321,6 +322,28 @@ fn non_inheriting(matched: &Value) -> HashSet<String> {
     let scripts = items(&matched["cssPropertyRegistrations"])
         .iter()
         .filter(|r| r["inherits"] == false)
+        .filter_map(|r| r["propertyName"].as_str());
+    rules.chain(scripts).map(String::from).collect()
+}
+
+/// Custom properties registered to inherit. A registered one that fails `var()`
+/// substitution takes the parent's computed value, unlike an unregistered one,
+/// which gets the guaranteed-invalid value and blocks the ancestor. The
+/// registration is document-wide, wherever CDP reports it.
+fn registered_inheriting(matched: &Value) -> HashSet<String> {
+    let rules = items(&matched["cssPropertyRules"]).iter().filter_map(|r| {
+        let inherits = items(&r["style"]["cssProperties"])
+            .iter()
+            .find(|p| p["name"] == "inherits")?;
+        let on = inherits["value"]
+            .as_str()?
+            .trim()
+            .eq_ignore_ascii_case("true");
+        r["propertyName"]["text"].as_str().filter(|_| on)
+    });
+    let scripts = items(&matched["cssPropertyRegistrations"])
+        .iter()
+        .filter(|r| r["inherits"] == true)
         .filter_map(|r| r["propertyName"].as_str());
     rules.chain(scripts).map(String::from).collect()
 }
@@ -661,6 +684,9 @@ struct NodeFacts<'a> {
     /// Properties with the value `var()` substitution gives them that the
     /// page says they reject (see `substituted_values`).
     rejected: &'a [(String, String)],
+    /// Registered custom properties that inherit: a failed substitution in
+    /// one takes the parent's value instead of claiming the declaration.
+    inheriting: Option<&'a HashSet<String>>,
 }
 
 impl NodeFacts<'_> {
@@ -679,7 +705,8 @@ impl NodeFacts<'_> {
     /// reference with no value and no fallback, or a value the property
     /// rejects (`color: var(--size)` with `--size: 20px`). Custom properties
     /// are left out of that: an unregistered one gets the guaranteed-invalid
-    /// value instead, which doesn't inherit.
+    /// value instead, which doesn't inherit. A registered inheriting one
+    /// instead takes the ancestor's computed value, like `unset`.
     fn value(&self, d: &Decl) -> Option<String> {
         let Some(vars) = self.vars.filter(|_| find_var(&d.value).is_some()) else {
             return Some(d.value.clone());
@@ -687,7 +714,16 @@ impl NodeFacts<'_> {
         match substituted(&d.value, vars) {
             Some(v) if self.rejected.iter().any(|(p, r)| *p == d.key() && *r == v) => None,
             Some(v) => Some(v),
-            None if d.name.starts_with("--") => Some(d.value.clone()),
+            None if d.name.starts_with("--") => {
+                if self
+                    .inheriting
+                    .is_some_and(|names| names.contains(&d.key()))
+                {
+                    None
+                } else {
+                    Some(d.value.clone())
+                }
+            }
             None => None,
         }
     }
@@ -1019,10 +1055,12 @@ fn scan_args(s: &str) -> Option<(usize, Option<usize>)> {
     None
 }
 
-/// The first CSS identifier in `text`, skipping whitespace and comments.
-/// Blink keeps a comment in the authored `var()` value but ignores it when
-/// resolving the property name, so the lookup key must do the same.
-fn var_name(text: &str) -> &str {
+/// The first CSS identifier in `text`, skipping whitespace and comments, with
+/// identifier escapes decoded. Blink keeps a comment in the authored `var()`
+/// value but ignores it when resolving the property name, and reads `\74 `
+/// as `t`: the whitespace ending a hex escape belongs to it, not to what
+/// follows. The lookup key must do the same; the authored value is untouched.
+fn var_name(text: &str) -> Cow<'_, str> {
     let bytes = text.as_bytes();
     let mut i = 0;
     loop {
@@ -1035,7 +1073,7 @@ fn var_name(text: &str) -> &str {
                     i += 4 + end;
                     continue;
                 }
-                None => return &text[i..],
+                None => return Cow::Borrowed(&text[i..]),
             }
         }
         break;
@@ -1044,17 +1082,57 @@ fn var_name(text: &str) -> &str {
     if bytes.get(i).is_some_and(|c| matches!(c, b'-' | b'+')) {
         i += 1;
     }
-    while bytes.get(i).is_some_and(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'\\') || !c.is_ascii()
-    }) {
-        i += 1;
+    let mut decoded: Option<String> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' {
+            let out = decoded.get_or_insert_with(|| text[start..i].to_string());
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+            if bytes[i].is_ascii_hexdigit() {
+                let mut value = 0u32;
+                let mut digits = 0;
+                while i < bytes.len() && digits < 6 {
+                    let Some(digit) = (bytes[i] as char).to_digit(16) else {
+                        break;
+                    };
+                    value = value * 16 + digit;
+                    i += 1;
+                    digits += 1;
+                }
+                if i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                out.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
+            } else {
+                let ch = text[i..].chars().next().unwrap_or('\u{FFFD}');
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+            continue;
+        }
+        if !(c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_') || !c.is_ascii()) {
+            break;
+        }
+        if let Some(out) = decoded.as_mut() {
+            let ch = text[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
     }
-    &text[start..i]
+    match decoded {
+        Some(out) => Cow::Owned(out),
+        None => Cow::Borrowed(&text[start..i]),
+    }
 }
 
-/// A `var()` call whose arguments start at `args[0]`: the property name, the
-/// fallback, and the offset of the closing `)`.
-fn split_var(args: &str) -> Option<(&str, Option<&str>, usize)> {
+/// A `var()` call whose arguments start at `args[0]`: the property name as
+/// looked up, the fallback, and the offset of the closing `)`.
+fn split_var(args: &str) -> Option<(Cow<'_, str>, Option<&str>, usize)> {
     let (close, comma) = scan_args(args)?;
     Some(match comma {
         Some(c) => (var_name(&args[..c]), Some(&args[c + 1..close]), close),
@@ -1113,7 +1191,7 @@ fn substitute(
         push_tokens(&mut out, &rest[..pos]);
         let args = &rest[pos + 4..];
         let (name, fallback, close) = split_var(args)?;
-        let replacement = match lookup(name) {
+        let replacement = match lookup(&name) {
             Some(v) => v,
             None => substitute(fallback?.trim(), lookup, depth + 1)?,
         };
@@ -1178,8 +1256,8 @@ fn var_names(value: &str, out: &mut Vec<String>) {
         let Some((name, fallback, close)) = split_var(args) else {
             return;
         };
-        if name.starts_with("--") && !out.iter().any(|n| n == name) {
-            out.push(name.to_string());
+        if name.starts_with("--") && !out.iter().any(|n| n == name.as_ref()) {
+            out.push(name.into_owned());
         }
         if let Some(fallback) = fallback {
             var_names(fallback, out);
@@ -1436,6 +1514,7 @@ fn build_report(
     // The element's own styles. Custom properties resolve against the
     // element's computed values.
     let element_vars = custom_properties(computed);
+    let inheriting = registered_inheriting(matched);
     let mut blocks = node_blocks(
         &matched["inlineStyle"],
         &matched["matchedCSSRules"],
@@ -1453,8 +1532,17 @@ fn build_report(
         vars: Some(&element_vars),
         flow: computed_value("writing-mode").zip(computed_value("direction")),
         rejected: &page.rejected,
+        inheriting: Some(&inheriting),
     };
     let all = all_properties(computed, &blocks);
+    // Only inheritable properties can reach the element from an ancestor, so
+    // an ancestor's `all` is expanded over just those. A reset of, say,
+    // `display` on the parent is not an inherited declaration to report.
+    let inherited_all: HashSet<String> = all
+        .iter()
+        .filter(|name| is_inherited(name, &non_inheriting))
+        .cloned()
+        .collect();
     let mut claimed = cascade(&mut blocks, &HashSet::new(), &element, &all);
     let rules = shown_blocks(
         blocks,
@@ -1485,9 +1573,13 @@ fn build_report(
             &page.longhands,
         );
         for block in &mut blocks {
+            // `all` is not itself an inherited property, but its reset of
+            // inherited ones stops a more distant ancestor's declarations.
+            // Keep it for the cascade, which expands it over the properties
+            // that can reach the element.
             block
                 .decls
-                .retain(|d| is_inherited(&d.key(), &non_inheriting));
+                .retain(|d| d.key() == "all" || is_inherited(&d.key(), &non_inheriting));
         }
         // Flow-relative properties don't inherit, so only the element's own
         // cascade maps them.
@@ -1495,8 +1587,9 @@ fn build_report(
             vars: info.map(|a| &a.vars),
             flow: None,
             rejected: &[],
+            inheriting: Some(&inheriting),
         };
-        let set_here = cascade(&mut blocks, &claimed, &ancestor, &all);
+        let set_here = cascade(&mut blocks, &claimed, &ancestor, &inherited_all);
         claimed.extend(set_here);
         let rules = shown_blocks(
             blocks,
@@ -1723,6 +1816,27 @@ async fn page_info(
     Ok(PageInfo::deserialize(&result["result"]["value"])?)
 }
 
+/// Take the `styleSheetAdded` headers out of the event buffer, leaving every
+/// other event where the next command can see it. A sheet can load after
+/// `CSS.enable` replies, so this is drained again after the matched-style
+/// request, whose reply may carry the rule that uses the late header.
+fn take_sheet_headers(client: &mut CdpClient, session_id: &str) -> HashMap<String, Value> {
+    let (added, others): (Vec<Value>, Vec<Value>) = std::mem::take(&mut client.events)
+        .into_iter()
+        .partition(|e| {
+            e["method"].as_str() == Some("CSS.styleSheetAdded")
+                && e["sessionId"].as_str() == Some(session_id)
+        });
+    client.events = others.into();
+    added
+        .into_iter()
+        .filter_map(|mut e| {
+            let header = e["params"]["header"].take();
+            Some((header["styleSheetId"].as_str()?.to_string(), header))
+        })
+        .collect()
+}
+
 async fn collect(
     client: &mut CdpClient,
     session_id: &str,
@@ -1761,20 +1875,7 @@ async fn collect(
     client
         .send_to_target(session_id, "CSS.enable", json!({}))
         .await?;
-    let (added, others): (Vec<Value>, Vec<Value>) = std::mem::take(&mut client.events)
-        .into_iter()
-        .partition(|e| {
-            e["method"].as_str() == Some("CSS.styleSheetAdded")
-                && e["sessionId"].as_str() == Some(session_id)
-        });
-    client.events = others.into();
-    let sheets: HashMap<String, Value> = added
-        .into_iter()
-        .filter_map(|mut e| {
-            let header = e["params"]["header"].take();
-            Some((header["styleSheetId"].as_str()?.to_string(), header))
-        })
-        .collect();
+    let mut sheets = take_sheet_headers(client, session_id);
 
     let matched = client
         .send_to_target(
@@ -1783,6 +1884,9 @@ async fn collect(
             json!({"nodeId": node_id}),
         )
         .await?;
+    // A sheet that loaded between the two replies is announced with the
+    // matched styles, too late for the first drain but in time for the report.
+    sheets.extend(take_sheet_headers(client, session_id));
     let computed = client
         .send_to_target(
             session_id,
@@ -2174,6 +2278,46 @@ Inherited from body:
         assert_eq!(report.rules[1].decls[0].status, Status::Overridden);
     }
 
+    /// An ancestor's `all` is kept in the inherited pass: it resets the
+    /// grandparent's inheritable declaration, but only over properties that
+    /// can reach the element. Without the parent's reset the grandparent wins.
+    #[test]
+    fn ancestor_all_resets_a_grandparent_declaration() {
+        let grandparent = rule(
+            "html",
+            1,
+            authored(&[("color", "red")], &[("color", "red")]),
+        );
+        let parent = rule("body", 2, authored(&[("all", "initial")], &[]));
+        let m = json!({
+            "inherited": [
+                {"matchedCSSRules": [parent]},
+                {"matchedCSSRules": [grandparent]},
+            ],
+            "cssPropertyRegistrations": [],
+        });
+        let info = PageInfo { depth: 2, ..page() };
+        let report = build_report(&m, &computed(), &sheets(), &info, &CssOptions::default());
+        assert_eq!(report.inherited.len(), 2);
+        assert_eq!(report.inherited[0].rules[0].decls[0].name, "all");
+        assert_eq!(report.inherited[0].rules[0].decls[0].status, Status::Active);
+        assert_eq!(
+            report.inherited[1].rules[0].decls[0].status,
+            Status::Overridden
+        );
+
+        let mut m = m;
+        m["inherited"][0] = json!({"matchedCSSRules": [rule("body", 2, authored(
+            &[("margin", "0")],
+            &[("margin-top", "0px")],
+        ))]});
+        let report = build_report(&m, &computed(), &sheets(), &info, &CssOptions::default());
+        // The parent's non-inheritable margin is not shown, so the
+        // grandparent is the only inherited view, and its color wins.
+        assert_eq!(report.inherited.len(), 1);
+        assert_eq!(report.inherited[0].rules[0].decls[0].status, Status::Active);
+    }
+
     /// A later declaration in the block still wins its own longhand, and the
     /// keys CSS excludes from `all` are never part of its expansion.
     #[test]
@@ -2320,6 +2464,33 @@ Inherited from body:
             .map(|d| d.name.as_str())
             .collect();
         assert_eq!(body, ["--free"]);
+    }
+
+    /// A registered custom property that inherits takes the parent's computed
+    /// value when its own substitution fails; an unregistered one keeps the
+    /// guaranteed-invalid value and blocks the ancestor.
+    #[test]
+    fn registered_inheriting_property_takes_the_parents_value() {
+        let decls = [("--tone", "var(--missing)")];
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = authored(&decls, &decls);
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] =
+            authored(&[("--tone", "red")], &[("--tone", "red")]);
+        m["cssPropertyRules"] = json!([{
+            "propertyName": {"text": "--tone"},
+            "style": {"cssProperties": [{"name": "inherits", "value": "true"}]},
+        }]);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(report.rules[0].decls[0].status, Status::Active);
+        assert_eq!(report.inherited[0].rules[0].decls[0].status, Status::Active);
+
+        m["cssPropertyRules"] = json!([]);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(
+            report.inherited[0].rules[0].decls[0].status,
+            Status::Overridden
+        );
     }
 
     #[test]
@@ -3180,6 +3351,27 @@ Inherited from body:
         );
     }
 
+    /// An escaped identifier resolves to the same custom property as its
+    /// plain spelling: the whitespace ending a hex escape continues the name,
+    /// and neither the lookup nor the ancestor value request sees the escape.
+    #[test]
+    fn identifier_escapes_decode_before_custom_property_lookup() {
+        let value = "color: var(--\\74 one, blue)";
+        assert_eq!(var_name(" --\\74 one"), "--tone");
+        let mut names = Vec::new();
+        var_names(value, &mut names);
+        assert_eq!(names, ["--tone"]);
+        let vars = HashMap::from([("--tone".to_string(), "red".to_string())]);
+        assert_eq!(substituted(value, &vars).as_deref(), Some("color: red"));
+        // The authored spelling is still what a declaration displays.
+        let decls = [("--tone", "red"), ("color", "var(--\\74 one, blue)")];
+        let report = report_for(
+            &json!({"inlineStyle": authored(&decls, &decls)}),
+            CssOptions::default(),
+        );
+        assert_eq!(report.rules[0].decls[1].value, "var(--\\74 one, blue)");
+    }
+
     /// Delimiters in an authored comment are not delimiters to Blink: the
     /// `)` and `,` below must not end the call or start its fallback.
     #[test]
@@ -3395,6 +3587,68 @@ Inherited from body:
             seen
         });
         (url, task)
+    }
+
+    /// A stylesheet announced with the matched-style reply still gives the
+    /// rule its file and line. Unrelated events in the buffer survive.
+    #[tokio::test]
+    async fn a_late_stylesheet_header_is_collected() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let browser = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let result = match req["method"].as_str().unwrap_or("") {
+                    "DOM.getDocument" => json!({"root": {"nodeId": 1}}),
+                    "DOM.querySelector" => json!({"nodeId": 2}),
+                    "CSS.getMatchedStylesForNode" => {
+                        ws.send(Message::Text(json!({
+                            "method": "CSS.styleSheetAdded",
+                            "sessionId": "S",
+                            "params": {"header": {"styleSheetId": "late", "sourceURL": "http://host/late.css", "startLine": 0}},
+                        }).to_string()))
+                        .await
+                        .unwrap();
+                        json!({"matchedCSSRules": [{
+                            "rule": {
+                                "origin": "regular",
+                                "styleSheetId": "late",
+                                "selectorList": {"text": "p", "selectors": [{"text": "p", "range": range(2)}]},
+                                "style": {"cssProperties": [{"name": "color", "value": "red", "range": range(2)}]},
+                            },
+                            "matchingSelectors": [0],
+                        }]})
+                    }
+                    "DOM.resolveNode" => json!({"object": {"objectId": "o"}}),
+                    "Runtime.callFunctionOn" => json!({"result": {"value": {"element": "p"}}}),
+                    _ => json!({}),
+                };
+                ws.send(Message::Text(
+                    json!({"id": req["id"], "result": result}).to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+        let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
+        client.events.push_back(json!({
+            "method": "Runtime.consoleAPICalled",
+            "sessionId": "S",
+        }));
+        let report = collect(&mut client, "S", "p", &CssOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.rules[0].source.as_deref(), Some("late.css:3"));
+        assert!(client
+            .events
+            .iter()
+            .any(|e| e["method"] == "Runtime.consoleAPICalled"));
+        drop(client);
+        browser.await.unwrap();
     }
 
     /// A connection lost while the page labels the element, or while the

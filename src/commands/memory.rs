@@ -220,6 +220,12 @@ struct MetaDetails {
 #[derive(serde::Deserialize)]
 struct SnapshotMeta {
     meta: MetaDetails,
+    /// V8 writes both record counts in the header. Older or trimmed files
+    /// omit them, so the counts are checked only when present.
+    #[serde(default)]
+    node_count: Option<usize>,
+    #[serde(default)]
+    edge_count: Option<usize>,
     /// Node-array index of the synthetic root. V8 leaves it out and DevTools
     /// then uses 0.
     #[serde(default)]
@@ -437,6 +443,22 @@ fn type_index(types: &[String], name: &str) -> Option<u32> {
     position(types, name).map(|i| i as u32)
 }
 
+/// The next edge-array offset after a node's `edge_count`, checked before it
+/// can leave the array or wrap around. Kept apart from the array access so
+/// the arithmetic can be tested without a snapshot large enough to overflow.
+fn edge_prefix(total: usize, count: u32, edge_size: usize, limit: usize) -> Result<usize> {
+    (count as usize)
+        .checked_mul(edge_size)
+        .and_then(|fields| total.checked_add(fields))
+        .filter(|&next| next <= limit)
+        .with_context(|| {
+            format!(
+                "Corrupt snapshot: the nodes' edge_count adds up to more than the \
+                 {limit} fields of the edges array; the file is truncated or malformed"
+            )
+        })
+}
+
 impl Snap {
     fn new(raw: RawSnapshot) -> Result<Self> {
         let RawSnapshot {
@@ -454,6 +476,8 @@ impl Snap {
             fields: edges,
             negative: negative_edges,
         } = edges;
+        let declared_nodes = snapshot.node_count;
+        let declared_edges = snapshot.edge_count;
         let meta = snapshot.meta;
         let required = |fields: &[String], name: &str, kind: &str| {
             position(fields, name).with_context(|| {
@@ -474,6 +498,14 @@ impl Snap {
             );
         }
         let node_count = nodes.len() / node_size;
+        if let Some(declared) = declared_nodes {
+            if declared != node_count {
+                bail!(
+                    "Corrupt snapshot: header declares {declared} nodes but the nodes array holds \
+                     {node_count}"
+                );
+            }
+        }
         // Ordinals and edge indices are stored as u32 with u32::MAX and
         // u32::MAX - 1 reserved as markers, the same limits DevTools has.
         if node_count >= (u32::MAX - 1) as usize || edges.len() >= u32::MAX as usize {
@@ -543,20 +575,7 @@ impl Snap {
             // Never past `edges.len()`, which fits in a u32.
             first_edge.push(total as u32);
             if let Some(off) = edge_count_off {
-                // The counts and the edge stride both come from the file, so
-                // the sum is checked at every step: a prefix that overflowed
-                // or ran past the edges array would send traversal out of it.
-                total = (nodes[ord * node_size + off] as usize)
-                    .checked_mul(edge_size)
-                    .and_then(|fields| total.checked_add(fields))
-                    .filter(|&total| total <= edges.len())
-                    .with_context(|| {
-                        format!(
-                            "Corrupt snapshot: the nodes' edge_count adds up to more than the \
-                             {} fields of the edges array; the file is truncated or malformed",
-                            edges.len()
-                        )
-                    })?;
+                total = edge_prefix(total, nodes[ord * node_size + off], edge_size, edges.len())?;
             }
         }
         if total != edges.len() {
@@ -566,6 +585,15 @@ impl Snap {
                 total,
                 edges.len()
             );
+        }
+        if let Some(declared) = declared_edges {
+            let records = total / edge_size;
+            if declared != records {
+                bail!(
+                    "Corrupt snapshot: header declares {declared} edges but the edges array holds \
+                     {records}"
+                );
+            }
         }
         first_edge.push(total as u32);
 
@@ -1892,6 +1920,15 @@ fn skip_descriptor_link(snap: &Snap, ord: usize, e: usize) -> bool {
         .is_ok_and(|i| i >= 2 && i % 3 == 1)
 }
 
+/// Older V8 snapshots give a native context a `sloppy_function_map` shortcut
+/// to a map. DevTools leaves that edge out of distance ranking: it is an
+/// internal detail, not a retainer an application path should lose to.
+fn skip_sloppy_function_map(snap: &Snap, ord: usize, e: usize) -> bool {
+    snap.is(ord, snap.nt.hidden)
+        && snap.raw_name(ord) == "system / NativeContext"
+        && snap.edge_name(e) == "sloppy_function_map"
+}
+
 /// DevTools' `tryParseWeakMapEdgeName`. V8 gives a WeakMap value two
 /// `internal` edges, one from the key and one from the WeakMap's table, both
 /// named `<n> / part of key (<key> @<id>) -> value (<value> @<id>) pair in
@@ -1935,13 +1972,16 @@ fn weak_map_pair(name: &str) -> Option<&str> {
 /// table do, so as in DevTools the first of its pair of edges to arrive
 /// waits for the second, which sets the distance. The third result maps each
 /// node reached that way to the edge that waited.
-fn bfs_from_root(snap: &Snap) -> (Vec<u32>, Vec<u32>, HashMap<usize, usize>) {
+/// The fourth result is whether each node was reached in the page-root pass
+/// (or only in the GC-root pass), so retainers can be ranked page first.
+fn bfs_from_root(snap: &Snap) -> (Vec<u32>, Vec<u32>, HashMap<usize, usize>, Vec<bool>) {
     let n = snap.node_count;
     let mut dist = vec![NONE; n];
     let mut parent = vec![NONE; n];
+    let mut page = vec![false; n];
     let mut waited = HashMap::new();
     if n == 0 {
-        return (dist, parent, waited);
+        return (dist, parent, waited, page);
     }
     let root = snap.root;
     dist[root] = 0;
@@ -1953,48 +1993,52 @@ fn bfs_from_root(snap: &Snap) -> (Vec<u32>, Vec<u32>, HashMap<usize, usize>) {
         }
         dist[to] = 1;
         parent[to] = e as u32;
+        page[to] = true;
         queue.push(to as u32);
     }
     let mut head = 0;
     // First edge of each pair, by the part of the name the pair shares. It
     // carries over to the GC-root pass, as in DevTools.
     let mut pending: HashMap<&str, usize> = HashMap::new();
-    let mut expand = |queue: &mut Vec<u32>, head: &mut usize| {
-        while *head < queue.len() {
-            let ord = queue[*head] as usize;
-            *head += 1;
-            for e in snap.edge_range(ord) {
-                let to = snap.edge_to(e);
-                if snap.edge_is(e, snap.et.weak)
-                    || dist[to] != NONE
-                    || skip_descriptor_link(snap, ord, e)
-                {
-                    continue;
-                }
-                if snap.edge_is(e, snap.et.internal) {
-                    if let Some(pair) = weak_map_pair(snap.string_edge_name(e)) {
-                        match pending.remove(pair) {
-                            Some(first) => {
-                                waited.insert(to, first);
-                            }
-                            None => {
-                                pending.insert(pair, e);
-                                continue;
+    let mut expand =
+        |queue: &mut Vec<u32>, head: &mut usize, page: &mut [bool], from_page: bool| {
+            while *head < queue.len() {
+                let ord = queue[*head] as usize;
+                *head += 1;
+                for e in snap.edge_range(ord) {
+                    let to = snap.edge_to(e);
+                    if snap.edge_is(e, snap.et.weak)
+                        || dist[to] != NONE
+                        || skip_descriptor_link(snap, ord, e)
+                        || skip_sloppy_function_map(snap, ord, e)
+                    {
+                        continue;
+                    }
+                    if snap.edge_is(e, snap.et.internal) {
+                        if let Some(pair) = weak_map_pair(snap.string_edge_name(e)) {
+                            match pending.remove(pair) {
+                                Some(first) => {
+                                    waited.insert(to, first);
+                                }
+                                None => {
+                                    pending.insert(pair, e);
+                                    continue;
+                                }
                             }
                         }
                     }
+                    dist[to] = dist[ord] + 1;
+                    parent[to] = e as u32;
+                    page[to] = from_page;
+                    queue.push(to as u32);
                 }
-                dist[to] = dist[ord] + 1;
-                parent[to] = e as u32;
-                queue.push(to as u32);
             }
-        }
-    };
-    expand(&mut queue, &mut head);
+        };
+    expand(&mut queue, &mut head, &mut page, true);
     // Then whatever only the GC roots reach.
     queue.push(root as u32);
-    expand(&mut queue, &mut head);
-    (dist, parent, waited)
+    expand(&mut queue, &mut head, &mut page, false);
+    (dist, parent, waited, page)
 }
 
 /// Edges from the root to `target` along the BFS tree, or `None` when the
@@ -2101,7 +2145,7 @@ fn inspect_node(snap: &Snap, node_id: u64, opts: &ListOptions) -> Result<NodeRep
     } else {
         node_class(snap, ord)
     };
-    let (dist, parent, waited) = bfs_from_root(snap);
+    let (dist, parent, waited, page) = bfs_from_root(snap);
     let distance = |ord: usize| (dist[ord] != NONE).then_some(dist[ord]);
     let row = |e: usize, ord: usize| EdgeRow {
         edge_name: truncate(&snap.edge_name(e), max).into_owned(),
@@ -2125,9 +2169,10 @@ fn inspect_node(snap: &Snap, node_id: u64, opts: &ListOptions) -> Result<NodeRep
     };
 
     let mut retainers = direct_retainers(snap, ord);
-    // Closest to the root first: those are the retainers a fix most likely
-    // has to cut. Unreached retainers (distance NONE) sort last.
-    retainers.sort_by_key(|&(e, src)| (dist[src], e));
+    // Page-root retainers come before GC-only ones even when the latter are a
+    // hop closer: DevTools' page paths are the ones a fix can act on. Within
+    // each pass, closest to the root first. Unreached retainers sort last.
+    retainers.sort_by_key(|&(e, src)| (!page[src], dist[src], e));
     let page = &retainers[page_bounds(retainers.len(), opts)];
     let retainer_rows = page.iter().map(|&(e, src)| row(e, src)).collect();
 
@@ -2220,7 +2265,7 @@ fn format_node_report(
         n.id,
         csv_escape(&n.name),
         csv_escape(&n.class_name),
-        n.node_type,
+        csv_escape(&n.node_type),
         n.detachedness,
         n.self_size,
         csv_distance(n.distance),
@@ -2239,10 +2284,10 @@ fn format_node_report(
             out,
             "{},{},{},{},{},{},{}",
             csv_escape(&r.edge_name),
-            r.edge_type,
+            csv_escape(&r.edge_type),
             r.node_id,
             csv_escape(&r.node_name),
-            r.node_type,
+            csv_escape(&r.node_type),
             r.self_size,
             csv_distance(r.distance),
         );
@@ -2268,10 +2313,10 @@ fn format_node_report(
                     out,
                     "{},{},{},{},{},{}",
                     csv_escape(&r.edge_name),
-                    r.edge_type,
+                    csv_escape(&r.edge_type),
                     r.node_id,
                     csv_escape(&r.node_name),
-                    r.node_type,
+                    csv_escape(&r.node_type),
                     r.self_size,
                 );
             }
@@ -2970,6 +3015,34 @@ mod tests {
         assert!(err.to_string().contains("out of bounds"), "{err}");
     }
 
+    /// The native context's legacy map shortcut is skipped for distances, so
+    /// the application path decides them. Other edges from that context, and
+    /// the same edge name from another source, still set distances.
+    #[test]
+    fn test_sloppy_function_map_is_not_a_distance_shortcut() {
+        let (mut t, window) = TestSnap::page();
+        let native = t.node("hidden", "system / NativeContext", 5, 0);
+        let a = t.node("object", "A", 11, 8);
+        let b = t.node("object", "B", 13, 8);
+        let target = t.node("object", "Leak", 15, 64);
+        let other = t.node("object", "Other", 17, 64);
+        t.edge(window, "internal", "context", native);
+        t.edge(native, "internal", "sloppy_function_map", target);
+        t.edge(native, "internal", "other", other);
+        t.edge(window, "property", "a", a);
+        t.edge(a, "property", "b", b);
+        t.edge(b, "property", "leak", target);
+        let snap = t.snap();
+        let (dist, _, _, _) = bfs_from_root(&snap);
+        assert_eq!(dist[target], 4);
+        assert_eq!(dist[other], 3);
+
+        t.nodes[native].edges[0].1 = "kept".to_string();
+        let snap = t.snap();
+        let (dist, _, _, _) = bfs_from_root(&snap);
+        assert_eq!(dist[target], 3);
+    }
+
     /// root -> Window -> list -> [3] -> target, plus a shorter route through
     /// the GC roots, a weak retainer, and a node only reached weakly.
     fn retention_fixture() -> TestSnap {
@@ -2999,8 +3072,9 @@ mod tests {
         let report = inspect_node(&snap, 13, &defaults()).unwrap();
         assert_eq!(report.node.class_name, "Leak");
         assert_eq!(report.node.distance, Some(3));
-        // Weak edges are not retainers. The GC-root group is the closest to
-        // the root, so it is listed first.
+        // Weak edges are not retainers. Page-root retainers rank before the
+        // closer GC-root group, which stays in the list rather than being
+        // dropped by a small limit.
         let retainers: Vec<(&str, &str, u32)> = report
             .retainers
             .iter()
@@ -3010,11 +3084,22 @@ mod tests {
         assert_eq!(
             retainers,
             [
-                ("0", "element", 5),
                 ("3", "element", 11),
-                ("leak", "property", 15)
+                ("leak", "property", 15),
+                ("0", "element", 5)
             ]
         );
+        let one = inspect_node(
+            &snap,
+            13,
+            &ListOptions {
+                limit: 1,
+                ..defaults()
+            },
+        )
+        .unwrap();
+        assert_eq!(one.retainers_total, 3);
+        assert_eq!(one.retainers[0].node_id, 11);
         // The path runs through the page's Window, not the GC-root shortcut,
         // because DevTools expands user roots first.
         let path: Vec<(&str, u32)> = report
@@ -3093,6 +3178,41 @@ mod tests {
         );
         assert!(text.contains("\n\"a,b\",property,3,Window"));
         assert!(text.contains("\n\"a,b\",property,11,"));
+    }
+
+    /// A snapshot can declare a type label containing a comma: it must stay
+    /// one CSV cell in the node, retainer and retaining-path sections.
+    #[test]
+    fn test_inspect_csv_escapes_type_labels() {
+        let row = |name: &str, node_id| EdgeRow {
+            edge_name: name.to_string(),
+            edge_type: "future,type".into(),
+            node_id,
+            node_name: "holder".into(),
+            node_type: "node,type".into(),
+            self_size: 4,
+            distance: Some(1),
+            conditional_on: None,
+        };
+        let report = NodeReport {
+            node: NodeInfo {
+                id: 1,
+                name: "target".into(),
+                class_name: "Class".into(),
+                node_type: "node,type".into(),
+                detachedness: "unknown",
+                self_size: 8,
+                distance: Some(2),
+            },
+            retainers_total: 1,
+            retainers: vec![row("a,b", 2)],
+            path: Some(vec![row("p,q", 2)]),
+        };
+        let text = format_node_report(&report, &defaults(), OutputFormat::Text).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "1,target,Class,\"node,type\",unknown,8,2");
+        assert!(lines.contains(&"\"a,b\",\"future,type\",2,holder,\"node,type\",4,1"));
+        assert!(lines.contains(&"\"p,q\",\"future,type\",2,holder,\"node,type\",4"));
     }
 
     /// Nodes of one type hanging off Window, for diff tests.
@@ -3792,8 +3912,12 @@ mod tests {
 
     #[test]
     fn test_rejects_edge_counts_that_overflow() {
-        // 65537 nodes of 2^32 - 2 edges, each edge 65536 fields long: the
-        // running total passes u64::MAX at the last node.
+        // Check the arithmetic on its own: the product or the running sum
+        // can wrap, and a prefix past the array is out of bounds.
+        assert!(edge_prefix(0, u32::MAX, usize::MAX, usize::MAX).is_err());
+        assert!(edge_prefix(usize::MAX, 1, 1, usize::MAX).is_err());
+        assert!(edge_prefix(0, u32::MAX, 1, 0).is_err());
+        // A small fixture still covers the bounds check through Snap::new.
         let raw = RawSnapshot {
             snapshot: SnapshotMeta {
                 meta: MetaDetails {
@@ -3801,14 +3925,16 @@ mod tests {
                         .map(String::from)
                         .to_vec(),
                     node_types: Vec::new(),
-                    edge_fields: vec![String::new(); 1 << 16],
+                    edge_fields: vec![String::new()],
                     edge_types: Vec::new(),
                     location_fields: Vec::new(),
                 },
+                node_count: None,
+                edge_count: None,
                 root_index: 0,
             },
             nodes: NodeArray {
-                fields: [0, 0, 0, u32::MAX - 1].repeat((1 << 16) + 1),
+                fields: [0, 0, 0, u32::MAX].to_vec(),
                 wide: Vec::new(),
             },
             edges: IntArray::default(),
@@ -3821,6 +3947,28 @@ mod tests {
                 .contains("edge_count adds up to more than the 0 fields of the edges array"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_rejects_declared_record_counts_that_disagree_with_the_arrays() {
+        let (mut t, window) = TestSnap::page();
+        let a = t.node("object", "A", 11, 8);
+        t.edge(window, "property", "a", a);
+        let mut v = t.json();
+        v["snapshot"]["node_count"] = json!(4);
+        let err = Snap::new(serde_json::from_value(v).unwrap()).err().unwrap();
+        assert!(err.to_string().contains("header declares 4 nodes"), "{err}");
+
+        let mut v = t.json();
+        v["snapshot"]["edge_count"] = json!(3);
+        let err = Snap::new(serde_json::from_value(v).unwrap()).err().unwrap();
+        assert!(err.to_string().contains("header declares 3 edges"), "{err}");
+
+        // The counts V8 writes are accepted; leaving them out still works.
+        let mut v = t.json();
+        v["snapshot"]["node_count"] = json!(3);
+        v["snapshot"]["edge_count"] = json!(2);
+        assert!(Snap::new(serde_json::from_value(v).unwrap()).is_ok());
     }
 
     /// Disabling the heap profiler makes V8 forget its object ids, so the

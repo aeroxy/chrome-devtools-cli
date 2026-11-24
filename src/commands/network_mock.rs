@@ -53,8 +53,10 @@ pub struct MockRequest<'a> {
     pub resource_type: Option<&'a str>,
 }
 
-/// Chrome's resource type names, for the `--resource-type` check. WebSocket
-/// is not one: the Fetch domain can't intercept it and rejects the filter.
+/// Resource types `Fetch.enable` accepts as filters. It maps each of these to
+/// a Blink resource type and rejects everything else (including WebSocket,
+/// TextTrack, Prefetch, Manifest, SignedExchange and Preflight) with
+/// InvalidParams, so those names must fail before the mock is saved.
 const RESOURCE_TYPES: &[&str] = &[
     "Document",
     "Stylesheet",
@@ -62,16 +64,11 @@ const RESOURCE_TYPES: &[&str] = &[
     "Media",
     "Font",
     "Script",
-    "TextTrack",
     "XHR",
     "Fetch",
-    "Prefetch",
     "EventSource",
-    "Manifest",
-    "SignedExchange",
-    "Ping",
     "CSPViolationReport",
-    "Preflight",
+    "Ping",
     "Other",
 ];
 
@@ -631,7 +628,21 @@ mod tests {
         };
         assert!(refused(vec!["Bad Name: v"], None).contains("not a valid header name"));
         assert!(refused(vec!["X-A: a\rb"], None).contains("line break"));
-        assert!(refused(vec![], Some("WebSocket")).contains("Unknown resource type"));
+        // Fetch.enable rejects these as filters even though the Network domain
+        // reports them as resource types.
+        for rejected in [
+            "WebSocket",
+            "TextTrack",
+            "Prefetch",
+            "Manifest",
+            "SignedExchange",
+            "Preflight",
+        ] {
+            assert!(
+                refused(vec![], Some(rejected)).contains("Unknown resource type"),
+                "{rejected}"
+            );
+        }
         assert!(req(None, vec![], Some("Pic"))
             .into_mock()
             .unwrap_err()
@@ -639,6 +650,8 @@ mod tests {
             .contains("Unknown resource type"));
         let ok = req(None, vec!["X-A: 1"], Some("xhr")).into_mock().unwrap();
         assert_eq!(ok.resource_type.as_deref(), Some("XHR"));
+        let image = req(None, vec![], Some("image")).into_mock().unwrap();
+        assert_eq!(image.resource_type.as_deref(), Some("Image"));
     }
 
     #[test]
