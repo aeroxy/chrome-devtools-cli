@@ -150,25 +150,65 @@ async fn traverse_history(client: &mut CdpClient, session_id: &str, entry_id: i6
     // commits in its own process, out of this session's sight.
     if !frames.is_empty() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        client
-            .wait_for_event_match(
-                &["Page.frameNavigated", "Page.navigatedWithinDocument"],
-                remaining,
-                |method, p| {
-                    let frame = if method == "Page.frameNavigated" {
-                        &p["frame"]["id"]
-                    } else {
-                        &p["frameId"]
-                    };
-                    frame
-                        .as_str()
-                        .is_some_and(|f| frames.iter().any(|w| w == f))
-                },
-            )
-            .await
-            .map_err(history_wait_error)?;
+        wait_for_event_from_session(client, remaining, |e| {
+            commit_from_session(e, session_id, &frames)
+        })
+        .await
+        .map_err(history_wait_error)?;
     }
     wait_for_load_until(client, session_id, deadline, NAVIGATION_TIMEOUT_MS, None).await
+}
+
+/// A commit that ends this traversal must come from the session running it.
+/// A failed detach can leave a stale session on this tab reporting the same
+/// main-frame (or same-process iframe) commit, which is not this traversal's.
+fn commit_from_session(event: &serde_json::Value, session_id: &str, frames: &[String]) -> bool {
+    if event["sessionId"].as_str() != Some(session_id) {
+        return false;
+    }
+    let frame = match event["method"].as_str() {
+        Some("Page.frameNavigated") => &event["params"]["frame"]["id"],
+        Some("Page.navigatedWithinDocument") => &event["params"]["frameId"],
+        _ => return false,
+    };
+    frame
+        .as_str()
+        .is_some_and(|f| frames.iter().any(|w| w == f))
+}
+
+/// Read until an event from the acting session matches, checking both buffered
+/// and freshly read events. The session lives on the event envelope, so the
+/// predicate needs the whole event, not just its method and params.
+async fn wait_for_event_from_session<F>(
+    client: &mut CdpClient,
+    timeout: std::time::Duration,
+    mut matches: F,
+) -> Result<serde_json::Value>
+where
+    F: FnMut(&serde_json::Value) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(idx) = client.events.iter().position(&mut matches) {
+            if let Some(event) = client.events.remove(idx) {
+                return Ok(event);
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("Timeout waiting for an event from this session");
+        }
+        let text = tokio::time::timeout(remaining, client.read_text())
+            .await
+            .map_err(|_| anyhow::anyhow!("Timeout waiting for an event from this session"))??;
+        let event: serde_json::Value = serde_json::from_str(&text)?;
+        if event.get("method").is_some() {
+            if matches(&event) {
+                return Ok(event);
+            }
+            client.push_event(event);
+        }
+    }
 }
 
 /// A lost connection keeps its type, which the daemon exits on; any other
@@ -268,6 +308,24 @@ pub async fn document_mark(client: &mut CdpClient, session_id: &str) -> Result<D
     })
 }
 
+/// The frame tree's loader ID, read within the navigation's remaining budget.
+async fn loader_id_within(
+    client: &mut CdpClient,
+    session_id: &str,
+    remaining: std::time::Duration,
+) -> Result<String> {
+    let tree = client
+        .send_to_target_within(session_id, "Page.getFrameTree", json!({}), remaining)
+        .await?;
+    loader_id_from_tree(&tree)
+}
+
+/// The same document answered the readiness probe only if its loader ID did
+/// not change while the probe ran. A commit in between needs another poll.
+fn same_document(before: Option<&str>, after: Option<&str>) -> bool {
+    before.is_some() && before == after
+}
+
 /// A navigation can destroy the context between probes; that is a reason to
 /// poll again, not to fail the wait.
 fn transient_context_error(e: &anyhow::Error) -> bool {
@@ -351,10 +409,7 @@ async fn wait_for_load_until(
         // The document identity comes from Chrome, not the page: a page can
         // replace `performance`, and a reload can keep the same URL.
         let loader = if previous.is_some() {
-            let tree = client
-                .send_to_target_within(session_id, "Page.getFrameTree", json!({}), remaining)
-                .await;
-            match tree.and_then(|tree| loader_id_from_tree(&tree)) {
+            match loader_id_within(client, session_id, remaining).await {
                 Ok(id) => Some(id),
                 Err(e) if transient_context_error(&e) => {
                     tokio::time::sleep(pause.min(remaining)).await;
@@ -387,12 +442,35 @@ async fn wait_for_load_until(
 
         match result {
             Ok(val) => {
-                if readiness_in_budget(
-                    load_finished(&val, previous, loader.as_deref()),
-                    tokio::time::Instant::now(),
-                    deadline,
-                    timeout_ms,
-                )? {
+                let finished = load_finished(&val, previous, loader.as_deref());
+                if finished && previous.is_some() {
+                    // The page can commit another document between the frame
+                    // tree probe above and the readiness probe. A `complete`
+                    // from that new document would otherwise pass with the
+                    // earlier loader ID, so confirm the same one answered both.
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(timed_out());
+                    }
+                    match loader_id_within(client, session_id, remaining).await {
+                        Ok(after) if same_document(loader.as_deref(), Some(&after)) => {}
+                        Ok(_) => {
+                            tokio::time::sleep(pause.min(remaining)).await;
+                            continue;
+                        }
+                        Err(e) if transient_context_error(&e) => {
+                            tokio::time::sleep(pause.min(remaining)).await;
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(
+                                e.context(format!("wait_for_load failed for session {session_id}"))
+                            )
+                        }
+                    }
+                }
+                if readiness_in_budget(finished, tokio::time::Instant::now(), deadline, timeout_ms)?
+                {
                     return Ok(());
                 }
             }
@@ -416,6 +494,37 @@ mod tests {
 
     fn started(session: &str, method: &str, frame: &str) -> serde_json::Value {
         json!({"sessionId": session, "method": method, "params": {"frameId": frame}})
+    }
+
+    /// A failed detach can leave another session on this tab; its commit must
+    /// not end the wait for this traversal.
+    #[test]
+    fn a_history_commit_must_come_from_the_traversing_session() {
+        let main = json!({
+            "sessionId": "s1",
+            "method": "Page.frameNavigated",
+            "params": {"frame": {"id": "MAIN"}},
+        });
+        assert!(commit_from_session(&main, "s1", &["MAIN".into()]));
+        // The same main frame reported by a stale session does not count.
+        assert!(!commit_from_session(&main, "s2", &["MAIN".into()]));
+        assert!(!commit_from_session(&main, "s1", &["CHILD".into()]));
+        let within = started("s1", "Page.navigatedWithinDocument", "MAIN");
+        assert!(commit_from_session(&within, "s1", &["MAIN".into()]));
+        assert!(!commit_from_session(&within, "s2", &["MAIN".into()]));
+        // An unrelated method is not a commit.
+        let other = started("s1", "Page.frameStartedLoading", "MAIN");
+        assert!(!commit_from_session(&other, "s1", &["MAIN".into()]));
+    }
+
+    #[test]
+    fn a_readiness_reply_from_a_replaced_document_is_not_accepted() {
+        // The loader ID before and after the readiness probe must name the
+        // same document; a commit in between sends the wait back to polling.
+        assert!(same_document(Some("L2"), Some("L2")));
+        assert!(!same_document(Some("L2"), Some("L3")));
+        assert!(!same_document(Some("L2"), None));
+        assert!(!same_document(None, None));
     }
 
     /// What Chrome 158 sent before replying to `Page.navigateToHistoryEntry`.

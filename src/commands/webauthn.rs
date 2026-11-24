@@ -142,7 +142,8 @@ fn authenticator_json(options: &AuthenticatorOptions, credentials: &[Value]) -> 
                 "credentialId": to_base64url(c["credentialId"].as_str().unwrap_or("")),
                 "rpId": c["rpId"].as_str().unwrap_or("unknown"),
                 "discoverable": c["isResidentCredential"].as_bool().unwrap_or(false),
-                "signCount": c["signCount"].as_u64().unwrap_or(0),
+                // CDP uses -1 for a credential with no signature counter.
+                "signCount": c["signCount"].as_i64().unwrap_or(0),
             });
             if let Some(name) = c["userName"].as_str().filter(|n| !n.is_empty()) {
                 out["userName"] = json!(name);
@@ -651,6 +652,34 @@ mod tests {
         assert!(format_text("added", &empty)
             .starts_with("Added a virtual authenticator.\nVirtual authenticator:"));
         assert!(format_text("added", &empty).ends_with("No credentials."));
+    }
+
+    /// CDP's -1 means the credential has no signature counter; it must not be
+    /// reported as a counter that has never advanced (0).
+    #[test]
+    fn a_disabled_signature_counter_stays_negative() {
+        let creds = vec![json!({
+            "credentialId": "AAEC+/8=",
+            "isResidentCredential": true,
+            "rpId": "localhost",
+            "signCount": -1,
+        })];
+        let a = authenticator_json(&ctap2(), &creds);
+        assert_eq!(a["credentials"][0]["signCount"], -1);
+        assert!(format_text("unchanged", &a).contains("signCount=-1"));
+
+        let positive = creds
+            .iter()
+            .cloned()
+            .map(|mut c| {
+                c["signCount"] = json!(2);
+                c
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authenticator_json(&ctap2(), &positive)["credentials"][0]["signCount"],
+            2
+        );
     }
 
     #[test]

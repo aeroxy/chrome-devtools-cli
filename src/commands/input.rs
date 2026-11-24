@@ -223,6 +223,7 @@ fn readback_dialog_result(
     text: &str,
     submit_key: Option<&str>,
     dialog: &crate::cdp::DialogOpen,
+    dialog_next: &str,
 ) -> CommandResult {
     let key = submit_key.map(|k| format!(" + {k}")).unwrap_or_default();
     let article = if dialog.dialog_type.starts_with(['a', 'e', 'i', 'o', 'u']) {
@@ -240,9 +241,7 @@ fn readback_dialog_result(
         "Typed: {text}{key}, and the page opened {article} {} dialog: \"{}\".{after} {} If the \
          daemon could not attach to this tab, no later command can handle the dialog: ask the \
          human to close it.",
-        dialog.dialog_type,
-        dialog.message,
-        crate::commands::executor::HANDLE_DIALOG_NEXT
+        dialog.dialog_type, dialog.message, dialog_next
     ))
 }
 
@@ -450,11 +449,13 @@ async fn wait_for_load_in_session(
         if remaining.is_zero() {
             return Ok(()); // an ordinary no-event timeout is not a failure
         }
-        let text = tokio::time::timeout(remaining, client.read_text())
-            .await
-            .map_err(|_| {
-                anyhow!("Timeout waiting for any event [\"Page.loadEventFired\", \"Page.frameStoppedLoading\"]")
-            })??;
+        // No load event within the remaining budget is an ordinary timeout,
+        // like the zero-remaining branch: let the caller's commit check decide.
+        // Only real read errors (e.g. ConnectionLost) are failures.
+        let Ok(text) = tokio::time::timeout(remaining, client.read_text()).await else {
+            return Ok(());
+        };
+        let text = text?;
         let event: serde_json::Value = serde_json::from_str(&text)?;
         if event.get("method").is_some() {
             client.push_event(event);
@@ -1191,11 +1192,34 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Insert text at the current focus point, optionally pressing a submit key.
+///
+/// The daemon's own session survives the command, so its dialog can be handled
+/// next. Direct callers use [`type_text_with_dialog_next`] to say theirs cannot.
 pub async fn type_text(
     client: &mut CdpClient,
     session_id: &str,
     text: &str,
     submit_key: Option<&str>,
+) -> Result<CommandResult> {
+    type_text_with_dialog_next(
+        client,
+        session_id,
+        text,
+        submit_key,
+        crate::commands::executor::HANDLE_DIALOG_NEXT,
+    )
+    .await
+}
+
+/// `type_text` with the recovery guidance for the mode running the command.
+/// A dialog that interrupted the URL readback still means the text went in, so
+/// this returns success in every mode; only the instruction differs.
+pub(crate) async fn type_text_with_dialog_next(
+    client: &mut CdpClient,
+    session_id: &str,
+    text: &str,
+    submit_key: Option<&str>,
+    dialog_next: &str,
 ) -> Result<CommandResult> {
     // Checked before typing: a bad key found afterwards would leave the text
     // typed, and a retry would type it twice.
@@ -1231,7 +1255,12 @@ pub async fn type_text(
             // The insertion (and the submit key, if any) succeeded; only the
             // URL readback was interrupted.
             let dialog = e.downcast_ref::<crate::cdp::DialogOpen>().unwrap();
-            return Ok(readback_dialog_result(text, submit_key, dialog));
+            return Ok(readback_dialog_result(
+                text,
+                submit_key,
+                dialog,
+                dialog_next,
+            ));
         }
         Err(e) => return Err(e),
     };
@@ -1534,16 +1563,49 @@ mod tests {
             dialog_type: "alert".into(),
             message: "later".into(),
         };
-        let none = readback_dialog_result("hi", None, &dialog).output;
+        let none = readback_dialog_result(
+            "hi",
+            None,
+            &dialog,
+            crate::commands::executor::HANDLE_DIALOG_NEXT,
+        )
+        .output;
         assert!(none.contains("text was inserted"));
         assert!(none.contains("URL check"));
         assert!(!none.contains("did not run"));
         assert!(!none.contains("before the submit key"));
+        assert!(none.contains("run `evaluate --dialog-action"));
 
-        let with_key = readback_dialog_result("hi", Some("Enter"), &dialog).output;
+        let with_key = readback_dialog_result(
+            "hi",
+            Some("Enter"),
+            &dialog,
+            crate::commands::executor::HANDLE_DIALOG_NEXT,
+        )
+        .output;
         assert!(with_key.contains("text and submit key were already sent"));
         assert!(with_key.contains("URL check"));
         assert!(!with_key.contains("did not run"));
+    }
+
+    /// The readback is a success in every mode: the text already went in. Only
+    /// the recovery instruction changes when the session ends with the command.
+    #[test]
+    fn a_readback_dialog_in_direct_mode_says_no_later_command_can_handle_it() {
+        let dialog = crate::cdp::DialogOpen {
+            dialog_type: "alert".into(),
+            message: "later".into(),
+        };
+        let direct = readback_dialog_result(
+            "hi",
+            None,
+            &dialog,
+            crate::commands::executor::DIRECT_DIALOG_NEXT,
+        )
+        .output;
+        assert!(direct.starts_with("Typed: hi,"));
+        assert!(direct.contains("no later command can handle the dialog"));
+        assert!(!direct.contains("--dialog-action"));
     }
 
     #[test]
