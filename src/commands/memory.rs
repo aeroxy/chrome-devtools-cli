@@ -129,6 +129,11 @@ async fn take_heapsnapshot_within(
 
             let method = event["method"].as_str().unwrap_or("");
             if method == "HeapProfiler.addHeapSnapshotChunk" {
+                // Only this capture's: one given up on in another session
+                // may still be streaming, and its bytes don't belong here.
+                if event["sessionId"].as_str() != Some(session_id) {
+                    continue;
+                }
                 if let Some(chunk) = event["params"]["chunk"].as_str() {
                     file.write_all(chunk.as_bytes())
                         .await
@@ -1850,8 +1855,9 @@ fn location_value(location: Option<Location>) -> serde_json::Value {
 /// The `+`/`-` rows are per-class, so a node that changes class appears in
 /// both classes. Say so, or a still-live object reads as deleted.
 const DETAIL_NOTE: &str = "+ = entered this class, - = left it, ~ = stayed in it and changed \
-                           size from previousSize; a + or - id present in the other capture is \
-                           a class change, not an allocation or deletion.";
+                           size from previousSize; alsoIn = the other capture has this id too, \
+                           so the object entered or left this class rather than being \
+                           allocated or freed.";
 
 /// Columns of a diff row, in output order.
 const DIFF_COLUMNS: [&str; 9] = [
@@ -3841,7 +3847,7 @@ mod tests {
             detail,
             "idx:1,className:Map,location:,addedCount:2,removedCount:1,countDelta:1,addedSize:240,removedSize:100,sizeDelta:140\n\
              \nObjects, largest size change first: showing 1-2 of 3; next page: --offset 2\n\
-             + = entered this class, - = left it, ~ = stayed in it and changed size from previousSize; a + or - id present in the other capture is a class change, not an allocation or deletion.\n\
+             + = entered this class, - = left it, ~ = stayed in it and changed size from previousSize; alsoIn = the other capture has this id too, so the object entered or left this class rather than being allocated or freed.\n\
              op,nodeId,selfSize,previousSize,alsoIn\n+,17,150,,-\n-,11,100,,-\n"
         );
     }
@@ -3874,7 +3880,7 @@ mod tests {
         assert!(
             detail(OutputFormat::Text).ends_with(
                 "\nObjects, largest size change first: showing 1-5 of 5\n\
-                 + = entered this class, - = left it, ~ = stayed in it and changed size from previousSize; a + or - id present in the other capture is a class change, not an allocation or deletion.\n\
+                 + = entered this class, - = left it, ~ = stayed in it and changed size from previousSize; alsoIn = the other capture has this id too, so the object entered or left this class rather than being allocated or freed.\n\
                  op,nodeId,selfSize,previousSize,alsoIn\n\
                  ~,11,400,100,-\n\
                  +,17,80,,-\n\
@@ -4825,6 +4831,57 @@ mod tests {
         .unwrap();
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "01");
         assert!(!client.heap_capture);
+        drop(client);
+        browser.abort();
+    }
+
+    /// A capture given up on in another session can still be streaming;
+    /// its chunks are not written into this capture's file.
+    #[tokio::test]
+    async fn test_take_heapsnapshot_keeps_only_its_own_sessions_chunks() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let browser = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let chunk = |session: &str, text: &str| {
+                Message::Text(
+                    json!({
+                        "method": "HeapProfiler.addHeapSnapshotChunk",
+                        "params": { "chunk": text },
+                        "sessionId": session,
+                    })
+                    .to_string(),
+                )
+            };
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if req["method"] == "HeapProfiler.takeHeapSnapshot" {
+                    ws.send(chunk("OLD", "stale")).await.unwrap();
+                    ws.send(chunk("S", "mine")).await.unwrap();
+                }
+                let reply = json!({ "id": req["id"], "result": {} });
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("s.heapsnapshot");
+        let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
+        take_heapsnapshot_within(
+            &mut client,
+            "S",
+            output.to_str().unwrap(),
+            OutputFormat::Text,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "mine");
         drop(client);
         browser.abort();
     }
