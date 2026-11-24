@@ -569,10 +569,14 @@ chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /t
 # 1,Detached <button>,,10,0,10,720,0,720
 ```
 
-A leak is a class whose `countDelta` is about a multiple of N in base → target
-and does not drop in base → final. Here every open/close left one dialog
-`<div>` and its `<button>` behind, while the `(compiled code)` growth was gone
-by the final snapshot, so it was not a leak. Classes are grouped as in the DevTools
+Treat a class whose `countDelta` is about a multiple of N in base → target and
+does not drop in base → final as a leak candidate, not proof: a cache that fills
+with ten views and then reuses them gives similar diffs. Here every open/close
+left one dialog `<div>` and its `<button>` retained, while the `(compiled code)`
+growth was gone by the final snapshot (a later one, since the script already
+closed each dialog). Run another batch to see whether the counts keep growing,
+then inspect the retaining path to decide whether the references are unintended.
+Classes are grouped as in the DevTools
 Memory panel: `Detached <div>` is DOM no longer in the document, `Function`
 holds every closure and `system / Context` the variables they capture,
 `{a, b, c}` groups plain objects by their properties, and `(string)`,
@@ -585,7 +589,7 @@ header gives the total and the `--offset` for the next page, `--limit` sets
 the page size (default 50), and names longer than `--max-name-length`
 characters (default 100) end in `…`.
 
-**3. List the leaked objects of a class** by its `idx`, largest first. `+`
+**3. List the retained objects of a class** by its `idx`, largest first. `+`
 objects exist in the `--current` file and `-` objects only in `--base`, so
 inspect each in the file that has it.
 

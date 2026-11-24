@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use serde_json::json;
 
 use crate::cdp::{CdpClient, GeolocationOverride, MediaOverride, ViewportOverride};
+use crate::format::{format_structured, OutputFormat};
 use crate::result::CommandResult;
 
 /// Media features Chrome emulates, with the values each takes. Chrome accepts
@@ -106,6 +107,92 @@ fn describe_media_status(media: &MediaOverride) -> String {
     }
 }
 
+/// The read-only emulation status as one result. Text keeps the prose status,
+/// while `--json`/`--toon` get structured data. Active and saved media use the
+/// same shape, with a pending-reset marker for a clear Chrome has not confirmed.
+fn current_overrides(
+    viewport: Option<&ViewportOverride>,
+    geolocation: Option<&GeolocationOverride>,
+    media: Option<&MediaOverride>,
+    saved: Option<&MediaOverride>,
+    blocklist: &[String],
+    format: OutputFormat,
+) -> Result<CommandResult> {
+    if !format.is_text() {
+        let media_status = |m: &MediaOverride| {
+            if m == &MediaOverride::default() {
+                json!({"pendingReset": true})
+            } else {
+                json!({"media": m.media, "features": m.features})
+            }
+        };
+        return Ok(CommandResult::output(format_structured(
+            &json!({
+                "viewport": viewport.map(|v| json!({
+                    "width": v.width,
+                    "height": v.height,
+                    "deviceScaleFactor": v.device_scale_factor,
+                    "mobile": v.mobile,
+                })),
+                "geolocation": geolocation.map(|g| json!({
+                    "latitude": g.latitude,
+                    "longitude": g.longitude,
+                    "accuracy": g.accuracy,
+                })),
+                "media": media.map(media_status),
+                "savedMedia": saved.map(media_status),
+                "blockedUrls": blocklist,
+            }),
+            format,
+        )?));
+    }
+    let mut out = String::new();
+    if let Some(vp) = viewport {
+        out.push_str(&format!(
+            "Viewport: {}x{} (scale: {}, mobile: {})\n",
+            vp.width, vp.height, vp.device_scale_factor, vp.mobile
+        ));
+    }
+    if let Some(geo) = geolocation {
+        out.push_str(&format!(
+            "Geolocation: {}, {} (acc: {}m)\n",
+            geo.latitude, geo.longitude, geo.accuracy
+        ));
+    }
+    if let Some(media) = media {
+        out.push_str(&format!("Media: {}\n", describe_media_status(media)));
+    } else if let Some(media) = saved {
+        out.push_str(&format!(
+            "Media: {} (saved for this tab, not applied: the daemon could not attach to it \
+             this time)\n",
+            describe_media_status(media)
+        ));
+    }
+    if !blocklist.is_empty() {
+        out.push_str("Blocked URLs:\n");
+        for p in blocklist {
+            out.push_str(&format!("  {p}\n"));
+        }
+    }
+    if out.is_empty() {
+        out.push_str("No emulation overrides active.");
+    }
+    Ok(CommandResult::output(out.trim_end().to_string()))
+}
+
+/// The outcome of a command that changed something: a prose summary in text
+/// mode, a list of actions otherwise.
+fn applied_actions(actions: Vec<String>, format: OutputFormat) -> Result<CommandResult> {
+    if format.is_text() {
+        Ok(CommandResult::output(actions.join(", ")))
+    } else {
+        Ok(CommandResult::output(format_structured(
+            &json!({"actions": actions}),
+            format,
+        )?))
+    }
+}
+
 /// Combined emulation parameters for the `emulate` command.
 pub struct EmulateParams {
     pub viewport: Option<String>,
@@ -200,9 +287,10 @@ fn check_media_session(params: &EmulateParams, persistent: bool) -> Result<()> {
 pub async fn emulate(
     client: &mut CdpClient,
     session_id: &str,
+    format: OutputFormat,
     params: EmulateParams,
 ) -> Result<CommandResult> {
-    emulate_tab(client, session_id, None, params).await
+    emulate_tab(client, session_id, format, None, params).await
 }
 
 /// [`emulate`] for the daemon, which knows the tab, `target_id`. When it could
@@ -212,6 +300,7 @@ pub async fn emulate(
 pub(crate) async fn emulate_tab(
     client: &mut CdpClient,
     session_id: &str,
+    format: OutputFormat,
     target_id: Option<&str>,
     params: EmulateParams,
 ) -> Result<CommandResult> {
@@ -422,44 +511,20 @@ pub(crate) async fn emulate_tab(
 
     // 5. If no specific action taken, show current overrides
     if actions.is_empty() {
-        let mut out = String::new();
-        if let Some(vp) = &client.viewport {
-            out.push_str(&format!(
-                "Viewport: {}x{} (scale: {}, mobile: {})\n",
-                vp.width, vp.height, vp.device_scale_factor, vp.mobile
-            ));
-        }
-        if let Some(geo) = &client.geolocation {
-            out.push_str(&format!(
-                "Geolocation: {}, {} (acc: {}m)\n",
-                geo.latitude, geo.longitude, geo.accuracy
-            ));
-        }
         let saved_media = saved_tab
             .and_then(|t| client.emulation_saved.get(t))
             .and_then(|saved| saved.media.as_ref());
-        if let Some(media) = &client.media {
-            out.push_str(&format!("Media: {}\n", describe_media_status(media)));
-        } else if let Some(media) = saved_media {
-            out.push_str(&format!(
-                "Media: {} (saved for this tab, not applied: the daemon could not attach to it \
-                 this time)\n",
-                describe_media_status(media)
-            ));
-        }
-        if !client.blocklist.is_empty() {
-            out.push_str("Blocked URLs:\n");
-            for p in &client.blocklist {
-                out.push_str(&format!("  {p}\n"));
-            }
-        }
-        if out.is_empty() {
-            out.push_str("No emulation overrides active.");
-        }
-        return Ok(CommandResult::output(out.trim_end().to_string()));
+        return current_overrides(
+            client.viewport.as_ref(),
+            client.geolocation.as_ref(),
+            client.media.as_ref(),
+            saved_media,
+            &client.blocklist,
+            format,
+        );
     }
 
-    Ok(CommandResult::output(actions.join(", ")))
+    applied_actions(actions, format)
 }
 
 #[cfg(test)]
@@ -647,5 +712,60 @@ mod tests {
             set.cdp_params(),
             json!({"media": "print", "features": [{"name": "prefers-color-scheme", "value": "dark"}]})
         );
+    }
+
+    /// Both outcomes of `emulate` are data under `--json`/`--toon`, including
+    /// active, saved and pending-reset media status. Text keeps the prose.
+    #[test]
+    fn emulate_results_are_structured_outside_text_mode() {
+        let applied = applied_actions(vec!["Viewport cleared".into()], OutputFormat::Json).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&applied.output).unwrap();
+        assert_eq!(json, json!({"actions": ["Viewport cleared"]}));
+
+        let pending = MediaOverride::default();
+        let saved = MediaOverride {
+            media: Some("print".into()),
+            features: vec![("prefers-color-scheme".into(), "dark".into())],
+        };
+        let result = current_overrides(
+            None,
+            None,
+            Some(&pending),
+            Some(&saved),
+            &["*.png".into()],
+            OutputFormat::Json,
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(json["media"], json!({"pendingReset": true}));
+        assert_eq!(
+            json["savedMedia"],
+            json!({"media": "print", "features": [["prefers-color-scheme", "dark"]]})
+        );
+        assert_eq!(json["blockedUrls"], json!(["*.png"]));
+        assert!(json["viewport"].is_null());
+
+        let viewport = ViewportOverride {
+            width: 800,
+            height: 600,
+            device_scale_factor: 2.0,
+            mobile: true,
+        };
+        let geolocation = GeolocationOverride {
+            latitude: 37.77,
+            longitude: -122.41,
+            accuracy: 100.0,
+        };
+        let toon = current_overrides(
+            Some(&viewport),
+            Some(&geolocation),
+            None,
+            None,
+            &[],
+            OutputFormat::Toon,
+        )
+        .unwrap();
+        assert!(toon.output.contains("viewport"), "{}", toon.output);
+        assert!(!toon.output.contains("Viewport:"), "{}", toon.output);
     }
 }
