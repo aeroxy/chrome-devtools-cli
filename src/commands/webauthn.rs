@@ -210,19 +210,18 @@ fn output(
     authenticator: Value,
     background_tab: bool,
 ) -> Result<CommandResult> {
-    if format.is_text() {
-        let mut text = format_text(action, &authenticator);
-        if background_tab {
-            text.push('\n');
-            text.push_str(BACKGROUND_TAB_NOTE);
-        }
-        return Ok(CommandResult::output(text));
-    }
-    let mut value = json!({"action": action, "authenticator": authenticator});
-    if background_tab {
-        value["warning"] = json!(BACKGROUND_TAB_NOTE);
-    }
-    Ok(CommandResult::output(format_structured(&value, format)?))
+    let result = if format.is_text() {
+        CommandResult::output(format_text(action, &authenticator))
+    } else {
+        let value = json!({"action": action, "authenticator": authenticator});
+        CommandResult::output(format_structured(&value, format)?)
+    };
+    // Advice belongs on stderr, where it never mixes into structured output.
+    Ok(if background_tab {
+        result.with_note(BACKGROUND_TAB_NOTE)
+    } else {
+        result
+    })
 }
 
 /// Option pairs Chrome refuses to add, and flags the merged options can't
@@ -657,17 +656,16 @@ mod tests {
     #[test]
     fn background_tab_gets_a_note() {
         let a = authenticator_json(&ctap2(), &[]);
-        let text = output(OutputFormat::Text, "added", a.clone(), true)
-            .unwrap()
-            .output;
-        assert!(text.ends_with(BACKGROUND_TAB_NOTE));
-        let front = output(OutputFormat::Text, "added", a.clone(), false)
-            .unwrap()
-            .output;
-        assert!(!front.contains("Note:"));
-        let json = output(OutputFormat::Json, "added", a, true).unwrap().output;
-        let v: Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["warning"], BACKGROUND_TAB_NOTE);
+        let text = output(OutputFormat::Text, "added", a.clone(), true).unwrap();
+        assert_eq!(text.notes, [BACKGROUND_TAB_NOTE]);
+        assert!(!text.output.contains(BACKGROUND_TAB_NOTE));
+        let front = output(OutputFormat::Text, "added", a.clone(), false).unwrap();
+        assert!(front.notes.is_empty());
+
+        let json = output(OutputFormat::Json, "added", a, true).unwrap();
+        assert_eq!(json.notes, [BACKGROUND_TAB_NOTE]);
+        let v: Value = serde_json::from_str(&json.output).unwrap();
+        assert!(v.get("warning").is_none());
         assert_eq!(v["action"], "added");
     }
 }

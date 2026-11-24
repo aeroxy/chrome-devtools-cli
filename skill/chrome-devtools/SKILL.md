@@ -368,10 +368,13 @@ chrome-devtools --target warm-squid evaluate "prompt('name')" --dialog-action "m
 
 # A dialog that is already open: handle it first, then evaluate
 chrome-devtools --target warm-squid evaluate --dialog-action dismiss "true"
-# Dialogs are answered only within the command's time limit (180s), so a page
-# that keeps opening them can't hold it longer: it then fails with "... ran past
-# its 180s limit, so this dialog is left open", and that dialog stays open. A
-# page that opens them in a loop needs `close-page`.
+# Each ordinary CDP call has its own time budget: 180 seconds by default, set
+# with CHROME_CDP_TIMEOUT_SECS, and a liveness check can stretch a call a little
+# beyond it. That is a per-call budget, not a promise that the whole command
+# ends at 180s. A page that keeps opening dialogs can't hold a call forever: the
+# call fails with "... ran past its Ns limit, so this dialog is left open", and
+# a newly seen dialog stays open. A page that opens them in a loop needs
+# `close-page`.
 
 # Save JS output to a file
 chrome-devtools --target warm-squid evaluate "JSON.stringify(performance.timing)" -o /tmp/perf.json
@@ -379,7 +382,7 @@ chrome-devtools --target warm-squid evaluate "JSON.stringify(performance.timing)
 
 **Avoid `evaluate` for DOM traversal.** Use `snapshot` to read page structure and `click`/`fill` to interact.
 
-**Dialogs opened by an action.** When a `click`, `press-key`, `fill`, `hover` or `type-text` makes the page open a dialog, the command succeeds and says so: `Clicked, and the page opened a confirm dialog: "Delete?"`. **Don't repeat the action.** Handle the dialog next with `evaluate --dialog-action accept|dismiss|<text> true`. Steps after the dialog opened did not run (for `type-text`, its `--submit-key`). If the CLI warned that it ran without the daemon, or the report says the daemon could not attach to the tab, no later command can handle the dialog: ask the human to close it, or `close-page` the tab.
+**Dialogs opened by an action.** When a `click`, `press-key`, `fill`, `hover` or `type-text` makes the page open a dialog, the command succeeds and says so: `Clicked, and the page opened a confirm dialog: "Delete?"`. **Don't repeat the action.** Handle the dialog next with `evaluate --dialog-action accept|dismiss|<text> true`. Steps after the dialog opened did not run. For `type-text`, if Enter may have opened the dialog, the `--submit-key` outcome is unconfirmed — don't press it again; say it did not run only when the dialog interrupted text insertion before the key was sent. If the CLI warned that it ran without the daemon, or the report says the daemon could not attach to the tab, no later command can handle the dialog: ask the human to close it, or `close-page` the tab.
 
 A dialog that opens while the command is only getting ready fails it instead, because the action never happened: `Moving the pointer there opened a dialog, so the click was not sent` (a mouseover handler) or `Focusing or clearing the field opened a dialog, so the value was not entered` (`fill`). Handle the dialog, then run the command again.
 
@@ -892,7 +895,7 @@ chrome-devtools --target warm-squid network --type Document --type Fetch --type 
 - **Values are credentials.** The default table shows only their lengths. Print them (`--header`, `--json`, `--toon`) only when a tool needs them, and don't echo them back to the user or into files without a reason.
 - `cookies` answers for the page's own site. A partitioned cookie that a cross-site iframe on the page set isn't included.
 - It looks cookies up by URL, so it lists a `SameSite` cookie that a cross-site request to that URL wouldn't carry. What one request actually sent is in `network --request-headers`.
-- Check each suspect cookie's `domain` and `path` (does it cover the failing URL?), `secure` (never sent over `http://`), `sameSite` (`Strict`/`Lax` cookies are not sent on many cross-site requests) and `expires`.
+- Check each suspect cookie's `domain` and `path` (does it cover the failing URL?), `secure` (Chrome normally requires HTTPS, but matches Secure cookies on `http://localhost`), `sameSite` (`Strict`/`Lax` cookies are not sent on many cross-site requests) and `expires`; the request headers in `network --request-headers` show which cookies were actually sent.
 - `network --request-headers --response-headers` shows which cookies a request actually carried and which `Set-Cookie` headers came back, but not why Chrome rejected a cookie. When that's the question, ask the human to look at the Application and Network panels in DevTools.
 - For a clean, logged-out session, use a throwaway profile (Pattern 16) rather than deleting the user's cookies.
 

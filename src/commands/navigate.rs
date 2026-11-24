@@ -275,6 +275,26 @@ fn transient_context_error(e: &anyhow::Error) -> bool {
     msg.contains("Execution context was destroyed") || msg.contains("Cannot find context")
 }
 
+/// A ready reply counts only inside the navigation's shared budget. A reply a
+/// liveness ping set aside can arrive after that deadline; reporting success
+/// then would claim the navigation finished after its allowance ran out.
+fn readiness_in_budget(
+    finished: bool,
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    timeout_ms: u64,
+) -> Result<bool> {
+    if !finished {
+        return Ok(false);
+    }
+    if now >= deadline {
+        return Err(anyhow::anyhow!(
+            "Timeout ({timeout_ms}ms) waiting for page readyState=complete"
+        ));
+    }
+    Ok(true)
+}
+
 /// Whether `wait_for_load`'s probe shows the load done: readyState
 /// "complete", in a document other than `previous` when there is one.
 fn load_finished(
@@ -367,7 +387,12 @@ async fn wait_for_load_until(
 
         match result {
             Ok(val) => {
-                if load_finished(&val, previous, loader.as_deref()) {
+                if readiness_in_budget(
+                    load_finished(&val, previous, loader.as_deref()),
+                    tokio::time::Instant::now(),
+                    deadline,
+                    timeout_ms,
+                )? {
                     return Ok(());
                 }
             }
@@ -445,6 +470,21 @@ mod tests {
         ));
         // Without a new identity the old document may still be showing.
         assert!(!load_finished(&state("complete"), Some(&old), None));
+    }
+
+    /// A `complete` reply read after the shared deadline is too late: the
+    /// navigation budget has expired, and reporting success would hide that.
+    #[test]
+    fn a_readiness_reply_after_the_deadline_is_not_success() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let before = deadline - std::time::Duration::from_millis(1);
+        assert!(readiness_in_budget(true, before, deadline, 1000).unwrap());
+        assert!(!readiness_in_budget(false, before, deadline, 1000).unwrap());
+        let err = readiness_in_budget(true, deadline, deadline, 1000).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Timeout (1000ms) waiting for page readyState=complete"
+        );
     }
 
     /// A page that replaces `performance` or rewrites its URL cannot fake a

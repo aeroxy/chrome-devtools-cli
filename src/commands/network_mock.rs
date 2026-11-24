@@ -179,10 +179,11 @@ fn parse_header(header: &str) -> Result<(String, String)> {
     Ok((name.to_string(), value.to_string()))
 }
 
-/// Chrome can't tell `fetch()` from XMLHttpRequest when it intercepts: it
-/// reports both as XHR. So each of the two types matches either.
+/// Chrome can't tell `fetch()`, XMLHttpRequest and `EventSource` apart when it
+/// intercepts: it reports all three as XHR. So each of the three types matches
+/// any of them.
 fn same_resource_type(wanted: &str, reported: &str) -> bool {
-    let xhr_like = |t: &str| t == "XHR" || t == "Fetch";
+    let xhr_like = |t: &str| t == "XHR" || t == "Fetch" || t == "EventSource";
     wanted == reported || (xhr_like(wanted) && xhr_like(reported))
 }
 
@@ -572,8 +573,8 @@ mod tests {
         );
     }
 
-    /// Chrome reports both fetch() and XMLHttpRequest as XHR when it
-    /// intercepts, and has no phrase of its own for unusual codes.
+    /// Chrome reports fetch(), XMLHttpRequest and EventSource all as XHR when
+    /// it intercepts, and has no phrase of its own for unusual codes.
     #[test]
     fn replies_fit_what_chrome_reports_and_accepts() {
         let mut fetch_only = mock("*", MockAction::Abort);
@@ -584,6 +585,15 @@ mod tests {
         assert_eq!(reply_to_paused(&mocks, &paused("Script")).2, None);
         assert_eq!(reason_phrase(404), "Not Found");
         assert_eq!(reason_phrase(599), "Mocked");
+
+        // An EventSource mock has to match the XHR type Chrome reports for its
+        // requests, not just the authored EventSource type.
+        let mut eventsource_only = mock("*", MockAction::Abort);
+        eventsource_only.resource_type = Some("EventSource".into());
+        let mocks = [eventsource_only];
+        assert_eq!(reply_to_paused(&mocks, &paused("XHR")).2, Some(0));
+        assert_eq!(reply_to_paused(&mocks, &paused("Fetch")).2, Some(0));
+        assert_eq!(reply_to_paused(&mocks, &paused("Script")).2, None);
     }
 
     /// A failure to update the browser must not hide that the daemon's mock

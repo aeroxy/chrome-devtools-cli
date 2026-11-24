@@ -80,6 +80,32 @@ fn describe_media(media: &MediaOverride) -> String {
     parts.join("; ")
 }
 
+/// A clear is only known to have happened once Chrome acknowledges it. Until
+/// then leave an empty override as a pending-reset marker: status must not
+/// claim media is cleared and `--clear-all` must retry, while a later media
+/// update must not resend the old value unless the user asks for it. An absent
+/// override stays absent (the tab whose saved override is being cleared may be
+/// a different one).
+fn media_after_clear(cache: &mut Option<MediaOverride>, acknowledged: bool) {
+    if acknowledged {
+        *cache = None;
+    } else if cache.is_some() {
+        *cache = Some(MediaOverride::default());
+    }
+}
+
+/// Status text for a media override, including the pending-reset marker left
+/// by a clear Chrome has not acknowledged.
+fn describe_media_status(media: &MediaOverride) -> String {
+    if media == &MediaOverride::default() {
+        "a clear was requested but not confirmed (it may still be active); rerun with \
+         --clear-media"
+            .to_string()
+    } else {
+        describe_media(media)
+    }
+}
+
 /// Combined emulation parameters for the `emulate` command.
 pub struct EmulateParams {
     pub viewport: Option<String>,
@@ -268,20 +294,24 @@ pub(crate) async fn emulate_tab(
         .and_then(|t| client.emulation_saved.get(t))
         .is_some_and(|s| s.media.is_some());
     if params.clear_media || (params.clear_all && (client.media.is_some() || saved_has_media)) {
-        // Forget the override before sending the clear: a dialog or a timeout
-        // can leave its outcome unknown, and a stale cache would both report
-        // `Media: print` and resend `print` on the next media update.
-        client.media = None;
-        if let Some(saved) = saved_tab.and_then(|t| client.emulation_saved.get_mut(t)) {
-            saved.media = None;
-        }
-        client
+        // Only forget the old override once Chrome acknowledges the reset. A
+        // dialog can stop the call before it is even written, in which case
+        // Chrome still has `print` and a forgotten cache would make `--clear-all`
+        // report success without clearing it. An unacknowledged clear leaves a
+        // pending-reset marker instead of the stale value (see `media_after_clear`).
+        let result = client
             .send_to_target(
                 session_id,
                 "Emulation.setEmulatedMedia",
                 MediaOverride::default().cdp_params(),
             )
-            .await?;
+            .await;
+        let acknowledged = result.is_ok();
+        media_after_clear(&mut client.media, acknowledged);
+        if let Some(saved) = saved_tab.and_then(|t| client.emulation_saved.get_mut(t)) {
+            media_after_clear(&mut saved.media, acknowledged);
+        }
+        result?;
         actions.push("Media emulation cleared".to_string());
     }
 
@@ -409,12 +439,12 @@ pub(crate) async fn emulate_tab(
             .and_then(|t| client.emulation_saved.get(t))
             .and_then(|saved| saved.media.as_ref());
         if let Some(media) = &client.media {
-            out.push_str(&format!("Media: {}\n", describe_media(media)));
+            out.push_str(&format!("Media: {}\n", describe_media_status(media)));
         } else if let Some(media) = saved_media {
             out.push_str(&format!(
                 "Media: {} (saved for this tab, not applied: the daemon could not attach to it \
                  this time)\n",
-                describe_media(media)
+                describe_media_status(media)
             ));
         }
         if !client.blocklist.is_empty() {
@@ -567,6 +597,39 @@ mod tests {
             describe_media(&merged),
             "print; prefers-color-scheme=light; forced-colors=active; prefers-reduced-motion=reduce"
         );
+    }
+
+    /// A clear is only forgotten once acknowledged. Until then a pending reset
+    /// keeps `--clear-all` retrying and status from claiming media is cleared,
+    /// but the old value is not merged into a later media update.
+    #[test]
+    fn an_unacknowledged_media_clear_keeps_a_pending_reset() {
+        let print = MediaOverride {
+            media: Some("print".into()),
+            features: vec![],
+        };
+        let mut cache = Some(print.clone());
+        media_after_clear(&mut cache, false);
+        assert_eq!(cache, Some(MediaOverride::default()));
+        assert_eq!(
+            describe_media_status(cache.as_ref().unwrap()),
+            "a clear was requested but not confirmed (it may still be active); rerun with \
+             --clear-media"
+        );
+        let next = merge_media(
+            cache.clone().unwrap_or_default(),
+            None,
+            vec![("prefers-color-scheme".into(), "dark".into())],
+        );
+        assert_eq!(next.media, None);
+
+        media_after_clear(&mut cache, true);
+        assert_eq!(cache, None);
+        // A tab with no active override of its own must not gain one from a
+        // failed clear of another tab's saved state.
+        let mut absent = None;
+        media_after_clear(&mut absent, false);
+        assert_eq!(absent, None);
     }
 
     /// An empty media string and an empty list are what turn Chrome's override off.
