@@ -603,10 +603,10 @@ fn rule_block(
     }
 }
 
-/// A node's styles, highest precedence first: inline style, matched rules
-/// (CDP lists them lowest first), with presentational attributes below the
-/// author rules but above the user-agent ones, as the author origin's
-/// lowest-precedence rules.
+/// A node's styles in normal precedence order, highest first: inline style,
+/// matched rules (CDP lists them lowest first), with presentational
+/// attributes below the author rules but above the user-agent ones, as the
+/// author origin's lowest-precedence rules.
 fn node_blocks(
     inline: &Value,
     rules: &Value,
@@ -969,6 +969,38 @@ fn split_var(args: &str) -> Option<(&str, Option<&str>, usize)> {
     })
 }
 
+/// Whether CSS text ending in `before` and text starting with `after` would
+/// read as one token if written together: `20` and `px` make the length
+/// `20px`, and `/` and `*` open a comment. Covers every pair css-syntax
+/// needs a comment between, and a few more, where one changes nothing.
+fn runs_together(before: &str, after: &str) -> bool {
+    let name =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '\\') || !c.is_ascii();
+    // What a name, a number or a dimension can start with.
+    let starts_word = |c: char| name(c) || matches!(c, '.' | '+');
+    match (before.chars().next_back(), after.chars().next()) {
+        (Some('/'), Some(b)) => b == '*',
+        (Some('#' | '@' | '.' | '+'), Some(b)) => starts_word(b),
+        // A name and `(` make a function, a number and `%` a percentage.
+        (Some(a), Some(b)) if name(a) => {
+            starts_word(b) || b == '(' || (b == '%' && a.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+/// Append `piece` to `out` as tokens of its own. `var()` substitutes tokens,
+/// not text, so `var(--size)px` with `--size: 20` is a number and then an
+/// identifier, which no property takes as a length. Chrome writes such a
+/// result with an empty comment between the two (`20/**/px`), and so does
+/// this, so that `CSS.supports` judges what Chrome does.
+fn push_tokens(out: &mut String, piece: &str) {
+    if runs_together(out, piece) {
+        out.push_str("/**/");
+    }
+    out.push_str(piece);
+}
+
 /// Replace every `var(--x, fallback)` in `value`. `lookup` is `None` for a
 /// custom property that isn't defined; an empty one (`--x: ;`) is defined,
 /// and its empty value replaces the reference rather than the fallback.
@@ -985,16 +1017,17 @@ fn substitute(
     let mut out = String::new();
     let mut rest = value;
     while let Some(pos) = find_var(rest) {
-        out.push_str(&rest[..pos]);
+        push_tokens(&mut out, &rest[..pos]);
         let args = &rest[pos + 4..];
         let (name, fallback, close) = split_var(args)?;
-        match lookup(name) {
-            Some(v) => out.push_str(&v),
-            None => out.push_str(&substitute(fallback?.trim(), lookup, depth + 1)?),
-        }
+        let replacement = match lookup(name) {
+            Some(v) => v,
+            None => substitute(fallback?.trim(), lookup, depth + 1)?,
+        };
+        push_tokens(&mut out, &replacement);
         rest = &args[close + 1..];
     }
-    out.push_str(rest);
+    push_tokens(&mut out, rest);
     Some(out)
 }
 
@@ -1451,7 +1484,9 @@ fn format_text(report: &Report) -> String {
         }
     }
     if !report.rules.is_empty() {
-        out.push_str("Rules (highest precedence first):\n");
+        // Normal precedence: an `!important` declaration can beat one in a
+        // rule above it, which only the declarations' tags show.
+        out.push_str("Rules (normal precedence order, highest first):\n");
         for rule in &report.rules {
             write_rule(&mut out, rule, 1);
         }
@@ -1707,7 +1742,9 @@ async fn collect(
 /// runs them in order, so waiting for the last one covers both, but only
 /// up to `limit`: a page that didn't answer the inspection won't answer
 /// this either, and the daemon serves nobody meanwhile. Chrome still runs
-/// them once the page is free.
+/// them once the page is free. The two writes keep the client's own bound:
+/// they are small, and after a lost connection, where one could stall,
+/// there is no cleanup (see `css_styles`).
 async fn disable_agents(
     client: &mut CdpClient,
     session_id: &str,
@@ -1747,10 +1784,17 @@ pub async fn css_styles(
         .iter()
         .map(|n| normalize_property_name(n))
         .collect();
-    let report = collect(client, session_id, selector, &opts).await;
-    // Turn the agents off whatever happened. The inspection's own error
-    // comes first; after a report, only a lost connection still counts: the
-    // daemon exits on it.
+    // A lost connection leaves no agents to turn off: Chrome drops a
+    // session's agents with its connection, and the daemon exits on the
+    // error. Writing to it anyway could wait out the whole call timeout,
+    // behind a write the inspection never finished.
+    let report = match collect(client, session_id, selector, &opts).await {
+        Err(e) if e.downcast_ref::<ConnectionLost>().is_some() => return Err(e),
+        report => report,
+    };
+    // Otherwise turn the agents off whatever happened. The inspection's own
+    // error comes first; after a report, only a lost connection still
+    // counts: the daemon exits on it.
     let disabled = disable_agents(client, session_id, SETUP_CALL_TIMEOUT).await;
     let report = report?;
     if let Err(e) = disabled {
@@ -1910,6 +1954,8 @@ mod tests {
         block.decls.iter().map(|d| d.status).collect()
     }
 
+    /// The rules come in normal precedence order, which the heading says:
+    /// `.btn.primary`'s important color beats the inline style above it.
     #[test]
     fn report_marks_the_cascade_and_hides_user_agent_rules() {
         let report = report_for(&matched(), CssOptions::default());
@@ -1923,7 +1969,7 @@ Computed:
   height: 20px;
   color: rgb(255, 255, 255);
   padding: 8px;
-Rules (highest precedence first):
+Rules (normal precedence order, highest first):
   element.style {
     [overridden] color: yellow;
   }
@@ -2945,6 +2991,58 @@ Inherited from body:
         assert_eq!(body_color(&report), Overridden);
     }
 
+    /// `var()` substitutes tokens, not text. In Chrome 158, `var(--size)px`
+    /// with `--size: 20` is a number and an identifier, no font size, so the
+    /// body's applies; `var(--a)var(--b)` is two lengths, which a margin
+    /// takes. The substituted value keeps them apart as Chrome writes them,
+    /// with an empty comment, so `CSS.supports` sees what Chrome does.
+    #[test]
+    fn substitution_keeps_tokens_apart() {
+        let vars = HashMap::from([
+            ("--size".to_string(), "20".to_string()),
+            ("--len".to_string(), "20px".to_string()),
+            ("--a".to_string(), "1px".to_string()),
+            ("--b".to_string(), "2px".to_string()),
+            ("--dot".to_string(), "1.".to_string()),
+            ("--none".to_string(), String::new()),
+        ]);
+        let resolve = |v: &str| resolve_vars(v, &vars);
+        assert_eq!(resolve("var(--size)px").as_deref(), Some("20/**/px"));
+        assert_eq!(resolve("var(--missing, 20)%").as_deref(), Some("20/**/%"));
+        assert_eq!(resolve("var(--a)var(--b)").as_deref(), Some("1px/**/2px"));
+        assert_eq!(resolve("var(--dot)5px").as_deref(), Some("1./**/5px"));
+        // Nor does an empty value join what is around it: `/*` is no comment.
+        assert_eq!(resolve("1/var(--none)*2").as_deref(), Some("1//**/*2"));
+        // Tokens that stay apart anyway are left as they are.
+        assert_eq!(resolve("var(--len)").as_deref(), Some("20px"));
+        assert_eq!(
+            resolve("calc(var(--size)*var(--len)/2)").as_deref(),
+            Some("calc(20*20px/2)")
+        );
+        assert_eq!(
+            resolve("rgb(var(--size),var(--size),0)").as_deref(),
+            Some("rgb(20,20,0)")
+        );
+
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        let decls = [("font-size", "var(--size)px")];
+        m["inlineStyle"] = authored(&decls, &decls);
+        let parent = [("font-size", "30px")];
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(&parent, &parent);
+        let mut list = computed();
+        list.push(("--size".into(), "20".into()));
+        // Chrome's `CSS.supports` turns down what the page is asked about.
+        let checks = substituted_values(&m, &custom_properties(&list));
+        assert_eq!(checks, [("font-size".to_string(), "20/**/px".to_string())]);
+        let info = PageInfo {
+            rejected: checks,
+            ..page()
+        };
+        let report = build_report(&m, &list, &sheets(), &info, &CssOptions::default());
+        assert_eq!(report.inherited[0].rules[0].decls[0].status, Status::Active);
+    }
+
     /// Chrome 158 takes a CSS-wide keyword that `var()` substitution leaves
     /// as that keyword: `var(--missing, inherit)` inherits, also for a
     /// custom property, `revert-layer` rolls back, and `initial` is a value
@@ -3035,12 +3133,16 @@ Inherited from body:
     /// A browser that answers css-styles' calls about an element with no
     /// styles (`.nope` matches nothing), hangs up when `close_on` arrives,
     /// and never answers `ignore`, though it still answers liveness pings.
+    /// It answers `garble` with a frame the client can't read, which ends
+    /// the client's reads but not its writes, and goes on reading.
     /// The task returns the methods it was sent.
     async fn fake_browser(
         close_on: &'static str,
         ignore: &'static str,
+        garble: &'static str,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         use futures_util::{SinkExt, StreamExt};
+        use tokio::io::AsyncWriteExt;
         use tokio_tungstenite::tungstenite::Message;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -3056,6 +3158,11 @@ Inherited from body:
                     break;
                 }
                 if method == ignore {
+                    continue;
+                }
+                if method == garble {
+                    // A one-byte text frame with a reserved bit set.
+                    let _ = ws.get_mut().write_all(&[0xC1, 0x01, b'x']).await;
                     continue;
                 }
                 let result = match method.as_str() {
@@ -3085,7 +3192,7 @@ Inherited from body:
     #[tokio::test]
     async fn a_lost_connection_is_not_a_report() {
         for close_on in ["Runtime.callFunctionOn", "DOM.disable"] {
-            let (url, browser) = fake_browser(close_on, "").await;
+            let (url, browser) = fake_browser(close_on, "", "").await;
             let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
             let result = css_styles(
                 &mut client,
@@ -3111,7 +3218,7 @@ Inherited from body:
     /// full call timeout, and both agents are still asked to turn off.
     #[tokio::test]
     async fn cleanup_waits_only_as_long_as_it_is_given() {
-        let (url, browser) = fake_browser("", "DOM.disable").await;
+        let (url, browser) = fake_browser("", "DOM.disable", "").await;
         let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
         let limit = std::time::Duration::from_millis(300);
         let disabled = tokio::time::timeout(
@@ -3135,7 +3242,7 @@ Inherited from body:
     /// inspection's error is the one reported, whatever the cleanup met.
     #[tokio::test]
     async fn cleanup_keeps_the_inspection_error() {
-        let (url, browser) = fake_browser("DOM.disable", "").await;
+        let (url, browser) = fake_browser("DOM.disable", "", "").await;
         let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
         let result = css_styles(
             &mut client,
@@ -3153,5 +3260,34 @@ Inherited from body:
         drop(client);
         let seen = browser.await.unwrap();
         assert_eq!(seen.last().map(String::as_str), Some("DOM.disable"));
+    }
+
+    /// Once the inspection has lost the connection, nothing more is sent to
+    /// turn the agents off. This browser still reads after the client's
+    /// reads failed, so it would see the cleanup's calls.
+    #[tokio::test]
+    async fn no_cleanup_after_a_lost_connection() {
+        let (url, browser) = fake_browser("", "", "Runtime.callFunctionOn").await;
+        let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
+        let result = css_styles(
+            &mut client,
+            "S",
+            "p",
+            CssOptions::default(),
+            OutputFormat::Text,
+        )
+        .await;
+        let error = result.err().expect("a lost connection");
+        assert!(
+            error.downcast_ref::<ConnectionLost>().is_some(),
+            "{error:#}"
+        );
+        drop(client);
+        let seen = browser.await.unwrap();
+        assert!(
+            seen.iter().any(|m| m == "Runtime.callFunctionOn"),
+            "{seen:?}"
+        );
+        assert!(!seen.iter().any(|m| m.ends_with(".disable")), "{seen:?}");
     }
 }

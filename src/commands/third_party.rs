@@ -49,9 +49,13 @@ const DISCOVER_TOOLS_JS: &str = r#"async () => {
     dtmcp.__discovered = groups;
     if (typeof dtmcp.executeTool !== 'function') {
         dtmcp.executeTool = async (toolName, args) => {
-            for (const group of dtmcp.toolGroups || []) {
+            // Outlives discovery: once that stops answering, the list is
+            // empty and listing shows a legacy toolGroup, so look there too.
+            const groups = Array.isArray(dtmcp.toolGroups) && dtmcp.toolGroups.length > 0
+                ? dtmcp.toolGroups : (dtmcp.toolGroup ? [dtmcp.toolGroup] : []);
+            for (const group of groups) {
                 const tool = (group.tools || []).find(t => t.name === toolName);
-                if (tool) return await tool.execute(args);
+                if (tool && typeof tool.execute === 'function') return await tool.execute(args);
             }
             throw new Error('Tool ' + toolName + ' not found');
         };
@@ -276,7 +280,9 @@ fn execute_tool_js(name: &str, params: &serde_json::Value) -> Result<String> {
                 const result = await dtmcp.executeTool({safe_name_json}, params);
                 return JSON.stringify({{ api: 'dtmcp', result }});
             }}
-            const groups = dtmcp.toolGroups || (dtmcp.toolGroup ? [dtmcp.toolGroup] : []);
+            // Look where listing does: an empty list falls back to toolGroup.
+            const groups = Array.isArray(dtmcp.toolGroups) && dtmcp.toolGroups.length > 0
+                ? dtmcp.toolGroups : (dtmcp.toolGroup ? [dtmcp.toolGroup] : []);
             for (const group of groups) {{
                 const tool = (group.tools || []).find(t => t.name === {safe_name_json});
                 if (tool && typeof tool.execute === 'function') {{
@@ -393,6 +399,22 @@ mod tests {
 
     /// A run that gets no answer clears only the list discovery installed,
     /// told apart by identity, never a list the page put in its place.
+    /// Once discovery stops answering, its list is emptied and listing shows
+    /// a legacy `toolGroup` instead, so running a tool looks there too: in
+    /// the executor discovery installed, and in the fallback without one.
+    #[test]
+    fn running_a_tool_looks_where_listing_does() {
+        let rule = "Array.isArray(dtmcp.toolGroups) && dtmcp.toolGroups.length > 0";
+        assert!(list_tools_js().contains(rule));
+        let executor = &DISCOVER_TOOLS_JS[at(DISCOVER_TOOLS_JS, "dtmcp.executeTool = ")..];
+        assert!(executor.contains(rule), "{executor}");
+        assert!(executor.contains("[dtmcp.toolGroup]"), "{executor}");
+        let exec = execute_tool_js("t", &json!({})).unwrap();
+        let fallback = &exec[at(&exec, "if (dtmcp.executeTool)")..];
+        assert!(fallback.contains(rule), "{fallback}");
+        assert!(fallback.contains("[dtmcp.toolGroup]"), "{fallback}");
+    }
+
     #[test]
     fn discovery_clears_only_the_groups_it_installed() {
         assert!(DISCOVER_TOOLS_JS.contains("dtmcp.__discovered = groups;"));

@@ -176,10 +176,22 @@ pub async fn emulate(
     session_id: &str,
     params: EmulateParams,
 ) -> Result<CommandResult> {
-    check_media_session(
-        &params,
-        client.persistent_session.as_deref() == Some(session_id),
-    )?;
+    emulate_tab(client, session_id, None, params).await
+}
+
+/// [`emulate`] for the daemon, which knows the tab, `target_id`. When it could
+/// not attach its own session to the tab, the command runs on a one-off
+/// session, and the tab's media override waits in `emulation_saved` for the
+/// daemon's next session on it, which would put it back.
+pub(crate) async fn emulate_tab(
+    client: &mut CdpClient,
+    session_id: &str,
+    target_id: Option<&str>,
+    params: EmulateParams,
+) -> Result<CommandResult> {
+    let persistent = client.persistent_session.as_deref() == Some(session_id);
+    check_media_session(&params, persistent)?;
+    let saved_tab = target_id.filter(|_| !persistent);
     let mut actions = Vec::new();
 
     // 0. Handle network blocklist (applied to the persistent session, not the
@@ -253,6 +265,9 @@ pub async fn emulate(
             )
             .await?;
         client.media = None;
+        if let Some(saved) = saved_tab.and_then(|t| client.emulation_saved.get_mut(t)) {
+            saved.media = None;
+        }
         actions.push("Media emulation cleared".to_string());
     }
 
@@ -376,8 +391,17 @@ pub async fn emulate(
                 geo.latitude, geo.longitude, geo.accuracy
             ));
         }
+        let saved_media = saved_tab
+            .and_then(|t| client.emulation_saved.get(t))
+            .and_then(|saved| saved.media.as_ref());
         if let Some(media) = &client.media {
             out.push_str(&format!("Media: {}\n", describe_media(media)));
+        } else if let Some(media) = saved_media {
+            out.push_str(&format!(
+                "Media: {} (saved for this tab, not applied: the daemon could not attach to it \
+                 this time)\n",
+                describe_media(media)
+            ));
         }
         if !client.blocklist.is_empty() {
             out.push_str("Blocked URLs:\n");

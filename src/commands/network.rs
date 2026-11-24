@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::cdp::CdpClient;
@@ -78,10 +78,14 @@ fn process_network_events(
     // Chrome says which hops do: `redirectHasExtraInfo` on the next hop's
     // request, `hasExtraInfo` on the response. So the wire events are lined up
     // with the hops that have them, a hop Chrome says nothing about counts as
-    // having them, and the page's view stands in where there are none.
+    // having them, and the page's view stands in where there are none. It
+    // also stands in for a chain whose first request isn't among these events
+    // (an earlier drain took it, or the buffer dropped it): wire events of the
+    // hops not seen here may still be, and nothing tells them apart.
     let mut wire_request: HashMap<&str, Vec<&serde_json::Value>> = HashMap::new();
     let mut wire_response: HashMap<&str, Vec<&serde_json::Value>> = HashMap::new();
     let mut hop_has_wire: HashMap<&str, Vec<bool>> = HashMap::new();
+    let mut begun_earlier: HashSet<&str> = HashSet::new();
     for event in events {
         let params = &event["params"];
         let Some(id) = params["requestId"].as_str() else {
@@ -99,8 +103,11 @@ fn process_network_events(
             Some("Network.requestWillBeSent") => {
                 let hops = hop_has_wire.entry(id).or_default();
                 if params.get("redirectResponse").is_some() {
-                    if let Some(redirected) = hops.last_mut() {
-                        *redirected = flag("redirectHasExtraInfo");
+                    match hops.last_mut() {
+                        Some(redirected) => *redirected = flag("redirectHasExtraInfo"),
+                        None => {
+                            begun_earlier.insert(id);
+                        }
                     }
                 }
                 hops.push(true);
@@ -117,6 +124,9 @@ fn process_network_events(
                 id: &str,
                 hop: usize,
                 page_view: &serde_json::Value| {
+        if begun_earlier.contains(id) {
+            return page_view.clone();
+        }
         let has_wire = hop_has_wire.get(id).map_or(&[][..], Vec::as_slice);
         let index = (has_wire.get(hop) != Some(&false))
             .then(|| has_wire.iter().take(hop).filter(|&&w| w).count());
@@ -274,7 +284,11 @@ fn format_network_output(
             writeln!(out, "{:<8} {:<6} {}", status, method, url).unwrap();
             // curl -v's markers: > what was sent, < what came back.
             for (marker, key) in [(">", "requestHeaders"), ("<", "responseHeaders")] {
-                for (name, value) in req[key].as_object().into_iter().flatten() {
+                // Chrome sorts the wire headers by name but not the page's
+                // view, so sort both, or the same headers print two ways.
+                let mut sorted: Vec<_> = req[key].as_object().into_iter().flatten().collect();
+                sorted.sort_by(|a, b| a.0.cmp(b.0));
+                for (name, value) in sorted {
                     // Chrome joins a repeated header's values with newlines.
                     for line in value.as_str().unwrap_or_default().split('\n') {
                         writeln!(out, "  {marker} {name}: {line}").unwrap();
@@ -433,6 +447,69 @@ mod tests {
         assert_eq!(out[0]["responseHeaders"], json!({"page": "0"}));
         assert_eq!(out[1]["requestHeaders"], json!({"wire": "1"}));
         assert_eq!(out[1]["responseHeaders"], json!({"wire": "1"}));
+    }
+
+    /// A drain that starts partway through a redirect chain (an earlier one
+    /// took its first request) can still hold the wire events of the hop it
+    /// doesn't see, here the 302's, so the hop it does see must not take them.
+    #[test]
+    fn a_chain_begun_before_the_drain_gets_the_page_view() {
+        let event =
+            |method: &str, params: serde_json::Value| json!({"method": method, "params": params});
+        let events = vec![
+            event(
+                "Network.responseReceivedExtraInfo",
+                json!({"requestId": "1", "headers": {"location": "/b", "set-cookie": "a=1"}}),
+            ),
+            event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "1", "type": "Fetch",
+                "request": {"url": "https://a.test/b", "method": "GET", "headers": {"page": "b"}},
+                "redirectResponse": {"status": 302, "statusText": "Found", "headers": {"location": "/b"}},
+                "redirectHasExtraInfo": true}),
+            ),
+            event(
+                "Network.requestWillBeSentExtraInfo",
+                json!({"requestId": "1", "headers": {"cookie": "a=1"}}),
+            ),
+            event(
+                "Network.responseReceivedExtraInfo",
+                json!({"requestId": "1", "headers": {"wire": "b"}}),
+            ),
+            event(
+                "Network.responseReceived",
+                json!({"requestId": "1", "hasExtraInfo": true,
+                "response": {"status": 200, "statusText": "OK", "headers": {"page": "b"}}}),
+            ),
+        ];
+        let both = Headers {
+            request: true,
+            response: true,
+        };
+        let out = process_network_events(&events, &[], both);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["url"], "https://a.test/b");
+        assert_eq!(out[0]["status"], 200);
+        assert_eq!(out[0]["requestHeaders"], json!({"page": "b"}));
+        assert_eq!(out[0]["responseHeaders"], json!({"page": "b"}));
+    }
+
+    /// Chrome sorts the wire headers by name but hands over the page's view
+    /// in no particular order, so text lists both by name, each value's
+    /// lines in the order Chrome gave them.
+    #[test]
+    fn text_lists_headers_by_name() {
+        let req = json!({"url": "https://a.test/", "method": "GET", "status": 200,
+            "responseHeaders": {"x-b": "2", "content-type": "text/html", "set-cookie": "b=2\na=1"}});
+        let text = format_network_output(&[req], OutputFormat::Text)
+            .unwrap()
+            .output;
+        assert!(
+            text.ends_with(
+                "  < content-type: text/html\n  < set-cookie: b=2\n  < set-cookie: a=1\n  < x-b: 2\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

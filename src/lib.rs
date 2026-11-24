@@ -287,10 +287,12 @@ pub enum Commands {
     /// Both are paged with --limit/--offset. Node IDs in the detail output
     /// are directly usable with `inspect-heapsnapshot-node --node-id`.
     ///
-    /// IMPORTANT: both snapshots must come from the same Chrome session —
-    /// nodes are matched by V8 heap object ID, which is only stable within a
-    /// single session. Snapshots taken across a browser restart diff as
-    /// "everything added + everything removed", which is meaningless.
+    /// IMPORTANT: take both snapshots of one tab with `take-heapsnapshot`,
+    /// with no command for another tab in between and the same daemon running
+    /// throughout. Nodes are matched by V8 heap object ID, which V8 renumbers
+    /// when the daemon's session leaves the tab, the daemon exits, or another
+    /// debugger detaches from it, and the new IDs overlap the old ones, so
+    /// the diff then pairs unrelated objects.
     #[command(name = "compare-heapsnapshots")]
     CompareHeapsnapshots {
         /// Path to the base (earlier) .heapsnapshot file
@@ -368,13 +370,11 @@ pub enum Commands {
         /// Response header as "Name: value" (repeatable)
         #[arg(long = "header", value_name = "HEADER", requires = "pattern")]
         headers: Vec<String>,
-        /// Response body text
-        #[arg(
-            long,
-            conflicts_with = "body_file",
-            requires = "pattern",
-            allow_hyphen_values = true
-        )]
+        /// Response body text; attach text that starts with a dash, as in
+        /// --body=-1
+        // No allow_hyphen_values: any text is a valid body, so a flag taken
+        // as one (`--body --abort`) would install the wrong mock unnoticed.
+        #[arg(long, conflicts_with = "body_file", requires = "pattern")]
         body: Option<String>,
         /// File whose bytes are the response body
         #[arg(long, requires = "pattern")]
@@ -489,7 +489,7 @@ pub enum Commands {
         #[arg(long = "name", value_name = "NAME")]
         names: Vec<String>,
         /// Print them as one Cookie request header (name=value; ...), values
-        /// included
+        /// included, for one URL: the page's or a single --url
         #[arg(long)]
         header: bool,
     },
@@ -2809,6 +2809,29 @@ mod tests {
             ),
             (json!(true), json!(true))
         );
+    }
+
+    /// A body can be any text, so one that took the next flag would go
+    /// unnoticed: `--body --abort` mocked a 200 whose body was "--abort".
+    /// Text that starts with a dash goes attached, as `--body=--abort`.
+    #[test]
+    fn a_mock_body_never_takes_the_next_flag() {
+        let parse = |argv: &[&str]| {
+            let mut full = vec!["chrome-devtools", "mock-network", "*/api/*"];
+            full.extend_from_slice(argv);
+            Cli::try_parse_from(full)
+        };
+        for next in ["--abort", "--json", "-hello"] {
+            let err = parse(&["--body", next])
+                .err()
+                .unwrap_or_else(|| panic!("--body {next} must be rejected"));
+            assert_eq!(err.kind(), ErrorKind::InvalidValue, "{next}");
+        }
+        let args = build_request(&parse(&["--body=--abort"]).unwrap())
+            .unwrap()
+            .args;
+        assert_eq!(args["body"], "--abort");
+        assert_eq!(args["abort"], false);
     }
 
     #[test]

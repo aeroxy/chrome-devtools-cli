@@ -59,7 +59,11 @@ pub async fn take_heapsnapshot(
     );
 
     // HeapProfiler must be enabled before takeHeapSnapshot — Chrome rejects
-    // the command otherwise.
+    // the command otherwise. It stays enabled afterwards: turning it off makes
+    // V8 forget the ids it gave objects, so the next snapshot would number
+    // every object afresh and a diff would pair unrelated objects. Every
+    // session on the page turns it off as it detaches, so the ids last at
+    // most while the daemon's session stays on this tab.
     client
         .send_to_target(session_id, "HeapProfiler.enable", json!({}))
         .await
@@ -116,10 +120,6 @@ pub async fn take_heapsnapshot(
         Ok::<(), anyhow::Error>(())
     }
     .await;
-
-    let _ = client
-        .send_to_target(session_id, "HeapProfiler.disable", json!({}))
-        .await;
 
     snapshot_result?;
 
@@ -494,10 +494,12 @@ impl Snap {
                 );
             }
         }
-        let type_off = position(nf, "type");
+        let node_types = enum_names(&meta.node_types, position(nf, "type"));
+        // A type field without its enum names no type, so such a file groups
+        // by name, as one without the field does.
+        let type_off = position(nf, "type").filter(|_| !node_types.is_empty());
         let edge_count_off = position(nf, "edge_count");
         let det_off = position(nf, "detachedness");
-        let node_types = enum_names(&meta.node_types, type_off);
         let nt = NodeTypes {
             hidden: type_index(&node_types, "hidden"),
             array: type_index(&node_types, "array"),
@@ -593,7 +595,18 @@ impl Snap {
                     to
                 );
             }
-            let ty = Some(edges[e + edge_type_off]);
+            let ty = edges[e + edge_type_off];
+            // Traversal tells weak edges by type, so an edge of a type the
+            // snapshot does not declare would pass for one that retains.
+            if ty as usize >= edge_types.len() {
+                bail!(
+                    "Corrupt snapshot: edge {} has type {ty}, but the snapshot declares {} \
+                     edge types",
+                    e / edge_size,
+                    edge_types.len()
+                );
+            }
+            let ty = Some(ty);
             let named_by_index = ty == et.element || ty == et.hidden;
             let name = edges[e + edge_name_off] as usize;
             if !named_by_index && name >= strings.len() {
@@ -1041,10 +1054,6 @@ impl Classes {
         self.ids.insert(name, id);
         id
     }
-
-    fn name_of(&self, ord: usize) -> &str {
-        &self.names[self.of_node[ord] as usize]
-    }
 }
 
 /// A node's class before interface definitions name plain objects.
@@ -1214,53 +1223,86 @@ fn apply_interface_definitions(snap: &Snap, defs: &[InterfaceDefinition], classe
     if defs.is_empty() {
         return;
     }
-    #[derive(Default)]
-    struct TreeNode {
-        next: HashMap<String, usize>,
-        matched: Option<(usize, usize)>,
-        greatest_next: Option<String>,
-    }
-    // A trie over sorted property names; each definition ends at one node.
-    let mut tree = vec![TreeNode::default()];
-    for (i, def) in defs.iter().enumerate() {
-        let mut props: Vec<&str> = def.properties.iter().map(String::as_str).collect();
-        props.sort_by(|a, b| cmp_utf16(a, b));
-        let mut cur = 0;
-        for p in &props {
-            cur = match tree[cur].next.get(*p).copied() {
-                Some(next) => next,
-                None => {
-                    let next = tree.len();
-                    tree.push(TreeNode::default());
-                    let node = &mut tree[cur];
-                    node.next.insert(p.to_string(), next);
-                    if node
-                        .greatest_next
-                        .as_deref()
-                        .is_none_or(|g| cmp_utf16(g, p).is_lt())
-                    {
-                        node.greatest_next = Some(p.to_string());
-                    }
-                    next
-                }
-            };
-        }
-        if tree[cur].matched.is_none() {
-            tree[cur].matched = Some((props.len(), i));
-        }
-    }
+    let mut matcher = InterfaceMatcher::new(defs);
     let def_class: Vec<u32> = defs
         .iter()
         .map(|d| classes.intern(Cow::Borrowed(&d.name)))
         .collect();
-
-    let mut props: Vec<&str> = Vec::new();
-    let mut states: Vec<usize> = Vec::new();
-    let mut current: Vec<usize> = Vec::new();
     for ord in 0..snap.node_count {
         if !is_plain_object(snap, ord) {
             continue;
         }
+        if let Some(i) = matcher.best(snap, ord) {
+            classes.of_node[ord] = def_class[i];
+        }
+    }
+}
+
+#[derive(Default)]
+struct TreeNode {
+    next: HashMap<String, usize>,
+    matched: Option<(usize, usize)>,
+    greatest_next: Option<String>,
+}
+
+/// Picks a plain object's definition one object at a time, so that
+/// inspecting one node does not classify the whole heap.
+struct InterfaceMatcher<'s> {
+    /// A trie over sorted property names; each definition ends at one node.
+    tree: Vec<TreeNode>,
+    // Reused from one object to the next.
+    props: Vec<&'s str>,
+    states: Vec<usize>,
+    current: Vec<usize>,
+}
+
+impl<'s> InterfaceMatcher<'s> {
+    fn new(defs: &[InterfaceDefinition]) -> Self {
+        let mut tree = vec![TreeNode::default()];
+        for (i, def) in defs.iter().enumerate() {
+            let mut props: Vec<&str> = def.properties.iter().map(String::as_str).collect();
+            props.sort_by(|a, b| cmp_utf16(a, b));
+            let mut cur = 0;
+            for p in &props {
+                cur = match tree[cur].next.get(*p).copied() {
+                    Some(next) => next,
+                    None => {
+                        let next = tree.len();
+                        tree.push(TreeNode::default());
+                        let node = &mut tree[cur];
+                        node.next.insert(p.to_string(), next);
+                        if node
+                            .greatest_next
+                            .as_deref()
+                            .is_none_or(|g| cmp_utf16(g, p).is_lt())
+                        {
+                            node.greatest_next = Some(p.to_string());
+                        }
+                        next
+                    }
+                };
+            }
+            if tree[cur].matched.is_none() {
+                tree[cur].matched = Some((props.len(), i));
+            }
+        }
+        InterfaceMatcher {
+            tree,
+            props: Vec::new(),
+            states: Vec::new(),
+            current: Vec::new(),
+        }
+    }
+
+    /// Index of the definition plain object `ord` is named after; `None`
+    /// keeps it "Object".
+    fn best(&mut self, snap: &'s Snap, ord: usize) -> Option<usize> {
+        let Self {
+            tree,
+            props,
+            states,
+            current,
+        } = self;
         props.clear();
         props.extend(
             snap.edge_range(ord)
@@ -1274,10 +1316,10 @@ fn apply_interface_definitions(snap: &Snap, defs: &[InterfaceDefinition], classe
         states.clear();
         states.push(0);
         let mut best = better_match(None, tree[0].matched);
-        for p in &props {
+        for p in props.iter() {
             current.clear();
-            current.extend_from_slice(&states);
-            for &state in &current {
+            current.extend_from_slice(states);
+            for &state in current.iter() {
                 let node = &tree[state];
                 if node
                     .greatest_next
@@ -1294,9 +1336,7 @@ fn apply_interface_definitions(snap: &Snap, defs: &[InterfaceDefinition], classe
                 }
             }
         }
-        if let Some((_, i)) = best {
-            classes.of_node[ord] = def_class[i];
-        }
+        best.map(|(_, i)| i)
     }
 }
 
@@ -2017,7 +2057,10 @@ fn inspect_node(snap: &Snap, node_id: u64, opts: &ListOptions) -> Result<NodeRep
     // rename plain objects; any other node's class is its own.
     let class_name = if is_plain_object(snap, ord) {
         let defs = infer_interface_definitions(snap);
-        assign_classes(snap, &defs).name_of(ord).to_string()
+        match InterfaceMatcher::new(&defs).best(snap, ord) {
+            Some(i) => defs[i].name.clone(),
+            None => node_class(snap, ord),
+        }
     } else {
         node_class(snap, ord)
     };
@@ -2384,6 +2427,12 @@ mod tests {
         }
     }
 
+    impl Classes {
+        fn name_of(&self, ord: usize) -> &str {
+            &self.names[self.of_node[ord] as usize]
+        }
+    }
+
     fn class_of(snap: &Snap, classes: &Classes, id: u32) -> String {
         let ord = (0..snap.node_count).find(|&o| snap.id(o) == id).unwrap();
         classes.name_of(ord).to_string()
@@ -2440,6 +2489,30 @@ mod tests {
         assert!(!aggs.classes.contains_key(&key("(number)")));
         assert!(!aggs.classes.contains_key(&key("(synthetic)")));
         assert!(!aggs.classes.contains_key(&key("onClick")));
+    }
+
+    #[test]
+    fn test_type_field_without_its_enum_groups_by_name() {
+        let (mut t, window) = TestSnap::page();
+        let foo = t.node("object", "Foo", 11, 20);
+        let bar = t.node("object", "Bar", 13, 20);
+        t.edge(window, "property", "foo", foo);
+        t.edge(window, "property", "bar", bar);
+        // Both share a type value, which names nothing without the enum.
+        let mut v = t.json();
+        v["snapshot"]["meta"]
+            .as_object_mut()
+            .unwrap()
+            .remove("node_types");
+        let snap = load_json(&v).unwrap();
+        let aggs = build_class_aggregates(&snap, &assign_classes(&snap, &[]));
+        assert_eq!(aggs.members(&key("Foo")), [(11, 20)]);
+        assert_eq!(aggs.members(&key("Bar")), [(13, 20)]);
+        let node = inspect_node(&snap, 11, &defaults()).unwrap().node;
+        assert_eq!(
+            (node.class_name.as_str(), node.node_type.as_str()),
+            ("Foo", "unknown")
+        );
     }
 
     #[test]
@@ -2589,6 +2662,11 @@ mod tests {
         assert_eq!(class_of(&snap, &classes, 107), "{x, y}");
         assert_eq!(class_of(&snap, &classes, 109), "Object");
         assert_eq!(class_of(&snap, &classes, 111), "{\"a,b\"}");
+        // Inspecting one object names it as classifying the heap does.
+        for id in (101..=113).step_by(2) {
+            let node = inspect_node(&snap, id.into(), &defaults()).unwrap().node;
+            assert_eq!(node.class_name, class_of(&snap, &classes, id), "{id}");
+        }
 
         // A base snapshot is named with the current snapshot's definitions.
         let (mut base, window) = TestSnap::page();
@@ -2813,6 +2891,27 @@ mod tests {
         v["edges"][2] = json!(7);
         let err = Snap::new(serde_json::from_value(v).unwrap()).err().unwrap();
         assert!(err.to_string().contains("invalid node index 7"), "{err}");
+    }
+
+    #[test]
+    fn test_rejects_edge_types_outside_the_enum() {
+        let (mut t, window) = TestSnap::page();
+        let a = t.node("object", "A", 11, 8);
+        t.edge(window, "weak", "a", a);
+        // As declared, the weak edge keeps nothing alive.
+        assert!(inspect_node(&t.snap(), 11, &defaults())
+            .unwrap()
+            .path
+            .is_none());
+        // Its type is field 3, after the root's edge. 7 is none of the seven
+        // edge types, and must not pass for an edge that retains.
+        let v = with_fields(t.json(), "edges", &[(3, json!(7))]);
+        let err = Snap::new(serde_json::from_value(v).unwrap()).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("edge 1 has type 7, but the snapshot declares 7 edge types"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3685,5 +3784,55 @@ mod tests {
                 .contains("edge_count adds up to more than the 0 fields of the edges array"),
             "{err}"
         );
+    }
+
+    /// Disabling the heap profiler makes V8 forget its object ids, so the
+    /// next snapshot of the tab would number every object afresh and a diff
+    /// would pair unrelated objects. A capture leaves the profiler enabled.
+    #[tokio::test]
+    async fn test_take_heapsnapshot_leaves_the_profiler_enabled() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let browser = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut methods = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: serde_json::Value = serde_json::from_str(&text).unwrap();
+                methods.push(req["method"].as_str().unwrap_or("").to_string());
+                if req["method"] == "HeapProfiler.takeHeapSnapshot" {
+                    let chunk = json!({
+                        "method": "HeapProfiler.addHeapSnapshotChunk",
+                        "params": { "chunk": "{}" },
+                        "sessionId": "S",
+                    });
+                    ws.send(Message::Text(chunk.to_string())).await.unwrap();
+                }
+                let reply = json!({ "id": req["id"], "result": {} });
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    break;
+                }
+            }
+            methods
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("s.heapsnapshot");
+        let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
+        take_heapsnapshot(
+            &mut client,
+            "S",
+            output.to_str().unwrap(),
+            OutputFormat::Text,
+        )
+        .await
+        .unwrap();
+        drop(client);
+        assert_eq!(
+            browser.await.unwrap(),
+            ["HeapProfiler.enable", "HeapProfiler.takeHeapSnapshot"]
+        );
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "{}");
     }
 }
