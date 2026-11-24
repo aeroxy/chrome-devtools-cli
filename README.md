@@ -219,7 +219,7 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 | `snapshot` | Accessibility tree dump |
 | `css-styles <selector> [--computed <prop>,...] [--ua-rules]` | CSS for the first matching element: computed values, matched rules (normal precedence order, highest first; `[overridden]` declarations tagged, `var()` values resolved, `file:line` sources), inline style, inherited rules |
 | `take-heapsnapshot --output <path>` | Capture V8 heap snapshot (streamed via CDP) |
-| `compare-heapsnapshots --base <path> --current <path> [--class-index N]` | Diff two snapshots per class, grouped as in the DevTools Memory panel; `--class-index` lists one class's added/deleted objects (offline) |
+| `compare-heapsnapshots --base <path> --current <path> [--class-index N]` | Diff two snapshots per class, grouped as in the DevTools Memory panel; `--class-index` lists one class's added, deleted and resized objects (offline) |
 | `inspect-heapsnapshot-node --file-path <path> --node-id <id>` | Show a node's class, detachedness, direct retainers and a retaining path from the root, shortest through the page's roots before the GC roots (offline) |
 
 The offline heap commands page their rows with `--limit` (default 50) and `--offset`, say how many rows there are in total, and cut names longer than `--max-name-length` (default 100) characters.
@@ -301,7 +301,7 @@ Other page commands list the errors the page raised while they ran (uncaught exc
 | `mock-network` | List the tab's mocks with hit counts |
 | `remove-network-mock [<url-glob>]` | Remove all mocks with this glob (including mocks of different resource types), or all of them on the tab when no glob is given |
 
-Globs use `*` for any characters and `?` for exactly one. The latest matching mock wins, and the HTTP cache is off while any is set so cached responses can't bypass it. A service worker can answer a matching request from its cache before Fetch interception sees it, so mocks may not apply to a page it controls. Mocks apply to requests on the tab's own session; cross-site iframe requests run in another process and are not paused. Mocks live on the daemon's session for the tab: they pause while the CLI works on another tab, and end when the daemon exits. A daemon with mocks keeps reading from the browser between commands, since a request waits for its answer, so it stays up while the page keeps making requests.
+Globs use `*` for any characters and `?` for exactly one. The latest matching mock wins, and the HTTP cache is off while any is set so cached responses can't bypass it. A service worker can answer a matching request from its cache before Fetch interception sees it, so mocks may not apply to a page it controls. Mocks catch the tab's own requests, but not those a cross-site iframe makes from its own process (its fetches, scripts, images). Mocks live on the daemon's session for the tab: they pause while the CLI works on another tab, and end when the daemon exits. A daemon with mocks keeps reading from the browser between commands, since a request waits for its answer, so it stays up while the page keeps making requests.
 
 ### Daemon
 

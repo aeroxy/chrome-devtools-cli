@@ -8,8 +8,10 @@
 //!
 //! Fetch is enabled only on the tab's own session. A cross-site iframe that
 //! Chrome runs in a separate renderer process is a separate DevTools target,
-//! so requests from it are not intercepted: a mock covers the tab's main frame
-//! and its same-process frames, not those out-of-process iframes.
+//! so the requests it makes are not intercepted: a mock covers the tab's main
+//! frame and its same-process frames, not those out-of-process iframes. The
+//! request for such an iframe's document is still the tab's, because the
+//! tab's frame starts that navigation, so it is intercepted (Chrome 158).
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -425,7 +427,7 @@ pub async fn mock_network(
     Ok(CommandResult::output(format!(
         "Mocked {summary}. It applies to this tab while the daemon runs (see `caffeinate`), \
          and only to requests made from now on: reload to mock the page's own requests. \
-         Requests from cross-site iframes in a separate renderer process are not covered."
+         Requests a cross-site iframe makes from its own process are not covered."
     )))
 }
 

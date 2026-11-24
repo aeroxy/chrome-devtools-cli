@@ -29,6 +29,26 @@ pub fn parse_media_type(raw: &str) -> Result<String> {
     }
 }
 
+/// Parse `--geolocation lat,lon`. The option takes values that start with `-`
+/// for southern and western coordinates, so clap hands it the next flag when
+/// its value is missing (`--geolocation --clear-all`). `validate` runs this
+/// so such a value fails before any other override is applied.
+pub fn parse_geolocation(raw: &str) -> Result<(f64, f64)> {
+    let invalid =
+        || anyhow!("Invalid --geolocation '{raw}': expected lat,lon (e.g. 37.77,-122.41)");
+    let (lat, lon) = raw.split_once(',').ok_or_else(invalid)?;
+    let lat: f64 = lat.trim().parse().map_err(|_| invalid())?;
+    let lon: f64 = lon.trim().parse().map_err(|_| invalid())?;
+    // The ranges also reject NaN and infinity, which parse as f64.
+    if !(-90.0..=90.0).contains(&lat) {
+        anyhow::bail!("Invalid --geolocation '{raw}': latitude must be between -90 and 90");
+    }
+    if !(-180.0..=180.0).contains(&lon) {
+        anyhow::bail!("Invalid --geolocation '{raw}': longitude must be between -180 and 180");
+    }
+    Ok((lat, lon))
+}
+
 /// Parse one `--media-feature name=value`, checked against [`MEDIA_FEATURES`].
 pub fn parse_media_feature(raw: &str) -> Result<(String, String)> {
     let (name, value) = raw.split_once('=').ok_or_else(|| {
@@ -232,6 +252,9 @@ impl EmulateParams {
         }
         if self.accuracy.is_some() && self.geolocation.is_none() {
             anyhow::bail!("--accuracy requires --geolocation");
+        }
+        if let Some(geolocation) = &self.geolocation {
+            parse_geolocation(geolocation)?;
         }
         if self.mobile && self.viewport.is_none() {
             anyhow::bail!("--mobile requires --viewport");
@@ -461,26 +484,8 @@ pub(crate) async fn emulate_tab(
 
     // 3. Handle setting geolocation
     if let Some(geo_str) = params.geolocation {
-        let parts: Vec<&str> = geo_str.split(',').collect();
-        if parts.len() != 2 {
-            anyhow::bail!("Geolocation must be in lat,lon format (e.g. 37.77,-122.41)");
-        }
-        let lat: f64 = parts[0]
-            .trim()
-            .parse()
-            .map_err(|_| anyhow!("Invalid latitude: {}", parts[0]))?;
-        let lon: f64 = parts[1]
-            .trim()
-            .parse()
-            .map_err(|_| anyhow!("Invalid longitude: {}", parts[1]))?;
+        let (lat, lon) = parse_geolocation(&geo_str)?;
         let acc = params.accuracy.unwrap_or(100.0);
-
-        if !(-90.0..=90.0).contains(&lat) {
-            anyhow::bail!("latitude must be between -90 and 90");
-        }
-        if !(-180.0..=180.0).contains(&lon) {
-            anyhow::bail!("longitude must be between -180 and 180");
-        }
 
         client
             .send_to_target(
@@ -608,6 +613,74 @@ mod tests {
         assert!(p.validate().is_ok());
         p.media = Some("braille".into());
         assert!(p.validate().is_err());
+    }
+
+    /// Coordinates are checked before any override is sent; southern and
+    /// western ones are negative and stay valid.
+    #[test]
+    fn validate_checks_geolocation_before_anything_is_applied() {
+        for (raw, expected) in [
+            ("37.77,-122.41", (37.77, -122.41)),
+            ("-33.86,151.2", (-33.86, 151.2)),
+            (" -90 , 180 ", (-90.0, 180.0)),
+        ] {
+            assert_eq!(parse_geolocation(raw).unwrap(), expected, "{raw}");
+        }
+        for raw in [
+            "--clear-all",
+            "37.77",
+            "37.77,-122.41,5",
+            "north,1",
+            "1,",
+            "91,0",
+            "0,-180.5",
+            "NaN,0",
+            "0,inf",
+        ] {
+            let mut p = params();
+            p.viewport = Some("800x600".into());
+            p.geolocation = Some(raw.into());
+            let err = p.validate().unwrap_err().to_string();
+            assert!(
+                err.starts_with(&format!("Invalid --geolocation '{raw}'")),
+                "{err}"
+            );
+        }
+    }
+
+    /// `--geolocation` takes values that start with `-`, so clap takes a flag
+    /// right after it as the value. Validation must reject that, or `emulate`
+    /// would apply and cache the viewport before failing.
+    #[test]
+    fn a_flag_taken_as_the_geolocation_fails_validation() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "chrome-devtools",
+            "emulate",
+            "--viewport",
+            "800x600",
+            "--geolocation",
+            "--clear-all",
+        ])
+        .unwrap();
+        let crate::Commands::Emulate {
+            viewport,
+            geolocation,
+            clear_all,
+            ..
+        } = cli.command
+        else {
+            panic!("expected emulate");
+        };
+        assert_eq!(geolocation.as_deref(), Some("--clear-all"));
+        assert!(!clear_all);
+        let p = EmulateParams {
+            viewport,
+            geolocation,
+            ..params()
+        };
+        let err = p.validate().unwrap_err().to_string();
+        assert!(err.contains("Invalid --geolocation '--clear-all'"), "{err}");
     }
 
     /// A one-off session takes its overrides with it when it detaches.
