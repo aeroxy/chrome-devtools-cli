@@ -503,6 +503,26 @@ impl CdpClient {
         self.events.clear();
     }
 
+    /// Fail a setup step. A lost connection is already unusable: writing a
+    /// detach to it would spend the ordinary call budget while the daemon waits,
+    /// and the error must reach the daemon unchanged so it retires the socket.
+    /// Ordinary CDP refusals still get the session cleaned up.
+    async fn fail_setup(
+        &mut self,
+        session_id: &str,
+        target_id: &str,
+        state_loaded: bool,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if error.downcast_ref::<ConnectionLost>().is_some() {
+            return error;
+        }
+        let cleanup = self
+            .cleanup_failed_session(session_id, target_id, state_loaded)
+            .await;
+        cleanup.err().unwrap_or(error)
+    }
+
     /// Ensure a persistent CDP session is attached to the given target for continuous
     /// event collection (Network + Console). If the target has changed, detaches
     /// the old session and attaches to the new one.
@@ -519,12 +539,45 @@ impl CdpClient {
         self.network_events.clear();
         self.console_events.clear();
 
+        let old_target = self.persistent_target_id.clone();
+
+        // Detach old session if target changed
+        if let Some(old_session) = self.persistent_session.take() {
+            self.forget_dialog(Some(&old_session));
+            match self
+                .send("Target.detachFromTarget", json!({"sessionId": old_session}))
+                .await
+            {
+                Ok(_) => {
+                    // The old tab's Fetch interception died with its session;
+                    // otherwise a later tab inherits idle reads it doesn't need.
+                    self.session_ended(&old_session);
+                }
+                Err(e) if e.downcast_ref::<ConnectionLost>().is_some() => {
+                    // The socket is gone; the daemon retires it and no request
+                    // on this session can be answered.
+                }
+                Err(_) => {
+                    // A failed detach can leave the old tab's Fetch interception
+                    // and paused requests alive. Answer them now, while the
+                    // active mocks still belong to that tab: once they are
+                    // replaced below, a URL match would send another tab's
+                    // mock to this page (and count its hit).
+                    self.answer_paused_requests().await?;
+                }
+            }
+            self.persistent_target_id = None;
+            self.events
+                .retain(|event| event["sessionId"].as_str() != Some(old_session.as_str()));
+        }
+
         // Save the previously-active tab's emulation state so it can be restored
         // when we return to it (per-tab isolation). The active state lives in the
         // top-level fields; stash it under the old target id — but only if the
         // tab actually has overrides, so the map doesn't accumulate empty entries
-        // for every tab ever visited.
-        if let Some(old_target) = self.persistent_target_id.clone() {
+        // for every tab ever visited. Stashed after the detach so the paused
+        // requests above are answered with this tab's own mocks.
+        if let Some(old_target) = old_target {
             let saved = TabEmulation {
                 blocklist: std::mem::take(&mut self.blocklist),
                 viewport: self.viewport.take(),
@@ -534,22 +587,6 @@ impl CdpClient {
                 network_mocks: std::mem::take(&mut self.network_mocks),
             };
             stash_tab_emulation(&mut self.emulation_saved, old_target, saved);
-        }
-
-        // Detach old session if target changed
-        if let Some(old_session) = self.persistent_session.take() {
-            self.forget_dialog(Some(&old_session));
-            let detached = self
-                .send("Target.detachFromTarget", json!({"sessionId": old_session}))
-                .await;
-            if detached.is_ok() {
-                // The old tab's Fetch interception died with its session;
-                // otherwise a later tab inherits idle reads it doesn't need.
-                self.session_ended(&old_session);
-            }
-            self.persistent_target_id = None;
-            self.events
-                .retain(|event| event["sessionId"].as_str() != Some(old_session.as_str()));
         }
 
         // Attach new persistent session
@@ -581,10 +618,7 @@ impl CdpClient {
                 .send_to_target_within(&session_id, method, json!({}), SETUP_CALL_TIMEOUT)
                 .await
             {
-                let cleanup = self
-                    .cleanup_failed_session(&session_id, target_id, false)
-                    .await;
-                return Err(cleanup.err().unwrap_or(e));
+                return Err(self.fail_setup(&session_id, target_id, false, e).await);
             }
         }
 
@@ -603,25 +637,16 @@ impl CdpClient {
             .apply_network_rules_on_enabled_session(&session_id)
             .await
         {
-            let cleanup = self
-                .cleanup_failed_session(&session_id, target_id, true)
-                .await;
-            return Err(cleanup.err().unwrap_or(e));
+            return Err(self.fail_setup(&session_id, target_id, true, e).await);
         }
 
         if let Err(e) = self.apply_emulation_internal(&session_id).await {
-            let cleanup = self
-                .cleanup_failed_session(&session_id, target_id, true)
-                .await;
-            return Err(cleanup.err().unwrap_or(e));
+            return Err(self.fail_setup(&session_id, target_id, true, e).await);
         }
 
         if !self.network_mocks.is_empty() {
             if let Err(e) = crate::commands::network_mock::apply_mocks(self, &session_id).await {
-                let cleanup = self
-                    .cleanup_failed_session(&session_id, target_id, true)
-                    .await;
-                return Err(cleanup.err().unwrap_or(e));
+                return Err(self.fail_setup(&session_id, target_id, true, e).await);
             }
         }
 
@@ -1054,6 +1079,12 @@ impl CdpClient {
                         continue;
                     }
                     if same_session {
+                        // A ping may have set aside the closing alongside the
+                        // opening. Apply it first, as the no-action path does,
+                        // or this action could answer a replacement dialog.
+                        if self.take_queued_dialog_close(dialog_session.as_deref().or(session_id)) {
+                            continue;
+                        }
                         if let Some(action) = self.dialog_action.clone() {
                             self.handle_dialog_helper(
                                 dialog_session.as_deref().or(session_id),
@@ -1108,6 +1139,9 @@ impl CdpClient {
         }
         .await;
         self.awaiting_replies.remove(&id);
+        // Nobody will read a reply deferred for a call that has exited, so
+        // drop it instead of carrying its payload for the daemon's lifetime.
+        self.deferred_replies.retain(|(rid, _)| *rid != id);
         result
     }
 
@@ -1221,6 +1255,7 @@ impl CdpClient {
             }
             .await;
             self.awaiting_replies.remove(&id);
+            self.deferred_replies.retain(|(rid, _)| *rid != id);
             result
         })
     }
@@ -1750,7 +1785,13 @@ impl CdpClient {
     /// returned: callers draining the persistent buffers would otherwise hold
     /// a second, uncapped copy of everything for the whole window.
     pub async fn read_events_for(&mut self, duration_ms: u64, collect: bool) -> Result<Vec<Value>> {
-        let mut events: Vec<Value> = self.events.drain(..).collect();
+        // With `collect` false nothing is returned, so pending events must stay
+        // buffered for the later drains that do collect them.
+        let mut events: Vec<Value> = if collect {
+            self.events.drain(..).collect()
+        } else {
+            Vec::new()
+        };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
 
         loop {
@@ -3058,5 +3099,244 @@ mod tests {
         assert!(client.awaiting_replies.is_empty());
         drop(client);
         chrome.await.unwrap();
+    }
+
+    /// A setup call whose read finds the socket gone must return that typed
+    /// error at once. A detach written to the same socket would spend the
+    /// ordinary call budget and hide why the daemon has to retire it.
+    #[tokio::test]
+    async fn a_connection_lost_setup_does_not_try_to_detach() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut calls = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: Value = serde_json::from_str(&text).unwrap();
+                calls.push(call["method"].as_str().unwrap_or_default().to_string());
+                match call["method"].as_str().unwrap_or_default() {
+                    "Target.attachToTarget" => {
+                        ws.send(Message::Text(
+                            json!({"id": call["id"], "result": {"sessionId": "S"}}).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    "Network.enable" => {
+                        ws.close(None).await.unwrap();
+                        return calls;
+                    }
+                    other => panic!("unexpected call: {other}"),
+                }
+            }
+            calls
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        let error = client
+            .ensure_persistent_session("T")
+            .await
+            .expect_err("setup fails with a lost connection");
+        assert!(
+            error.downcast_ref::<ConnectionLost>().is_some(),
+            "{error:#}"
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls, ["Target.attachToTarget", "Network.enable"]);
+    }
+
+    #[tokio::test]
+    async fn read_events_without_collect_keeps_pending_events() {
+        let (mut client, chrome) = fake_chrome(|_| (std::time::Duration::ZERO, Vec::new())).await;
+        let event = json!({"method": "Page.frameNavigated", "params": {"url": "https://a.test"}});
+        client.events.push_back(event.clone());
+        let collected = client
+            .read_events_for(0, false)
+            .await
+            .expect("a zero-length window reads nothing");
+        assert!(
+            collected.is_empty(),
+            "a non-collecting read returns nothing"
+        );
+        assert_eq!(
+            client.events.front(),
+            Some(&event),
+            "pending events stay buffered for a collecting drain"
+        );
+        let collected = client.read_events_for(0, true).await.unwrap();
+        assert_eq!(collected, vec![event]);
+        assert!(client.events.is_empty());
+        drop(client);
+        chrome.await.unwrap();
+    }
+
+    /// A detach that fails leaves the old tab's interception in place. Its
+    /// paused requests must be answered with that tab's mocks, not with the
+    /// replacement tab's list once it is loaded.
+    #[tokio::test]
+    async fn a_paused_request_is_answered_with_its_own_tabs_mocks() {
+        use base64::Engine;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut calls = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: Value = serde_json::from_str(&text).unwrap();
+                let method = call["method"].as_str().unwrap_or_default().to_string();
+                let reply = match method.as_str() {
+                    "Target.detachFromTarget" => {
+                        json!({"id": call["id"], "error": {"code": -32000, "message": "busy"}})
+                    }
+                    "Target.attachToTarget" => {
+                        json!({"id": call["id"], "result": {"sessionId": "S-new"}})
+                    }
+                    _ => json!({"id": call["id"], "result": {}}),
+                };
+                calls.push(call);
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+            calls
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        let mock = |body: &str, status: u16| crate::commands::network_mock::NetworkMock {
+            pattern: "*".into(),
+            resource_type: None,
+            action: crate::commands::network_mock::MockAction::Fulfill {
+                status,
+                headers: vec![],
+                body: body.as_bytes().to_vec(),
+            },
+            hits: 0,
+        };
+        client.persistent_session = Some("S-old".into());
+        client.persistent_target_id = Some("T-old".into());
+        client.network_mocks = vec![mock("old", 200)];
+        client.paused_requests.push_back(json!({
+            "method": "Fetch.requestPaused",
+            "sessionId": "S-old",
+            "params": {"requestId": "R", "request": {"url": "https://a.test/"},
+                       "resourceType": "Fetch"}
+        }));
+        client.emulation_saved.insert(
+            "T-new".into(),
+            TabEmulation {
+                network_mocks: vec![mock("new", 500)],
+                ..Default::default()
+            },
+        );
+        // Park the detach's refusal so no read runs during it that could
+        // answer the old request with the old mocks.
+        client.deferred_replies.push_back((
+            1,
+            json!({"id": 1, "error": {"code": -32000, "message": "busy"}}).to_string(),
+        ));
+        client
+            .ensure_persistent_session("T-new")
+            .await
+            .expect("the switch succeeds despite the failed detach");
+        assert!(
+            client.paused_requests.is_empty(),
+            "the old tab's request was answered"
+        );
+        assert_eq!(
+            client.network_mocks[0].hits, 0,
+            "the new tab's mock was not used"
+        );
+        assert_eq!(
+            client.emulation_saved["T-old"].network_mocks[0].hits, 1,
+            "the old tab's mock answered its own request"
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        let answered = calls
+            .iter()
+            .find(|call| call["method"] == "Fetch.fulfillRequest")
+            .expect("the paused request was answered");
+        assert_eq!(answered["sessionId"], "S-old");
+        assert_eq!(answered["params"]["responseCode"], 200);
+        assert_eq!(
+            answered["params"]["body"],
+            base64::engine::general_purpose::STANDARD.encode("old")
+        );
+    }
+
+    /// A queued closing applies before the same-session `--dialog-action`:
+    /// answering a dialog that already closed could hit a replacement one.
+    #[tokio::test]
+    async fn a_queued_close_is_applied_before_the_dialog_action() {
+        let (mut client, chrome) = fake_chrome(|_| (std::time::Duration::ZERO, Vec::new())).await;
+        client.dialog_action = Some("accept".into());
+        client.unread.push_back(
+            json!({"method": "Page.javascriptDialogOpening",
+                   "params": {"type": "alert", "message": "already closed"}})
+            .to_string(),
+        );
+        client.unread.push_back(
+            json!({"method": "Page.javascriptDialogClosed", "params": {"result": true}})
+                .to_string(),
+        );
+        client
+            .unread
+            .push_back(json!({"id": 1, "result": {"value": 7}}).to_string());
+        let result = client
+            .send("DOM.getDocument", json!({}))
+            .await
+            .expect("the queued close lets the call read its reply");
+        assert_eq!(result["value"], 7);
+        assert!(client.open_dialog.is_none(), "the queued close was applied");
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(
+            calls,
+            ["DOM.getDocument"],
+            "no action was sent for a dialog that had already closed"
+        );
+    }
+
+    /// A handler that fails while the held-up call's reply is deferred must
+    /// drop that reply: the call exits on the error and nobody will read it.
+    #[tokio::test]
+    async fn a_failed_call_drops_its_deferred_reply() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let messages = match call["method"].as_str() {
+                Some("Runtime.evaluate") => vec![opening("hi")],
+                Some("Page.handleJavaScriptDialog") => vec![
+                    // The evaluation finishes; the handler parks its reply.
+                    json!({"id": 1, "sessionId": "S", "result": {"value": 42}}),
+                    json!({"id": call["id"], "error": {"code": -32000,
+                           "message": "handler broke"}}),
+                ],
+                _ => Vec::new(),
+            };
+            (std::time::Duration::ZERO, messages)
+        })
+        .await;
+        client.dialog_action = Some("accept".into());
+        let error = client
+            .send_to_target_within(
+                "S",
+                "Runtime.evaluate",
+                json!({}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect_err("the dialog handler fails");
+        assert!(format!("{error:#}").contains("handler broke"), "{error:#}");
+        assert!(client.awaiting_replies.is_empty());
+        assert!(
+            client.deferred_replies.is_empty(),
+            "{:?}",
+            client.deferred_replies
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls, ["Runtime.evaluate", "Page.handleJavaScriptDialog"]);
     }
 }

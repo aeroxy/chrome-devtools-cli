@@ -5,8 +5,47 @@ use crate::cdp::CdpClient;
 use crate::result::CommandResult;
 
 /// The script that finds where to click or hover `selector`.
-fn element_center_js(selector: &str) -> Result<String> {
+///
+/// `allow_label` is true for clicks: a label activates its control, so its
+/// lines are hit points too. A pointer move over a label does not hover the
+/// control, so hover only accepts hits on the element or its descendants.
+fn element_center_js(selector: &str, allow_label: bool) -> Result<String> {
     let escaped = serde_json::to_string(selector)?;
+    let label_boxes = if allow_label {
+        r#"
+                // A label activates its control even when it sits beside a
+                // clipped one, so its lines are candidates too. The hit check
+                // below still decides whether the point reaches the control.
+                for (const label of el.labels || []) {
+                    const style = getComputedStyle(label);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    for (const r of label.getClientRects()) {
+                        if (r.width > 0 && r.height > 0) out.push({node: label, rect: r});
+                    }
+                }
+"#
+    } else {
+        ""
+    };
+    let label_logic = if allow_label {
+        // HTML does not forward a label's activation from interactive content
+        // inside it: a link there takes the click instead of toggling the
+        // control. Rejecting the point lets the loop try another line of text.
+        r#"const labelReachesControl = hit => {
+                const label = hit.closest('label');
+                if (!label || label.control !== el) return false;
+                const interactive = hit.closest('a[href], button, input, select, textarea, [tabindex], [contenteditable], summary');
+                return !interactive || interactive === label || el.contains(interactive);
+            };
+            "#
+    } else {
+        ""
+    };
+    let reaches = if allow_label {
+        "const reaches = hit => hit && (el.contains(hit) || labelReachesControl(hit));"
+    } else {
+        "const reaches = hit => hit && el.contains(hit);"
+    };
     // Mouse events go to whatever is at the point, so an element off screen
     // or without a box would send the click elsewhere (a hidden button's
     // centre is the page's top-left corner) while reporting success.
@@ -41,16 +80,7 @@ fn element_center_js(selector: &str) -> Result<String> {
                     const r = child.getBoundingClientRect();
                     if (r.width > 0 && r.height > 0) out.push({{node: child, rect: r}});
                 }}
-                // A label activates its control even when it sits beside a
-                // clipped one, so its lines are candidates too. The hit check
-                // below still decides whether the point reaches the control.
-                for (const label of el.labels || []) {{
-                    const style = getComputedStyle(label);
-                    if (style.display === 'none' || style.visibility === 'hidden') continue;
-                    for (const r of label.getClientRects()) {{
-                        if (r.width > 0 && r.height > 0) out.push({{node: label, rect: r}});
-                    }}
-                }}
+                {label_boxes}
                 return out;
             }};
             let candidates = boxes();
@@ -64,7 +94,7 @@ fn element_center_js(selector: &str) -> Result<String> {
                 candidates = boxes();
                 rect = candidates[0].rect;
             }}
-            const reaches = hit => hit && (el.contains(hit) || hit.closest('label')?.control === el);
+            {label_logic}{reaches}
             for (const {{rect: r}} of candidates) {{
                 const x = r.x + r.width / 2, y = r.y + r.height / 2;
                 if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;
@@ -91,8 +121,9 @@ async fn get_element_center(
     client: &mut CdpClient,
     session_id: &str,
     selector: &str,
+    allow_label: bool,
 ) -> Result<(f64, f64)> {
-    let expr = element_center_js(selector)?;
+    let expr = element_center_js(selector, allow_label)?;
     let result = client
         .send_to_target(
             session_id,
@@ -262,7 +293,7 @@ pub async fn click(
             // the pointer move are separate round trips, and a page update in
             // between could otherwise move the element off the stored point.
             let pages_before = page_ids_before(client).await?;
-            let (x, y) = get_element_center(client, session_id, selector).await?;
+            let (x, y) = get_element_center(client, session_id, selector, true).await?;
             click_point(
                 client,
                 session_id,
@@ -367,12 +398,17 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
     // A fragment change and a reload can both be buffered. The first match
     // is not the whole story: a later main-frame commit means a new document,
     // which the URL comparison alone would miss when the URL is unchanged.
+    // A start can also follow the fragment in the buffer without a commit
+    // there yet; that reload is still loading, so its start keeps the wait
+    // alive instead of ending it on the same-document match.
     let committed = main_frame_committed(&client.events, session_id, &main_frame_id);
-    if method != "Page.frameStartedLoading" && !committed {
+    let started_loading = method == "Page.frameStartedLoading"
+        || main_frame_started(&client.events, session_id, &main_frame_id);
+    if !started_loading && !committed {
         return Ok(false);
     }
 
-    if method == "Page.frameStartedLoading" {
+    if started_loading {
         // `Page.loadEventFired` carries no frame or session ID. One buffered
         // before this start belongs to the previous document, so drop those
         // and wait only for a load that arrives after the navigation began.
@@ -401,6 +437,21 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
         session_id,
         &main_frame_id,
     ))
+}
+
+/// Whether a main-frame load has started for this page. A reload can queue a
+/// same-document event before its start, so the start may still be in the
+/// buffer when the first event match points at the fragment change.
+fn main_frame_started(
+    events: &std::collections::VecDeque<serde_json::Value>,
+    session_id: &str,
+    main_frame_id: &str,
+) -> bool {
+    events.iter().any(|e| {
+        e["method"] == "Page.frameStartedLoading"
+            && e["sessionId"].as_str() == Some(session_id)
+            && e["params"]["frameId"].as_str() == Some(main_frame_id)
+    })
 }
 
 /// Whether a main-frame document commit is already buffered for this page.
@@ -623,7 +674,7 @@ async fn click_point(
     if let Some(selector) = selector {
         let mut attempts = MAX_HIT_MOVES;
         loop {
-            let (new_x, new_y) = get_element_center(client, session_id, selector)
+            let (new_x, new_y) = get_element_center(client, session_id, selector, true)
                 .await
                 .map_err(moved)?;
             match hit_recheck((x, y), (new_x, new_y), attempts) {
@@ -668,7 +719,7 @@ pub async fn hover(
     selector: &str,
 ) -> Result<CommandResult> {
     let initial_url = client.current_url(session_id).await?;
-    let (x, y) = get_element_center(client, session_id, selector).await?;
+    let (x, y) = get_element_center(client, session_id, selector, false).await?;
     // Here moving the pointer is the action.
     client.input_sent = true;
     dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0).await?;
@@ -1643,7 +1694,7 @@ mod tests {
     /// only after the hit test found nothing of it at the point.
     #[test]
     fn a_hidden_element_is_hit_tested_before_it_is_refused() {
-        let js = element_center_js("#toggle").unwrap();
+        let js = element_center_js("#toggle", true).unwrap();
         let hit_test = js.find("elementFromPoint").unwrap();
         let refusal = js
             .find("getComputedStyle(el).visibility === 'hidden'")
@@ -1655,7 +1706,7 @@ mod tests {
     /// valid hit because anything inside the selected element counts.
     #[test]
     fn a_zero_size_wrapper_gets_its_descendants_hit_tested() {
-        let js = element_center_js("#wrapper").unwrap();
+        let js = element_center_js("#wrapper", true).unwrap();
         let descendants = js.find("querySelectorAll('*')").unwrap();
         let refusal = js.find("has no size").unwrap();
         assert!(descendants < refusal, "{js}");
@@ -1665,13 +1716,43 @@ mod tests {
     /// must be hit tested before the element is called obstructed.
     #[test]
     fn an_associated_label_is_a_hit_test_candidate() {
-        let js = element_center_js("#toggle").unwrap();
+        let js = element_center_js("#toggle", true).unwrap();
         let labels = js.find("el.labels").unwrap();
         let hit_test = js.find("elementFromPoint").unwrap();
         assert!(labels < hit_test, "{js}");
         // The label's box is only a candidate; the hit still has to reach the
-        // control (or its label), so an obstructed label does not pass.
-        assert!(js.contains("hit.closest('label')?.control === el"), "{js}");
+        // control through a label, so an obstructed label does not pass.
+        assert!(js.contains("labelReachesControl(hit)"), "{js}");
+        assert!(js.contains("label.control !== el"), "{js}");
+        // Inserted snippets are format arguments, not format text: their
+        // braces must not stay doubled in the emitted JavaScript.
+        assert!(js.contains("out.push({node: label, rect: r})"), "{js}");
+        assert!(!js.contains("{{") && !js.contains("}}"), "{js}");
+
+        // Hover cannot activate a control through its label, so it gets
+        // neither the label's boxes nor the label's hit-test fallback.
+        let hover = element_center_js("#toggle", false).unwrap();
+        assert!(!hover.contains("el.labels"), "{hover}");
+        assert!(
+            hover.contains("const reaches = hit => hit && el.contains(hit);"),
+            "{hover}"
+        );
+    }
+
+    /// A link inside a label keeps the click: HTML does not forward the label's
+    /// activation from interactive descendants, so that point must be refused
+    /// and the loop tries another line of the label.
+    #[test]
+    fn a_label_hit_on_interactive_content_is_rejected() {
+        let js = element_center_js("#toggle", true).unwrap();
+        assert!(
+            js.contains("a[href], button, input, select, textarea"),
+            "{js}"
+        );
+        assert!(js.contains("el.contains(interactive)"), "{js}");
+        let reaches = js.find("labelReachesControl").unwrap();
+        let hit_test = js.find("elementFromPoint(x, y)").unwrap();
+        assert!(reaches < hit_test, "{js}");
     }
 
     /// Every pointer move gets a recheck. A point confirmed before the last
@@ -1715,6 +1796,35 @@ mod tests {
         assert!(!main_frame_committed(&events, "s1", "OTHER"));
         let child_only: std::collections::VecDeque<_> = [commit("s1", "CHILD")].into();
         assert!(!main_frame_committed(&child_only, "s1", "MAIN"));
+    }
+
+    /// A same-document match can be buffered ahead of a main-frame reload's
+    /// start. The start is still pending for this session, so the wait must
+    /// not end on the fragment alone. Stale events from other sessions and
+    /// frames do not count.
+    #[test]
+    fn a_buffered_reload_start_keeps_the_wait_alive() {
+        let started = |session, frame| {
+            json!({"sessionId": session, "method": "Page.frameStartedLoading",
+                   "params": {"frameId": frame}})
+        };
+        let events: std::collections::VecDeque<_> = [
+            json!({"sessionId": "s1", "method": "Page.navigatedWithinDocument",
+                   "params": {"frameId": "MAIN"}}),
+            started("s1", "MAIN"),
+            started("s1", "CHILD"),
+            started("s2", "MAIN"),
+        ]
+        .into();
+        assert!(main_frame_started(&events, "s1", "MAIN"));
+        assert!(!main_frame_started(&events, "s1", "OTHER"));
+        assert!(!main_frame_started(&events, "s3", "MAIN"));
+        let fragment_only: std::collections::VecDeque<_> = [
+            json!({"sessionId": "s1", "method": "Page.navigatedWithinDocument",
+                    "params": {"frameId": "MAIN"}}),
+        ]
+        .into();
+        assert!(!main_frame_started(&fragment_only, "s1", "MAIN"));
     }
 
     #[test]

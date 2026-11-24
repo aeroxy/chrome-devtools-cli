@@ -75,9 +75,9 @@ pub async fn evaluate(
     if let Some(initial_url) = initial_url {
         // `location.href = ...` or `form.submit()` only requests a navigation,
         // which starts after the script returns.
-        let new_document = crate::commands::input::wait_for_navigation(client, session_id)
-            .await
-            .unwrap_or(false);
+        let new_document = navigation_after_expression(
+            crate::commands::input::wait_for_navigation(client, session_id).await,
+        )?;
         let new_url = client.current_url(session_id).await?;
         Ok(CommandResult::output(output_hint)
             .save_output(output)
@@ -87,6 +87,24 @@ pub async fn evaluate(
         Ok(CommandResult::output(output_hint)
             .save_output(output)
             .await?)
+    }
+}
+
+/// Interpret the navigation probe after the expression has already run.
+///
+/// An ordinary absence of navigation is not an error. A stalled or lost page
+/// is: it must be reported before `current_url` starts another full-budget
+/// page call on a renderer that has stopped answering.
+fn navigation_after_expression(result: Result<bool>) -> Result<bool> {
+    match result {
+        Ok(navigated) => Ok(navigated),
+        Err(e)
+            if e.downcast_ref::<crate::cdp::PageUnresponsive>().is_some()
+                || e.downcast_ref::<crate::cdp::ConnectionLost>().is_some() =>
+        {
+            Err(e.context("The expression already ran, but the navigation check could not finish"))
+        }
+        Err(_) => Ok(false),
     }
 }
 
@@ -610,6 +628,34 @@ pub async fn run_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The expression has run, so a stalled page call cannot be swallowed and
+    /// followed by another one: both would spend a full page-call budget.
+    #[test]
+    fn a_stalled_navigation_check_after_the_expression_is_propagated() {
+        let stalled = navigation_after_expression(Err(anyhow::anyhow!(
+            crate::cdp::PageUnresponsive("no answer".into())
+        )));
+        let err = stalled.unwrap_err();
+        assert!(err.downcast_ref::<crate::cdp::PageUnresponsive>().is_some());
+        assert!(err.to_string().contains("expression already ran"));
+
+        let lost = navigation_after_expression(Err(anyhow::anyhow!(crate::cdp::ConnectionLost(
+            "closed".into()
+        ))));
+        assert!(lost
+            .unwrap_err()
+            .downcast_ref::<crate::cdp::ConnectionLost>()
+            .is_some());
+
+        assert!(!navigation_after_expression(Ok(false)).unwrap());
+        assert!(navigation_after_expression(Ok(true)).unwrap());
+        // An ordinary miss (the event wait timing out) is not a navigation.
+        assert!(!navigation_after_expression(Err(anyhow::anyhow!(
+            "Timeout waiting for any event"
+        )))
+        .unwrap());
+    }
 
     #[test]
     fn test_parse_adapter_domains() {

@@ -1962,6 +1962,50 @@ fn weak_map_pair(name: &str) -> Option<&str> {
         .then_some(shared)
 }
 
+/// The key's and the table's node ids embedded in a WeakMap pair edge's name.
+/// Both halves carry both ids even when only one half is still present, which
+/// is what lets a lone table retainer be marked conditional on its missing key.
+fn weak_map_pair_ids(name: &str) -> Option<(u32, u32)> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let shared = name.trim_start_matches(|c: char| c.is_ascii_digit());
+    if shared.len() == name.len() {
+        return None;
+    }
+    let (middle, table) = shared
+        .strip_prefix(" / part of key (")?
+        .strip_suffix(')')?
+        .rsplit_once(" pair in WeakMap (table @")?;
+    if !digits(table) {
+        return None;
+    }
+    let (key_and_value, _) = middle.strip_suffix(')')?.rsplit_once(" @")?;
+    // The key's name may itself contain `) -> value (`, so take the first
+    // separator that has a numeric id before it.
+    let key = key_and_value
+        .match_indices(") -> value (")
+        .find_map(|(i, _)| {
+            let id = key_and_value[..i].rsplit_once(" @")?.1;
+            digits(id).then(|| id.parse::<u32>().ok()).flatten()
+        })?;
+    Some((key, table.parse().ok()?))
+}
+
+/// The other edge a WeakMap-pair retainer needs in order to keep the value
+/// alive. Each half names both the key and the table, so this works even when
+/// the other half is not a retainer (the missing-key case).
+fn weak_map_condition(snap: &Snap, edge: usize) -> Option<PairedEdge> {
+    let (key, table) = weak_map_pair_ids(snap.string_edge_name(edge))?;
+    let source = snap.id(snap.edge_source(edge));
+    let (role, node_id) = if source == table {
+        ("key", key)
+    } else if source == key {
+        ("table", table)
+    } else {
+        return None;
+    };
+    Some(PairedEdge { role, node_id })
+}
+
 /// Hop count from the root and the edge that set it, by a BFS that mirrors
 /// DevTools' `calculateDistances`: the user roots (`Window`, "(Document DOM
 /// trees)") are expanded before the GC-root groups, so paths lead through
@@ -2104,8 +2148,9 @@ struct EdgeRow {
     node_type: String,
     self_size: u64,
     distance: Option<u32>,
-    /// For a path step that is one edge of a WeakMap entry: the source of the
-    /// other edge, which must stay alive too for the step to retain anything.
+    /// For a path step or a direct retainer that is one edge of a WeakMap
+    /// entry: the source of the other edge, which must stay alive too for it
+    /// to retain anything.
     conditional_on: Option<PairedEdge>,
 }
 
@@ -2174,7 +2219,17 @@ fn inspect_node(snap: &Snap, node_id: u64, opts: &ListOptions) -> Result<NodeRep
     // each pass, closest to the root first. Unreached retainers sort last.
     retainers.sort_by_key(|&(e, src)| (!page[src], dist[src], e));
     let page = &retainers[page_bounds(retainers.len(), opts)];
-    let retainer_rows = page.iter().map(|&(e, src)| row(e, src)).collect();
+    // A WeakMap value's key and table are both listed as direct retainers, but
+    // neither keeps it alive alone. Mark each half with the other source, just
+    // as a conditional path step is marked, so a lone table in the list does
+    // not read as a sufficient retainer.
+    let retainer_rows = page
+        .iter()
+        .map(|&(e, src)| EdgeRow {
+            conditional_on: weak_map_condition(snap, e),
+            ..row(e, src)
+        })
+        .collect();
 
     let step = |e: usize| {
         let to = snap.edge_to(e);
@@ -2291,6 +2346,22 @@ fn format_node_report(
             r.self_size,
             csv_distance(r.distance),
         );
+    }
+    for (i, r) in report.retainers.iter().enumerate() {
+        if let Some(c) = &r.conditional_on {
+            let other = if c.role == "table" {
+                "the WeakMap's table"
+            } else {
+                "its key"
+            };
+            let _ = writeln!(
+                out,
+                "Retainer {} is conditional: as a WeakMap entry it keeps this value alive only \
+                 while {other}, node {}, is alive too.",
+                i + 1,
+                c.node_id
+            );
+        }
     }
 
     out.push('\n');
@@ -3464,10 +3535,25 @@ mod tests {
         assert!(path[..4].iter().all(|r| r.conditional_on.is_none()));
         let c = path[4].conditional_on.as_ref().unwrap();
         assert_eq!((c.role, c.node_id), ("table", 15));
-        // Both halves are still listed as retainers.
+        // Both halves are still listed as retainers, and each says what else
+        // has to stay alive for it to retain the value.
         assert_eq!(report.retainers_total, 2);
+        let conds: Vec<_> = report
+            .retainers
+            .iter()
+            .map(|r| r.conditional_on.as_ref().map(|c| (c.role, c.node_id)))
+            .collect();
+        assert_eq!(conds, [Some(("key", 11)), Some(("table", 15))]);
 
         let text = format_node_report(&report, &defaults(), OutputFormat::Text).unwrap();
+        assert!(text.contains(
+            "Retainer 1 is conditional: as a WeakMap entry it keeps this value alive only \
+             while its key, node 11, is alive too.\n"
+        ));
+        assert!(text.contains(
+            "Retainer 2 is conditional: as a WeakMap entry it keeps this value alive only \
+             while the WeakMap's table, node 15, is alive too.\n"
+        ));
         assert!(text.ends_with(
             "\nStep 5 is conditional: as a WeakMap entry it keeps its value alive only \
              while the WeakMap's table, node 15, is alive too.\n"
@@ -3481,6 +3567,14 @@ mod tests {
             json!({ "role": "table", "nodeId": 15 })
         );
         assert!(json["retainingPath"][3].get("conditionalOn").is_none());
+        assert_eq!(
+            json["retainers"]["items"][0]["conditionalOn"],
+            json!({ "role": "key", "nodeId": 11 })
+        );
+        assert_eq!(
+            json["retainers"]["items"][1]["conditionalOn"],
+            json!({ "role": "table", "nodeId": 15 })
+        );
 
         // The value's name, which both edge names embed, may span lines; the
         // value still waits for the key rather than taking the table's
@@ -3511,13 +3605,40 @@ mod tests {
         // With no way to the key, the table alone does not retain the value.
         let mut t = weak_map_fixture(0, 0, "Val");
         t.nodes[1].edges.retain(|(_, name, _)| name != "key");
-        let report = inspect_node(&t.snap(), 17, &defaults()).unwrap();
+        let opts = ListOptions {
+            limit: 1,
+            ..defaults()
+        };
+        let report = inspect_node(&t.snap(), 17, &opts).unwrap();
         assert_eq!(report.node.distance, None);
         assert!(report.path.is_none());
         // The table's internal edge still reaches it, so the report does not
-        // claim that only weak edges do.
+        // claim that only weak edges do. With just that one retainer shown, it
+        // still says the missing key is required.
         assert_eq!(report.retainers_total, 2);
-        let text = format_node_report(&report, &defaults(), OutputFormat::Text).unwrap();
+        assert_eq!(report.retainers.len(), 1);
+        assert_eq!(
+            report.retainers[0]
+                .conditional_on
+                .as_ref()
+                .map(|c| (c.role, c.node_id)),
+            Some(("key", 11))
+        );
+        let text = format_node_report(&report, &opts, OutputFormat::Text).unwrap();
+        assert!(
+            text.contains(
+                "Retainer 1 is conditional: as a WeakMap entry it keeps this value alive only \
+                 while its key, node 11, is alive too.\n"
+            ),
+            "{text}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&format_node_report(&report, &opts, OutputFormat::Json).unwrap())
+                .unwrap();
+        assert_eq!(
+            json["retainers"]["items"][0]["conditionalOn"],
+            json!({ "role": "key", "nodeId": 11 })
+        );
         assert!(
             text.ends_with("\n\nRetaining path: none found.\n"),
             "{text}"
@@ -3530,6 +3651,13 @@ mod tests {
         assert_eq!(
             weak_map_pair(name),
             Some(" / part of key (Key @7) -> value (Val @9) pair in WeakMap (table @5)")
+        );
+        assert_eq!(weak_map_pair_ids(name), Some((7, 5)));
+        assert_eq!(
+            weak_map_pair_ids(
+                "1 / part of key (a) -> value (b @1) @2) -> value (c @3) pair in WeakMap (table @4)"
+            ),
+            Some((2, 4))
         );
         // Names may contain the separators, and line breaks.
         for name in [

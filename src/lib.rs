@@ -1702,6 +1702,13 @@ fn print_result(result: &result::CommandResult, output_format: format::OutputFor
     );
 }
 
+/// A token after an attached `-o...` supplies the expression only when it is
+/// not another CLI flag. A leading-dash number is still an expression, so
+/// `evaluate -oout.json -1` keeps working.
+fn token_supplies_expression(token: &str) -> bool {
+    !token.starts_with('-') || token[1..].parse::<f64>().is_ok()
+}
+
 /// `-oout.json` is clap's attached short-option form, but the expression's
 /// `allow_hyphen_values` makes clap take that token as the expression and the
 /// real expression as an extra argument. Split it before parsing, but only for
@@ -1740,8 +1747,12 @@ fn normalize_cli_args(args: &mut Vec<String>) {
         if arg == "evaluate" {
             // A lone `-o...` token is the expression (allow_hyphen_values), not
             // an attached output option. Split it only when a separate token
-            // follows, which is the expression and leaves this one as `-o`.
-            if args.get(i + 2).is_some() {
+            // follows that is the expression, not a flag such as
+            // `--track-navigation` (which would leave no expression at all).
+            if args
+                .get(i + 2)
+                .is_some_and(|next| token_supplies_expression(next))
+            {
                 let path = args
                     .get(i + 1)
                     .and_then(|a| a.strip_prefix("-o"))
@@ -2215,6 +2226,17 @@ async fn run_direct_fallback(cli: &Cli, ws_url: &str, error: &anyhow::Error) -> 
         }
     }
     result.map(|_| ())
+}
+
+/// V8 forgets heap object IDs when the profiler's session detaches, and a
+/// direct capture always tears its session down. Mirror the daemon's one-off
+/// warning so a later diff can't silently pair unrelated objects by ID.
+fn direct_heap_ids_note(command: &Commands) -> Option<String> {
+    matches!(command, Commands::TakeHeapSnapshot { .. }).then(|| {
+        "Heap object IDs are scoped to the daemon's persistent session. This snapshot used a \
+         one-off session, so its IDs may not match earlier snapshots."
+            .to_string()
+    })
 }
 
 /// Direct execution without daemon (fallback).
@@ -2723,8 +2745,10 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
 
     let _ = client.detach_from_target(&session_id).await;
     let name = friendly::to_friendly(&target_id);
+    let heap_ids_note = direct_heap_ids_note(&cli.command);
     result.map(|mut r| {
         r.target_id = Some(name);
+        r.notes.extend(heap_ids_note);
         r
     })
 }
@@ -2869,12 +2893,22 @@ mod tests {
                 "{attached}"
             );
         }
-        // A lone `-o`-prefixed token is JavaScript, not an output option.
+        // A lone `-o`-prefixed token is JavaScript, not an output option,
+        // including when only a flag follows it.
         assert_eq!(normalize(&["evaluate", "-offset"])["expression"], "-offset");
         assert_eq!(
             normalize(&["evaluate", "-oout.json"])["expression"],
             "-oout.json"
         );
+        let with_flag = normalize(&["evaluate", "-offset", "--track-navigation"]);
+        assert_eq!(with_flag["expression"], "-offset");
+        assert!(with_flag["output"].is_null());
+        assert_eq!(with_flag["track_navigation"], true);
+        // A negative number after an attached output option is still the
+        // expression, not a flag.
+        let negative = normalize(&["evaluate", "-oout.json", "-1"]);
+        assert_eq!(negative["expression"], "-1");
+        assert!(negative["output"].as_str().unwrap().ends_with("out.json"));
         // The explicit `--` form still passes a leading dash through.
         assert_eq!(normalize(&["evaluate", "--", "-1"])["expression"], "-1");
         // Global options before the subcommand must not hide it.
@@ -2899,6 +2933,16 @@ mod tests {
             }
             _ => panic!("expected run-script, got a different command"),
         }
+    }
+
+    #[test]
+    fn direct_capture_warns_about_unstable_heap_ids() {
+        let note = |command| direct_heap_ids_note(&command);
+        assert!(note(Commands::TakeHeapSnapshot {
+            output: "heap.heapsnapshot".to_string()
+        })
+        .is_some_and(|n| n.contains("IDs may not match earlier snapshots")));
+        assert!(note(Commands::ListPages).is_none());
     }
 
     #[test]

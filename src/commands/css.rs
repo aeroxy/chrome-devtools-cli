@@ -164,6 +164,9 @@ enum Status {
     Overridden,
     Invalid,
     Disabled,
+    /// The winning static declaration is overridden by a running animation or
+    /// transition, so this report cannot say it is the value in use.
+    Indeterminate,
 }
 
 /// One declaration, as the cascade sees it and the output shows it.
@@ -288,6 +291,14 @@ struct Report {
     inherited: Vec<InheritedView>,
     hidden_ua_rules: usize,
 }
+
+/// Matched rules, computed values and the page's own details are read in
+/// separate CDP requests. Page script can change the element's classes or
+/// styles between them, so a rule marked active and a computed value can come
+/// from different states. Say so rather than presenting them as one snapshot.
+const STATE_NOTE: &str =
+    "Matched rules, computed values and page details are read in separate requests; if the page \
+     changes styles during the inspection they may describe different states.";
 
 /// A JSON array's items, or none.
 fn items(v: &Value) -> &[Value] {
@@ -752,12 +763,19 @@ fn all_properties(computed: &[(String, String)], blocks: &[Block]) -> HashSet<St
 /// Run the cascade over one node's blocks, marking each declaration that wins
 /// at least one of its longhands active. `claimed` longhands are already
 /// decided (set on the element itself, or on a nearer ancestor) and nothing
-/// here wins them. `all` holds the keys an `all` declaration resets. Returns
-/// the longhands decided here. A winning `inherit` or `unset` decides none:
-/// the value comes from an ancestor's declaration, so that one still applies.
-/// Nor does a declaration that is invalid at computed-value time, which acts
-/// as `unset`. These keywords count after `var()` substitution too (see
-/// `NodeFacts::value`).
+/// here wins them. `all` holds the keys an `all` declaration resets. `inherited`
+/// holds the longhands a nearer element takes from its parent that do not
+/// inherit by default: an ancestor's `unset` on one of those is the initial
+/// value, which stops a more distant ancestor from supplying it (on one that
+/// does inherit, `unset` is `inherit` and keeps looking further up). Returns
+/// the longhands decided here and the ones whose winning value comes from a
+/// parent. `animated` longhands are marked indeterminate rather than active:
+/// an animation or transition can override the winning declaration. A winning
+/// `inherit` or `unset`
+/// decides none on the element: the value comes from an ancestor's declaration,
+/// so that one still applies. Nor does a declaration that is invalid at
+/// computed-value time, which acts as `unset`. These keywords count after
+/// `var()` substitution too (see `NodeFacts::value`).
 ///
 /// A winning `revert-layer` rolls the longhand back to the next lower
 /// cascade layer, and `revert` to the user-agent origin: the first
@@ -771,9 +789,12 @@ fn cascade(
     claimed: &HashSet<String>,
     node: &NodeFacts,
     all: &HashSet<String>,
-) -> HashSet<String> {
+    stop_on_unset: &HashSet<String>,
+    animated: &HashSet<String>,
+) -> (HashSet<String>, HashSet<String>) {
     let mut won = HashSet::new();
     let mut decided = HashSet::new();
+    let mut from_parent = HashSet::new();
     // Longhands a winning `revert-layer` or `revert` rolled back, with the
     // first block that may still win them. That is a position in normal
     // order even for an important one: Chrome rolls an important
@@ -816,7 +837,7 @@ fn cascade(
                 } else {
                     None
                 };
-                let from_parent = value.is_none() || is("inherit") || is("unset");
+                let needs_parent = value.is_none() || is("inherit") || is("unset");
                 // The one `all` row CDP gives us resets every property at
                 // once; a later declaration in this block was seen first and
                 // has already claimed its own longhands.
@@ -833,11 +854,29 @@ fn cascade(
                     {
                         continue;
                     }
-                    d.status = Status::Active;
+                    // A running animation or transition sets the property at a
+                    // higher level than the static cascade. The declaration is
+                    // still the winner among rules, but whether its value is in
+                    // use is not something this report can claim.
+                    if animated.contains(&key) {
+                        d.status = Status::Indeterminate;
+                    } else if d.status != Status::Indeterminate {
+                        d.status = Status::Active;
+                    }
                     if let Some(from) = rollback {
                         rolled_back.insert(key, from);
                     } else {
-                        if !from_parent {
+                        if needs_parent {
+                            from_parent.insert(key.clone());
+                            // On an ancestor, `unset` (or a value that is
+                            // invalid at computed-value time) is the initial
+                            // value for a longhand a nearer element inherits:
+                            // no more distant ancestor supplies it. `inherit`
+                            // keeps looking further up instead.
+                            if stop_on_unset.contains(&key) && !is("inherit") {
+                                decided.insert(key.clone());
+                            }
+                        } else {
                             decided.insert(key.clone());
                         }
                         won.insert(key);
@@ -846,7 +885,7 @@ fn cascade(
             }
         }
     }
-    decided
+    (decided, from_parent)
 }
 
 /// For each block, the first block (in normal order) of the next lower
@@ -977,20 +1016,80 @@ fn important_order(blocks: &[Block]) -> Vec<usize> {
         .collect()
 }
 
-/// Byte offset of the next `var(` that is a function call: not the end of a
-/// longer name such as `somevar(`, not text in a string such as
-/// `content: "var(--x)"`, which the browser shows as written, and not text
-/// in a comment, which Blink keeps but does not tokenize.
-fn find_var(s: &str) -> Option<usize> {
+/// Offset of the `(` after the CSS identifier at `start`, when that identifier
+/// decodes (CSS escapes included) to `var`. A hex escape consumes the one
+/// whitespace that ends it, so `v\\61 r(` reads as `var(`. The authored spelling
+/// is never changed; only the lookup uses the decoded name.
+fn var_call_open(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = start;
+    let mut decoded = String::new();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => return decoded.eq_ignore_ascii_case("var").then_some(i),
+            b'\\' => {
+                i += 1;
+                let c = *bytes.get(i)?;
+                if c.is_ascii_hexdigit() {
+                    let mut value = 0u32;
+                    let mut digits = 0;
+                    while i < bytes.len() && digits < 6 {
+                        let Some(d) = (bytes[i] as char).to_digit(16) else {
+                            break;
+                        };
+                        value = value * 16 + d;
+                        i += 1;
+                        digits += 1;
+                    }
+                    if i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    decoded.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
+                } else {
+                    let ch = s[i..].chars().next()?;
+                    // A backslash before a line break continues the line; it
+                    // contributes no character to the identifier.
+                    if !matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
+                        decoded.push(ch);
+                    }
+                    i += ch.len_utf8();
+                }
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_') => {
+                decoded.push(c as char);
+                i += 1;
+            }
+            c if !c.is_ascii() => {
+                let ch = s[i..].chars().next()?;
+                decoded.push(ch);
+                i += ch.len_utf8();
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Start of the next `var()` function call and the offset just past its `(`:
+/// not the end of a longer name such as `somevar(`, not text in a string such
+/// as `content: "var(--x)"`, which the browser shows as written, and not text
+/// in a comment, which Blink keeps but does not tokenize. Escaped function
+/// names are decoded, so `v\\61 r(` is found just like `var(`.
+fn find_var(s: &str) -> Option<(usize, usize)> {
     let bytes = s.as_bytes();
     let mut quote = None;
     let mut i = 0;
     while i < bytes.len() {
-        let prev = i.checked_sub(1).map(|p| bytes[p]);
-        let call = bytes
-            .get(i..i + 4)
-            .is_some_and(|w| w.eq_ignore_ascii_case(b"var("))
-            && !prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
+        if quote.is_none() {
+            let prev = i.checked_sub(1).map(|p| bytes[p]);
+            let boundary = !prev
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'\\'));
+            if boundary && matches!(bytes[i], b'v' | b'V' | b'\\') {
+                if let Some(open) = var_call_open(s, i) {
+                    return Some((i, open + 1));
+                }
+            }
+        }
         match (quote, bytes[i]) {
             // An escaped character is never a quote or the start of `var(`.
             (_, b'\\') => i += 1,
@@ -1001,7 +1100,6 @@ fn find_var(s: &str) -> Option<usize> {
                 None => return None,
             },
             (None, c @ (b'"' | b'\'')) => quote = Some(c),
-            (None, _) if call => return Some(i),
             _ => {}
         }
         i += 1;
@@ -1187,9 +1285,9 @@ fn substitute(
     }
     let mut out = String::new();
     let mut rest = value;
-    while let Some(pos) = find_var(rest) {
-        push_tokens(&mut out, &rest[..pos]);
-        let args = &rest[pos + 4..];
+    while let Some((start, args_at)) = find_var(rest) {
+        push_tokens(&mut out, &rest[..start]);
+        let args = &rest[args_at..];
         let (name, fallback, close) = split_var(args)?;
         let replacement = match lookup(&name) {
             Some(v) => v,
@@ -1251,8 +1349,8 @@ fn resolve_vars(value: &str, vars: &HashMap<String, String>) -> Option<String> {
 /// Custom property names a value references, fallbacks included.
 fn var_names(value: &str, out: &mut Vec<String>) {
     let mut rest = value;
-    while let Some(pos) = find_var(rest) {
-        let args = &rest[pos + 4..];
+    while let Some((_, args_at)) = find_var(rest) {
+        let args = &rest[args_at..];
         let Some((name, fallback, close)) = split_var(args) else {
             return;
         };
@@ -1500,12 +1598,24 @@ fn element_props_to_read(
 }
 
 /// Turn CDP's matched and computed styles into what `css-styles` prints.
+#[cfg(test)]
 fn build_report(
     matched: &Value,
     computed: &[(String, String)],
     sheets: &HashMap<String, Value>,
     page: &PageInfo,
     opts: &CssOptions,
+) -> Report {
+    build_report_with_animated(matched, computed, sheets, page, opts, &HashSet::new())
+}
+
+fn build_report_with_animated(
+    matched: &Value,
+    computed: &[(String, String)],
+    sheets: &HashMap<String, Value>,
+    page: &PageInfo,
+    opts: &CssOptions,
+    animated: &HashSet<String>,
 ) -> Report {
     let non_inheriting = non_inheriting(matched);
     let mut hidden_ua = 0;
@@ -1543,7 +1653,14 @@ fn build_report(
         .filter(|name| is_inherited(name, &non_inheriting))
         .cloned()
         .collect();
-    let mut claimed = cascade(&mut blocks, &HashSet::new(), &element, &all);
+    let (mut claimed, mut inherited_keys) = cascade(
+        &mut blocks,
+        &HashSet::new(),
+        &element,
+        &all,
+        &HashSet::new(),
+        animated,
+    );
     let rules = shown_blocks(
         blocks,
         Some(&element_vars),
@@ -1577,9 +1694,10 @@ fn build_report(
             // inherited ones stops a more distant ancestor's declarations.
             // Keep it for the cascade, which expands it over the properties
             // that can reach the element.
-            block
-                .decls
-                .retain(|d| d.key() == "all" || is_inherited(&d.key(), &non_inheriting));
+            block.decls.retain(|d| {
+                let key = d.key();
+                key == "all" || is_inherited(&key, &non_inheriting) || inherited_keys.contains(&key)
+            });
         }
         // Flow-relative properties don't inherit, so only the element's own
         // cascade maps them.
@@ -1589,8 +1707,24 @@ fn build_report(
             rejected: &[],
             inheriting: Some(&inheriting),
         };
-        let set_here = cascade(&mut blocks, &claimed, &ancestor, &inherited_all);
-        claimed.extend(set_here);
+        let stop_on_unset: HashSet<String> = inherited_keys
+            .iter()
+            .filter(|key| !is_inherited(key, &non_inheriting))
+            .cloned()
+            .collect();
+        let (set_here, more_parent) = cascade(
+            &mut blocks,
+            &claimed,
+            &ancestor,
+            &inherited_all,
+            &stop_on_unset,
+            animated,
+        );
+        claimed.extend(set_here.iter().cloned());
+        // A longhand decided here no longer reaches from a further ancestor;
+        // one still taken from a parent keeps the search going.
+        inherited_keys.retain(|k| !set_here.contains(k));
+        inherited_keys.extend(more_parent);
         let rules = shown_blocks(
             blocks,
             info.map(|a| &a.vars),
@@ -1638,6 +1772,7 @@ fn write_rule(out: &mut String, rule: &Block, indent: usize) {
             Status::Overridden => "[overridden] ",
             Status::Invalid => "[invalid] ",
             Status::Disabled => "[disabled] ",
+            Status::Indeterminate => "[animation] ",
         };
         let important = if p.important { " !important" } else { "" };
         let resolved = p
@@ -1692,6 +1827,7 @@ fn format_text(report: &Report) -> String {
         )
         .unwrap();
     }
+    writeln!(out, "Note: {STATE_NOTE}").unwrap();
     out.trim_end().to_string()
 }
 
@@ -1707,6 +1843,7 @@ fn report_json(report: &Report) -> Result<Value> {
         "rules": serde_json::to_value(&report.rules)?,
         "inherited": serde_json::to_value(&report.inherited)?,
         "hiddenUserAgentRules": report.hidden_ua_rules,
+        "note": STATE_NOTE,
     }))
 }
 
@@ -1837,6 +1974,38 @@ fn take_sheet_headers(client: &mut CdpClient, session_id: &str) -> HashMap<Strin
         .collect()
 }
 
+/// The property names in a `CSS.getAnimatedStylesForNode` reply, normalised to
+/// the keys the cascade uses. Both animations and transitions set properties
+/// outside the matched rules.
+fn animated_names(result: &Value) -> HashSet<String> {
+    ["animations", "transitions"]
+        .into_iter()
+        .flat_map(|kind| items(&result[kind]))
+        .flat_map(|entry| items(&entry["properties"]))
+        .filter_map(|p| p["name"].as_str())
+        .map(normalize_property_name)
+        .collect()
+}
+
+/// Longhands a running animation or transition sets on the node. CDP reports
+/// these apart from the matched rules, so the cascade can avoid calling a
+/// static declaration active when something else currently sets its value.
+/// A browser without the call is treated as having no animated properties.
+async fn animated_properties(
+    client: &mut CdpClient,
+    session_id: &str,
+    node_id: i64,
+) -> Result<HashSet<String>> {
+    let result = client
+        .send_to_target(
+            session_id,
+            "CSS.getAnimatedStylesForNode",
+            json!({"nodeId": node_id}),
+        )
+        .await?;
+    Ok(animated_names(&result))
+}
+
 async fn collect(
     client: &mut CdpClient,
     session_id: &str,
@@ -1930,8 +2099,18 @@ async fn collect(
             ..Default::default()
         },
     };
+    // An animation or transition setting a property is not observable from the
+    // matched rules or the computed value alone. A browser that does not know
+    // the CDP call is treated as having none.
+    let animated = match animated_properties(client, session_id, node_id).await {
+        Ok(animated) => animated,
+        Err(e) if e.downcast_ref::<ConnectionLost>().is_some() => return Err(e),
+        Err(_) => HashSet::new(),
+    };
 
-    Ok(build_report(&matched, &computed, &sheets, &page, opts))
+    Ok(build_report_with_animated(
+        &matched, &computed, &sheets, &page, opts, &animated,
+    ))
 }
 
 /// Turn the CSS and DOM agents off again. Left on, the CSS agent keeps
@@ -2199,7 +2378,8 @@ Inherited from body:
     [overridden] color: var(--fg); /* #222 */
     font-family: Georgia;
   }
-(1 user-agent rule(s) hidden; --ua-rules shows them)"
+(1 user-agent rule(s) hidden; --ua-rules shows them)
+Note: Matched rules, computed values and page details are read in separate requests; if the page changes styles during the inspection they may describe different states."
         );
     }
 
@@ -2244,6 +2424,7 @@ Inherited from body:
         assert!(v["rules"][2]["properties"][0].get("important").is_none());
         assert_eq!(v["inherited"][0]["from"], "body");
         assert_eq!(v["hiddenUserAgentRules"], 1);
+        assert_eq!(v["note"], STATE_NOTE);
     }
 
     #[test]
@@ -2254,6 +2435,8 @@ Inherited from body:
             &mut blocks,
             &HashSet::new(),
             &NodeFacts::default(),
+            &HashSet::new(),
+            &HashSet::new(),
             &HashSet::new(),
         );
         let status: Vec<Status> = blocks[0].decls.iter().map(|d| d.status).collect();
@@ -2342,7 +2525,14 @@ Inherited from body:
         assert!(!all.contains("direction"));
         assert!(!all.contains("unicode-bidi"));
         assert!(!all.contains("--tone"));
-        let decided = cascade(&mut blocks, &HashSet::new(), &NodeFacts::default(), &all);
+        let (decided, _) = cascade(
+            &mut blocks,
+            &HashSet::new(),
+            &NodeFacts::default(),
+            &all,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(
             blocks[0].decls.iter().map(|d| d.status).collect::<Vec<_>>(),
             [Status::Active; 5]
@@ -2364,6 +2554,8 @@ Inherited from body:
             &mut blocks,
             &HashSet::new(),
             &NodeFacts::default(),
+            &HashSet::new(),
+            &HashSet::new(),
             &HashSet::new(),
         );
         assert_eq!(blocks[1].decls[0].status, Status::Active);
@@ -2858,6 +3050,82 @@ Inherited from body:
         );
     }
 
+    /// `background-color` does not inherit by default, but an element that
+    /// takes it explicitly with `inherit` still needs the parent declaration
+    /// that supplies the value. An ancestor's `unset` is the initial value for
+    /// that longhand and stops a more distant ancestor from supplying one.
+    #[test]
+    fn explicit_inherit_keeps_the_parent_declaration() {
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = authored(
+            &[("background-color", "inherit")],
+            &[("background-color", "inherit")],
+        );
+        let red = [("background-color", "red")];
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(&red, &red);
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(report.rules[0].decls[0].status, Status::Active);
+        let parent = &report.inherited[0].rules[0].decls[0];
+        assert_eq!(parent.name, "background-color");
+        assert_eq!(parent.status, Status::Active);
+
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(
+            &[("background-color", "unset")],
+            &[("background-color", "unset")],
+        );
+        let html = rule("html", 1, authored(&red, &red));
+        m["inherited"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "matchedCSSRules": [html] }));
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(report.inherited[0].rules[0].decls[0].status, Status::Active);
+        // The parent's `unset` is the initial value for this non-inherited
+        // property, so the grandparent's red does not supply it.
+        assert_eq!(
+            report.inherited[1].rules[0].decls[0].status,
+            Status::Overridden
+        );
+    }
+
+    /// An animation or transition sets a property above the static cascade, so
+    /// a rule that wins it is shown as indeterminate, not active. Properties
+    /// without one keep their definite status.
+    #[test]
+    fn animated_properties_are_not_marked_active() {
+        let reply = json!({
+            "animations": [{"properties": [{"name": "Opacity"}]}],
+            "transitions": [{"properties": [{"name": "width"}]}],
+        });
+        let animated = animated_names(&reply);
+        assert_eq!(animated, HashSet::from(["opacity".into(), "width".into()]));
+
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = authored(
+            &[("opacity", "1"), ("color", "red")],
+            &[("opacity", "1"), ("color", "red")],
+        );
+        let report = build_report_with_animated(
+            &m,
+            &computed(),
+            &sheets(),
+            &page(),
+            &CssOptions::default(),
+            &animated,
+        );
+        let decls = &report.rules[0].decls;
+        assert_eq!(decls[0].status, Status::Indeterminate);
+        assert_eq!(decls[1].status, Status::Active);
+        let text = format_text(&report);
+        assert!(text.contains("[animation] opacity: 1;"), "{text}");
+        assert!(text.contains("  color: red;"), "{text}");
+        let json = report_json(&report).unwrap();
+        assert_eq!(json["rules"][0]["properties"][0]["status"], "indeterminate");
+        assert_eq!(json["rules"][0]["properties"][1]["status"], "active");
+    }
+
     /// `<table cellspacing>` beats the user-agent stylesheet's spacing, and
     /// an author rule beats it.
     #[test]
@@ -2897,6 +3165,8 @@ Inherited from body:
             &mut blocks,
             &HashSet::new(),
             &NodeFacts::default(),
+            &HashSet::new(),
+            &HashSet::new(),
             &HashSet::new(),
         );
         assert_eq!(statuses(&blocks[0]), [Status::Active]);
@@ -3392,6 +3662,29 @@ Inherited from body:
         // A call named in a comment is text, not a reference.
         assert_eq!(find_var("/* var(--tone) */ color"), None);
         assert_eq!(resolve_vars("/* var(--tone) */ color", &vars), None);
+    }
+
+    /// CSS decodes escapes in a function name, so `v\61 r(` is a `var()` call
+    /// and uses the parent's value. Blink keeps the authored spelling in the
+    /// declaration, which the report shows; only the lookup uses the decoded
+    /// name. Strings and longer names are still not calls.
+    #[test]
+    fn escaped_function_names_are_var_calls() {
+        let vars = HashMap::from([("--tone".to_string(), "red".to_string())]);
+        for value in [r"v\61 r(--tone)", r"\76 ar(--tone)"] {
+            let args_at = value.find('(').unwrap() + 1;
+            assert_eq!(find_var(value), Some((0, args_at)), "{value}");
+            assert_eq!(
+                resolve_vars(value, &vars).as_deref(),
+                Some("red"),
+                "{value}"
+            );
+        }
+        assert_eq!(find_var(r#""v\61 r(--tone)""#), None);
+        assert_eq!(find_var(r"somev\61 r(--tone)"), None);
+        let mut names = Vec::new();
+        var_names(r"v\61 r(--tone, var(--other))", &mut names);
+        assert_eq!(names, ["--tone", "--other"]);
     }
 
     /// `var()` substitutes tokens, not text. In Chrome 158, `var(--size)px`
