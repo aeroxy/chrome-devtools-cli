@@ -385,6 +385,13 @@ fn rollback_error(original: anyhow::Error, rollback: anyhow::Error) -> anyhow::E
     }
 }
 
+/// A lost connection cannot carry the rollback write either: retrying the
+/// browser update would spend another full write deadline before the daemon
+/// retires the socket. The typed error reaches it on its own.
+fn rollback_needed(apply_error: &anyhow::Error) -> bool {
+    apply_error.downcast_ref::<ConnectionLost>().is_none()
+}
+
 /// Add a mock, replacing any with the same pattern and resource type.
 pub async fn mock_network(
     client: &mut CdpClient,
@@ -403,6 +410,9 @@ pub async fn mock_network(
         // A mock Chrome refused must not linger, or every later change would
         // resend it and fail too: go back to what applied before.
         client.network_mocks = previous;
+        if !rollback_needed(&e) {
+            return Err(e);
+        }
         if let Err(rollback) = apply_mocks(client, session_id).await {
             // The disable can be blocked by a dialog, leaving Chrome
             // intercepting. `fetch_may_be_enabled` keeps idle reads on; say
@@ -621,6 +631,17 @@ mod tests {
 
         let many = partial_removal_context(2);
         assert!(many.contains("Removed 2 network mocks from the daemon"));
+    }
+
+    /// An apply that already lost the connection must not write a rollback on
+    /// the same dead socket; an ordinary refusal still gets the browser reset.
+    #[test]
+    fn a_lost_apply_skips_the_browser_rollback() {
+        let lost = anyhow::Error::new(ConnectionLost("closed".into()));
+        assert!(!rollback_needed(&lost));
+        assert!(rollback_needed(&anyhow::anyhow!(
+            "the browser refused the mock"
+        )));
     }
 
     /// A rollback that loses the connection keeps its typed error so the

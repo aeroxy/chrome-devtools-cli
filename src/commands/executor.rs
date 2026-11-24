@@ -373,15 +373,18 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
             }
         }
         client.blocklist.retain(|b| !req.unblock_url.contains(b));
-        if let Err(e) = client.apply_network_rules().await {
-            // Only a CDP refusal proves the rule was not applied. Otherwise
-            // the write may have succeeded without a reply; keep the new list
-            // rather than claim a rollback the browser may not have made.
-            if browser_refused_request(&e) {
+        if let Err(e) = client.apply_network_rules_reported().await {
+            // A failure before the rule write (a dialog that opened while
+            // waiting for `Network.enable`, say) means the new list was never
+            // applied, so restore the previous one. A CDP refusal at the write
+            // proves the same. Once the write may have reached Chrome its
+            // outcome is unknown: keep the new list rather than claim a
+            // rollback the browser may not have made.
+            if !e.write_attempted || browser_refused_request(&e.error) {
                 client.blocklist = previous;
             }
             client.dialog_action = None;
-            return Err(e);
+            return Err(e.error);
         }
         client.dialog_action = None;
     }
@@ -1729,6 +1732,34 @@ mod tests {
             "the rule may be in Chrome, so no rollback may be claimed"
         );
         calls_made(client, browser).await;
+    }
+
+    /// A dialog opened while `Network.enable` waited means the rule write was
+    /// never reached. The unapplied rule must not stay in the stored list,
+    /// which a later recovery command or attach would apply unexpectedly.
+    #[tokio::test]
+    async fn a_rule_never_written_because_enable_hit_a_dialog_is_rolled_back() {
+        let (mut client, browser) = fake_browser(|method, params| {
+            if method == "Network.enable" {
+                dialog("during-enable")
+            } else {
+                usual(method, params)
+            }
+        })
+        .await;
+        let mut blocklisted = request("evaluate", json!({"expression": "'done'"}));
+        blocklisted.block_url = vec!["*.png".into()];
+        let error = failure(execute_command(&mut client, &blocklisted).await);
+        assert!(is_dialog(&error), "{error:#}");
+        assert!(
+            !client.blocklist.contains(&"*.png".to_string()),
+            "Network.enable failed before the rule write, so restore the old list"
+        );
+        let calls = calls_made(client, browser).await;
+        assert!(
+            !calls.iter().any(|c| c == "Network.setBlockedURLs@S1"),
+            "the rule write was never reached: {calls:?}"
+        );
     }
 
     /// The daemon's session is what keeps heap object IDs stable across

@@ -549,6 +549,17 @@ impl Snap {
                     strings.len()
                 );
             }
+            // An out-of-range type would no longer compare equal to
+            // `synthetic`, turning a GC-root group into a page root.
+            if let Some(off) = type_off {
+                let ty = nodes[ord * node_size + off];
+                if ty as usize >= node_types.len() {
+                    bail!(
+                        "Corrupt snapshot: node type index {ty} out of bounds (node_types len {})",
+                        node_types.len()
+                    );
+                }
+            }
         }
 
         let ef = &meta.edge_fields;
@@ -1304,6 +1315,8 @@ struct InterfaceMatcher<'s> {
     props: Vec<&'s str>,
     states: Vec<usize>,
     current: Vec<usize>,
+    /// Membership of `states`, so pruning and deduplication don't scan it.
+    seen: HashSet<usize>,
 }
 
 impl<'s> InterfaceMatcher<'s> {
@@ -1341,6 +1354,7 @@ impl<'s> InterfaceMatcher<'s> {
             props: Vec::new(),
             states: Vec::new(),
             current: Vec::new(),
+            seen: HashSet::new(),
         }
     }
 
@@ -1352,6 +1366,7 @@ impl<'s> InterfaceMatcher<'s> {
             props,
             states,
             current,
+            seen,
         } = self;
         props.clear();
         props.extend(
@@ -1361,29 +1376,39 @@ impl<'s> InterfaceMatcher<'s> {
         );
         props.sort_by(|a, b| cmp_utf16(a, b));
         // Several trie paths can be live at once, since an object may have
-        // properties no definition lists. `states` mirrors the JS Set,
-        // including its insertion order.
+        // properties no definition lists. Rebuild the frontier in one pass
+        // per property: `seen` makes pruning and dedup constant time, and a
+        // state reached for p is neither iterated nor consumed again for p.
         states.clear();
         states.push(0);
+        seen.clear();
+        seen.insert(0);
         let mut best = better_match(None, tree[0].matched);
         for p in props.iter() {
             current.clear();
-            current.extend_from_slice(states);
-            for &state in current.iter() {
+            for &state in states.iter() {
                 let node = &tree[state];
                 if node
                     .greatest_next
                     .as_deref()
                     .is_none_or(|g| !cmp_utf16(p, g).is_lt())
                 {
-                    states.retain(|&s| s != state);
+                    // No later property can advance this state. Drop it, but
+                    // an exact match below still supplies the next state.
+                    seen.remove(&state);
+                } else {
+                    current.push(state);
                 }
                 if let Some(&next) = node.next.get(*p) {
-                    if !states.contains(&next) {
-                        states.push(next);
-                    }
                     best = better_match(best, tree[next].matched);
+                    if seen.insert(next) {
+                        current.push(next);
+                    }
                 }
+            }
+            std::mem::swap(states, current);
+            if states.is_empty() {
+                break;
             }
         }
         best.map(|(_, i)| i)
@@ -1592,12 +1617,15 @@ fn diff_snapshots(base: &Aggregates, current: &Aggregates) -> Result<Vec<HeapSna
     Ok(diffs)
 }
 
-/// One added or deleted object of a class.
+/// One object that entered or left a class. `also_in_other` marks a class
+/// change rather than an allocation or deletion: V8 keeps the node id when,
+/// for example, a live `<div>` becomes detached between captures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DiffObject {
     added: bool,
     id: u32,
     self_size: u64,
+    also_in_other: bool,
 }
 
 /// The added and deleted objects of one class, largest first so the first
@@ -1607,12 +1635,21 @@ fn compute_class_node_detail(
     current: &Aggregates,
     key: &ClassKey,
 ) -> Vec<DiffObject> {
+    let base_ids: HashSet<u32> = base.classes.values().flatten().map(|&(id, _)| id).collect();
+    let current_ids: HashSet<u32> = current
+        .classes
+        .values()
+        .flatten()
+        .map(|&(id, _)| id)
+        .collect();
     let mut objects = Vec::new();
     merge_diff(base, current, key, |added, id, self_size| {
+        let other = if added { &base_ids } else { &current_ids };
         objects.push(DiffObject {
             added,
             id,
             self_size,
+            also_in_other: other.contains(&id),
         })
     });
     objects.sort_by(|a, b| {
@@ -1698,6 +1735,11 @@ fn location_value(location: Option<Location>) -> serde_json::Value {
         None => serde_json::Value::Null,
     }
 }
+
+/// The `+`/`-` rows are per-class, so a node that changes class appears in
+/// both classes. Say so, or a still-live object reads as deleted.
+const DETAIL_NOTE: &str = "+ = entered this class, - = left it; an id present in the other \
+                           capture is a class change, not an allocation or deletion.";
 
 /// Columns of a diff row, in output order.
 const DIFF_COLUMNS: [&str; 9] = [
@@ -1805,16 +1847,35 @@ fn format_class_diff_detail(
     use std::fmt::Write;
     let page = &objects[page_bounds(objects.len(), opts)];
     let op = |o: &DiffObject| if o.added { "+" } else { "-" };
+    // `alsoIn` names the capture holding the same id under another class: the
+    // object changed class, it was not allocated or freed.
+    let also_in = |o: &DiffObject| {
+        if !o.also_in_other {
+            None
+        } else if o.added {
+            Some("base")
+        } else {
+            Some("current")
+        }
+    };
     if !format.is_text() {
         let nodes: Vec<serde_json::Value> = page
             .iter()
-            .map(|o| json!({ "op": op(o), "nodeId": o.id, "selfSize": o.self_size }))
+            .map(|o| {
+                json!({
+                    "op": op(o),
+                    "nodeId": o.id,
+                    "selfSize": o.self_size,
+                    "alsoIn": also_in(o),
+                })
+            })
             .collect();
         let mut row = diff_json(idx, diff, opts);
         row.insert("totalNodes".into(), json!(objects.len()));
         row.insert("offset".into(), json!(opts.offset));
         row.insert("limit".into(), json!(opts.limit));
         row.insert("nodes".into(), json!(nodes));
+        row.insert("note".into(), json!(DETAIL_NOTE));
         return crate::format::format_structured(&row.into(), format);
     }
     let values = diff_values(idx, diff, opts);
@@ -1830,11 +1891,19 @@ fn format_class_diff_detail(
         "\nObjects, largest selfSize first: {}",
         page_summary(objects.len(), opts.offset, page.len())
     );
+    let _ = writeln!(out, "{DETAIL_NOTE}");
     if !page.is_empty() {
-        out.push_str("op,nodeId,selfSize\n");
+        out.push_str("op,nodeId,selfSize,alsoIn\n");
     }
     for o in page {
-        let _ = writeln!(out, "{},{},{}", op(o), o.id, o.self_size);
+        let _ = writeln!(
+            out,
+            "{},{},{},{}",
+            op(o),
+            o.id,
+            o.self_size,
+            also_in(o).unwrap_or("-")
+        );
     }
     Ok(out)
 }
@@ -2834,6 +2903,36 @@ mod tests {
         assert_eq!(snap.self_size(other), 24);
     }
 
+    /// Definitions sharing a first property keep the whole frontier live until
+    /// the shared second property arrives. The matcher must still pick the
+    /// longest complete definition without rescanning that frontier.
+    #[test]
+    fn test_interface_matcher_shared_prefix_frontier() {
+        let (mut t, window) = TestSnap::page();
+        let obj = t.node("object", "Object", 101, 16);
+        t.edge(window, "property", "o", obj);
+        let defs: Vec<InterfaceDefinition> = (0..300)
+            .map(|i| {
+                let p = format!("p{i:03}");
+                t.edge(obj, "property", &p, window);
+                let properties = if i == 299 {
+                    vec![p, "tail".into(), "z".into()]
+                } else {
+                    vec![p, "z".into()]
+                };
+                InterfaceDefinition {
+                    name: format!("{{{}}}", properties.join(", ")),
+                    properties,
+                }
+            })
+            .collect();
+        t.edge(obj, "property", "tail", window);
+        t.edge(obj, "property", "z", window);
+        let snap = t.snap();
+        let mut matcher = InterfaceMatcher::new(&defs);
+        assert_eq!(matcher.best(&snap, obj), Some(299));
+    }
+
     #[test]
     fn test_interface_definitions_name_plain_objects() {
         let (mut t, window) = TestSnap::page();
@@ -3122,6 +3221,20 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_node_types_outside_the_enum() {
+        let (t, _) = TestSnap::page();
+        // The synthetic root's type is field 0. One past the enum would stop
+        // comparing equal to `synthetic` and read as a page root instead.
+        let v = with_fields(t.json(), "nodes", &[(0, json!(NODE_TYPES.len()))]);
+        let err = Snap::new(serde_json::from_value(v).unwrap()).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("node type index 15 out of bounds (node_types len 15)"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn test_rejects_truncated_nodes_and_bad_strings() {
         let raw = |nodes: serde_json::Value| -> RawSnapshot {
             serde_json::from_value(json!({
@@ -3383,12 +3496,14 @@ mod tests {
                 DiffObject {
                     added: true,
                     id: 17,
-                    self_size: 150
+                    self_size: 150,
+                    also_in_other: false,
                 },
                 DiffObject {
                     added: false,
                     id: 13,
-                    self_size: 100
+                    self_size: 100,
+                    also_in_other: false,
                 },
             ]
         );
@@ -3398,7 +3513,8 @@ mod tests {
             [DiffObject {
                 added: false,
                 id: 15,
-                self_size: 50
+                self_size: 50,
+                also_in_other: false,
             }]
         );
     }
@@ -3444,6 +3560,43 @@ mod tests {
         ));
     }
 
+    /// A node that changes class keeps its id: the per-class + and - rows are
+    /// class membership, not an allocation and a deletion of two objects.
+    #[test]
+    fn test_class_change_is_not_reported_as_an_allocation() {
+        let (mut base, w) = TestSnap::page();
+        let node = base.node("object", "Map", 11, 40);
+        base.edge(w, "property", "x", node);
+        let (mut current, w) = TestSnap::page();
+        let node = current.node("object", "Detached Map", 11, 40);
+        current.edge(w, "property", "x", node);
+        let base = base.aggregates();
+        let current = current.aggregates();
+        let diffs = diff_snapshots(&base, &current).unwrap();
+        assert_eq!(diffs.len(), 2);
+        // Both rows are one object that moved class, not two objects.
+        assert_eq!(diffs[0].key.name, "Detached Map");
+        assert_eq!(diffs[1].key.name, "Map");
+        for d in &diffs {
+            let objects = compute_class_node_detail(&base, &current, &d.key);
+            assert_eq!(objects.len(), 1);
+            assert!(objects[0].also_in_other, "{}", d.key.name);
+        }
+        let objects = compute_class_node_detail(&base, &current, &diffs[0].key);
+        let text =
+            format_class_diff_detail(0, &diffs[0], &objects, &defaults(), OutputFormat::Text)
+                .unwrap();
+        assert!(text.contains(DETAIL_NOTE), "{text}");
+        assert!(text.contains("+,11,40,base\n"), "{text}");
+        let json: serde_json::Value = serde_json::from_str(
+            &format_class_diff_detail(0, &diffs[0], &objects, &defaults(), OutputFormat::Json)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["note"], DETAIL_NOTE);
+        assert_eq!(json["nodes"][0]["alsoIn"], "base");
+    }
+
     #[test]
     fn test_summary_pages_and_detail_shares_indices() {
         let base = objects(&[(11, "Map", 100), (13, "Set", 50)]);
@@ -3479,7 +3632,8 @@ mod tests {
             detail,
             "idx:1,className:Map,location:,addedCount:2,removedCount:1,countDelta:1,addedSize:240,removedSize:100,sizeDelta:140\n\
              \nObjects, largest selfSize first: showing 1-2 of 3; next page: --offset 2\n\
-             op,nodeId,selfSize\n+,17,150\n-,11,100\n"
+             + = entered this class, - = left it; an id present in the other capture is a class change, not an allocation or deletion.\n\
+             op,nodeId,selfSize,alsoIn\n+,17,150,-\n-,11,100,-\n"
         );
     }
 
@@ -3510,7 +3664,7 @@ mod tests {
 
         let detail = run(Some(0)).unwrap().output;
         assert!(detail.contains("className:Window"));
-        assert!(detail.contains("\n+,15,500\n"));
+        assert!(detail.contains("\n+,15,500,-\n"));
 
         let err = run(Some(99)).err().unwrap();
         let msg = err.to_string();
@@ -3844,7 +3998,7 @@ mod tests {
             "{summary}"
         );
         assert!(summary.contains("\n1,Edge,,1,0,1,4294967295,0,4294967295\n"));
-        assert!(run(Some(0)).ends_with("\n+,13,5368709120\n"));
+        assert!(run(Some(0)).ends_with("\n+,13,5368709120,-\n"));
 
         // Only `self_size` may be that wide.
         let mut v = t.json();
@@ -4005,7 +4159,7 @@ mod tests {
             detail.starts_with("idx:2,className:Foo,location:7:10:1,addedCount:1,"),
             "{detail}"
         );
-        assert!(detail.ends_with("\n+,15,20\n"));
+        assert!(detail.ends_with("\n+,15,20,-\n"));
         let json: serde_json::Value = serde_json::from_str(
             &format_class_diff_detail(2, &diffs[2], &objects, &defaults(), OutputFormat::Json)
                 .unwrap(),

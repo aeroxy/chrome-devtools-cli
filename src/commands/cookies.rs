@@ -45,7 +45,15 @@ pub async fn cookies(
             return Ok(CommandResult::output("")
                 .with_note(format!("[note] No cookies for {}", urls.join(", "))));
         }
-        return Ok(CommandResult::output(out));
+        let mut result = CommandResult::output(out);
+        if header_order_is_ambiguous(&cookies) {
+            result = result.with_note(
+                "[warning] Two cookies share a name and path length, which Chrome orders by \
+                 creation time. Network.getCookies does not preserve that order, so this header \
+                 may list them differently from a real request; use --json to check both.",
+            );
+        }
+        return Ok(result);
     }
     if !format.is_text() {
         return Ok(CommandResult::output(format_structured(
@@ -91,6 +99,18 @@ fn cookie_header(cookies: &[&Value]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Equal path lengths mean the browser orders same-name cookies by creation
+/// time. `Network.getCookies` builds its result from a hash map, so that order
+/// is gone and the header's first value for the name cannot be reconstructed.
+fn header_order_is_ambiguous(cookies: &[&Value]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    cookies.iter().any(|c| {
+        let name = c["name"].as_str().unwrap_or("");
+        let path_depth = c["path"].as_str().unwrap_or("").len();
+        !seen.insert((name, path_depth))
+    })
 }
 
 /// A table of the cookies with their value lengths but not their values.
@@ -227,6 +247,27 @@ mod tests {
         let deep = cookie("b", "2", "/app/x");
         assert_eq!(cookie_header(&[&root, &deep]), "b=2; a=1");
         assert_eq!(cookie_header(&[]), "");
+    }
+
+    /// Two `sid` cookies at `/` on different domains are ordered by creation
+    /// time in a real header, which `Network.getCookies` cannot tell us.
+    #[test]
+    fn equal_depth_cookies_with_one_name_are_ambiguous() {
+        let mut parent = cookie("sid", "parent", "/");
+        parent["domain"] = json!(".a.test");
+        let mut host = cookie("sid", "host", "/");
+        host["domain"] = json!("app.a.test");
+        assert!(header_order_is_ambiguous(&[&parent, &host]));
+        // Different names at the same depth, or the same name at different
+        // depths, keep the browser's order from the path-length sort alone.
+        assert!(!header_order_is_ambiguous(&[
+            &parent,
+            &cookie("theme", "dark", "/")
+        ]));
+        assert!(!header_order_is_ambiguous(&[
+            &parent,
+            &cookie("sid", "app", "/app")
+        ]));
     }
 
     /// A cookie set without a name (`Set-Cookie: AAA`) goes as its bare

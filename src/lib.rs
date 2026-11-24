@@ -1706,11 +1706,49 @@ fn print_result(result: &result::CommandResult, output_format: format::OutputFor
     );
 }
 
+/// Flags `evaluate` accepts: its own plus the global ones and clap's
+/// built-ins. A leading-dash token that is one of these remains a flag; after
+/// an attached `-o`, anything else is the JavaScript expression.
+fn is_evaluate_flag(token: &str) -> bool {
+    let name = token.split_once('=').map_or(token, |(n, _)| n);
+    matches!(
+        name,
+        "--dialog-action"
+            | "--output"
+            | "-o"
+            | "--track-navigation"
+            | "--ws-endpoint"
+            | "--port"
+            | "--user-data-dir"
+            | "--browser"
+            | "--channel"
+            | "--page"
+            | "-p"
+            | "--target"
+            | "-t"
+            | "--json"
+            | "--toon"
+            | "--block-url"
+            | "--unblock-url"
+            | "--help"
+            | "-h"
+            | "--version"
+            | "-V"
+    )
+}
+
 /// A token after an attached `-o...` supplies the expression only when it is
-/// not another CLI flag. A leading-dash number is still an expression, so
-/// `evaluate -oout.json -1` keeps working.
-fn token_supplies_expression(token: &str) -> bool {
-    !token.starts_with('-') || token[1..].parse::<f64>().is_ok()
+/// not another `evaluate` flag. A leading-dash number is always an expression
+/// (`evaluate -oout.json -1`), and so is JavaScript like `-Math.abs(2)` once
+/// the output option has been seen.
+fn token_supplies_expression(token: &str, after_output: bool) -> bool {
+    if !token.starts_with('-') {
+        return true;
+    }
+    if token[1..].parse::<f64>().is_ok() {
+        return true;
+    }
+    after_output && !is_evaluate_flag(token)
 }
 
 /// The filename in clap's attached `-oout.json` / `-o=out.json` form. A lone
@@ -1810,7 +1848,7 @@ fn normalize_cli_args(args: &mut Vec<OsString>) {
                         continue;
                     }
                 }
-                if token_supplies_expression(token) {
+                if token_supplies_expression(token, candidate.is_some()) {
                     if let Some((idx, path)) = candidate {
                         args[idx] = OsString::from("-o");
                         args.insert(idx + 1, OsString::from(path));
@@ -2534,7 +2572,14 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             commands::input::fill(&mut client, &session_id, selector, value, cwd.as_deref()).await
         }
         Commands::TypeText { text, submit_key } => {
-            commands::input::type_text(&mut client, &session_id, text, submit_key.as_deref()).await
+            commands::input::type_text_with_dialog_next(
+                &mut client,
+                &session_id,
+                text,
+                submit_key.as_deref(),
+                commands::executor::DIRECT_DIALOG_NEXT,
+            )
+            .await
         }
         Commands::PressKey { key } => {
             commands::input::press_key(&mut client, &session_id, key).await
@@ -2962,6 +3007,28 @@ mod tests {
         let negative = normalize(&["evaluate", "-oout.json", "-1"]);
         assert_eq!(negative["expression"], "-1");
         assert!(negative["output"].as_str().unwrap().ends_with("out.json"));
+        // A non-numeric leading-dash expression after the attached option is
+        // split too; clap would otherwise read `-oout.json` as the expression.
+        let dash_expr = normalize(&["evaluate", "-oout.json", "-Math.abs(2)"]);
+        assert_eq!(dash_expr["expression"], "-Math.abs(2)");
+        assert!(dash_expr["output"].as_str().unwrap().ends_with("out.json"));
+        // Real `evaluate` flags between the two are still skipped.
+        let dash_expr_with_flags = normalize(&[
+            "evaluate",
+            "-oout.json",
+            "--track-navigation",
+            "--dialog-action",
+            "accept",
+            "--json",
+            "-Math.abs(2)",
+        ]);
+        assert_eq!(dash_expr_with_flags["expression"], "-Math.abs(2)");
+        assert!(dash_expr_with_flags["output"]
+            .as_str()
+            .unwrap()
+            .ends_with("out.json"));
+        assert_eq!(dash_expr_with_flags["track_navigation"], true);
+        assert_eq!(dash_expr_with_flags["dialog_action"], "accept");
         // The explicit `--` form still passes a leading dash through.
         assert_eq!(normalize(&["evaluate", "--", "-1"])["expression"], "-1");
         // A flag before the attached `-o`, or between it and the expression,

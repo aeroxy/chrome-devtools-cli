@@ -6,7 +6,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::cdp::{is_connection_or_page_failure, CdpClient, ConnectionLost, SETUP_CALL_TIMEOUT};
+use crate::cdp::{
+    is_connection_or_page_failure, CdpClient, ConnectionLost, DialogOpen, SETUP_CALL_TIMEOUT,
+};
 use crate::format::{format_structured, OutputFormat};
 use crate::result::CommandResult;
 
@@ -281,6 +283,10 @@ struct AncestorInfo {
     /// The referenced custom properties the ancestor has, empty ones
     /// included; one it doesn't have is left out.
     vars: HashMap<String, String>,
+    /// The ancestor's own `writing-mode` and `direction`, so a logical
+    /// longhand it declares can be matched to the physical side a child
+    /// explicitly inherits.
+    flow: Option<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -704,9 +710,7 @@ impl NodeFacts<'_> {
     /// The key a longhand cascades under: a flow-relative longhand and the
     /// physical one it maps to are one property for the cascade.
     fn key(&self, longhand: &str) -> String {
-        self.flow
-            .and_then(|(writing_mode, direction)| physical(longhand, writing_mode, direction))
-            .unwrap_or_else(|| longhand.to_string())
+        mapped_key(longhand, self.flow)
     }
 
     /// The value the cascade acts on: the one after `var()` substitution
@@ -921,6 +925,16 @@ fn layer_ends(blocks: &[Block]) -> Vec<usize> {
         ends.resize(end, end);
     }
     ends
+}
+
+/// The key a longhand cascades under. A flow-relative name maps to the
+/// physical side this node's `writing-mode` and `direction` give it; without
+/// that information the two stay apart. Ancestors need their own flow here:
+/// an explicit `inherit` reads the parent's physical side, not its authored
+/// logical name (see `physical`).
+fn mapped_key(longhand: &str, flow: Option<(&str, &str)>) -> String {
+    flow.and_then(|(writing_mode, direction)| physical(longhand, writing_mode, direction))
+        .unwrap_or_else(|| longhand.to_string())
 }
 
 /// The physical longhand a flow-relative one sets on a node with this
@@ -1360,6 +1374,22 @@ fn resolve_vars(value: &str, vars: &HashMap<String, String>) -> Option<String> {
     (resolved.trim() != value.trim()).then(|| resolved.trim().to_string())
 }
 
+/// As `resolve_vars`, except that a name the page was never asked about stays
+/// unknown. A queried name missing from the page still takes its fallback:
+/// that is what the page reported; an unqueried one would be a guess.
+fn resolve_queried_vars(
+    value: &str,
+    vars: &HashMap<String, String>,
+    queried: &HashSet<&str>,
+) -> Option<String> {
+    let mut names = Vec::new();
+    var_names(value, &mut names);
+    if names.iter().any(|n| !queried.contains(n.as_str())) {
+        return None;
+    }
+    resolve_vars(value, vars)
+}
+
 /// Custom property names a value references, fallbacks included.
 fn var_names(value: &str, out: &mut Vec<String>) {
     let mut rest = value;
@@ -1378,9 +1408,12 @@ fn var_names(value: &str, out: &mut Vec<String>) {
     }
 }
 
-/// The custom properties each ancestor's inheritable declarations reference,
-/// so the page can be asked for their values on that ancestor.
-fn ancestor_var_names(matched: &Value) -> Vec<Vec<String>> {
+/// The custom properties each ancestor's declarations that can reach the
+/// element reference, so the page can be asked for their values on that
+/// ancestor. Besides properties that inherit by default, this covers rows the
+/// report keeps because the element explicitly inherits them: a page that was
+/// never asked for such a name cannot resolve it.
+fn ancestor_var_names(matched: &Value, inherited_keys: &HashSet<String>) -> Vec<Vec<String>> {
     let non_inheriting = non_inheriting(matched);
     let none = HashMap::new();
     items(&matched["inherited"])
@@ -1388,7 +1421,12 @@ fn ancestor_var_names(matched: &Value) -> Vec<Vec<String>> {
         .map(|level| {
             let mut names = Vec::new();
             for d in level_styles(level).flat_map(|s| declarations(s, &none)) {
-                if is_inherited(&d.key(), &non_inheriting) {
+                let key = d.key();
+                if key == "all"
+                    || is_inherited(&key, &non_inheriting)
+                    || inherited_keys.contains(&key)
+                    || d.longhands.iter().any(|l| inherited_keys.contains(l))
+                {
                     var_names(&d.value, &mut names);
                 }
             }
@@ -1435,10 +1473,12 @@ fn shorthands_to_expand(
 /// The blocks worth showing, with `var()` references resolved, noting what
 /// they declare. User-agent blocks are only counted unless asked for. `vars`
 /// is `None` when the node's custom properties are unknown, and then nothing
-/// is resolved rather than guessed.
+/// is resolved rather than guessed. `queried`, when given, names what the page
+/// was asked for on this node; a reference outside it stays unresolved too.
 fn shown_blocks(
     blocks: Vec<Block>,
     vars: Option<&HashMap<String, String>>,
+    queried: Option<&HashSet<&str>>,
     ua_rules: bool,
     hidden_ua: &mut usize,
     declared: &mut Declared,
@@ -1456,7 +1496,10 @@ fn shown_blocks(
             if d.usable() {
                 declared.add(d);
             }
-            d.resolved = vars.and_then(|vars| resolve_vars(&d.value, vars));
+            d.resolved = vars.and_then(|vars| match queried {
+                Some(queried) => resolve_queried_vars(&d.value, vars, queried),
+                None => resolve_vars(&d.value, vars),
+            });
         }
         out.push(block);
     }
@@ -1611,34 +1654,28 @@ fn element_props_to_read(
     names
 }
 
-/// Turn CDP's matched and computed styles into what `css-styles` prints.
-#[cfg(test)]
-fn build_report(
-    matched: &Value,
-    computed: &[(String, String)],
-    sheets: &HashMap<String, Value>,
-    page: &PageInfo,
-    opts: &CssOptions,
-) -> Report {
-    build_report_with_animated(matched, computed, sheets, page, opts, &HashSet::new())
+/// Animated properties CDP reports for the inspected node and, separately,
+/// for each ancestor in its inheritance chain. An animation on a parent can
+/// supply the value a child inherits without setting that property on the
+/// child, so the two sets must not be merged.
+#[derive(Debug, Default)]
+struct AnimatedStyles {
+    element: HashSet<String>,
+    ancestors: Vec<HashSet<String>>,
 }
 
-fn build_report_with_animated(
+/// Cascade the element's own styles once. The inherited keys are needed before
+/// the page is asked which custom properties its ancestors reference; the
+/// animation data only changes declaration statuses, so an empty set suffices
+/// for that early pass.
+fn element_cascade(
     matched: &Value,
     computed: &[(String, String)],
     sheets: &HashMap<String, Value>,
     page: &PageInfo,
-    opts: &CssOptions,
     animated: &HashSet<String>,
-) -> Report {
+) -> (Vec<Block>, HashSet<String>, HashSet<String>) {
     let non_inheriting = non_inheriting(matched);
-    let mut hidden_ua = 0;
-    let mut declared = Declared::default();
-
-    // The element's own styles. Custom properties resolve against the
-    // element's computed values.
-    let element_vars = custom_properties(computed);
-    let inheriting = registered_inheriting(matched);
     let mut blocks = node_blocks(
         &matched["inlineStyle"],
         &matched["matchedCSSRules"],
@@ -1646,6 +1683,7 @@ fn build_report_with_animated(
         sheets,
         &page.longhands,
     );
+    let element_vars = custom_properties(computed);
     let computed_value = |name: &str| {
         computed
             .iter()
@@ -1656,10 +1694,10 @@ fn build_report_with_animated(
         vars: Some(&element_vars),
         flow: computed_value("writing-mode").zip(computed_value("direction")),
         rejected: &page.rejected,
-        inheriting: Some(&inheriting),
+        inheriting: Some(&registered_inheriting(matched)),
     };
     let all = all_properties(computed, &blocks);
-    let (mut claimed, mut inherited_keys) = cascade(
+    let (claimed, inherited_keys) = cascade(
         &mut blocks,
         &HashSet::new(),
         &element,
@@ -1668,9 +1706,53 @@ fn build_report_with_animated(
         &HashSet::new(),
         animated,
     );
+    (blocks, claimed, inherited_keys)
+}
+
+/// Turn CDP's matched and computed styles into what `css-styles` prints.
+#[cfg(test)]
+fn build_report(
+    matched: &Value,
+    computed: &[(String, String)],
+    sheets: &HashMap<String, Value>,
+    page: &PageInfo,
+    opts: &CssOptions,
+) -> Report {
+    build_report_with_animated(
+        matched,
+        computed,
+        sheets,
+        page,
+        opts,
+        &AnimatedStyles::default(),
+        None,
+    )
+}
+
+fn build_report_with_animated(
+    matched: &Value,
+    computed: &[(String, String)],
+    sheets: &HashMap<String, Value>,
+    page: &PageInfo,
+    opts: &CssOptions,
+    animated: &AnimatedStyles,
+    queried: Option<&[Vec<String>]>,
+) -> Report {
+    let non_inheriting = non_inheriting(matched);
+    let inheriting = registered_inheriting(matched);
+    let mut hidden_ua = 0;
+    let mut declared = Declared::default();
+
+    // The element's own styles. Custom properties resolve against the
+    // element's computed values.
+    let element_vars = custom_properties(computed);
+    let (blocks, mut claimed, mut inherited_keys) =
+        element_cascade(matched, computed, sheets, page, &animated.element);
+    let all = all_properties(computed, &blocks);
     let rules = shown_blocks(
         blocks,
         Some(&element_vars),
+        None,
         opts.ua_rules,
         &mut hidden_ua,
         &mut declared,
@@ -1687,8 +1769,16 @@ fn build_report_with_animated(
         &[]
     };
     let mut inherited = Vec::new();
+    let no_animated = HashSet::new();
     for (i, level) in levels.iter().enumerate() {
         let info = ancestors.get(i);
+        // A logical longhand maps to the physical side this ancestor sets,
+        // which is also the side a child's explicit `inherit` reads. The
+        // child's flow can be the opposite one (RTL under an LTR parent).
+        let flow = info
+            .and_then(|a| a.flow.as_ref())
+            .map(|(writing_mode, direction)| (writing_mode.as_str(), direction.as_str()));
+        let key = move |name: &str| mapped_key(name, flow);
         let mut blocks = node_blocks(
             &level["inlineStyle"],
             &level["matchedCSSRules"],
@@ -1704,20 +1794,20 @@ fn build_report_with_animated(
             // through one longhand the element explicitly inherits; the
             // others must not be marked active.
             block.decls.retain(|d| {
-                let key = d.key();
-                key == "all"
-                    || is_inherited(&key, &non_inheriting)
-                    || inherited_keys.contains(&key)
-                    || d.longhands.iter().any(|l| inherited_keys.contains(l))
+                let k = key(&d.key());
+                k == "all"
+                    || is_inherited(&k, &non_inheriting)
+                    || inherited_keys.contains(&k)
+                    || d.longhands.iter().any(|l| inherited_keys.contains(&key(l)))
             });
             for d in &mut block.decls {
-                let key = d.key();
-                if key != "all"
-                    && !is_inherited(&key, &non_inheriting)
-                    && !inherited_keys.contains(&key)
+                let k = key(&d.key());
+                if k != "all" && !is_inherited(&k, &non_inheriting) && !inherited_keys.contains(&k)
                 {
-                    d.longhands
-                        .retain(|l| is_inherited(l, &non_inheriting) || inherited_keys.contains(l));
+                    d.longhands.retain(|l| {
+                        let lk = key(l);
+                        is_inherited(&lk, &non_inheriting) || inherited_keys.contains(&lk)
+                    });
                 }
             }
         }
@@ -1729,11 +1819,13 @@ fn build_report_with_animated(
             .filter(|name| is_inherited(name, &non_inheriting) || inherited_keys.contains(*name))
             .cloned()
             .collect();
-        // Flow-relative properties don't inherit, so only the element's own
-        // cascade maps them.
+        // CDP reports an ancestor's animations on its own entry, not on the
+        // child's: use that entry's properties when judging this ancestor's
+        // declarations, and never fold them into the child's set.
+        let ancestor_animated = animated.ancestors.get(i).unwrap_or(&no_animated);
         let ancestor = NodeFacts {
             vars: info.map(|a| &a.vars),
-            flow: None,
+            flow,
             rejected: &[],
             inheriting: Some(&inheriting),
         };
@@ -1749,7 +1841,7 @@ fn build_report_with_animated(
             &non_inheriting,
             &inherited_all,
             &stop_on_unset,
-            animated,
+            ancestor_animated,
         );
         claimed.extend(set_here.iter().cloned());
         // A longhand decided here no longer reaches from a further ancestor.
@@ -1760,9 +1852,13 @@ fn build_report_with_animated(
             !set_here.contains(k) && (is_inherited(k, &non_inheriting) || more_parent.contains(k))
         });
         inherited_keys.extend(more_parent);
+        let queried_set: Option<HashSet<&str>> = queried
+            .and_then(|names| names.get(i))
+            .map(|names| names.iter().map(String::as_str).collect());
         let rules = shown_blocks(
             blocks,
             info.map(|a| &a.vars),
+            queried_set.as_ref(),
             opts.ua_rules,
             &mut hidden_ua,
             &mut declared,
@@ -1928,7 +2024,14 @@ const PAGE_INFO_JS: &str = r#"function (varNames, props, expand, checks) {
       // property is among the computed style's names.
       if (v || (defined = defined || new Set(cs)).has(n)) vars[n] = v;
     }
-    out.ancestors.push({ label: label(el), vars });
+    out.ancestors.push({
+      label: label(el),
+      vars,
+      flow: [
+        cs.getPropertyValue('writing-mode').trim(),
+        cs.getPropertyValue('direction').trim(),
+      ],
+    });
   }
   return out;
 }"#;
@@ -2029,32 +2132,32 @@ fn take_sheet_headers(client: &mut CdpClient, session_id: &str) -> HashMap<Strin
         .collect()
 }
 
-/// The property names in a `CSS.getAnimatedStylesForNode` reply, normalised to
-/// the keys the cascade uses. Both animations and transitions set properties
-/// outside the matched rules.
-fn animated_names(result: &Value) -> HashSet<String> {
-    // CDP puts each animation's style under `animationStyles[].style` and the
-    // transition's under `transitionsStyle`; both are `CSSStyle`s whose
-    // properties live in `cssProperties`.
-    items(&result["animationStyles"])
+/// The property names one `CSS.getAnimatedStylesForNode` entry sets,
+/// normalised to the keys the cascade uses. An entry describes the node itself
+/// or one ancestor in the inheritance chain: CDP puts each animation's style
+/// under `animationStyles[].style` and the transition's under
+/// `transitionsStyle`, both `CSSStyle`s with properties in `cssProperties`.
+fn animated_entry_names(entry: &Value) -> HashSet<String> {
+    items(&entry["animationStyles"])
         .iter()
-        .map(|entry| &entry["style"])
-        .chain(std::iter::once(&result["transitionsStyle"]))
+        .map(|animation| &animation["style"])
+        .chain(std::iter::once(&entry["transitionsStyle"]))
         .flat_map(|style| items(&style["cssProperties"]))
         .filter_map(|p| p["name"].as_str())
         .map(normalize_property_name)
         .collect()
 }
 
-/// Longhands a running animation or transition sets on the node. CDP reports
-/// these apart from the matched rules, so the cascade can avoid calling a
-/// static declaration active when something else currently sets its value.
-/// A browser without the call is treated as having no animated properties.
+/// Longhands a running animation or transition sets on the node and on each
+/// of its ancestors. CDP reports these apart from the matched rules, so the
+/// cascade can avoid calling a static declaration active when something else
+/// currently sets its value. A browser without the call is treated as having
+/// no animated properties anywhere in the chain.
 async fn animated_properties(
     client: &mut CdpClient,
     session_id: &str,
     node_id: i64,
-) -> Result<HashSet<String>> {
+) -> Result<AnimatedStyles> {
     let result = client
         .send_to_target(
             session_id,
@@ -2062,7 +2165,13 @@ async fn animated_properties(
             json!({"nodeId": node_id}),
         )
         .await?;
-    Ok(animated_names(&result))
+    Ok(AnimatedStyles {
+        element: animated_entry_names(&result),
+        ancestors: items(&result["inherited"])
+            .iter()
+            .map(animated_entry_names)
+            .collect(),
+    })
 }
 
 /// The page's labels and the animation list are enrichments: an ordinary
@@ -2080,11 +2189,11 @@ fn page_info_fallback(result: Result<PageInfo>, selector: &str) -> Result<PageIn
     }
 }
 
-fn animated_fallback(result: Result<HashSet<String>>) -> Result<HashSet<String>> {
+fn animated_fallback(result: Result<AnimatedStyles>) -> Result<AnimatedStyles> {
     match result {
         Ok(animated) => Ok(animated),
         Err(e) if is_connection_or_page_failure(&e) => Err(e),
-        Err(_) => Ok(HashSet::new()),
+        Err(_) => Ok(AnimatedStyles::default()),
     }
 }
 
@@ -2166,7 +2275,20 @@ async fn collect(
     // var() reference resolves to as one its property accepts. A page that
     // stops answering or a lost connection is no nicety: it must reach the
     // caller instead of starting another page call on the same renderer.
-    let names = ancestor_var_names(&matched);
+    // The element's cascade says which properties it takes from a parent, so
+    // an ancestor declaration that reaches it through an explicit `inherit`
+    // has the custom properties it references queried on that ancestor too.
+    // This pass precedes the page call that supplies labels and longhand
+    // expansions; its own defaults are enough for the key test, and anything
+    // it misses stays unknown rather than resolving to a guessed fallback.
+    let (_, _, inherited_keys) = element_cascade(
+        &matched,
+        &computed,
+        &sheets,
+        &PageInfo::default(),
+        &HashSet::new(),
+    );
+    let names = ancestor_var_names(&matched, &inherited_keys);
     let props = element_props_to_read(&matched, &computed, &opts.computed);
     let expand = shorthands_to_expand(&matched, &computed, &opts.computed);
     let checks = substituted_values(&matched, &custom_properties(&computed));
@@ -2183,7 +2305,13 @@ async fn collect(
     let animated = animated_fallback(animated_properties(client, session_id, node_id).await)?;
 
     Ok(build_report_with_animated(
-        &matched, &computed, &sheets, &page, opts, &animated,
+        &matched,
+        &computed,
+        &sheets,
+        &page,
+        opts,
+        &animated,
+        Some(&names),
     ))
 }
 
@@ -2205,25 +2333,25 @@ async fn disable_agents(
     session_id: &str,
     limit: std::time::Duration,
 ) -> Result<()> {
-    // The same session check `settle_dialog_within` uses: only then would the
-    // guarded send refuse to write.
-    let dialog_open = client
-        .open_dialog
-        .as_ref()
-        .is_some_and(|d| d.session_id.as_deref() == Some(session_id));
     client
         .send_raw_no_wait(Some(session_id), "CSS.disable", json!({}))
         .await?;
-    if dialog_open {
-        client
+    // Let the guarded send decide whether this session has a dialog. The
+    // public `open_dialog` only mirrors the newest one, which can belong to a
+    // different session; reading it would send DOM.disable through a guard
+    // that then refuses it and leaves the agent enabled. On that refusal,
+    // queue the write without the guard, as for CSS.disable.
+    match client
+        .send_to_target_within(session_id, "DOM.disable", json!({}), limit)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.downcast_ref::<DialogOpen>().is_some() => client
             .send_raw_no_wait(Some(session_id), "DOM.disable", json!({}))
-            .await?;
-    } else {
-        client
-            .send_to_target_within(session_id, "DOM.disable", json!({}), limit)
-            .await?;
+            .await
+            .map(|_| ()),
+        Err(e) => Err(e),
     }
-    Ok(())
 }
 
 /// Property names are case-insensitive; custom property names are not.
@@ -2333,6 +2461,7 @@ mod tests {
             ancestors: vec![AncestorInfo {
                 label: "body".into(),
                 vars: HashMap::from([("--fg".to_string(), "#222".to_string())]),
+                flow: None,
             }],
             depth: 1,
             shorthands: HashMap::from([("padding".to_string(), "8px".to_string())]),
@@ -2696,7 +2825,71 @@ Note: Matched rules, computed values and page details are read in separate reque
         let mut m = matched();
         m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] =
             authored(&[("color", "var(--fg)"), ("margin", "var(--m)")], &[]);
-        assert_eq!(ancestor_var_names(&m), vec![vec!["--fg".to_string()]]);
+        assert_eq!(
+            ancestor_var_names(&m, &HashSet::new()),
+            vec![vec!["--fg".to_string()]]
+        );
+    }
+
+    /// An explicitly inherited declaration brings its ancestor's `var()`
+    /// references along. A name that was not queried stays unknown rather
+    /// than showing its fallback as if it were resolved.
+    #[test]
+    fn explicit_inherit_queries_the_ancestors_variables() {
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = authored(
+            &[("background-color", "inherit")],
+            &[("background-color", "inherit")],
+        );
+        let value = "var(--tone, blue)";
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(
+            &[("background-color", value)],
+            &[("background-color", value)],
+        );
+
+        let (_, _, inherited_keys) =
+            element_cascade(&m, &computed(), &sheets(), &page(), &HashSet::new());
+        assert!(inherited_keys.contains("background-color"));
+        assert_eq!(
+            ancestor_var_names(&m, &inherited_keys),
+            vec![vec!["--tone".to_string()]]
+        );
+        // Without that key test the ancestor's `var(--tone, blue)` is never
+        // asked about, even though its row is shown.
+        let without = ancestor_var_names(&m, &HashSet::new());
+        assert!(!without[0].iter().any(|n| n == "--tone"));
+
+        // Queried names cover the fixture's inherited `color` but not the
+        // ancestor's `--tone`, so its fallback must stay unclaimed.
+        let unqueried = vec![vec!["--fg".to_string()]];
+        let report = build_report_with_animated(
+            &m,
+            &computed(),
+            &sheets(),
+            &page(),
+            &CssOptions::default(),
+            &AnimatedStyles::default(),
+            Some(&unqueried),
+        );
+        assert_eq!(report.inherited[0].rules[0].decls[0].resolved, None);
+
+        let mut info = page();
+        info.ancestors[0].vars.insert("--tone".into(), "red".into());
+        let queried = vec![vec!["--tone".to_string()]];
+        let report = build_report_with_animated(
+            &m,
+            &computed(),
+            &sheets(),
+            &info,
+            &CssOptions::default(),
+            &AnimatedStyles::default(),
+            Some(&queried),
+        );
+        assert_eq!(
+            report.inherited[0].rules[0].decls[0].resolved.as_deref(),
+            Some("red")
+        );
     }
 
     /// A stylesheet `@property` rule and a `CSS.registerProperty` call can
@@ -2725,7 +2918,10 @@ Note: Matched rules, computed values and page details are read in separate reque
         m["cssPropertyRules"] = regs["cssPropertyRules"].clone();
         let decls = [("--rule", "var(--a)"), ("--free", "var(--b)")];
         m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(&decls, &decls);
-        assert_eq!(ancestor_var_names(&m), vec![vec!["--b".to_string()]]);
+        assert_eq!(
+            ancestor_var_names(&m, &HashSet::new()),
+            vec![vec!["--b".to_string()]]
+        );
         let report = report_for(&m, CssOptions::default());
         let body: Vec<&str> = report.inherited[0].rules[0]
             .decls
@@ -3287,10 +3483,10 @@ Note: Matched rules, computed values and page details are read in separate reque
             ],
             "transitionsStyle": {"cssProperties": [{"name": "width", "value": "10px"}]},
         });
-        let animated = animated_names(&reply);
+        let animated = animated_entry_names(&reply);
         assert_eq!(animated, HashSet::from(["opacity".into(), "width".into()]));
         // A node with no animated styles has nothing to mark indeterminate.
-        assert!(animated_names(&json!({})).is_empty());
+        assert!(animated_entry_names(&json!({})).is_empty());
 
         let mut m = matched();
         m["matchedCSSRules"] = json!([]);
@@ -3304,7 +3500,11 @@ Note: Matched rules, computed values and page details are read in separate reque
             &sheets(),
             &page(),
             &CssOptions::default(),
-            &animated,
+            &AnimatedStyles {
+                element: animated,
+                ..Default::default()
+            },
+            None,
         );
         let decls = &report.rules[0].decls;
         assert_eq!(decls[0].status, Status::Indeterminate);
@@ -3315,6 +3515,101 @@ Note: Matched rules, computed values and page details are read in separate reque
         let json = report_json(&report).unwrap();
         assert_eq!(json["rules"][0]["properties"][0]["status"], "indeterminate");
         assert_eq!(json["rules"][0]["properties"][1]["status"], "active");
+    }
+
+    /// CDP reports an ancestor's animations on that ancestor's own entry. A
+    /// child's animated property must not make the parent's static declaration
+    /// indeterminate, while the parent's own animation must.
+    #[test]
+    fn an_ancestors_animation_is_used_only_for_that_ancestor() {
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = Value::Null;
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] =
+            authored(&[("color", "green")], &[("color", "green")]);
+        let names = |items: &[&str]| {
+            items
+                .iter()
+                .map(|n| (*n).to_string())
+                .collect::<HashSet<String>>()
+        };
+        let status = |element: HashSet<String>, ancestors: Vec<HashSet<String>>| {
+            let report = build_report_with_animated(
+                &m,
+                &computed(),
+                &sheets(),
+                &page(),
+                &CssOptions::default(),
+                &AnimatedStyles { element, ancestors },
+                None,
+            );
+            report.inherited[0].rules[0].decls[0].status
+        };
+        assert_eq!(
+            status(names(&["color"]), vec![HashSet::new()]),
+            Status::Active
+        );
+        assert_eq!(
+            status(HashSet::new(), vec![names(&["color"])]),
+            Status::Indeterminate
+        );
+    }
+
+    /// An ancestor's logical longhand reaches an explicitly inheriting child
+    /// under the physical side that ancestor's own flow gives it, not the
+    /// child's or the authored name.
+    #[test]
+    fn ancestor_logical_longhands_map_with_the_ancestors_flow() {
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = authored(&[("margin-left", "inherit")], &[("margin-left", "inherit")]);
+        let value = "20px";
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(
+            &[("margin-inline-start", value)],
+            &[("margin-inline-start", value)],
+        );
+        let info = |direction: &str| {
+            let mut info = page();
+            info.ancestors[0].flow = Some(("horizontal-tb".into(), direction.into()));
+            info
+        };
+        let report = build_report(
+            &m,
+            &computed(),
+            &sheets(),
+            &info("ltr"),
+            &CssOptions::default(),
+        );
+        let decl = &report.inherited[0].rules[0].decls[0];
+        assert_eq!(decl.name, "margin-inline-start");
+        assert_eq!(decl.status, Status::Active);
+
+        // The same LTR parent has no margin-right for a margin-left request,
+        // but an RTL parent maps the logical start to that side instead.
+        let report = build_report(
+            &m,
+            &computed(),
+            &sheets(),
+            &info("rtl"),
+            &CssOptions::default(),
+        );
+        assert!(report.inherited.is_empty());
+
+        m["inlineStyle"] = authored(
+            &[("margin-right", "inherit")],
+            &[("margin-right", "inherit")],
+        );
+        let report = build_report(
+            &m,
+            &computed(),
+            &sheets(),
+            &info("rtl"),
+            &CssOptions::default(),
+        );
+        assert_eq!(
+            report.inherited[0].rules[0].decls[0].name,
+            "margin-inline-start"
+        );
     }
 
     /// A stalled page or a lost connection during either optional enrichment
@@ -3337,9 +3632,8 @@ Note: Matched rules, computed values and page details are read in separate reque
         }
         let info = page_info_fallback(Err(anyhow::anyhow!("Method not found")), "p").unwrap();
         assert_eq!(info.element, "p");
-        assert!(animated_fallback(Err(anyhow::anyhow!("Method not found")))
-            .unwrap()
-            .is_empty());
+        let animated = animated_fallback(Err(anyhow::anyhow!("Method not found"))).unwrap();
+        assert!(animated.element.is_empty() && animated.ancestors.is_empty());
     }
 
     /// `<table cellspacing>` beats the user-agent stylesheet's spacing, and

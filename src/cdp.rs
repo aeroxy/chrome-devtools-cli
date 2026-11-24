@@ -62,6 +62,17 @@ impl std::fmt::Display for DialogOpen {
 
 impl std::error::Error for DialogOpen {}
 
+/// A failure applying the daemon's blocklist, tagged with whether the
+/// `Network.setBlockedURLs` write may have reached Chrome. A failure during
+/// `Network.enable` happens before the rule write (`write_attempted == false`),
+/// so the stored list can be restored; once the write was attempted its outcome
+/// is unknown and the new list must be kept.
+#[derive(Debug)]
+pub(crate) struct ApplyRulesError {
+    pub(crate) error: anyhow::Error,
+    pub(crate) write_attempted: bool,
+}
+
 /// The browser answers but the page doesn't. Usually a JavaScript dialog
 /// opened where this client couldn't see it (before it attached, or under a
 /// session it has since left): Chrome tells only the sessions that were
@@ -208,6 +219,11 @@ pub struct CdpClient {
     /// empty: a failed rollback can leave `Fetch.enable` in place. Keep
     /// reading between commands in that case so paused requests get answered.
     pub fetch_may_be_enabled: bool,
+    /// Sessions whose detach failed and that may still be intercepting
+    /// requests. Tracked per session so ending a later tab cannot clear the
+    /// interception state of one that is still live. Idle reads stay on while
+    /// any such session remains.
+    sessions_may_intercept: std::collections::HashSet<String>,
     /// `Fetch.requestPaused` events not yet answered. The page's request
     /// waits until they are, so every read answers them first.
     paused_requests: std::collections::VecDeque<Value>,
@@ -497,6 +513,7 @@ impl CdpClient {
             webauthn: None,
             network_mocks: Vec::new(),
             fetch_may_be_enabled: false,
+            sessions_may_intercept: std::collections::HashSet::new(),
             paused_requests: std::collections::VecDeque::new(),
             emulation_saved: std::collections::HashMap::new(),
         })
@@ -568,10 +585,13 @@ impl CdpClient {
                 }
                 Err(_) => {
                     // A failed detach can leave the old tab's Fetch interception
-                    // and paused requests alive. Answer them now, while the
-                    // active mocks still belong to that tab: once they are
-                    // replaced below, a URL match would send another tab's
-                    // mock to this page (and count its hit).
+                    // and paused requests alive. Remember it so a later tab's
+                    // successful detach cannot end the idle reads it still
+                    // needs. Answer its paused requests now, while the active
+                    // mocks still belong to that tab: once they are replaced
+                    // below, a URL match would send another tab's mock to this
+                    // page (and count its hit).
+                    self.sessions_may_intercept.insert(old_session.clone());
                     self.answer_paused_requests().await?;
                 }
             }
@@ -820,8 +840,19 @@ impl CdpClient {
     /// Falls back silently if no persistent session is active (e.g. during
     /// daemon startup or after a target switch that hasn't finished attaching).
     pub async fn apply_network_rules(&mut self) -> Result<()> {
+        self.apply_network_rules_reported()
+            .await
+            .map_err(|e| e.error)
+    }
+
+    /// As [`Self::apply_network_rules`], but reports whether the rule write was
+    /// attempted so a caller that changes `blocklist` can roll it back only
+    /// when the outcome is certain (see [`ApplyRulesError`]).
+    pub(crate) async fn apply_network_rules_reported(
+        &mut self,
+    ) -> std::result::Result<(), ApplyRulesError> {
         if let Some(ref session) = self.persistent_session.clone() {
-            self.apply_network_rules_internal(session).await?;
+            self.apply_network_rules_reported_for(session).await?;
         }
         Ok(())
     }
@@ -830,14 +861,31 @@ impl CdpClient {
     /// `Network.setBlockedURLs`. Used for both the persistent session and
     /// fallback per-command sessions (when the persistent one is unavailable).
     pub(crate) async fn apply_network_rules_internal(&mut self, session_id: &str) -> Result<()> {
+        self.apply_network_rules_reported_for(session_id)
+            .await
+            .map_err(|e| e.error)
+    }
+
+    async fn apply_network_rules_reported_for(
+        &mut self,
+        session_id: &str,
+    ) -> std::result::Result<(), ApplyRulesError> {
         self.send_to_target(session_id, "Network.enable", json!({}))
-            .await?;
+            .await
+            .map_err(|error| ApplyRulesError {
+                error,
+                write_attempted: false,
+            })?;
         self.send_to_target(
             session_id,
             "Network.setBlockedURLs",
             json!({"urls": self.blocklist}),
         )
-        .await?;
+        .await
+        .map_err(|error| ApplyRulesError {
+            error,
+            write_attempted: true,
+        })?;
         Ok(())
     }
 
@@ -1034,9 +1082,17 @@ impl CdpClient {
             if let Some(sid) = session_id {
                 // A liveness ping can leave the opening in `unread`. Note it
                 // before writing so this call settles or reports it first.
-                self.note_queued_dialogs_for(sid);
-                self.settle_dialog_within(sid, method, started, limit)
-                    .await?;
+                let queued = self.note_queued_dialogs_for(sid);
+                if let Err(e) = self.settle_dialog_within(sid, method, started, limit).await {
+                    // Only a dialog a ping set aside was necessarily open
+                    // before this call's write. One the action itself opened
+                    // is still in `open_dialogs` and must keep input_sent, or
+                    // a successful action would be reported as skipped.
+                    if queued {
+                        self.input_sent = false;
+                    }
+                    return Err(e);
+                }
             }
         }
         // Settlement can run past the limit when its reply arrives during a
@@ -1222,6 +1278,12 @@ impl CdpClient {
                         if other_session.is_some_and(|s| session_id.is_some_and(|sid| s != sid)) {
                             // Another session's dialog: recorded above for its
                             // own page, not ours to answer with this action.
+                            continue;
+                        }
+                        // A ping may have set the closing aside with the
+                        // opening. Apply it first, as the top-level branch
+                        // does, or this action can answer a later dialog.
+                        if self.take_queued_dialog_close(other_session.or(session_id)) {
                             continue;
                         }
                         self.handle_dialog_helper(
@@ -1491,7 +1553,8 @@ impl CdpClient {
     /// before the next command writes to that page. Only messages for that
     /// session are removed; everything else stays in `unread` in wire order,
     /// so other callers still get their replies and events.
-    fn note_queued_dialogs_for(&mut self, session_id: &str) {
+    fn note_queued_dialogs_for(&mut self, session_id: &str) -> bool {
+        let mut found = false;
         let mut i = 0;
         while i < self.unread.len() {
             let is_transition = serde_json::from_str::<Value>(&self.unread[i])
@@ -1507,10 +1570,12 @@ impl CdpClient {
                 if let Ok(msg) = serde_json::from_str::<Value>(&text) {
                     self.note_dialog_event(&msg);
                 }
+                found = true;
             } else {
                 i += 1;
             }
         }
+        found
     }
 
     /// Apply a closing a liveness ping set aside alongside its opening, so a
@@ -1628,22 +1693,27 @@ impl CdpClient {
         &self,
         session: Option<&str>,
     ) -> &[crate::commands::network_mock::NetworkMock] {
+        // A session whose mocks were stashed during a tab switch (the outgoing
+        // tab after a failed detach) can still pause requests while the new
+        // session is being attached, when `persistent_session` is still None.
+        // Its saved list is the source of truth for that session; the active
+        // list belongs to the outgoing tab only before the stash.
+        if let Some(session) = session {
+            if let Some(state) = self
+                .emulation_saved
+                .values()
+                .find(|state| state.session_id.as_deref().is_some_and(|s| s == session))
+            {
+                return &state.network_mocks;
+            }
+        }
         if session.is_none()
             || self.persistent_session.is_none()
             || self.persistent_session.as_deref() == session
         {
             return &self.network_mocks;
         }
-        self.emulation_saved
-            .values()
-            .find(|state| {
-                state
-                    .session_id
-                    .as_deref()
-                    .is_some_and(|s| Some(s) == session)
-            })
-            .map(|state| state.network_mocks.as_slice())
-            .unwrap_or(&[])
+        &[]
     }
 
     /// The matching mock in the same list [`Self::mocks_for_session`] chose, so
@@ -1653,21 +1723,24 @@ impl CdpClient {
         session: Option<&str>,
         index: usize,
     ) -> Option<&mut crate::commands::network_mock::NetworkMock> {
+        // Use the same list [`Self::mocks_for_session`] chose, so an
+        // attach-window pause credits the hit to the outgoing tab's saved mock.
+        if let Some(session) = session {
+            if let Some(state) = self
+                .emulation_saved
+                .values_mut()
+                .find(|state| state.session_id.as_deref().is_some_and(|s| s == session))
+            {
+                return state.network_mocks.get_mut(index);
+            }
+        }
         if session.is_none()
             || self.persistent_session.is_none()
             || self.persistent_session.as_deref() == session
         {
             return self.network_mocks.get_mut(index);
         }
-        self.emulation_saved
-            .values_mut()
-            .find(|state| {
-                state
-                    .session_id
-                    .as_deref()
-                    .is_some_and(|s| Some(s) == session)
-            })
-            .and_then(|state| state.network_mocks.get_mut(index))
+        None
     }
 
     /// Answer the requests the page is holding for a mock. Each stays queued
@@ -1698,7 +1771,13 @@ impl CdpClient {
     /// idle reads and drop the requests it left paused. Kept separate from a
     /// failed `Fetch.disable`: there the same session may still intercept.
     fn session_ended(&mut self, session_id: &str) {
-        self.fetch_may_be_enabled = false;
+        self.sessions_may_intercept.remove(session_id);
+        // Only stop reading when no other session may still be intercepting:
+        // a failed detach on an earlier tab leaves its Fetch domain live even
+        // though this tab's detach succeeded.
+        if self.sessions_may_intercept.is_empty() {
+            self.fetch_may_be_enabled = false;
+        }
         self.paused_requests
             .retain(|e| e["sessionId"].as_str() != Some(session_id));
     }
@@ -1709,6 +1788,7 @@ impl CdpClient {
         !self.network_mocks.is_empty()
             || !self.paused_requests.is_empty()
             || self.fetch_may_be_enabled
+            || !self.sessions_may_intercept.is_empty()
     }
 
     /// One read between commands: buffer what arrives and answer paused
@@ -2613,6 +2693,52 @@ mod tests {
         chrome.await.unwrap();
     }
 
+    /// A tab whose detach was refused may still intercept. Ending a later tab
+    /// must not stop idle reads while that earlier session is still live.
+    #[tokio::test]
+    async fn a_failed_detach_keeps_idle_reads_when_a_later_tab_ends() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let message = match call["method"].as_str() {
+                Some("Target.detachFromTarget") if call["params"]["sessionId"] == "S1" => {
+                    json!({"id": call["id"], "error": {"code": -32000, "message": "busy"}})
+                }
+                Some("Target.attachToTarget") if call["params"]["targetId"] == "T2" => {
+                    json!({"id": call["id"], "result": {"sessionId": "S2"}})
+                }
+                Some("Target.attachToTarget") => {
+                    json!({"id": call["id"], "result": {"sessionId": "S3"}})
+                }
+                _ => json!({"id": call["id"], "result": {}}),
+            };
+            (std::time::Duration::ZERO, vec![message])
+        })
+        .await;
+        client.persistent_session = Some("S1".into());
+        client.persistent_target_id = Some("T1".into());
+        client.fetch_may_be_enabled = true;
+        client.network_mocks = vec![crate::commands::network_mock::NetworkMock {
+            pattern: "*".into(),
+            resource_type: None,
+            action: crate::commands::network_mock::MockAction::Abort,
+            hits: 0,
+        }];
+        client
+            .ensure_persistent_session("T2")
+            .await
+            .expect("switch to the second tab");
+        assert!(client.sessions_may_intercept.contains("S1"));
+        client
+            .ensure_persistent_session("T3")
+            .await
+            .expect("switch to the third tab");
+        assert!(
+            client.wants_idle_reads(),
+            "S2's successful detach must not clear S1's interception"
+        );
+        drop(client);
+        chrome.await.unwrap();
+    }
+
     /// The check that the last quiet read ends in is the final one: checking
     /// again would stretch the call by another 15s at most.
     #[tokio::test]
@@ -3142,6 +3268,77 @@ mod tests {
         assert_eq!(calls, ["Page.handleJavaScriptDialog", "DOM.getDocument"]);
     }
 
+    /// A queued dialog that refuses the write before it reaches Chrome must
+    /// clear input progress. Otherwise the executor turns the skipped write
+    /// into a success, inviting a retry that would perform the action twice.
+    #[tokio::test]
+    async fn a_pre_write_dialog_refusal_clears_input_sent() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            (
+                std::time::Duration::ZERO,
+                vec![json!({"id": call["id"], "result": {}})],
+            )
+        })
+        .await;
+        // A liveness ping set the dialog opening aside for this session.
+        client.unread.push_back(opening("queued").to_string());
+        client.input_sent = true;
+        let error = client
+            .send_to_target("S", "Input.insertText", json!({"text": "x"}))
+            .await
+            .expect_err("the queued dialog blocks the write");
+        assert!(error.downcast_ref::<DialogOpen>().is_some(), "{error:#}");
+        assert!(
+            !client.input_sent,
+            "a write that never reached Chrome is not input progress"
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert!(
+            !calls.iter().any(|c| c == "Input.insertText"),
+            "the input was never written: {calls:?}"
+        );
+    }
+
+    /// A nested dialog whose closing a ping set aside must be consumed before
+    /// the handler answers it: otherwise the configured action answers a
+    /// dialog that opened after the queued close.
+    #[tokio::test]
+    async fn a_nested_dialog_uses_its_queued_close_before_answering() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            (
+                std::time::Duration::ZERO,
+                vec![json!({"id": call["id"], "result": {}})],
+            )
+        })
+        .await;
+        let d1 = dialog_from_event(&opening("first"));
+        // A ping set aside both the second dialog's opening and its closing.
+        client.unread.push_back(opening("second").to_string());
+        client.unread.push_back(
+            json!({"method": "Page.javascriptDialogClosed", "sessionId": "S", "params": {}})
+                .to_string(),
+        );
+        client
+            .handle_dialog_helper(
+                Some("S"),
+                "accept".into(),
+                d1,
+                "call",
+                tokio::time::Instant::now(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("the first dialog is answered");
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(
+            calls,
+            ["Page.handleJavaScriptDialog"],
+            "the queued close consumed the nested dialog, so no second answer was sent"
+        );
+    }
+
     /// Setup already enabled Network with the short setup budget. Enabling it
     /// again here would put the rest of setup on the ordinary call budget.
     #[tokio::test]
@@ -3462,6 +3659,79 @@ mod tests {
             .expect("the paused request was answered");
         assert_eq!(answered["sessionId"], "S-old");
         assert_eq!(answered["params"]["responseCode"], 200);
+        assert_eq!(
+            answered["params"]["body"],
+            base64::engine::general_purpose::STANDARD.encode("old")
+        );
+    }
+
+    /// A pause from the outgoing session can arrive while the new session's
+    /// attach is still pending, after the old mocks were stashed and before
+    /// `persistent_session` is set. It must still be answered by that tab's
+    /// saved mock and charge the hit there.
+    #[tokio::test]
+    async fn a_pause_during_attach_uses_the_outgoing_sessions_saved_mocks() {
+        use base64::Engine;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut calls = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: Value = serde_json::from_str(&text).unwrap();
+                let method = call["method"].as_str().unwrap_or_default().to_string();
+                let reply = match method.as_str() {
+                    "Target.detachFromTarget" => {
+                        json!({"id": call["id"], "error": {"code": -32000, "message": "busy"}})
+                    }
+                    "Target.attachToTarget" => {
+                        // The old session pauses a request before this attach
+                        // has a session of its own or a loaded mock list.
+                        let pause = json!({"method": "Fetch.requestPaused", "sessionId": "S-old",
+                            "params": {"requestId": "R",
+                                "request": {"url": "https://a.test/"}, "resourceType": "Fetch"}});
+                        ws.send(Message::Text(pause.to_string())).await.unwrap();
+                        json!({"id": call["id"], "result": {"sessionId": "S-new"}})
+                    }
+                    _ => json!({"id": call["id"], "result": {}}),
+                };
+                calls.push(call);
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+            calls
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        client.persistent_session = Some("S-old".into());
+        client.persistent_target_id = Some("T-old".into());
+        client.network_mocks = vec![crate::commands::network_mock::NetworkMock {
+            pattern: "*".into(),
+            resource_type: None,
+            action: crate::commands::network_mock::MockAction::Fulfill {
+                status: 200,
+                headers: vec![],
+                body: b"old".to_vec(),
+            },
+            hits: 0,
+        }];
+        client
+            .ensure_persistent_session("T-new")
+            .await
+            .expect("the switch succeeds despite the failed detach");
+        assert!(client.paused_requests.is_empty());
+        assert_eq!(
+            client.emulation_saved["T-old"].network_mocks[0].hits, 1,
+            "the outgoing tab's saved mock answered its own request"
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        let answered = calls
+            .iter()
+            .find(|call| call["method"] == "Fetch.fulfillRequest")
+            .expect("the paused request was answered");
+        assert_eq!(answered["sessionId"], "S-old");
         assert_eq!(
             answered["params"]["body"],
             base64::engine::general_purpose::STANDARD.encode("old")

@@ -299,7 +299,7 @@ Other page commands list the errors the page raised while they ran (uncaught exc
 | `mock-network <url-glob> --abort` | Fail matching requests with a network error |
 | `mock-network <url-glob> ... --resource-type <type>` | Only requests of one type (`Document`, `Script`, `Image`, `XHR`, `Fetch`, ...; Chrome reports `fetch()` as XHR when it intercepts, so `XHR` and `Fetch` each match both) |
 | `mock-network` | List the tab's mocks with hit counts |
-| `remove-network-mock [<url-glob>]` | Remove one mock, or all of them on the tab |
+| `remove-network-mock [<url-glob>]` | Remove all mocks with this glob (including mocks of different resource types), or all of them on the tab when no glob is given |
 
 Globs use `*` for any characters and `?` for exactly one. The latest matching mock wins, and the HTTP cache is off while any is set so cached responses can't bypass it. Mocks apply to requests on the tab's own session; cross-site iframe requests run in another process and are not paused. Mocks live on the daemon's session for the tab: they pause while the CLI works on another tab, and end when the daemon exits. A daemon with mocks keeps reading from the browser between commands, since a request waits for its answer, so it stays up while the page keeps making requests.
 
