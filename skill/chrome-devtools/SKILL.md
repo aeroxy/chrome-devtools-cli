@@ -838,7 +838,7 @@ chrome-devtools --target warm-squid configure-webauthn --protocol u2f --transpor
 chrome-devtools --target warm-squid configure-webauthn --remove
 ```
 
-- Omitted flags keep their current values. Defaults: `ctap2`, `internal` (a platform authenticator like Touch ID), resident keys and user verification on. `u2f` has neither, so `--has-resident-key true` or `--has-user-verification true` fails on a `u2f` authenticator, also one set up earlier: add `--protocol ctap2` to switch.
+- Omitted flags keep their current values, except on a switch to `u2f`: `u2f` has neither resident keys nor user verification, so switching to it turns both off even when omitted. Defaults: `ctap2`, `internal` (a platform authenticator like Touch ID), resident keys and user verification on. `--has-resident-key true` or `--has-user-verification true` fails on a `u2f` authenticator, also one set up earlier: add `--protocol ctap2` to switch.
 - The authenticator lives on the daemon's session for the tab (Chrome removes it when the session that added it detaches), so it lasts across commands on that tab until `--remove`, the tab closes, or the daemon exits.
 - **Working on another tab drops its credentials.** When the CLI comes back to the tab, it re-creates the authenticator with the same options but empty. Finish a register-then-sign-in flow on one tab.
 - `credentialId` is shown as the page sees it (`PublicKeyCredential.id`). Private keys are never printed.

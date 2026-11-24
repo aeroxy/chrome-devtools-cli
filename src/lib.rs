@@ -1762,6 +1762,9 @@ struct AttachedOption {
     short: &'static str,
     long: &'static str,
     value: String,
+    /// True for `-o=…`/`-p=…`/`-t=…`: explicit option syntax that must not be
+    /// reinterpreted as a trailing JavaScript expression.
+    explicit: bool,
 }
 
 impl AttachedOption {
@@ -1782,7 +1785,7 @@ impl AttachedOption {
 /// `token` is one. A lone `-offset` is JavaScript, and `-o`/`-p`/`-t` with no
 /// value take a separate token. The explicit `-o=` form may carry a
 /// dash-prefixed value; without `=` a leading dash means script data.
-fn attached_option_value(token: &str) -> Option<(&'static str, &'static str, String)> {
+fn attached_option_value(token: &str) -> Option<(&'static str, &'static str, String, bool)> {
     for (short, long) in [("-o", "--output"), ("-p", "--page"), ("-t", "--target")] {
         let Some(rest) = token.strip_prefix(short) else {
             continue;
@@ -1790,7 +1793,7 @@ fn attached_option_value(token: &str) -> Option<(&'static str, &'static str, Str
         let explicit = rest.starts_with('=');
         let value = rest.strip_prefix('=').unwrap_or(rest);
         if !value.is_empty() && (explicit || !value.starts_with('-')) {
-            return Some((short, long, value.to_string()));
+            return Some((short, long, value.to_string(), explicit));
         }
     }
     None
@@ -1853,6 +1856,7 @@ fn normalize_cli_args(args: &mut Vec<OsString>) {
             // them in reverse so inserted values don't shift later indices.
             // A lone `-offset` with no expression after it stays JavaScript.
             let mut pending: Vec<AttachedOption> = Vec::new();
+            let mut found_expression = false;
             let mut j = i + 1;
             while j < args.len() {
                 let Some(token) = args[j].to_str() else {
@@ -1863,33 +1867,50 @@ fn normalize_cli_args(args: &mut Vec<OsString>) {
                     // verbatim (`evaluate -oout.json -- -offset`), but an
                     // attached option before it still has to be split.
                     if j + 1 < args.len() {
-                        for option in pending.into_iter().rev() {
+                        for option in pending.drain(..).rev() {
                             option.apply(args);
                         }
                     }
+                    found_expression = true;
                     break;
                 }
                 if takes_value_token(token) && j + 1 < args.len() {
                     j += 2;
                     continue;
                 }
-                if let Some((short, long, value)) = attached_option_value(token) {
+                if let Some((short, long, value, explicit)) = attached_option_value(token) {
                     pending.push(AttachedOption {
                         idx: j,
                         short,
                         long,
                         value,
+                        explicit,
                     });
                     j += 1;
                     continue;
                 }
                 if token_supplies_expression(token, !pending.is_empty()) {
-                    for option in pending.into_iter().rev() {
+                    for option in pending.drain(..).rev() {
                         option.apply(args);
                     }
+                    found_expression = true;
                     break;
                 }
                 j += 1;
+            }
+            // If no separate expression followed: explicit `-o=`/`-p=`/`-t=`
+            // tokens are unambiguous option syntax (never script data), so
+            // apply them; among non-explicit attached tokens (e.g.
+            // `evaluate -oout.json -price`), reserve the last one as the
+            // expression and split every earlier option. A lone `-offset`
+            // stays untouched.
+            if !found_expression {
+                let last_implicit = pending.iter().rposition(|o| !o.explicit);
+                for (k, option) in pending.into_iter().enumerate().rev() {
+                    if Some(k) != last_implicit {
+                        option.apply(args);
+                    }
+                }
             }
         }
         return; // the first positional is the subcommand, whatever it is
@@ -3139,6 +3160,21 @@ mod tests {
         assert_eq!(cli.target.as_deref(), Some("win"));
         assert_eq!(expression(&cli), "1+1");
         assert!(output(&cli).ends_with("out.json"));
+
+        // When no separate expression follows, the last non-explicit attached
+        // token is reserved as the expression (`-price`), while earlier options
+        // still split. Explicit `=` forms stay option syntax and are not run as JS.
+        let cli = parse(&["evaluate", "-oout.json", "-price"]);
+        assert_eq!(expression(&cli), "-price");
+        assert!(output(&cli).ends_with("out.json"));
+        let mut explicit_missing = vec![
+            OsString::from("chrome-devtools"),
+            OsString::from("evaluate"),
+            OsString::from("-o=out.json"),
+            OsString::from("-p=0"),
+        ];
+        normalize_cli_args(&mut explicit_missing);
+        assert!(Cli::try_parse_from(explicit_missing).is_err());
 
         let cli = parse(&["evaluate", "-p0", "-oout.json", "-twin", "1+1"]);
         assert_eq!(cli.page, Some(0));

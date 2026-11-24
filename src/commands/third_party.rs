@@ -5,20 +5,19 @@ use crate::cdp::CdpClient;
 use crate::format::{format_structured, OutputFormat};
 use crate::result::CommandResult;
 
-/// Ask the page for its tool groups the way DevTools does: dispatch a
-/// `devtoolstooldiscovery` event whose `respondWith` hands back each group,
-/// then expose what came back as `window.__dtmcp`, which the list and execute
-/// expressions read, and return it. Pages that set `__dtmcp` themselves answer
-/// nothing and keep theirs; groups an earlier discovery installed are dropped
-/// once nothing answers, so a page that removed its listener stops listing its
-/// old tools, unless the page has since put its own list in their place. The
-/// page's own plural array, which answering discovery replaces, is restored
-/// when nothing answers again.
-/// A group missing a field, or holding a malformed tool, is skipped with a
-/// console error, and the other groups still count. Only the legacy path runs
-/// this: WebMCP needs none of it, and must not fail because of it.
-const DISCOVER_TOOLS_JS: &str = r#"async () => {
+/// How long the host waits after dispatching `devtoolstooldiscovery` for
+/// listeners that answer asynchronously (microtask or zero-delay timer).
+/// Waiting in Rust rather than via `window.setTimeout` keeps legacy tools
+/// working on pages that install fake timers.
+const DISCOVERY_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// First half of legacy tool discovery: dispatch `devtoolstooldiscovery` with
+/// `event.respondWith` and stash the collected groups under a shared symbol so
+/// the host can wait outside the page's timers before finalizing.
+const DISCOVER_START_JS: &str = r#"() => {
     const groups = [];
+    const key = Symbol.for('chrome-devtools-cli.discovery');
+    globalThis[key] = groups;
     const event = new CustomEvent('devtoolstooldiscovery');
     event.respondWith = (group) => {
         if (!group || typeof group.name !== 'string' || !Array.isArray(group.tools)
@@ -36,8 +35,22 @@ const DISCOVER_TOOLS_JS: &str = r#"async () => {
         groups.push(group);
     };
     window.dispatchEvent(event);
-    // A listener may answer from a microtask or a zero-delay timer.
-    await new Promise(r => setTimeout(r, 0));
+}"#;
+
+/// Second half of legacy tool discovery: take the groups collected since
+/// [`DISCOVER_START_JS`], expose them as `window.__dtmcp`, and return them.
+/// Pages that set `__dtmcp` themselves answer nothing and keep theirs; groups
+/// an earlier discovery installed are dropped once nothing answers, so a page
+/// that removed its listener stops listing its old tools, unless the page has
+/// since put its own list in their place. The page's own plural array, which
+/// answering discovery replaces, is restored when nothing answers again.
+const DISCOVER_FINALIZE_JS: &str = r#"() => {
+    const key = Symbol.for('chrome-devtools-cli.discovery');
+    const pending = globalThis[key];
+    delete globalThis[key];
+    // Copy so a late respondWith after the discovery window cannot mutate the
+    // exposed toolGroups array.
+    const groups = Array.isArray(pending) ? pending.slice() : [];
     if (groups.length === 0) {
         const dtmcp = window.__dtmcp;
         if (dtmcp && dtmcp.__discovered && dtmcp.toolGroups === dtmcp.__discovered) {
@@ -76,6 +89,29 @@ const DISCOVER_TOOLS_JS: &str = r#"async () => {
     return groups;
 }"#;
 
+/// Check WebMCP (`document.modelContext`) for `list-3p-tools`. Returns empty
+/// string when WebMCP is absent so the caller falls back to legacy discovery
+/// without touching `window.__dtmcp` on WebMCP pages.
+const WEBMCP_LIST_JS: &str = r#"(async () => {
+    if (document.modelContext && typeof document.modelContext.getTools === 'function') {
+        return document.modelContext.getTools().then(tools => JSON.stringify({
+            api: 'modelContext',
+            groups: [{
+                name: 'WebMCP',
+                description: 'Tools exposed via the WebMCP API',
+                tools: tools.map(t => ({
+                    name: t.name,
+                    description: t.description,
+                    inputSchema: t.inputSchema,
+                    annotations: t.annotations || null,
+                    origin: t.origin || null
+                }))
+            }]
+        })).catch(e => JSON.stringify({ error: e.message || String(e) }));
+    }
+    return '';
+})()"#;
+
 /// Tools take named parameters, so anything but a JSON object (an array, a
 /// bare string) is a mistake the page would otherwise have to make sense of.
 fn parse_tool_params(params: Option<&str>) -> Result<serde_json::Value> {
@@ -87,27 +123,11 @@ fn parse_tool_params(params: Option<&str>) -> Result<serde_json::Value> {
     Ok(parsed)
 }
 
-/// The page-side half of `list-3p-tools`. It is handed the discovery function
-/// and calls it only once WebMCP turns out to be missing.
-fn list_tools_js() -> String {
-    let list_expr = r#"async (discover) => {
-        if (document.modelContext && typeof document.modelContext.getTools === 'function') {
-            return document.modelContext.getTools().then(tools => JSON.stringify({
-                api: 'modelContext',
-                groups: [{
-                    name: 'WebMCP',
-                    description: 'Tools exposed via the WebMCP API',
-                    tools: tools.map(t => ({
-                        name: t.name,
-                        description: t.description,
-                        inputSchema: t.inputSchema,
-                        annotations: t.annotations || null,
-                        origin: t.origin || null
-                    }))
-                }]
-            })).catch(e => JSON.stringify({ error: e.message || String(e) }));
-        }
-        await discover();
+/// The legacy half of `list-3p-tools`, run after [`DISCOVER_START_JS`] and the
+/// host-controlled wait.
+fn legacy_list_js() -> String {
+    let list_expr = r#"(finalize) => {
+        finalize();
         const dtmcp = window.__dtmcp;
         if (!dtmcp) {
             return JSON.stringify({ api: 'none', groups: [] });
@@ -146,7 +166,33 @@ fn list_tools_js() -> String {
         }
         return JSON.stringify({ api: 'none', groups: [] });
     }"#;
-    format!("({list_expr})({DISCOVER_TOOLS_JS})")
+    format!("({list_expr})({DISCOVER_FINALIZE_JS})")
+}
+
+async fn evaluate_js(
+    client: &mut CdpClient,
+    session_id: &str,
+    expression: &str,
+) -> Result<serde_json::Value> {
+    let result = client
+        .send_to_target(
+            session_id,
+            "Runtime.evaluate",
+            json!({"expression": expression, "returnByValue": true, "awaitPromise": true}),
+        )
+        .await?;
+    if let Some(exception) = result.get("exceptionDetails") {
+        anyhow::bail!("{}", crate::remote_object::describe_exception(exception));
+    }
+    Ok(result)
+}
+
+/// Dispatch legacy discovery and wait on the host clock so fake page timers
+/// cannot stall the command.
+async fn start_discovery_and_wait(client: &mut CdpClient, session_id: &str) -> Result<()> {
+    evaluate_js(client, session_id, &format!("({DISCOVER_START_JS})()")).await?;
+    tokio::time::sleep(DISCOVERY_WAIT).await;
+    Ok(())
 }
 
 /// List third-party DevTools tools via WebMCP (`document.modelContext`) or
@@ -156,23 +202,20 @@ pub async fn list_3p_tools(
     session_id: &str,
     format: OutputFormat,
 ) -> Result<CommandResult> {
-    let result = client
-        .send_to_target(
-            session_id,
-            "Runtime.evaluate",
-            json!({"expression": list_tools_js(), "returnByValue": true, "awaitPromise": true}),
-        )
-        .await?;
+    let webmcp = evaluate_js(client, session_id, WEBMCP_LIST_JS).await?;
+    let val_str = match webmcp["result"]["value"].as_str() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            start_discovery_and_wait(client, session_id).await?;
+            let result = evaluate_js(client, session_id, &legacy_list_js()).await?;
+            result["result"]["value"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Failed to list third-party tools"))?
+                .to_string()
+        }
+    };
 
-    if let Some(exception) = result.get("exceptionDetails") {
-        anyhow::bail!("{}", crate::remote_object::describe_exception(exception));
-    }
-
-    let val_str = result["result"]["value"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Failed to list third-party tools"))?;
-
-    let val: serde_json::Value = serde_json::from_str(val_str)?;
+    let val: serde_json::Value = serde_json::from_str(&val_str)?;
     if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
         bail!("Failed to list tools: {err}");
     }
@@ -247,19 +290,16 @@ pub async fn list_3p_tools(
     }
 }
 
-/// The page-side half of `execute-3p-tool`: the WebMCP tool of that name if
-/// there is one, then a tool discovery hands back, then the legacy `__dtmcp`.
-fn execute_tool_js(name: &str, params: &serde_json::Value) -> Result<String> {
-    // Safe escaping of name and params: Re-serialize to get valid JSON literals
+/// WebMCP half of `execute-3p-tool`. Returns `{ fallback: true, hasModelContext }`
+/// when the tool wasn't found via WebMCP so the caller runs legacy discovery.
+fn webmcp_execute_js(name: &str, params: &serde_json::Value) -> Result<String> {
     let safe_name_json = serde_json::to_string(name)?;
     let safe_params_json = serde_json::to_string(params)?;
 
     Ok(format!(
         r#"(async () => {{
         const params = {safe_params_json};
-        let hasModelContext = false;
         if (document.modelContext && typeof document.modelContext.getTools === 'function') {{
-            hasModelContext = true;
             try {{
                 const tools = await document.modelContext.getTools();
                 const tool = tools.find(t => t.name === {safe_name_json});
@@ -267,11 +307,32 @@ fn execute_tool_js(name: &str, params: &serde_json::Value) -> Result<String> {
                     const result = await document.modelContext.executeTool(tool, params);
                     return JSON.stringify({{ api: 'modelContext', result }});
                 }}
+                return JSON.stringify({{ fallback: true, hasModelContext: true }});
             }} catch (e) {{
                 return JSON.stringify({{ error: e.message || String(e) }});
             }}
         }}
-        const discovered = await ({DISCOVER_TOOLS_JS})();
+        return JSON.stringify({{ fallback: true, hasModelContext: false }});
+    }})()"#
+    ))
+}
+
+/// Legacy half of `execute-3p-tool`, run after [`DISCOVER_START_JS`] and the
+/// host-controlled wait: tries discovered tools, then `dtmcp.executeTool`,
+/// then `toolGroups`/`toolGroup`.
+fn legacy_execute_js(
+    name: &str,
+    params: &serde_json::Value,
+    has_model_context: bool,
+) -> Result<String> {
+    let safe_name_json = serde_json::to_string(name)?;
+    let safe_params_json = serde_json::to_string(params)?;
+
+    Ok(format!(
+        r#"(async () => {{
+        const params = {safe_params_json};
+        const hasModelContext = {has_model_context};
+        const discovered = ({DISCOVER_FINALIZE_JS})();
         const dtmcp = window.__dtmcp;
         if (!dtmcp) {{
             const msg = hasModelContext
@@ -319,25 +380,36 @@ pub async fn execute_3p_tool(
     params: Option<&str>,
     format: OutputFormat,
 ) -> Result<CommandResult> {
-    let expr = execute_tool_js(name, &parse_tool_params(params)?)?;
-
-    let result = client
-        .send_to_target(
-            session_id,
-            "Runtime.evaluate",
-            json!({"expression": expr, "returnByValue": true, "awaitPromise": true}),
-        )
-        .await?;
-
-    if let Some(exception) = result.get("exceptionDetails") {
-        anyhow::bail!("{}", crate::remote_object::describe_exception(exception));
-    }
-
-    let val_str = result["result"]["value"]
+    let parsed_params = parse_tool_params(params)?;
+    let webmcp = evaluate_js(
+        client,
+        session_id,
+        &webmcp_execute_js(name, &parsed_params)?,
+    )
+    .await?;
+    let webmcp_str = webmcp["result"]["value"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Failed to execute third-party tool"))?;
+    let mut val: serde_json::Value = serde_json::from_str(webmcp_str)?;
 
-    let val: serde_json::Value = serde_json::from_str(val_str)?;
+    if val.get("fallback").and_then(|v| v.as_bool()) == Some(true) {
+        let has_model_context = val
+            .get("hasModelContext")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        start_discovery_and_wait(client, session_id).await?;
+        let legacy = evaluate_js(
+            client,
+            session_id,
+            &legacy_execute_js(name, &parsed_params, has_model_context)?,
+        )
+        .await?;
+        let legacy_str = legacy["result"]["value"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Failed to execute third-party tool"))?;
+        val = serde_json::from_str(legacy_str)?;
+    }
+
     if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
         bail!("Tool execution error: {err}");
     }
@@ -396,17 +468,30 @@ mod tests {
     /// working WebMCP call fail.
     #[test]
     fn webmcp_comes_before_discovery() {
-        let list = list_tools_js();
-        assert!(at(&list, "modelContext.getTools()") < at(&list, "await discover()"));
-        let exec = execute_tool_js("t", &json!({})).unwrap();
-        assert!(at(&exec, "modelContext.executeTool(") < at(&exec, "devtoolstooldiscovery"));
+        assert!(WEBMCP_LIST_JS.contains("modelContext.getTools()"));
+        assert!(!WEBMCP_LIST_JS.contains("devtoolstooldiscovery"));
+        let exec = webmcp_execute_js("t", &json!({})).unwrap();
+        assert!(exec.contains("modelContext.executeTool("));
+        assert!(!exec.contains("devtoolstooldiscovery"));
+    }
+
+    /// Legacy discovery waits on the host clock, not the page's `setTimeout`,
+    /// so fake timers in test pages cannot stall listing or execution.
+    #[test]
+    fn discovery_does_not_depend_on_page_timers() {
+        assert!(!DISCOVER_START_JS.contains("setTimeout"));
+        assert!(!DISCOVER_FINALIZE_JS.contains("setTimeout"));
+        assert!(!legacy_list_js().contains("setTimeout"));
+        assert!(!legacy_execute_js("t", &json!({}), false)
+            .unwrap()
+            .contains("setTimeout"));
     }
 
     /// A discovered tool runs its own `execute`, ahead of a legacy
     /// `executeTool` the page set itself, which need not know it.
     #[test]
     fn discovered_tools_run_their_own_handler() {
-        let exec = execute_tool_js("t", &json!({})).unwrap();
+        let exec = legacy_execute_js("t", &json!({}), false).unwrap();
         assert!(at(&exec, "of discovered)") < at(&exec, "dtmcp.executeTool("));
     }
 
@@ -418,11 +503,11 @@ mod tests {
     #[test]
     fn running_a_tool_looks_where_listing_does() {
         let rule = "Array.isArray(dtmcp.toolGroups) && dtmcp.toolGroups.length > 0";
-        assert!(list_tools_js().contains(rule));
-        let executor = &DISCOVER_TOOLS_JS[at(DISCOVER_TOOLS_JS, "dtmcp.executeTool = ")..];
+        assert!(legacy_list_js().contains(rule));
+        let executor = &DISCOVER_FINALIZE_JS[at(DISCOVER_FINALIZE_JS, "dtmcp.executeTool = ")..];
         assert!(executor.contains(rule), "{executor}");
         assert!(executor.contains("[dtmcp.toolGroup]"), "{executor}");
-        let exec = execute_tool_js("t", &json!({})).unwrap();
+        let exec = legacy_execute_js("t", &json!({}), false).unwrap();
         let fallback = &exec[at(&exec, "if (dtmcp.executeTool)")..];
         assert!(fallback.contains(rule), "{fallback}");
         assert!(fallback.contains("[dtmcp.toolGroup]"), "{fallback}");
@@ -430,9 +515,9 @@ mod tests {
 
     #[test]
     fn discovery_clears_only_the_groups_it_installed() {
-        assert!(DISCOVER_TOOLS_JS.contains("dtmcp.__discovered = groups;"));
-        assert!(DISCOVER_TOOLS_JS.contains("dtmcp.toolGroups === dtmcp.__discovered"));
-        assert!(!DISCOVER_TOOLS_JS.contains("__discovered = true"));
+        assert!(DISCOVER_FINALIZE_JS.contains("dtmcp.__discovered = groups;"));
+        assert!(DISCOVER_FINALIZE_JS.contains("dtmcp.toolGroups === dtmcp.__discovered"));
+        assert!(!DISCOVER_FINALIZE_JS.contains("__discovered = true"));
     }
 
     /// A page that answers discovery with its own `toolGroups` set gets that
@@ -440,22 +525,28 @@ mod tests {
     /// replacing it, and restores it on the first unanswered run.
     #[test]
     fn discovery_restores_the_pages_own_tool_groups() {
-        let save = at(DISCOVER_TOOLS_JS, "dtmcp.toolGroups !== dtmcp.__discovered");
+        let save = at(
+            DISCOVER_FINALIZE_JS,
+            "dtmcp.toolGroups !== dtmcp.__discovered",
+        );
         let assign = at(
-            DISCOVER_TOOLS_JS,
+            DISCOVER_FINALIZE_JS,
             "dtmcp.__beforeDiscovery = dtmcp.toolGroups",
         );
         let restore = at(
-            DISCOVER_TOOLS_JS,
+            DISCOVER_FINALIZE_JS,
             "dtmcp.toolGroups = dtmcp.__beforeDiscovery",
         );
-        let clear = at(DISCOVER_TOOLS_JS, "dtmcp.toolGroups === dtmcp.__discovered");
+        let clear = at(
+            DISCOVER_FINALIZE_JS,
+            "dtmcp.toolGroups === dtmcp.__discovered",
+        );
         assert!(save < assign);
         // The restore only runs on the unanswered path, ahead of the save
         // and replacement on an answered one.
         assert!(clear < restore);
-        assert!(restore < at(DISCOVER_TOOLS_JS, "dtmcp.toolGroups = groups;"));
-        assert!(DISCOVER_TOOLS_JS.contains("delete dtmcp.__beforeDiscovery;"));
-        assert!(DISCOVER_TOOLS_JS.contains("delete dtmcp.__discovered;"));
+        assert!(restore < at(DISCOVER_FINALIZE_JS, "dtmcp.toolGroups = groups;"));
+        assert!(DISCOVER_FINALIZE_JS.contains("delete dtmcp.__beforeDiscovery;"));
+        assert!(DISCOVER_FINALIZE_JS.contains("delete dtmcp.__discovered;"));
     }
 }

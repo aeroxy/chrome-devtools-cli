@@ -382,7 +382,14 @@ pub(crate) async fn emulate_tab(
     let saved_has_media = saved_tab
         .and_then(|t| client.emulation_saved.get(t))
         .is_some_and(|s| s.media.is_some());
-    if params.clear_media || (params.clear_all && (client.media.is_some() || saved_has_media)) {
+    // `client.media` belongs to the persistent session; a one-off session on
+    // another tab must inspect and update only that tab's saved entry.
+    let target_has_media = if persistent {
+        client.media.is_some()
+    } else {
+        saved_has_media
+    };
+    if params.clear_media || (params.clear_all && target_has_media) {
         // Only forget the old override once Chrome acknowledges the reset. A
         // dialog can stop the call before it is even written, in which case
         // Chrome still has `print` and a forgotten cache would make `--clear-all`
@@ -396,8 +403,9 @@ pub(crate) async fn emulate_tab(
             )
             .await;
         let acknowledged = result.is_ok();
-        media_after_clear(&mut client.media, acknowledged);
-        if let Some(saved) = saved_tab.and_then(|t| client.emulation_saved.get_mut(t)) {
+        if persistent {
+            media_after_clear(&mut client.media, acknowledged);
+        } else if let Some(saved) = saved_tab.and_then(|t| client.emulation_saved.get_mut(t)) {
             media_after_clear(&mut saved.media, acknowledged);
         }
         result?;
@@ -517,7 +525,7 @@ pub(crate) async fn emulate_tab(
         return current_overrides(
             client.viewport.as_ref(),
             client.geolocation.as_ref(),
-            client.media.as_ref(),
+            client.media.as_ref().filter(|_| persistent),
             saved_media,
             &client.blocklist,
             format,

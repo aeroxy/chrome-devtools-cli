@@ -99,14 +99,19 @@ fn element_center_js(selector: &str, allow_label: bool) -> Result<String> {
             }}
             {label_logic}{reaches}
             for (const {{rect: r}} of candidates) {{
-                const x = r.x + r.width / 2, y = r.y + r.height / 2;
-                if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;
+                const left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
+                const top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
+                if (right <= left || bottom <= top) continue;
+                const x = (left + right) / 2, y = (top + bottom) / 2;
                 if (reaches(document.elementFromPoint(x, y))) return JSON.stringify({{x, y}});
             }}
             if (getComputedStyle(el).visibility === 'hidden') {{
                 return JSON.stringify({{error: "Element is hidden with visibility:hidden: " + {escaped}}});
             }}
-            const x = Math.round(rect.x + rect.width / 2), y = Math.round(rect.y + rect.height / 2);
+            const cl = Math.max(0, rect.left), cr = Math.min(innerWidth, rect.right);
+            const ct = Math.max(0, rect.top), cb = Math.min(innerHeight, rect.bottom);
+            const x = Math.round(cr > cl ? (cl + cr) / 2 : rect.x + rect.width / 2);
+            const y = Math.round(cb > ct ? (ct + cb) / 2 : rect.y + rect.height / 2);
             const top = document.elementFromPoint(x, y);
             if (!top) {{
                 return JSON.stringify({{error: "Element is outside the visible page, and scrolling doesn't bring it in: " + {escaped}}});
@@ -557,9 +562,10 @@ where
     }
 }
 
-/// Drop this session's load events that predate the matched start. The
-/// `getFrameTree` reply can follow a load of the navigation just started, and
-/// that load must still complete the wait.
+/// Drop this session's load completions and main-frame commits that predate the
+/// matched start. The `getFrameTree` reply can follow events of the navigation
+/// just started, so anything at or after `start_index` stays eligible while
+/// earlier document events cannot end the wait or count as a new commit.
 fn drop_loads_before_start(
     events: &mut std::collections::VecDeque<serde_json::Value>,
     session_id: &str,
@@ -568,8 +574,9 @@ fn drop_loads_before_start(
 ) {
     let mut index = 0;
     events.retain(|e| {
-        let before_start =
-            index < start_index && load_completion_matches(e, session_id, main_frame_id);
+        let before_start = index < start_index
+            && (load_completion_matches(e, session_id, main_frame_id)
+                || is_main_frame_commit(e, session_id, main_frame_id));
         index += 1;
         !before_start
     });
@@ -626,7 +633,8 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
     // A start can also follow the fragment in the buffer without a commit
     // there yet; that reload is still loading, so its start keeps the wait
     // alive instead of ending it on the same-document match.
-    let committed = main_frame_committed(&client.events, session_id, &main_frame_id);
+    let committed =
+        main_frame_committed_from(&client.events, session_id, &main_frame_id, start_index);
     // The matched event can be a fragment change while a reload's start is
     // still buffered behind it. That start — not the fragment's index — is the
     // load-completion boundary: a load before it belongs to the old document.
@@ -641,8 +649,13 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
         // `Page.loadEventFired` carries no frame ID. One buffered before this
         // start belongs to the previous document; one after it belongs to the
         // navigation being waited on, even if it arrived before the frame-tree
-        // reply. The same applies to a main-frame `frameStoppedLoading`.
+        // reply. The same applies to a main-frame `frameStoppedLoading` and an
+        // earlier document's `Page.frameNavigated`.
         drop_loads_before_start(&mut client.events, session_id, &main_frame_id, boundary);
+    } else {
+        // Same-document match with a buffered commit at or after `start_index`:
+        // drop any earlier stale commit so the final check stays bounded too.
+        drop_loads_before_start(&mut client.events, session_id, &main_frame_id, start_index);
     }
 
     // A full navigation started on the main frame, so wait for it to finish
@@ -673,17 +686,33 @@ fn main_frame_start_index(
     })
 }
 
+/// Whether `event` is a main-frame document commit on `session_id`.
+fn is_main_frame_commit(event: &serde_json::Value, session_id: &str, main_frame_id: &str) -> bool {
+    event["method"] == "Page.frameNavigated"
+        && event["sessionId"].as_str() == Some(session_id)
+        && event["params"]["frame"]["id"].as_str() == Some(main_frame_id)
+}
+
+/// Whether a main-frame document commit is buffered at or after `from`.
+fn main_frame_committed_from(
+    events: &std::collections::VecDeque<serde_json::Value>,
+    session_id: &str,
+    main_frame_id: &str,
+    from: usize,
+) -> bool {
+    events
+        .iter()
+        .skip(from)
+        .any(|e| is_main_frame_commit(e, session_id, main_frame_id))
+}
+
 /// Whether a main-frame document commit is already buffered for this page.
 fn main_frame_committed(
     events: &std::collections::VecDeque<serde_json::Value>,
     session_id: &str,
     main_frame_id: &str,
 ) -> bool {
-    events.iter().any(|e| {
-        e["method"] == "Page.frameNavigated"
-            && e["sessionId"].as_str() == Some(session_id)
-            && e["params"]["frame"]["id"].as_str() == Some(main_frame_id)
-    })
+    main_frame_committed_from(events, session_id, main_frame_id, 0)
 }
 
 /// IDs of the open tabs, to tell afterwards which ones an action opened.
@@ -2488,6 +2517,29 @@ mod tests {
         assert_eq!(events[0]["params"]["frameId"], "CHILD");
         assert_eq!(events[1]["method"], "Page.frameStartedLoading");
         assert_eq!(events[2]["method"], "Page.loadEventFired");
+    }
+
+    /// A main-frame commit buffered before the selected navigation's start
+    /// belongs to an earlier document and must not count as a commit for the
+    /// new navigation when it stops without committing (e.g. a 204 reply).
+    #[test]
+    fn a_stale_commit_before_the_start_is_dropped() {
+        let commit = |frame| {
+            json!({"sessionId": "s1", "method": "Page.frameNavigated",
+                   "params": {"frame": {"id": frame}}})
+        };
+        let mut events: std::collections::VecDeque<_> = [
+            commit("MAIN"), // earlier document
+            json!({"sessionId": "s1", "method": "Page.frameStartedLoading",
+                   "params": {"frameId": "MAIN"}}),
+            commit("CHILD"),
+        ]
+        .into();
+        drop_loads_before_start(&mut events, "s1", "MAIN", 1);
+        assert!(!main_frame_committed(&events, "s1", "MAIN"));
+        // A commit at or after the start is kept.
+        events.push_back(commit("MAIN"));
+        assert!(main_frame_committed(&events, "s1", "MAIN"));
     }
 
     #[test]
