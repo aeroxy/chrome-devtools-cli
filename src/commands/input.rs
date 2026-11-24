@@ -25,18 +25,39 @@ fn element_center_js(selector: &str) -> Result<String> {
         r#"(() => {{
             const el = document.querySelector({escaped});
             if (!el) return JSON.stringify({{error: "Element not found: " + {escaped}}});
-            let rect = el.getBoundingClientRect();
-            if (rect.width === 0 || rect.height === 0) {{
+            // A zero-size wrapper can still show an absolutely positioned
+            // child. Anything inside `el` counts as a hit, so its bounds are
+            // candidates too: don't refuse the wrapper before hit testing.
+            const boxes = () => {{
+                const out = [];
+                const own = el.getBoundingClientRect();
+                if (own.width > 0 && own.height > 0) out.push({{node: el, rect: own}});
+                for (const r of el.getClientRects()) {{
+                    if (r.width > 0 && r.height > 0) out.push({{node: el, rect: r}});
+                }}
+                for (const child of el.querySelectorAll('*')) {{
+                    const style = getComputedStyle(child);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    const r = child.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) out.push({{node: child, rect: r}});
+                }}
+                return out;
+            }};
+            let candidates = boxes();
+            if (candidates.length === 0) {{
                 return JSON.stringify({{error: "Element has no size, so it can't be clicked or hovered (hidden with display:none, collapsed, or empty): " + {escaped}}});
             }}
+            let rect = candidates[0].rect;
             const cx = rect.x + rect.width / 2, cy = rect.y + rect.height / 2;
             if (cx < 0 || cy < 0 || cx >= innerWidth || cy >= innerHeight) {{
-                el.scrollIntoView({{block: 'center', inline: 'center', behavior: 'instant'}});
-                rect = el.getBoundingClientRect();
+                candidates[0].node.scrollIntoView({{block: 'center', inline: 'center', behavior: 'instant'}});
+                candidates = boxes();
+                rect = candidates[0].rect;
             }}
             const reaches = hit => hit && (el.contains(hit) || hit.closest('label')?.control === el);
-            for (const r of [rect, ...el.getClientRects()]) {{
+            for (const {{rect: r}} of candidates) {{
                 const x = r.x + r.width / 2, y = r.y + r.height / 2;
+                if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;
                 if (reaches(document.elementFromPoint(x, y))) return JSON.stringify({{x, y}});
             }}
             if (getComputedStyle(el).visibility === 'hidden') {{
@@ -203,8 +224,21 @@ pub async fn click(
             )
         }
         "not_option" => {
+            // Snapshot the tabs before resolving the point: the hit test and
+            // the pointer move are separate round trips, and a page update in
+            // between could otherwise move the element off the stored point.
+            let pages_before = page_ids_before(client).await?;
             let (x, y) = get_element_center(client, session_id, selector).await?;
-            click_at(client, session_id, x, y, Some(initial_url)).await
+            click_point(
+                client,
+                session_id,
+                x,
+                y,
+                Some(initial_url),
+                Some(selector),
+                pages_before,
+            )
+            .await
         }
         refused => Err(option_refusal(refused, selector)),
     }
@@ -296,17 +330,22 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
             Err(_) => return Ok(false),
         }
     }
-    if method != "Page.frameStartedLoading" {
-        // Same document: the URL comparison reports it.
+    // A fragment change and a reload can both be buffered. The first match
+    // is not the whole story: a later main-frame commit means a new document,
+    // which the URL comparison alone would miss when the URL is unchanged.
+    let committed = main_frame_committed(&client.events, session_id, &main_frame_id);
+    if method != "Page.frameStartedLoading" && !committed {
         return Ok(false);
     }
 
-    // `Page.loadEventFired` carries no frame or session ID. One buffered
-    // before this start belongs to the previous document, so drop those and
-    // wait only for a load that arrives after the navigation began.
-    client
-        .events
-        .retain(|e| e["method"] != "Page.loadEventFired");
+    if method == "Page.frameStartedLoading" {
+        // `Page.loadEventFired` carries no frame or session ID. One buffered
+        // before this start belongs to the previous document, so drop those
+        // and wait only for a load that arrives after the navigation began.
+        client
+            .events
+            .retain(|e| e["method"] != "Page.loadEventFired");
+    }
 
     // A full navigation started on the main frame, so wait for it to finish loading
     let _ = client
@@ -323,11 +362,24 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
         )
         .await;
     // Loading can stop without a new document (a download, a 204 reply).
-    Ok(client.events.iter().any(|e| {
+    Ok(main_frame_committed(
+        &client.events,
+        session_id,
+        &main_frame_id,
+    ))
+}
+
+/// Whether a main-frame document commit is already buffered for this page.
+fn main_frame_committed(
+    events: &std::collections::VecDeque<serde_json::Value>,
+    session_id: &str,
+    main_frame_id: &str,
+) -> bool {
+    events.iter().any(|e| {
         e["method"] == "Page.frameNavigated"
             && e["sessionId"].as_str() == Some(session_id)
-            && e["params"]["frame"]["id"].as_str() == Some(&main_frame_id)
-    }))
+            && e["params"]["frame"]["id"].as_str() == Some(main_frame_id)
+    })
 }
 
 /// IDs of the open tabs, to tell afterwards which ones an action opened.
@@ -340,13 +392,32 @@ async fn page_ids(client: &mut CdpClient) -> Result<std::collections::HashSet<St
         .collect())
 }
 
+/// The inventory is only for notes: an ordinary failure must not stop an
+/// action that was about to run. A lost connection is different — the daemon
+/// has to retire that socket. `None` means no snapshot, not an empty page set
+/// (which would mark every existing tab as new).
+async fn page_ids_before(
+    client: &mut CdpClient,
+) -> Result<Option<std::collections::HashSet<String>>> {
+    match page_ids(client).await {
+        Ok(ids) => Ok(Some(ids)),
+        Err(e) if e.downcast_ref::<crate::cdp::ConnectionLost>().is_some() => {
+            Err(e.context("Could not list the open tabs before the input"))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 /// One stderr note per tab that appeared since `before`, so the caller learns
 /// its name instead of carrying on in the old tab.
 async fn opened_pages(
     client: &mut CdpClient,
     session_id: &str,
-    before: &std::collections::HashSet<String>,
+    before: Option<&std::collections::HashSet<String>>,
 ) -> Result<Vec<String>> {
+    let Some(before) = before else {
+        return Ok(Vec::new());
+    };
     // The action already ran, so a lost connection is not an optional note:
     // the daemon has to retire the dead socket. An ordinary query failure
     // still just leaves the note out.
@@ -362,7 +433,8 @@ async fn opened_pages(
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let notes = new_tab_notes(infos, before, None);
+    let requested = action_requested_new_tab(&client.events, session_id);
+    let notes = new_tab_notes(infos, before, None, requested);
     if notes.is_empty() {
         return Ok(notes);
     }
@@ -378,18 +450,37 @@ async fn opened_pages(
     let own_id = own
         .as_ref()
         .and_then(|info| info["targetInfo"]["targetId"].as_str());
-    Ok(new_tab_notes(infos, before, own_id))
+    Ok(new_tab_notes(infos, before, own_id, requested))
+}
+
+/// Whether the input itself asked for a new tab. A timer on the page can open
+/// a popup during a command that does nothing; the popup still names the
+/// acting tab as its opener. Only a navigation request from this page's frame
+/// during the action ties creation to the action.
+fn action_requested_new_tab(
+    events: &std::collections::VecDeque<serde_json::Value>,
+    session_id: &str,
+) -> bool {
+    events.iter().any(|e| {
+        e["sessionId"].as_str() == Some(session_id)
+            && e["method"] == "Page.frameRequestedNavigation"
+            && matches!(
+                e["params"]["disposition"].as_str(),
+                Some("newWindow" | "newForegroundTab" | "newBackgroundTab")
+            )
+    })
 }
 
 /// Notes for the page targets in `infos` (`Target.getTargets`) missing from
-/// `before`. Chrome names the tab that opened one, even through `noopener`:
-/// `[opened: …]` is a tab `acting` opened (a `target=_blank` link, a
-/// `window.open` button). Any other, such as one a person opened meanwhile,
-/// is only `[new tab: …]`, since the action can't be shown to have opened it.
+/// `before`. Chrome names the opener of a tab even through `noopener`, but a
+/// timer on the acting page can open one too: `[opened: …]` needs both that
+/// opener and a navigation request from the action. Everything else, such as
+/// a tab a person opened meanwhile, is only `[new tab: …]`.
 fn new_tab_notes(
     infos: &[serde_json::Value],
     before: &std::collections::HashSet<String>,
     acting: Option<&str>,
+    requested: bool,
 ) -> Vec<String> {
     infos
         .iter()
@@ -399,9 +490,10 @@ fn new_tab_notes(
             if before.contains(id) {
                 return None;
             }
-            let label = match t["openerId"].as_str() {
-                Some(opener) if Some(opener) == acting => "opened",
-                _ => "new tab",
+            let label = if requested && t["openerId"].as_str().is_some_and(|o| Some(o) == acting) {
+                "opened"
+            } else {
+                "new tab"
             };
             let url = t["url"].as_str().unwrap_or_default();
             Some(format!(
@@ -412,7 +504,8 @@ fn new_tab_notes(
         .collect()
 }
 
-/// Click at absolute page coordinates (x, y).
+/// Click at absolute page coordinates (x, y). An explicit coordinate action:
+/// no selector hit test or recheck; the caller owns the coordinates.
 pub async fn click_at(
     client: &mut CdpClient,
     session_id: &str,
@@ -420,22 +513,50 @@ pub async fn click_at(
     y: f64,
     initial_url: Option<String>,
 ) -> Result<CommandResult> {
+    let pages_before = page_ids_before(client).await?;
+    click_point(client, session_id, x, y, initial_url, None, pages_before).await
+}
+
+/// Dispatch a click at `x, y`. With a selector, moving the pointer can change
+/// layout (`:hover`), so re-resolve the hit before pressing and follow the
+/// element if it moved.
+async fn click_point(
+    client: &mut CdpClient,
+    session_id: &str,
+    mut x: f64,
+    mut y: f64,
+    initial_url: Option<String>,
+    selector: Option<&str>,
+    pages_before: Option<std::collections::HashSet<String>>,
+) -> Result<CommandResult> {
     let initial_url = match initial_url {
         Some(url) => url,
         None => client.current_url(session_id).await?,
     };
-    let pages_before = page_ids(client).await?;
     // Everything Chrome sent before that reply has been read by now, so what
     // gets buffered from here on came after the action began.
     client.clear_events();
+    let moved = |e| {
+        before_action(
+            e,
+            "Moving the pointer there opened a dialog, so the click was not sent",
+        )
+    };
     dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0)
         .await
-        .map_err(|e| {
-            before_action(
-                e,
-                "Moving the pointer there opened a dialog, so the click was not sent",
-            )
-        })?;
+        .map_err(moved)?;
+    if let Some(selector) = selector {
+        let (new_x, new_y) = get_element_center(client, session_id, selector)
+            .await
+            .map_err(moved)?;
+        if (new_x, new_y) != (x, y) {
+            x = new_x;
+            y = new_y;
+            dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0)
+                .await
+                .map_err(moved)?;
+        }
+    }
     // The press starts the click: the page may act on it, as on a person's.
     client.input_sent = true;
     dispatch_mouse(client, session_id, "mousePressed", x, y, "left", 1).await?;
@@ -451,7 +572,7 @@ pub async fn click_at(
         initial_url,
         new_document,
     );
-    result.notes = opened_pages(client, session_id, &pages_before).await?;
+    result.notes = opened_pages(client, session_id, pages_before.as_ref()).await?;
     Ok(result)
 }
 
@@ -879,7 +1000,7 @@ pub async fn press_key(
 ) -> Result<CommandResult> {
     let spec = parse_key_spec(key)?;
     let initial_url = client.current_url(session_id).await?;
-    let pages_before = page_ids(client).await?;
+    let pages_before = page_ids_before(client).await?;
     // Everything Chrome sent before that reply has been read by now, so what
     // gets buffered from here on came after the key press.
     client.clear_events();
@@ -894,7 +1015,7 @@ pub async fn press_key(
         initial_url,
         new_document,
     );
-    result.notes = opened_pages(client, session_id, &pages_before).await?;
+    result.notes = opened_pages(client, session_id, pages_before.as_ref()).await?;
     Ok(result)
 }
 
@@ -1323,10 +1444,11 @@ mod tests {
         );
     }
 
-    /// A tab counts as opened by the action only when this tab opened it;
-    /// Chrome names the opener even of a `noopener` link.
+    /// An opener ID alone is not proof the action opened the tab: a timer on
+    /// the same page could have. The navigation request from the action is
+    /// needed as well.
     #[test]
-    fn new_tabs_are_credited_to_the_action_only_when_this_tab_opened_them() {
+    fn new_tabs_need_action_evidence_as_well_as_the_opener() {
         let before: std::collections::HashSet<String> = ["A".to_string(), "B".to_string()].into();
         let infos = [
             json!({"targetId": "A", "type": "page", "url": "https://a.test/"}),
@@ -1336,8 +1458,17 @@ mod tests {
             json!({"targetId": "F", "type": "service_worker", "url": "https://a.test/sw.js", "openerId": "A"}),
         ];
         let name = crate::friendly::to_friendly;
+        // Same-document creation during the command: no tab is credited.
         assert_eq!(
-            new_tab_notes(&infos, &before, Some("A")),
+            new_tab_notes(&infos, &before, Some("A"), false),
+            [
+                format!("[new tab: {} https://a.test/pop]", name("C")),
+                format!("[new tab: {} about:blank]", name("D")),
+                format!("[new tab: {} https://b.test/]", name("E")),
+            ]
+        );
+        assert_eq!(
+            new_tab_notes(&infos, &before, Some("A"), true),
             [
                 format!("[opened: {} https://a.test/pop]", name("C")),
                 format!("[new tab: {} about:blank]", name("D")),
@@ -1345,12 +1476,32 @@ mod tests {
             ]
         );
         // Without knowing which tab acted, no tab is credited to the action.
-        let unplaced = new_tab_notes(&infos, &before, None);
+        let unplaced = new_tab_notes(&infos, &before, None, true);
         assert_eq!(unplaced.len(), 3);
         assert!(
             unplaced.iter().all(|n| n.starts_with("[new tab: ")),
             "{unplaced:?}"
         );
+    }
+
+    /// The evidence is a new-window navigation request from this page's frame,
+    /// not one for the current tab or from another session.
+    #[test]
+    fn a_new_tab_request_from_the_action_is_recognised() {
+        let request = |session, disposition| {
+            json!({"sessionId": session, "method": "Page.frameRequestedNavigation",
+                   "params": {"disposition": disposition}})
+        };
+        let events: std::collections::VecDeque<_> = [
+            request("s2", "newWindow"),
+            request("s1", "currentTab"),
+            request("s1", "newBackgroundTab"),
+        ]
+        .into();
+        assert!(action_requested_new_tab(&events, "s1"));
+        assert!(!action_requested_new_tab(&events, "s3"));
+        let none: std::collections::VecDeque<_> = [request("s1", "sameDocument")].into();
+        assert!(!action_requested_new_tab(&none, "s1"));
     }
 
     /// A visibility:hidden element takes no clicks itself, but a visible
@@ -1360,8 +1511,40 @@ mod tests {
     fn a_hidden_element_is_hit_tested_before_it_is_refused() {
         let js = element_center_js("#toggle").unwrap();
         let hit_test = js.find("elementFromPoint").unwrap();
-        let refusal = js.find("visibility === 'hidden'").unwrap();
+        let refusal = js
+            .find("getComputedStyle(el).visibility === 'hidden'")
+            .unwrap();
         assert!(hit_test < refusal, "{js}");
+    }
+
+    /// A wrapper with no box can still show a positioned child, which is a
+    /// valid hit because anything inside the selected element counts.
+    #[test]
+    fn a_zero_size_wrapper_gets_its_descendants_hit_tested() {
+        let js = element_center_js("#wrapper").unwrap();
+        let descendants = js.find("querySelectorAll('*')").unwrap();
+        let refusal = js.find("has no size").unwrap();
+        assert!(descendants < refusal, "{js}");
+    }
+
+    /// A fragment event can be buffered ahead of the commit of a reload that
+    /// keeps the URL. The commit, not the first match, decides.
+    #[test]
+    fn a_buffered_commit_is_seen_behind_a_same_document_event() {
+        let commit = |session, frame| {
+            json!({"sessionId": session, "method": "Page.frameNavigated",
+                   "params": {"frame": {"id": frame}}})
+        };
+        let events: std::collections::VecDeque<_> = [
+            json!({"sessionId": "s1", "method": "Page.navigatedWithinDocument",
+                   "params": {"frameId": "MAIN"}}),
+            commit("s1", "MAIN"),
+        ]
+        .into();
+        assert!(main_frame_committed(&events, "s1", "MAIN"));
+        assert!(!main_frame_committed(&events, "s1", "OTHER"));
+        let child_only: std::collections::VecDeque<_> = [commit("s1", "CHILD")].into();
+        assert!(!main_frame_committed(&child_only, "s1", "MAIN"));
     }
 
     #[test]

@@ -646,12 +646,9 @@ where
     // respawned cleanly next time.
     if is_fatal {
         // A bare transport error doesn't tell the caller (often an agent) that
-        // the daemon is gone and that simply rerunning the command recovers.
-        let name = crate::browser::display_name(browser);
-        response.error.push_str(&format!(
-            "\nLost the connection to {name}, so the daemon has exited. Run the command again to \
-             reconnect; {name} may ask you to approve the new connection."
-        ));
+        // the daemon is gone. A read-only reconnect comes first: the original
+        // action may already have taken effect before the connection dropped.
+        response.error.push_str(&lost_connection_advice(browser));
         // The code, not the text above, is how `caffeinate` tells that its
         // connection died from any other failed check.
         response.error_code = Some(ErrorCode::WebSocketDisconnected as u32);
@@ -666,6 +663,18 @@ where
     } else {
         ConnectionOutcome::Continue
     }
+}
+
+/// Advice appended to a fatal connection error. `caffeinate` replaces this
+/// part with its own and uses only the original error's first line as the
+/// cause, so wording here stays specific to ordinary commands.
+fn lost_connection_advice(browser: &str) -> String {
+    let name = crate::browser::display_name(browser);
+    format!(
+        "\nLost the connection to {name}, so the daemon has exited. Run a read-only command such \
+         as `list-pages` to reconnect, then verify whether the original action took effect \
+         before repeating it. {name} may ask you to approve the new connection."
+    )
 }
 
 /// Stamp a response with this daemon's version, for the CLI's mismatch check.
@@ -1049,5 +1058,18 @@ mod tests {
         assert!(pid.exists());
         assert!(endpoint.exists());
         assert!(info.exists());
+    }
+
+    /// A dropped connection can follow an action that already took effect, so
+    /// the advice must send callers to a read-only reconnect first.
+    #[test]
+    fn a_lost_connection_advises_a_read_only_reconnect() {
+        let advice = lost_connection_advice("chrome");
+        assert!(advice.contains("list-pages"), "{advice}");
+        assert!(
+            advice.contains("verify whether the original action took effect"),
+            "{advice}"
+        );
+        assert!(!advice.contains("Run the command again"), "{advice}");
     }
 }

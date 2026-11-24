@@ -141,14 +141,19 @@ async fn traverse_history(client: &mut CdpClient, session_id: &str, entry_id: i6
             json!({"entryId": entry_id}),
         )
         .await?;
+    // One budget for both phases: a slow commit must not give the load wait
+    // a fresh full timeout.
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_millis(NAVIGATION_TIMEOUT_MS);
     let frames = traversal_frames(&client.events, session_id, &main_frame);
     // None named: the entry moves only an iframe from another site, which
     // commits in its own process, out of this session's sight.
     if !frames.is_empty() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         client
             .wait_for_event_match(
                 &["Page.frameNavigated", "Page.navigatedWithinDocument"],
-                std::time::Duration::from_millis(NAVIGATION_TIMEOUT_MS),
+                remaining,
                 |method, p| {
                     let frame = if method == "Page.frameNavigated" {
                         &p["frame"]["id"]
@@ -163,7 +168,7 @@ async fn traverse_history(client: &mut CdpClient, session_id: &str, entry_id: i6
             .await
             .map_err(history_wait_error)?;
     }
-    wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS, None).await
+    wait_for_load_until(client, session_id, deadline, NAVIGATION_TIMEOUT_MS, None).await
 }
 
 /// A lost connection keeps its type, which the daemon exits on; any other
@@ -218,8 +223,14 @@ async fn do_reload(
     output: Option<&str>,
 ) -> Result<CommandResult> {
     let before = document_mark(client, session_id).await?;
+    // Chrome refuses the reload if a different document committed after the
+    // mark, instead of applying it to that document and reporting success.
     client
-        .send_to_target(session_id, "Page.reload", json!({}))
+        .send_to_target(
+            session_id,
+            "Page.reload",
+            json!({"loaderId": before.loader_id}),
+        )
         .await?;
     wait_for_load(client, session_id, NAVIGATION_TIMEOUT_MS, Some(&before)).await?;
     let url = client.current_url(session_id).await?;
@@ -291,21 +302,42 @@ pub async fn wait_for_load(
     previous: Option<&DocumentMark>,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    wait_for_load_until(client, session_id, deadline, timeout_ms, previous).await
+}
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+/// `wait_for_load` with a caller-owned deadline, so history traversal can
+/// spend the same navigation budget on its commit and this load wait.
+async fn wait_for_load_until(
+    client: &mut CdpClient,
+    session_id: &str,
+    deadline: tokio::time::Instant,
+    timeout_ms: u64,
+    previous: Option<&DocumentMark>,
+) -> Result<()> {
+    let timed_out =
+        || anyhow::anyhow!("Timeout ({timeout_ms}ms) waiting for page readyState=complete");
+    let pause = std::time::Duration::from_millis(100);
+
+    tokio::time::sleep(pause).await;
 
     loop {
-        if tokio::time::Instant::now() > deadline {
-            anyhow::bail!("Timeout ({timeout_ms}ms) waiting for page readyState=complete");
+        if tokio::time::Instant::now() >= deadline {
+            return Err(timed_out());
         }
+        // A probe must itself end by the shared deadline: sending it with the
+        // default call timeout would let one slow page extend the whole wait.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
 
         // The document identity comes from Chrome, not the page: a page can
         // replace `performance`, and a reload can keep the same URL.
         let loader = if previous.is_some() {
-            match document_loader_id(client, session_id).await {
+            let tree = client
+                .send_to_target_within(session_id, "Page.getFrameTree", json!({}), remaining)
+                .await;
+            match tree.and_then(|tree| loader_id_from_tree(&tree)) {
                 Ok(id) => Some(id),
                 Err(e) if transient_context_error(&e) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(pause.min(remaining)).await;
                     continue;
                 }
                 Err(e) => {
@@ -316,13 +348,14 @@ pub async fn wait_for_load(
             None
         };
         let result = client
-            .send_to_target(
+            .send_to_target_within(
                 session_id,
                 "Runtime.evaluate",
                 json!({
                     "expression": "document.readyState",
                     "returnByValue": true,
                 }),
+                remaining,
             )
             .await;
 
@@ -333,7 +366,7 @@ pub async fn wait_for_load(
                 }
             }
             Err(e) if transient_context_error(&e) => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(pause.min(remaining)).await;
             }
             Err(e) => {
                 // Context rather than a new error, so a lost connection keeps
@@ -342,7 +375,7 @@ pub async fn wait_for_load(
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(pause.min(remaining)).await;
     }
 }
 

@@ -162,8 +162,13 @@ pub struct CdpClient {
     /// Buffer for storing unhandled events (e.g., navigation events)
     pub events: std::collections::VecDeque<Value>,
     /// Messages already taken off the socket that `read_text` must return
-    /// before reading more, oldest first. Only [`CdpClient::ping`] fills it.
+    /// before reading more, oldest first. [`CdpClient::ping`] and queued
+    /// dialog transitions fill it.
     unread: std::collections::VecDeque<String>,
+    /// Replies to other in-flight calls set aside while a dialog was handled.
+    /// Keyed by request id: pushing them to `unread` alone would make the
+    /// dialog handler read its own deferred reply again on every iteration.
+    deferred_replies: std::collections::VecDeque<(u64, String)>,
     /// Persistent CDP session for continuous event collection across commands.
     pub persistent_session: Option<String>,
     /// Target ID the persistent session is attached to.
@@ -465,6 +470,7 @@ impl CdpClient {
             input_sent: false,
             events: std::collections::VecDeque::new(),
             unread: std::collections::VecDeque::new(),
+            deferred_replies: std::collections::VecDeque::new(),
             persistent_session: None,
             persistent_target_id: None,
             network_events: std::collections::VecDeque::new(),
@@ -523,9 +529,14 @@ impl CdpClient {
         // Detach old session if target changed
         if let Some(old_session) = self.persistent_session.take() {
             self.forget_dialog(Some(&old_session));
-            let _ = self
+            let detached = self
                 .send("Target.detachFromTarget", json!({"sessionId": old_session}))
                 .await;
+            if detached.is_ok() {
+                // The old tab's Fetch interception died with its session;
+                // otherwise a later tab inherits idle reads it doesn't need.
+                self.session_ended(&old_session);
+            }
             self.persistent_target_id = None;
             self.events
                 .retain(|event| event["sessionId"].as_str() != Some(old_session.as_str()));
@@ -627,9 +638,12 @@ impl CdpClient {
         }
 
         self.forget_dialog(Some(session_id));
-        let _ = self
+        let detached = self
             .send("Target.detachFromTarget", json!({"sessionId": session_id}))
             .await;
+        if detached.is_ok() {
+            self.session_ended(session_id);
+        }
 
         self.persistent_session = None;
         self.persistent_target_id = None;
@@ -650,6 +664,9 @@ impl CdpClient {
         if self.persistent_target_id.as_deref() == Some(target_id) {
             let session = self.persistent_session.clone();
             self.forget_dialog(session.as_deref());
+            if let Some(ref sid) = session {
+                self.session_ended(sid);
+            }
             self.blocklist.clear();
             self.viewport = None;
             self.geolocation = None;
@@ -960,7 +977,7 @@ impl CdpClient {
 
         loop {
             let resp_text = self
-                .read_text_for_call(method, session_id, started, limit)
+                .read_text_for_call(id, method, session_id, started, limit)
                 .await?;
             let resp: Value = serde_json::from_str(&resp_text)?;
             self.note_dialog_event(&resp);
@@ -987,6 +1004,12 @@ impl CdpClient {
                 // `new-page` opened as not opened. The dialog, recorded above,
                 // is for the next call on its page.
                 if session_id.is_some() {
+                    if self.take_queued_dialog_close(session_id) {
+                        // The opening and its closing were set aside together
+                        // by a ping; the dialog is gone, so keep reading for
+                        // this call's reply.
+                        continue;
+                    }
                     bail!(dialog_from_event(&resp));
                 }
             }
@@ -1002,6 +1025,10 @@ impl CdpClient {
             } else if resp.get("method").is_some() {
                 // Store events for later consumption
                 self.push_event(resp);
+            } else if let Some(other_id) = resp.get("id").and_then(|v| v.as_u64()) {
+                // A reply to a different call: the dialog handler may have
+                // read it while draining the socket. Keep it for its owner.
+                self.deferred_replies.push_back((other_id, resp_text));
             }
             // Skip other unrelated responses
         }
@@ -1054,7 +1081,13 @@ impl CdpClient {
 
             loop {
                 let resp_text = self
-                    .read_text_for_call("Page.handleJavaScriptDialog", session_id, started, limit)
+                    .read_text_for_call(
+                        id,
+                        "Page.handleJavaScriptDialog",
+                        session_id,
+                        started,
+                        limit,
+                    )
                     .await?;
                 let resp: Value = serde_json::from_str(&resp_text)?;
                 self.note_dialog_event(&resp);
@@ -1093,6 +1126,10 @@ impl CdpClient {
                     return Ok(());
                 } else if resp.get("method").is_some() {
                     self.push_event(resp);
+                } else if let Some(other_id) = resp.get("id").and_then(|v| v.as_u64()) {
+                    // The call this dialog held up can finish while we wait
+                    // for the handler's own reply. Hand its reply back to it.
+                    self.deferred_replies.push_back((other_id, resp_text));
                 }
             }
         })
@@ -1200,6 +1237,7 @@ impl CdpClient {
     /// the daemon and its approved connection in place.
     async fn read_text_for_call(
         &mut self,
+        id: u64,
         method: &str,
         session_id: Option<&str>,
         started: tokio::time::Instant,
@@ -1209,6 +1247,12 @@ impl CdpClient {
         // that check has already been made.
         let mut checked = false;
         loop {
+            // A dialog handler that drained the socket may have set this
+            // call's reply aside. It belongs to us, not to the handler.
+            if let Some(pos) = self.deferred_replies.iter().position(|(rid, _)| *rid == id) {
+                let (_, text) = self.deferred_replies.remove(pos).unwrap();
+                return Ok(text);
+            }
             let remaining = limit.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 // Whose fault: a lost connection exits the daemon, a stuck
@@ -1301,6 +1345,25 @@ impl CdpClient {
         }
     }
 
+    /// Apply a closing a liveness ping set aside alongside its opening, so a
+    /// dialog that already closed does not fail the call reading the opening.
+    /// Returns whether one was found for `session_id`.
+    fn take_queued_dialog_close(&mut self, session_id: Option<&str>) -> bool {
+        let pos = self.unread.iter().position(|t| {
+            serde_json::from_str::<Value>(t).ok().is_some_and(|m| {
+                m["method"].as_str() == Some("Page.javascriptDialogClosed")
+                    && m["sessionId"].as_str() == session_id
+            })
+        });
+        if let Some(text) = pos.and_then(|p| self.unread.remove(p)) {
+            if let Ok(msg) = serde_json::from_str::<Value>(&text) {
+                self.note_dialog_event(&msg);
+            }
+            return true;
+        }
+        false
+    }
+
     /// Forget the open dialog if it belongs to `session_id`: it was handled,
     /// closed, or its session is gone (only that session could handle it).
     pub fn forget_dialog(&mut self, session_id: Option<&str>) {
@@ -1331,6 +1394,16 @@ impl CdpClient {
         started: tokio::time::Instant,
         limit: std::time::Duration,
     ) -> Result<()> {
+        // A ping may have set the closing aside with the opening. Only apply
+        // it once that opening is the one we are tracking; consuming the
+        // closing first would leave a still-queued opening to fail this call.
+        if self
+            .open_dialog
+            .as_ref()
+            .is_some_and(|d| d.session_id.as_deref() == Some(session_id))
+        {
+            self.take_queued_dialog_close(Some(session_id));
+        }
         let Some(open) = self
             .open_dialog
             .clone()
@@ -1384,6 +1457,15 @@ impl CdpClient {
             }
         }
         Ok(())
+    }
+
+    /// A session ended, so it can no longer hold requests for a mock. Stop
+    /// idle reads and drop the requests it left paused. Kept separate from a
+    /// failed `Fetch.disable`: there the same session may still intercept.
+    fn session_ended(&mut self, session_id: &str) {
+        self.fetch_may_be_enabled = false;
+        self.paused_requests
+            .retain(|e| e["sessionId"].as_str() != Some(session_id));
     }
 
     /// Whether the daemon must keep reading between commands: with mocks
@@ -2189,6 +2271,105 @@ mod tests {
             "sessionId": "S",
             "params": {"type": "alert", "message": message}
         })
+    }
+
+    /// A dialog handler drains the socket while the call it held up finishes.
+    /// That call's reply must not be discarded with the unrelated messages, or
+    /// it waits out its limit after the dialog is already gone.
+    #[tokio::test]
+    async fn a_reply_read_while_handling_a_dialog_reaches_its_call() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let reply = json!({"id": call["id"], "sessionId": "S", "result": {}});
+            let messages = match call["method"].as_str() {
+                Some("Runtime.evaluate") => vec![opening("hi")],
+                Some("Page.handleJavaScriptDialog") => vec![
+                    // The evaluation finishes first. Its reply is not the
+                    // handler's, so it has to be kept for the caller.
+                    json!({"id": 1, "sessionId": "S", "result": {"value": 42}}),
+                    reply,
+                ],
+                _ => Vec::new(),
+            };
+            (std::time::Duration::ZERO, messages)
+        })
+        .await;
+        client.dialog_action = Some("accept".into());
+        let result = client
+            .send_to_target_within(
+                "S",
+                "Runtime.evaluate",
+                json!({}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("the evaluation's reply is not lost");
+        assert_eq!(result["value"], 42);
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls, ["Runtime.evaluate", "Page.handleJavaScriptDialog"]);
+    }
+
+    /// A liveness ping can set aside an opening, its closing and the call's
+    /// reply. Reading the opening alone must not fail a call whose dialog is
+    /// already gone.
+    #[tokio::test]
+    async fn a_queued_dialog_close_lets_the_call_read_its_reply() {
+        let (mut client, chrome) = fake_chrome(|_| (std::time::Duration::ZERO, Vec::new())).await;
+        client.unread.push_back(opening("hi").to_string());
+        client.unread.push_back(
+            json!({"method": "Page.javascriptDialogClosed", "sessionId": "S",
+                   "params": {"result": true, "userInput": ""}})
+            .to_string(),
+        );
+        client
+            .unread
+            .push_back(json!({"id": 1, "sessionId": "S", "result": {"value": 7}}).to_string());
+        let result = client
+            .send_to_target_within(
+                "S",
+                "DOM.getDocument",
+                json!({}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("the reply queued with the dialog is returned");
+        assert_eq!(result["value"], 7);
+        assert!(client.open_dialog.is_none(), "the queued close is applied");
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls, ["DOM.getDocument"]);
+    }
+
+    /// Fetch interception belongs to a session. Switching away from a tab that
+    /// had mocks must not leave the daemon reading idle events for a tab that
+    /// never enabled Fetch.
+    #[tokio::test]
+    async fn switching_from_a_mocked_session_stops_idle_reads() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let result = if call["method"].as_str() == Some("Target.attachToTarget") {
+                json!({"sessionId": "S2"})
+            } else {
+                json!({})
+            };
+            (
+                std::time::Duration::ZERO,
+                vec![json!({"id": call["id"], "result": result})],
+            )
+        })
+        .await;
+        client.persistent_session = Some("S1".into());
+        client.persistent_target_id = Some("T1".into());
+        client.fetch_may_be_enabled = true;
+        client
+            .ensure_persistent_session("T2")
+            .await
+            .expect("switch");
+        assert!(
+            !client.fetch_may_be_enabled && !client.wants_idle_reads(),
+            "the old session's interception is gone"
+        );
+        drop(client);
+        chrome.await.unwrap();
     }
 
     /// The check that the last quiet read ends in is the final one: checking

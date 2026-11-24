@@ -693,14 +693,35 @@ impl NodeFacts<'_> {
     }
 }
 
+/// The property keys the `all` shorthand resets on this node. CDP reports it
+/// as one declaration and leaves the expansion to the cascade. The computed
+/// style names every longhand the element has; the declared ones also cover
+/// names CDP couldn't expand (`var()` shorthands, for instance). CSS excludes
+/// `direction`, `unicode-bidi` and custom properties from `all`.
+fn all_properties(computed: &[(String, String)], blocks: &[Block]) -> HashSet<String> {
+    let mut keys: HashSet<String> = computed
+        .iter()
+        .map(|(name, _)| name.clone())
+        .chain(
+            blocks
+                .iter()
+                .flat_map(|b| b.decls.iter())
+                .flat_map(|d| d.longhands.iter().cloned()),
+        )
+        .collect();
+    keys.retain(|k| k != "direction" && k != "unicode-bidi" && !k.starts_with("--"));
+    keys
+}
+
 /// Run the cascade over one node's blocks, marking each declaration that wins
 /// at least one of its longhands active. `claimed` longhands are already
 /// decided (set on the element itself, or on a nearer ancestor) and nothing
-/// here wins them. Returns the longhands decided here. A winning `inherit`
-/// or `unset` decides none: the value comes from an ancestor's declaration,
-/// so that one still applies. Nor does a declaration that is invalid at
-/// computed-value time, which acts as `unset`. These keywords count after
-/// `var()` substitution too (see `NodeFacts::value`).
+/// here wins them. `all` holds the keys an `all` declaration resets. Returns
+/// the longhands decided here. A winning `inherit` or `unset` decides none:
+/// the value comes from an ancestor's declaration, so that one still applies.
+/// Nor does a declaration that is invalid at computed-value time, which acts
+/// as `unset`. These keywords count after `var()` substitution too (see
+/// `NodeFacts::value`).
 ///
 /// A winning `revert-layer` rolls the longhand back to the next lower
 /// cascade layer, and `revert` to the user-agent origin: the first
@@ -709,7 +730,12 @@ impl NodeFacts<'_> {
 ///
 /// `!important` beats normal, and an important declaration is ranked by
 /// `important_order`.
-fn cascade(blocks: &mut [Block], claimed: &HashSet<String>, node: &NodeFacts) -> HashSet<String> {
+fn cascade(
+    blocks: &mut [Block],
+    claimed: &HashSet<String>,
+    node: &NodeFacts,
+    all: &HashSet<String>,
+) -> HashSet<String> {
     let mut won = HashSet::new();
     let mut decided = HashSet::new();
     // Longhands a winning `revert-layer` or `revert` rolled back, with the
@@ -755,7 +781,15 @@ fn cascade(blocks: &mut [Block], claimed: &HashSet<String>, node: &NodeFacts) ->
                     None
                 };
                 let from_parent = value.is_none() || is("inherit") || is("unset");
-                for longhand in &d.longhands {
+                // The one `all` row CDP gives us resets every property at
+                // once; a later declaration in this block was seen first and
+                // has already claimed its own longhands.
+                let longhands: Vec<String> = if d.key() == "all" {
+                    all.iter().cloned().collect()
+                } else {
+                    d.longhands.clone()
+                };
+                for longhand in &longhands {
                     let key = node.key(longhand);
                     if claimed.contains(&key)
                         || won.contains(&key)
@@ -908,8 +942,9 @@ fn important_order(blocks: &[Block]) -> Vec<usize> {
 }
 
 /// Byte offset of the next `var(` that is a function call: not the end of a
-/// longer name such as `somevar(`, and not text in a string such as
-/// `content: "var(--x)"`, which the browser shows as written.
+/// longer name such as `somevar(`, not text in a string such as
+/// `content: "var(--x)"`, which the browser shows as written, and not text
+/// in a comment, which Blink keeps but does not tokenize.
 fn find_var(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut quote = None;
@@ -925,6 +960,10 @@ fn find_var(s: &str) -> Option<usize> {
             (_, b'\\') => i += 1,
             (Some(q), c) if c == q => quote = None,
             (Some(_), _) => {}
+            (None, b'/') if bytes.get(i + 1) == Some(&b'*') => match s[i + 2..].find("*/") {
+                Some(end) => i += 3 + end,
+                None => return None,
+            },
             (None, c @ (b'"' | b'\'')) => quote = Some(c),
             (None, _) if call => return Some(i),
             _ => {}
@@ -935,25 +974,46 @@ fn find_var(s: &str) -> Option<usize> {
 }
 
 /// Offset of the `)` closing a function whose arguments start at `s[0]`, and
-/// of the first top-level comma before it, skipping nested parentheses and
-/// strings.
+/// of the first top-level comma before it, skipping nested parentheses,
+/// strings and comments.
 fn scan_args(s: &str) -> Option<(usize, Option<usize>)> {
-    let (mut depth, mut quote, mut comma) = (0usize, None::<char>, None);
-    let mut chars = s.char_indices();
-    while let Some((i, c)) = chars.next() {
-        match (quote, c) {
+    let bytes = s.as_bytes();
+    let (mut depth, mut quote, mut comma) = (0usize, None::<u8>, None);
+    let mut i = 0;
+    while i < bytes.len() {
+        match (quote, bytes[i]) {
             // An escaped character (`"a\"b"`) never ends a string or a call.
-            (_, '\\') => {
-                chars.next();
+            (_, b'\\') => i += 2,
+            (Some(q), c) if c == q => {
+                quote = None;
+                i += 1;
             }
-            (Some(q), _) if c == q => quote = None,
-            (Some(_), _) => {}
-            (None, '"' | '\'') => quote = Some(c),
-            (None, '(') => depth += 1,
-            (None, ')') if depth == 0 => return Some((i, comma)),
-            (None, ')') => depth -= 1,
-            (None, ',') if depth == 0 && comma.is_none() => comma = Some(i),
-            _ => {}
+            (Some(_), _) => i += 1,
+            (None, b'/') if bytes.get(i + 1) == Some(&b'*') => {
+                // A `)` or `,` in an authored comment is not a delimiter.
+                i = match s[i + 2..].find("*/") {
+                    Some(end) => i + 4 + end,
+                    None => return None,
+                };
+            }
+            (None, b'"' | b'\'') => {
+                quote = Some(bytes[i]);
+                i += 1;
+            }
+            (None, b'(') => {
+                depth += 1;
+                i += 1;
+            }
+            (None, b')') if depth == 0 => return Some((i, comma)),
+            (None, b')') => {
+                depth -= 1;
+                i += 1;
+            }
+            (None, b',') if depth == 0 && comma.is_none() => {
+                comma = Some(i);
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
     None
@@ -1394,7 +1454,8 @@ fn build_report(
         flow: computed_value("writing-mode").zip(computed_value("direction")),
         rejected: &page.rejected,
     };
-    let mut claimed = cascade(&mut blocks, &HashSet::new(), &element);
+    let all = all_properties(computed, &blocks);
+    let mut claimed = cascade(&mut blocks, &HashSet::new(), &element, &all);
     let rules = shown_blocks(
         blocks,
         Some(&element_vars),
@@ -1435,7 +1496,7 @@ fn build_report(
             flow: None,
             rejected: &[],
         };
-        let set_here = cascade(&mut blocks, &claimed, &ancestor);
+        let set_here = cascade(&mut blocks, &claimed, &ancestor, &all);
         claimed.extend(set_here);
         let rules = shown_blocks(
             blocks,
@@ -1778,17 +1839,33 @@ async fn collect(
 /// them once the page is free. The two writes keep the client's own bound:
 /// they are small, and after a lost connection, where one could stall,
 /// there is no cleanup (see `css_styles`).
+///
+/// A dialog recorded during the inspection makes the guarded send refuse to
+/// write at all, so with one open on this session both commands are queued
+/// without that guard. The renderer runs them once the dialog is settled.
 async fn disable_agents(
     client: &mut CdpClient,
     session_id: &str,
     limit: std::time::Duration,
 ) -> Result<()> {
+    // The same session check `settle_dialog_within` uses: only then would the
+    // guarded send refuse to write.
+    let dialog_open = client
+        .open_dialog
+        .as_ref()
+        .is_some_and(|d| d.session_id.as_deref() == Some(session_id));
     client
         .send_raw_no_wait(Some(session_id), "CSS.disable", json!({}))
         .await?;
-    client
-        .send_to_target_within(session_id, "DOM.disable", json!({}), limit)
-        .await?;
+    if dialog_open {
+        client
+            .send_raw_no_wait(Some(session_id), "DOM.disable", json!({}))
+            .await?;
+    } else {
+        client
+            .send_to_target_within(session_id, "DOM.disable", json!({}), limit)
+            .await?;
+    }
     Ok(())
 }
 
@@ -1848,6 +1925,7 @@ pub async fn css_styles(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cdp::{DialogOpen, OpenDialog};
 
     fn range(line: u64) -> Value {
         json!({"startLine": line, "startColumn": 0, "endLine": line, "endColumn": 1})
@@ -2068,9 +2146,64 @@ Inherited from body:
     fn later_declaration_in_a_block_wins() {
         let style = authored(&[("color", "red"), ("color", "blue")], &[("color", "blue")]);
         let mut blocks = vec![block(&style)];
-        cascade(&mut blocks, &HashSet::new(), &NodeFacts::default());
+        cascade(
+            &mut blocks,
+            &HashSet::new(),
+            &NodeFacts::default(),
+            &HashSet::new(),
+        );
         let status: Vec<Status> = blocks[0].decls.iter().map(|d| d.status).collect();
         assert_eq!(status, [Status::Overridden, Status::Active]);
+    }
+
+    /// `all` is one CDP declaration, but it resets the properties lower rules
+    /// set. One `all` row stays in the output.
+    #[test]
+    fn all_resets_lower_priority_longhands() {
+        let mut m = matched();
+        m["inlineStyle"] = Value::Null;
+        m["matchedCSSRules"] = json!([
+            rule("p", 7, authored(&[("color", "red")], &[("color", "red")])),
+            rule("p.reset", 10, authored(&[("all", "initial")], &[])),
+        ]);
+        let report = build_report(&m, &computed(), &sheets(), &page(), &CssOptions::default());
+        assert_eq!(report.rules.len(), 2);
+        assert_eq!(report.rules[0].decls.len(), 1);
+        assert_eq!(report.rules[0].decls[0].name, "all");
+        assert_eq!(report.rules[0].decls[0].status, Status::Active);
+        assert_eq!(report.rules[1].decls[0].status, Status::Overridden);
+    }
+
+    /// A later declaration in the block still wins its own longhand, and the
+    /// keys CSS excludes from `all` are never part of its expansion.
+    #[test]
+    fn all_leaves_excluded_and_later_declarations_alone() {
+        let style = authored(
+            &[
+                ("all", "initial"),
+                ("color", "blue"),
+                ("direction", "rtl"),
+                ("unicode-bidi", "isolate"),
+                ("--tone", "red"),
+            ],
+            &[
+                ("color", "blue"),
+                ("direction", "rtl"),
+                ("unicode-bidi", "isolate"),
+                ("--tone", "red"),
+            ],
+        );
+        let mut blocks = vec![block(&style)];
+        let all = all_properties(&computed(), &blocks);
+        assert!(!all.contains("direction"));
+        assert!(!all.contains("unicode-bidi"));
+        assert!(!all.contains("--tone"));
+        let decided = cascade(&mut blocks, &HashSet::new(), &NodeFacts::default(), &all);
+        assert_eq!(
+            blocks[0].decls.iter().map(|d| d.status).collect::<Vec<_>>(),
+            [Status::Active; 5]
+        );
+        assert!(decided.contains("color"));
     }
 
     /// A shorthand overrides a longhand from a lower-precedence rule, and
@@ -2083,7 +2216,12 @@ Inherited from body:
             json!([{"name": "padding-top"}, {"name": "padding-bottom"}]);
         let lower = authored(&[("padding-bottom", "9px")], &[("padding-bottom", "9px")]);
         let mut blocks = vec![block(&high), block(&low), block(&lower)];
-        cascade(&mut blocks, &HashSet::new(), &NodeFacts::default());
+        cascade(
+            &mut blocks,
+            &HashSet::new(),
+            &NodeFacts::default(),
+            &HashSet::new(),
+        );
         assert_eq!(blocks[1].decls[0].status, Status::Active);
         assert_eq!(blocks[2].decls[0].status, Status::Overridden);
     }
@@ -2584,7 +2722,12 @@ Inherited from body:
         );
         let origins: Vec<&str> = blocks.iter().map(|b| b.origin.as_str()).collect();
         assert_eq!(origins, ["regular", "attributes", "user-agent"]);
-        cascade(&mut blocks, &HashSet::new(), &NodeFacts::default());
+        cascade(
+            &mut blocks,
+            &HashSet::new(),
+            &NodeFacts::default(),
+            &HashSet::new(),
+        );
         assert_eq!(statuses(&blocks[0]), [Status::Active]);
         assert_eq!(statuses(&blocks[1]), [Status::Overridden, Status::Active]);
         assert_eq!(
@@ -3037,6 +3180,28 @@ Inherited from body:
         );
     }
 
+    /// Delimiters in an authored comment are not delimiters to Blink: the
+    /// `)` and `,` below must not end the call or start its fallback.
+    #[test]
+    fn comments_do_not_end_var_arguments() {
+        let vars = HashMap::from([("--tone".to_string(), "red".to_string())]);
+        assert_eq!(
+            resolve_vars("var(/* ) */ --tone, blue)", &vars).as_deref(),
+            Some("red")
+        );
+        assert_eq!(
+            resolve_vars("var(--tone/* , */, blue)", &vars).as_deref(),
+            Some("red")
+        );
+        assert_eq!(
+            resolve_vars("var(--tone, calc(1px/* ) */ + 2px))", &vars).as_deref(),
+            Some("red")
+        );
+        // A call named in a comment is text, not a reference.
+        assert_eq!(find_var("/* var(--tone) */ color"), None);
+        assert_eq!(resolve_vars("/* var(--tone) */ color", &vars), None);
+    }
+
     /// `var()` substitutes tokens, not text. In Chrome 158, `var(--size)px`
     /// with `--size: 20` is a number and an identifier, no font size, so the
     /// body's applies; `var(--a)var(--b)` is two lengths, which a margin
@@ -3278,6 +3443,28 @@ Inherited from body:
             error.downcast_ref::<ConnectionLost>().is_none(),
             "{error:#}"
         );
+        drop(client);
+        let seen = browser.await.unwrap();
+        assert!(seen.iter().any(|m| m == "CSS.disable"), "{seen:?}");
+        assert!(seen.iter().any(|m| m == "DOM.disable"), "{seen:?}");
+    }
+
+    /// A dialog left open by the inspection must not cost `DOM.disable` its
+    /// write: the guarded send would refuse before putting it on the wire.
+    #[tokio::test]
+    async fn a_recorded_dialog_still_gets_both_disable_writes() {
+        let (url, browser) = fake_browser("", "", "").await;
+        let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
+        client.open_dialog = Some(OpenDialog {
+            session_id: Some("S".into()),
+            dialog: DialogOpen {
+                dialog_type: "alert".into(),
+                message: "hi".into(),
+            },
+        });
+        disable_agents(&mut client, "S", std::time::Duration::from_millis(300))
+            .await
+            .expect("cleanup writes both commands even with a dialog open");
         drop(client);
         let seen = browser.await.unwrap();
         assert!(seen.iter().any(|m| m == "CSS.disable"), "{seen:?}");

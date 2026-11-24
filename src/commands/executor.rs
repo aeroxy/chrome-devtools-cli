@@ -301,6 +301,15 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     let target = client.resolve_page(target_id_arg, page_idx_arg).await?;
     let target_id = target.target_id.clone();
 
+    // Special case for commands that target a page but don't need a session.
+    if cmd == "close-page" || cmd == "select-page" {
+        return match cmd {
+            "close-page" => commands::pages::close_page(client, &target_id).await,
+            "select-page" => commands::pages::select_page(client, &target_id).await,
+            _ => unreachable!(),
+        };
+    }
+
     // Maintain a persistent CDP session for continuous event collection
     // (Network + Console) across commands. Skip for close/select which don't need it.
     if cmd != "close-page" && cmd != "select-page" {
@@ -331,22 +340,37 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         && cmd != "select-page"
         && (!req.block_url.is_empty() || !req.unblock_url.is_empty())
     {
+        // `Network.enable` is a page call: an open dialog blocks it, so set
+        // this command's action and settle the dialog before touching rules.
+        // The action is cleared again below and set for the command itself
+        // later, so an error here cannot leak into a later command.
+        client.dialog_action = args
+            .get("dialog_action")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let settled = if let Some(ref sid) = client.persistent_session.clone() {
+            client.settle_open_dialog(sid).await
+        } else {
+            Ok(())
+        };
+        if let Err(e) = settled {
+            client.dialog_action = None;
+            return Err(e);
+        }
+        let previous = client.blocklist.clone();
         for p in &req.block_url {
             if !client.blocklist.contains(p) {
                 client.blocklist.push(p.clone());
             }
         }
         client.blocklist.retain(|b| !req.unblock_url.contains(b));
-        client.apply_network_rules().await?;
-    }
-
-    // Special case for commands that target a page but don't need a session
-    if cmd == "close-page" || cmd == "select-page" {
-        return match cmd {
-            "close-page" => commands::pages::close_page(client, &target_id).await,
-            "select-page" => commands::pages::select_page(client, &target_id).await,
-            _ => unreachable!(),
-        };
+        if let Err(e) = client.apply_network_rules().await {
+            // Never keep a rule Chrome did not receive.
+            client.blocklist = previous;
+            client.dialog_action = None;
+            return Err(e);
+        }
+        client.dialog_action = None;
     }
 
     // Prefer the persistent session so navigation, emulation, and event
@@ -379,8 +403,8 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         .map(|s| s.to_string());
     let console_mark = client.console_pushed;
     client.input_sent = false;
-    // A dialog left open by an earlier command blocks the page: handle it
-    // first, or fail now rather than wait on a page that won't answer.
+    // A dialog on a fresh one-off session is settled here; on the persistent
+    // session it was already settled before the blocklist was applied.
     let result = match client.settle_open_dialog(&session_id).await {
         Ok(()) => {
             let result = inner_execute(client, &session_id, &target_id, req).await;
@@ -411,11 +435,21 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
         client.page_errors_since(console_mark)
     };
 
+    // V8 forgets heap object IDs when the profiler's session detaches. A
+    // one-off session ends with this command, so a diff against an earlier
+    // snapshot can pair unrelated objects without warning.
+    let heap_ids_note = (!using_persistent && cmd == "take-heapsnapshot").then(|| {
+        "Heap object IDs are scoped to the daemon's persistent session. This snapshot used a \
+         one-off session, so its IDs may not match earlier snapshots."
+            .to_string()
+    });
+
     // Append target ID so the caller can pin subsequent commands to this page
     let name = friendly::to_friendly(&target_id);
     result.map(|mut r| {
         r.target_id = Some(name);
         r.notes.extend(page_errors);
+        r.notes.extend(heap_ids_note);
         r
     })
 }
@@ -1514,5 +1548,96 @@ mod tests {
         // stays a failure.
         assert!(dialog_opened_by_input("click", false, opened(), DIRECT_DIALOG_NEXT).is_err());
         assert!(dialog_opened_by_input("evaluate", true, opened(), DIRECT_DIALOG_NEXT).is_err());
+    }
+
+    /// A page dialog and `--block-url` in one command: the dialog must be
+    /// dismissed before `Network.enable`, or the rule change fails first and
+    /// leaves the pattern in the stored list.
+    #[tokio::test]
+    async fn a_blocklist_change_settles_the_open_dialog_first() {
+        let page = json!([{"targetId": "T1", "type": "page", "url": "https://a.test/"}]);
+        let (mut client, browser) = fake_browser(dialog_while_idle(page)).await;
+        let mut blocklisted = request(
+            "evaluate",
+            json!({"expression": "'done'", "dialog_action": "dismiss"}),
+        );
+        blocklisted.block_url = vec!["*.png".into()];
+        let result = execute_command(&mut client, &blocklisted)
+            .await
+            .expect("the dialog is dismissed before the rules");
+        assert_eq!(result.output, "done");
+        assert!(client.blocklist.contains(&"*.png".to_string()));
+        let calls = calls_made(client, browser).await;
+        let handled = calls
+            .iter()
+            .position(|c| c == "Page.handleJavaScriptDialog@S1")
+            .expect("the dialog was handled");
+        let blocked = calls
+            .iter()
+            .position(|c| c == "Network.setBlockedURLs@S1")
+            .expect("the rule was applied");
+        assert!(handled < blocked, "{calls:?}");
+    }
+
+    /// A rule Chrome refused must not stay in the daemon's blocklist.
+    #[tokio::test]
+    async fn a_refused_blocklist_rule_is_not_kept() {
+        let (mut client, browser) = fake_browser(|method, params| {
+            if method == "Network.setBlockedURLs"
+                && params["urls"]
+                    .as_array()
+                    .is_some_and(|urls| urls.iter().any(|u| u == "*.png"))
+            {
+                cdp_error("refused")
+            } else {
+                usual(method, params)
+            }
+        })
+        .await;
+        let mut blocklisted = request("evaluate", json!({"expression": "'done'"}));
+        blocklisted.block_url = vec!["*.png".into()];
+        let error = failure(execute_command(&mut client, &blocklisted).await);
+        assert!(error.to_string().contains("refused"), "{error:#}");
+        assert!(
+            !client.blocklist.contains(&"*.png".to_string()),
+            "the rule Chrome never got is not kept"
+        );
+        calls_made(client, browser).await;
+    }
+
+    /// The daemon's session is what keeps heap object IDs stable across
+    /// snapshots; a one-off session must say its IDs may not match.
+    #[tokio::test]
+    async fn a_one_off_heap_snapshot_notes_that_ids_may_not_match() {
+        let (mut client, browser) =
+            without_the_daemons_session(persistent_setup_refused(|method, _| {
+                (method == "HeapProfiler.takeHeapSnapshot").then(|| Answer {
+                    events: vec![json!({
+                        "method": "HeapProfiler.addHeapSnapshotChunk",
+                        "sessionId": "S2",
+                        "params": {"chunk": "{}"}
+                    })],
+                    reply: Some(json!({"result": {}})),
+                })
+            }))
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("snapshot.heapsnapshot");
+        let snapshot = request(
+            "take-heapsnapshot",
+            json!({"output": output.to_str().unwrap()}),
+        );
+        let result = execute_command(&mut client, &snapshot)
+            .await
+            .expect("the snapshot is saved");
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|n| n.contains("IDs may not match earlier snapshots")),
+            "{:?}",
+            result.notes
+        );
+        calls_made(client, browser).await;
     }
 }

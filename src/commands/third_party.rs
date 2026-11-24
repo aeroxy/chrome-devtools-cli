@@ -11,7 +11,9 @@ use crate::result::CommandResult;
 /// expressions read, and return it. Pages that set `__dtmcp` themselves answer
 /// nothing and keep theirs; groups an earlier discovery installed are dropped
 /// once nothing answers, so a page that removed its listener stops listing its
-/// old tools, unless the page has since put its own list in their place.
+/// old tools, unless the page has since put its own list in their place. The
+/// page's own plural array, which answering discovery replaces, is restored
+/// when nothing answers again.
 /// A group missing a field, or holding a malformed tool, is skipped with a
 /// console error, and the other groups still count. Only the legacy path runs
 /// this: WebMCP needs none of it, and must not fail because of it.
@@ -39,11 +41,22 @@ const DISCOVER_TOOLS_JS: &str = r#"async () => {
     if (groups.length === 0) {
         const dtmcp = window.__dtmcp;
         if (dtmcp && dtmcp.__discovered && dtmcp.toolGroups === dtmcp.__discovered) {
-            dtmcp.toolGroups = [];
+            // Give the page its own array back once no listener answers again.
+            if (dtmcp.__beforeDiscovery === undefined) {
+                delete dtmcp.toolGroups;
+            } else {
+                dtmcp.toolGroups = dtmcp.__beforeDiscovery;
+            }
+            delete dtmcp.__beforeDiscovery;
+            delete dtmcp.__discovered;
         }
         return groups;
     }
     const dtmcp = window.__dtmcp = window.__dtmcp || {};
+    if (dtmcp.toolGroups !== dtmcp.__discovered) {
+        // Keep the page's own array: discovery answers may stop at any time.
+        dtmcp.__beforeDiscovery = dtmcp.toolGroups;
+    }
     dtmcp.toolGroups = groups;
     // The list itself, so a later run can tell it from one the page set.
     dtmcp.__discovered = groups;
@@ -420,5 +433,29 @@ mod tests {
         assert!(DISCOVER_TOOLS_JS.contains("dtmcp.__discovered = groups;"));
         assert!(DISCOVER_TOOLS_JS.contains("dtmcp.toolGroups === dtmcp.__discovered"));
         assert!(!DISCOVER_TOOLS_JS.contains("__discovered = true"));
+    }
+
+    /// A page that answers discovery with its own `toolGroups` set gets that
+    /// array back when its listener is removed: discovery saves it before
+    /// replacing it, and restores it on the first unanswered run.
+    #[test]
+    fn discovery_restores_the_pages_own_tool_groups() {
+        let save = at(DISCOVER_TOOLS_JS, "dtmcp.toolGroups !== dtmcp.__discovered");
+        let assign = at(
+            DISCOVER_TOOLS_JS,
+            "dtmcp.__beforeDiscovery = dtmcp.toolGroups",
+        );
+        let restore = at(
+            DISCOVER_TOOLS_JS,
+            "dtmcp.toolGroups = dtmcp.__beforeDiscovery",
+        );
+        let clear = at(DISCOVER_TOOLS_JS, "dtmcp.toolGroups === dtmcp.__discovered");
+        assert!(save < assign);
+        // The restore only runs on the unanswered path, ahead of the save
+        // and replacement on an answered one.
+        assert!(clear < restore);
+        assert!(restore < at(DISCOVER_TOOLS_JS, "dtmcp.toolGroups = groups;"));
+        assert!(DISCOVER_TOOLS_JS.contains("delete dtmcp.__beforeDiscovery;"));
+        assert!(DISCOVER_TOOLS_JS.contains("delete dtmcp.__discovered;"));
     }
 }
