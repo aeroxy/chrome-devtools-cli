@@ -347,6 +347,12 @@ async fn wait_for_load_until(
         } else {
             None
         };
+        // The frame-tree probe may have used up the budget. A readiness call
+        // with the original allowance could return success after the deadline.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(timed_out());
+        }
         let result = client
             .send_to_target_within(
                 session_id,

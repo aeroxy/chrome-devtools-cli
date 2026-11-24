@@ -189,6 +189,10 @@ pub(crate) async fn emulate_tab(
     target_id: Option<&str>,
     params: EmulateParams,
 ) -> Result<CommandResult> {
+    // CLI and daemon validate before building these params, but `emulate` is
+    // public: a library caller must not get a viewport applied and cached
+    // before an invalid media feature stops the command.
+    params.validate()?;
     let persistent = client.persistent_session.as_deref() == Some(session_id);
     check_media_session(&params, persistent)?;
     let saved_tab = target_id.filter(|_| !persistent);
@@ -264,6 +268,13 @@ pub(crate) async fn emulate_tab(
         .and_then(|t| client.emulation_saved.get(t))
         .is_some_and(|s| s.media.is_some());
     if params.clear_media || (params.clear_all && (client.media.is_some() || saved_has_media)) {
+        // Forget the override before sending the clear: a dialog or a timeout
+        // can leave its outcome unknown, and a stale cache would both report
+        // `Media: print` and resend `print` on the next media update.
+        client.media = None;
+        if let Some(saved) = saved_tab.and_then(|t| client.emulation_saved.get_mut(t)) {
+            saved.media = None;
+        }
         client
             .send_to_target(
                 session_id,
@@ -271,10 +282,6 @@ pub(crate) async fn emulate_tab(
                 MediaOverride::default().cdp_params(),
             )
             .await?;
-        client.media = None;
-        if let Some(saved) = saved_tab.and_then(|t| client.emulation_saved.get_mut(t)) {
-            saved.media = None;
-        }
         actions.push("Media emulation cleared".to_string());
     }
 

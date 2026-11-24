@@ -24,8 +24,12 @@ pub async fn evaluate(
     let initial_url = if track_navigation {
         // run-script's auto-navigation leaves its own navigation events
         // buffered, and the wait below would take them for this expression's.
+        // Read the baseline first: a same-URL reload that commits while that
+        // read is in flight would otherwise be buffered after the clear and
+        // blamed on this expression.
+        let url = client.current_url(session_id).await?;
         client.clear_events();
-        Some(client.current_url(session_id).await?)
+        Some(url)
     } else {
         None
     };

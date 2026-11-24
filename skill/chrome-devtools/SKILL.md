@@ -203,9 +203,12 @@ chrome-devtools --target warm-squid emulate --media-feature prefers-color-scheme
 chrome-devtools --target warm-squid emulate --media-feature prefers-reduced-motion=reduce --media print
 # Output: Media emulation set (print; prefers-color-scheme=dark; prefers-reduced-motion=reduce)
 
-# Show current overrides
+# Show current overrides (the viewport, geolocation and media set above)
 chrome-devtools --target warm-squid emulate
-# Output: No emulation overrides active.  (or lists current blocks/viewport/media/etc.)
+# Output: Viewport: 1920x1080 (scale: 1, mobile: false)
+#         Geolocation: 40.71, -74 (acc: 100m)
+#         Media: print; prefers-color-scheme=dark; prefers-reduced-motion=reduce
+# After --clear-all, the same command prints: No emulation overrides active.
 
 # Clear emulation overrides
 chrome-devtools --target warm-squid emulate --clear-all        # clears everything
@@ -264,11 +267,14 @@ Two ways to fill inputs — choose based on what the site expects:
 ```bash
 # Click an element by CSS selector. It is scrolled into view first. If something
 # else covers its centre (a cookie banner, a modal, a sticky header), click and
-# hover fail and name it instead of acting on it; click-at with the coordinates
-# the error gives clicks there anyway.
+# hover fail and name the obstruction instead of acting on it. Resolve that
+# obstruction (dismiss the banner/modal, or scroll it away), then retry the
+# selector. Do not retry with the coordinates from the error: they point at the
+# covering element, so a click there would activate that element instead.
 chrome-devtools --target warm-squid click "button.submit"
 
-# Click at viewport-relative coordinates (0,0 is top-left of the visible viewport)
+# Click at viewport-relative coordinates (0,0 is top-left of the visible viewport).
+# Use this only for an intentional click on the element at those coordinates.
 chrome-devtools --target warm-squid click-at 100 200
 
 # Fill a text input (fast, no key events)
@@ -307,7 +313,13 @@ The daemon maintains a persistent session for the current page that continuously
 # Navigate (generates network + console events)
 chrome-devtools --target warm-squid navigate https://example.com
 
-# Drain accumulated network requests (instant, non-blocking)
+# Headers (> lines sent, < lines received): inspect them before draining — this
+# drains the network buffer too, so reload or generate fresh requests to see
+# them again. It is an alternative to the first plain `network` drain below,
+# not a second look at the same events.
+chrome-devtools --target warm-squid network --request-headers --response-headers
+
+# Drain any new network requests since that header drain (instant, non-blocking)
 chrome-devtools --target warm-squid network
 
 # Drain console messages
@@ -319,9 +331,6 @@ chrome-devtools --target warm-squid console --type error --type warning
 # Filter network by resource type (case-insensitive): Document, Script, Stylesheet,
 # Image, Font, XHR, Fetch, Manifest, Media, Other
 chrome-devtools --target warm-squid network --type Fetch --type XHR
-
-# Headers: what each request was sent with (> lines) and what came back (< lines)
-chrome-devtools --target warm-squid network --type Fetch --request-headers --response-headers
 
 # Live monitoring: blocks for N milliseconds, collecting events during that window
 chrome-devtools --target warm-squid console --duration 5000

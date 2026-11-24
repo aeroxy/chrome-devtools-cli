@@ -41,6 +41,16 @@ fn element_center_js(selector: &str) -> Result<String> {
                     const r = child.getBoundingClientRect();
                     if (r.width > 0 && r.height > 0) out.push({{node: child, rect: r}});
                 }}
+                // A label activates its control even when it sits beside a
+                // clipped one, so its lines are candidates too. The hit check
+                // below still decides whether the point reaches the control.
+                for (const label of el.labels || []) {{
+                    const style = getComputedStyle(label);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    for (const r of label.getClientRects()) {{
+                        if (r.width > 0 && r.height > 0) out.push({{node: label, rect: r}});
+                    }}
+                }}
                 return out;
             }};
             let candidates = boxes();
@@ -145,6 +155,30 @@ async fn dispatch_mouse(
 fn before_action(error: anyhow::Error, what_happened: &'static str) -> anyhow::Error {
     if error.downcast_ref::<crate::cdp::DialogOpen>().is_some() {
         error.context(what_happened)
+    } else {
+        error
+    }
+}
+
+/// Marks a dialog opened from the submit key's handler, so the command's
+/// report does not claim the key was skipped when it was in fact pressed.
+/// Anyhow keeps this marker in the error chain for the executor to read.
+#[derive(Debug)]
+pub(crate) struct SubmitKeyDialog;
+
+impl std::fmt::Display for SubmitKeyDialog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the submit key's handler opened the dialog")
+    }
+}
+
+impl std::error::Error for SubmitKeyDialog {}
+
+/// Mark a dialog that blocked a call made after the text was inserted as one
+/// from the submit-key phase, so the report cannot claim the key was skipped.
+fn mark_submit_key_dialog(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<crate::cdp::DialogOpen>().is_some() {
+        error.context(SubmitKeyDialog)
     } else {
         error
     }
@@ -433,8 +467,8 @@ async fn opened_pages(
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let requested = action_requested_new_tab(&client.events, session_id);
-    let notes = new_tab_notes(infos, before, None, requested);
+    let requested = action_requested_new_tab_urls(&client.events, session_id);
+    let notes = new_tab_notes(infos, before, None, &requested);
     if notes.is_empty() {
         return Ok(notes);
     }
@@ -450,58 +484,99 @@ async fn opened_pages(
     let own_id = own
         .as_ref()
         .and_then(|info| info["targetInfo"]["targetId"].as_str());
-    Ok(new_tab_notes(infos, before, own_id, requested))
+    Ok(new_tab_notes(infos, before, own_id, &requested))
 }
 
-/// Whether the input itself asked for a new tab. A timer on the page can open
-/// a popup during a command that does nothing; the popup still names the
-/// acting tab as its opener. Only a navigation request from this page's frame
-/// during the action ties creation to the action.
-fn action_requested_new_tab(
+/// URLs of the new-tab navigation requests this page's frame made during the
+/// action. A timer on the page can open a popup that also names the acting tab
+/// as opener. A request only ties creation to the action for the tab it
+/// navigated, which is identified by URL; a tab created without one (or with a
+/// URL that no request names) keeps the neutral label.
+fn action_requested_new_tab_urls(
     events: &std::collections::VecDeque<serde_json::Value>,
     session_id: &str,
-) -> bool {
-    events.iter().any(|e| {
-        e["sessionId"].as_str() == Some(session_id)
-            && e["method"] == "Page.frameRequestedNavigation"
-            && matches!(
-                e["params"]["disposition"].as_str(),
-                Some("newWindow" | "newForegroundTab" | "newBackgroundTab")
-            )
-    })
+) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| {
+            e["sessionId"].as_str() == Some(session_id)
+                && e["method"] == "Page.frameRequestedNavigation"
+                && matches!(
+                    e["params"]["disposition"].as_str(),
+                    Some("newWindow" | "newForegroundTab" | "newBackgroundTab")
+                )
+        })
+        .filter_map(|e| e["params"]["url"].as_str().map(str::to_string))
+        .collect()
 }
 
 /// Notes for the page targets in `infos` (`Target.getTargets`) missing from
 /// `before`. Chrome names the opener of a tab even through `noopener`, but a
-/// timer on the acting page can open one too: `[opened: …]` needs both that
-/// opener and a navigation request from the action. Everything else, such as
-/// a tab a person opened meanwhile, is only `[new tab: …]`.
+/// timer on the acting page can open one too. `[opened: …]` needs the opener,
+/// one request for that URL and one new tab at it: two tabs from the same
+/// opener must not both be credited to a single request. Everything else,
+/// such as a tab a person opened meanwhile, is only `[new tab: …]`.
 fn new_tab_notes(
     infos: &[serde_json::Value],
     before: &std::collections::HashSet<String>,
     acting: Option<&str>,
-    requested: bool,
+    requested_urls: &[String],
 ) -> Vec<String> {
-    infos
+    let new_tabs: Vec<_> = infos
         .iter()
         .filter(|t| t["type"] == "page")
+        .filter(|t| {
+            t["targetId"]
+                .as_str()
+                .is_some_and(|id| !before.contains(id))
+        })
+        .collect();
+    new_tabs
+        .iter()
         .filter_map(|t| {
             let id = t["targetId"].as_str()?;
-            if before.contains(id) {
-                return None;
-            }
-            let label = if requested && t["openerId"].as_str().is_some_and(|o| Some(o) == acting) {
-                "opened"
-            } else {
-                "new tab"
-            };
             let url = t["url"].as_str().unwrap_or_default();
+            // One request can place one tab. Two tabs at the same URL, or two
+            // matching requests, leave the association ambiguous.
+            let credited = requested_urls.iter().filter(|u| u.as_str() == url).count() == 1
+                && new_tabs
+                    .iter()
+                    .filter(|other| other["url"].as_str().unwrap_or_default() == url)
+                    .count()
+                    == 1
+                && t["openerId"].as_str().is_some_and(|o| Some(o) == acting);
+            let label = if credited { "opened" } else { "new tab" };
             Some(format!(
                 "[{label}: {} {url}]",
                 crate::friendly::to_friendly(id)
             ))
         })
         .collect()
+}
+
+/// How many times to follow a selector that keeps shifting under the pointer.
+const MAX_HIT_MOVES: usize = 3;
+
+/// One recheck while settling a selector's hit point. Only `Stable` may be
+/// pressed: a point confirmed before the last move may now hit something that
+/// move uncovered.
+#[derive(Debug, PartialEq)]
+enum HitRecheck {
+    Stable,
+    Follow((f64, f64)),
+    Unsettled,
+}
+
+/// Decide from a recheck whether the point is settled, needs another move, or
+/// has exhausted the retry limit.
+fn hit_recheck(current: (f64, f64), reported: (f64, f64), attempts_left: usize) -> HitRecheck {
+    if reported == current {
+        HitRecheck::Stable
+    } else if attempts_left > 0 {
+        HitRecheck::Follow(reported)
+    } else {
+        HitRecheck::Unsettled
+    }
 }
 
 /// Click at absolute page coordinates (x, y). An explicit coordinate action:
@@ -546,15 +621,25 @@ async fn click_point(
         .await
         .map_err(moved)?;
     if let Some(selector) = selector {
-        let (new_x, new_y) = get_element_center(client, session_id, selector)
-            .await
-            .map_err(moved)?;
-        if (new_x, new_y) != (x, y) {
-            x = new_x;
-            y = new_y;
-            dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0)
+        let mut attempts = MAX_HIT_MOVES;
+        loop {
+            let (new_x, new_y) = get_element_center(client, session_id, selector)
                 .await
                 .map_err(moved)?;
+            match hit_recheck((x, y), (new_x, new_y), attempts) {
+                HitRecheck::Stable => break,
+                HitRecheck::Follow((nx, ny)) => {
+                    x = nx;
+                    y = ny;
+                    dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0)
+                        .await
+                        .map_err(moved)?;
+                    attempts -= 1;
+                }
+                HitRecheck::Unsettled => bail!(
+                    "The element kept moving under the pointer, so no click was sent: {selector}"
+                ),
+            }
         }
     }
     // The press starts the click: the page may act on it, as on a person's.
@@ -972,19 +1057,33 @@ pub async fn type_text(
     client.input_sent = true;
     client
         .send_to_target(session_id, "Input.insertText", json!({"text": text}))
-        .await?;
+        .await
+        .map_err(|e| {
+            before_action(
+                e,
+                "A dialog opened while the text was inserted, so the submit key was not sent",
+            )
+        })?;
 
     let mut new_document = false;
     if let Some(spec) = &submit {
         // Only navigations from the key press count.
         client.clear_events();
-        dispatch_key(client, session_id, spec).await?;
+        dispatch_key(client, session_id, spec)
+            .await
+            .map_err(mark_submit_key_dialog)?;
         new_document = wait_for_navigation(client, session_id)
             .await
             .unwrap_or(false);
     }
 
-    let new_url = client.current_url(session_id).await?;
+    let new_url = match submit {
+        Some(_) => client
+            .current_url(session_id)
+            .await
+            .map_err(mark_submit_key_dialog)?,
+        None => client.current_url(session_id).await?,
+    };
     Ok(CommandResult::output(format!(
         "Typed: {text}{}",
         submit_key.map(|k| format!(" + {k}")).unwrap_or_default()
@@ -1445,8 +1544,8 @@ mod tests {
     }
 
     /// An opener ID alone is not proof the action opened the tab: a timer on
-    /// the same page could have. The navigation request from the action is
-    /// needed as well.
+    /// the same page could have. A navigation request for that tab's URL from
+    /// the action is needed as well.
     #[test]
     fn new_tabs_need_action_evidence_as_well_as_the_opener() {
         let before: std::collections::HashSet<String> = ["A".to_string(), "B".to_string()].into();
@@ -1458,17 +1557,18 @@ mod tests {
             json!({"targetId": "F", "type": "service_worker", "url": "https://a.test/sw.js", "openerId": "A"}),
         ];
         let name = crate::friendly::to_friendly;
-        // Same-document creation during the command: no tab is credited.
+        // No request from the action: no tab is credited.
         assert_eq!(
-            new_tab_notes(&infos, &before, Some("A"), false),
+            new_tab_notes(&infos, &before, Some("A"), &[]),
             [
                 format!("[new tab: {} https://a.test/pop]", name("C")),
                 format!("[new tab: {} about:blank]", name("D")),
                 format!("[new tab: {} https://b.test/]", name("E")),
             ]
         );
+        let requested = vec!["https://a.test/pop".to_string()];
         assert_eq!(
-            new_tab_notes(&infos, &before, Some("A"), true),
+            new_tab_notes(&infos, &before, Some("A"), &requested),
             [
                 format!("[opened: {} https://a.test/pop]", name("C")),
                 format!("[new tab: {} about:blank]", name("D")),
@@ -1476,7 +1576,7 @@ mod tests {
             ]
         );
         // Without knowing which tab acted, no tab is credited to the action.
-        let unplaced = new_tab_notes(&infos, &before, None, true);
+        let unplaced = new_tab_notes(&infos, &before, None, &requested);
         assert_eq!(unplaced.len(), 3);
         assert!(
             unplaced.iter().all(|n| n.starts_with("[new tab: ")),
@@ -1484,24 +1584,58 @@ mod tests {
         );
     }
 
+    /// One request cannot speak for two tabs that share an opener.
+    #[test]
+    fn one_request_does_not_open_every_same_opener_tab() {
+        let before: std::collections::HashSet<String> = ["A".to_string()].into();
+        let infos = [
+            json!({"targetId": "C", "type": "page", "url": "https://a.test/pop", "openerId": "A"}),
+            json!({"targetId": "D", "type": "page", "url": "https://timer.test/", "openerId": "A"}),
+        ];
+        let name = crate::friendly::to_friendly;
+        let requested = vec!["https://a.test/pop".to_string()];
+        assert_eq!(
+            new_tab_notes(&infos, &before, Some("A"), &requested),
+            [
+                format!("[opened: {} https://a.test/pop]", name("C")),
+                format!("[new tab: {} https://timer.test/]", name("D")),
+            ]
+        );
+        // Two tabs at the requested URL: the request cannot pick one.
+        let ambiguous = [
+            infos[0].clone(),
+            json!({
+                "targetId": "E", "type": "page", "url": "https://a.test/pop", "openerId": "A"
+            }),
+        ];
+        assert!(new_tab_notes(&ambiguous, &before, Some("A"), &requested)
+            .iter()
+            .all(|n| n.starts_with("[new tab: ")));
+    }
+
     /// The evidence is a new-window navigation request from this page's frame,
-    /// not one for the current tab or from another session.
+    /// not one for the current tab or from another session. Its URL is what
+    /// ties it to a particular new tab.
     #[test]
     fn a_new_tab_request_from_the_action_is_recognised() {
-        let request = |session, disposition| {
+        let request = |session, disposition, url| {
             json!({"sessionId": session, "method": "Page.frameRequestedNavigation",
-                   "params": {"disposition": disposition}})
+                   "params": {"disposition": disposition, "url": url}})
         };
         let events: std::collections::VecDeque<_> = [
-            request("s2", "newWindow"),
-            request("s1", "currentTab"),
-            request("s1", "newBackgroundTab"),
+            request("s2", "newWindow", "https://other.test/"),
+            request("s1", "currentTab", "https://a.test/"),
+            request("s1", "newBackgroundTab", "https://a.test/pop"),
         ]
         .into();
-        assert!(action_requested_new_tab(&events, "s1"));
-        assert!(!action_requested_new_tab(&events, "s3"));
-        let none: std::collections::VecDeque<_> = [request("s1", "sameDocument")].into();
-        assert!(!action_requested_new_tab(&none, "s1"));
+        assert_eq!(
+            action_requested_new_tab_urls(&events, "s1"),
+            ["https://a.test/pop"]
+        );
+        assert!(action_requested_new_tab_urls(&events, "s3").is_empty());
+        let none: std::collections::VecDeque<_> =
+            [request("s1", "sameDocument", "https://a.test/")].into();
+        assert!(action_requested_new_tab_urls(&none, "s1").is_empty());
     }
 
     /// A visibility:hidden element takes no clicks itself, but a visible
@@ -1525,6 +1659,42 @@ mod tests {
         let descendants = js.find("querySelectorAll('*')").unwrap();
         let refusal = js.find("has no size").unwrap();
         assert!(descendants < refusal, "{js}");
+    }
+
+    /// A sibling label can be the only visible part of a styled control, so it
+    /// must be hit tested before the element is called obstructed.
+    #[test]
+    fn an_associated_label_is_a_hit_test_candidate() {
+        let js = element_center_js("#toggle").unwrap();
+        let labels = js.find("el.labels").unwrap();
+        let hit_test = js.find("elementFromPoint").unwrap();
+        assert!(labels < hit_test, "{js}");
+        // The label's box is only a candidate; the hit still has to reach the
+        // control (or its label), so an obstructed label does not pass.
+        assert!(js.contains("hit.closest('label')?.control === el"), "{js}");
+    }
+
+    /// Every pointer move gets a recheck. A point confirmed before the last
+    /// move is not enough, and a selector that never settles is not pressed.
+    #[test]
+    fn a_selector_click_waits_for_a_stable_hit_point() {
+        assert_eq!(
+            hit_recheck((10.0, 10.0), (20.0, 20.0), MAX_HIT_MOVES),
+            HitRecheck::Follow((20.0, 20.0))
+        );
+        // The second move can shift it again; the old code pressed here.
+        assert_eq!(
+            hit_recheck((20.0, 20.0), (30.0, 30.0), MAX_HIT_MOVES - 1),
+            HitRecheck::Follow((30.0, 30.0))
+        );
+        assert_eq!(
+            hit_recheck((30.0, 30.0), (30.0, 30.0), MAX_HIT_MOVES - 2),
+            HitRecheck::Stable
+        );
+        assert_eq!(
+            hit_recheck((30.0, 30.0), (40.0, 40.0), 0),
+            HitRecheck::Unsettled
+        );
     }
 
     /// A fragment event can be buffered ahead of the commit of a reload that

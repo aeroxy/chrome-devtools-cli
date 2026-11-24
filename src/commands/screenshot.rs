@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use serde_json::json;
 
-use crate::cdp::{CdpClient, DialogOpen};
+use crate::cdp::{is_connection_or_page_failure, CdpClient, DialogOpen};
 use crate::result::CommandResult;
 
 /// Chrome's GPU texture limit: past this many device pixels in either
@@ -200,13 +200,16 @@ async fn page_device_pixel_ratio(client: &mut CdpClient, session_id: &str) -> Re
     dpr_probe_result(ratio)
 }
 
-/// A dialog failure from the DPR probe is the screenshot's failure too: the
-/// capture would otherwise handle it again with a fresh deadline, and could
-/// succeed where the probe timed out. Other errors only mean the ratio is
-/// unavailable, so the metrics-based fallback can supply it.
+/// A dialog or a failed page/connection from the DPR probe is the screenshot's
+/// failure too: the capture would otherwise retry the same page with a fresh
+/// deadline, doubling the wait before it fails (and keeping the daemon busy).
+/// Other errors only mean the ratio is unavailable, so the metrics-based
+/// fallback can supply it.
 fn dpr_probe_result(ratio: Result<Option<f64>>) -> Result<Option<f64>> {
     match ratio {
-        Err(e) if e.downcast_ref::<DialogOpen>().is_some() => Err(e),
+        Err(e) if e.downcast_ref::<DialogOpen>().is_some() || is_connection_or_page_failure(&e) => {
+            Err(e)
+        }
         Err(_) => Ok(None),
         Ok(ratio) => Ok(ratio),
     }
@@ -379,6 +382,22 @@ mod tests {
             None
         );
         assert_eq!(dpr_probe_result(Ok(Some(2.0))).unwrap(), Some(2.0));
+    }
+
+    /// A stalled page or a lost connection must stop the command here: retrying
+    /// `Page.captureScreenshot` on the same page only doubles the wait.
+    #[test]
+    fn the_dpr_probe_keeps_a_stall_or_lost_connection() {
+        for error in [
+            anyhow::Error::new(crate::cdp::PageUnresponsive("stalled".into())),
+            anyhow::Error::new(crate::cdp::ConnectionLost("closed".into())),
+        ] {
+            let failed = dpr_probe_result(Err(error)).unwrap_err();
+            assert!(
+                crate::cdp::is_connection_or_page_failure(&failed),
+                "{failed}"
+            );
+        }
     }
 
     #[test]

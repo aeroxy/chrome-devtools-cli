@@ -1738,17 +1738,22 @@ fn normalize_cli_args(args: &mut Vec<String>) {
             continue;
         }
         if arg == "evaluate" {
-            let path = args
-                .get(i + 1)
-                .and_then(|a| a.strip_prefix("-o"))
-                // Clap accepts both `-oout.json` and `-o=out.json`; keep the
-                // filename, not the separator.
-                .map(|p| p.strip_prefix('=').unwrap_or(p))
-                .filter(|p| !p.is_empty() && !p.starts_with('-'))
-                .map(str::to_string);
-            if let Some(path) = path {
-                args[i + 1] = "-o".to_string();
-                args.insert(i + 2, path);
+            // A lone `-o...` token is the expression (allow_hyphen_values), not
+            // an attached output option. Split it only when a separate token
+            // follows, which is the expression and leaves this one as `-o`.
+            if args.get(i + 2).is_some() {
+                let path = args
+                    .get(i + 1)
+                    .and_then(|a| a.strip_prefix("-o"))
+                    // Clap accepts both `-oout.json` and `-o=out.json`; keep the
+                    // filename, not the separator.
+                    .map(|p| p.strip_prefix('=').unwrap_or(p))
+                    .filter(|p| !p.is_empty() && !p.starts_with('-'))
+                    .map(str::to_string);
+                if let Some(path) = path {
+                    args[i + 1] = "-o".to_string();
+                    args.insert(i + 2, path);
+                }
             }
         }
         return; // the first positional is the subcommand, whatever it is
@@ -2100,6 +2105,8 @@ const CAFFEINATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// would put up a prompt nobody asked for, and another after every check that
 /// timed out waiting on it.
 async fn caffeinate(cli: &Cli, ws_url: &str, key: &str, request: &DaemonRequest) -> Result<()> {
+    let name = browser::display_name(&cli.browser);
+    let started = std::time::Instant::now();
     let first = match client::send_to_daemon(key, request).await {
         Ok(resp) => resp,
         Err(_) => {
@@ -2108,31 +2115,43 @@ async fn caffeinate(cli: &Cli, ws_url: &str, key: &str, request: &DaemonRequest)
             client::send_to_daemon(key, request).await?
         }
     };
-    // A failure exits with the daemon's error and code, as any other command
-    // would. A success prints nothing but the warning for a daemon of another
-    // version, once: caffeinate is what keeps such a daemon from exiting.
+    // A typed lost connection ends caffeinate with the same stop guidance as a
+    // later check: the daemon's advice to re-check an action belongs to
+    // ordinary commands, not to a check that only pings the browser.
+    if lost_connection(&first) {
+        if let Some(reason) = caffeinate_stop_reason(Ok(&first), &name, started.elapsed()) {
+            return Err(reason);
+        }
+    }
+    // Other failures keep the daemon's error and code. A success prints
+    // nothing but the warning for a daemon of another version, once:
+    // caffeinate is what keeps such a daemon from exiting.
     print_response(&first, cli.output_format());
 
-    let name = browser::display_name(&cli.browser);
     eprintln!(
         "Keeping the connection to {name} alive, checking it every {}s. Stop with Ctrl-C.",
         CAFFEINATE_INTERVAL.as_secs()
     );
-    let started = std::time::Instant::now();
     loop {
         tokio::time::sleep(CAFFEINATE_INTERVAL).await;
         let outcome = client::send_to_daemon(key, request).await;
-        if let Some(reason) = caffeinate_stop_reason(outcome, &name, started.elapsed()) {
+        if let Some(reason) = caffeinate_stop_reason(outcome.as_ref(), &name, started.elapsed()) {
             return Err(reason);
         }
     }
+}
+
+/// Whether the daemon reported that the connection caffeinate was keeping has
+/// gone. Match the code, not the error text, which pages can imitate.
+fn lost_connection(resp: &protocol::DaemonResponse) -> bool {
+    !resp.success && resp.error_code == Some(error::ErrorCode::WebSocketDisconnected.code())
 }
 
 /// Why `caffeinate` must stop after a check, or `None` while the connection is
 /// fine. A lost connection always reads "Lost the connection to <browser>": an
 /// agent running caffeinate in the background learns of it from this alone.
 fn caffeinate_stop_reason(
-    outcome: Result<protocol::DaemonResponse>,
+    outcome: Result<&protocol::DaemonResponse, &anyhow::Error>,
     browser: &str,
     alive_for: std::time::Duration,
 ) -> Option<anyhow::Error> {
@@ -2144,7 +2163,7 @@ fn caffeinate_stop_reason(
     );
     match outcome {
         Ok(resp) if resp.success => None,
-        Ok(resp) if resp.error_code == Some(error::ErrorCode::WebSocketDisconnected.code()) => {
+        Ok(resp) if lost_connection(resp) => {
             // The first line is the cause. The rest is the daemon's advice for
             // ordinary commands, which `next` replaces.
             let cause = resp.error.lines().next().unwrap_or_default();
@@ -2732,18 +2751,19 @@ mod tests {
         let code_of = |e: &anyhow::Error| e.downcast_ref::<error::CliError>().map(|ce| ce.code());
         let alive_for = std::time::Duration::from_secs(2 * 3600 + 13 * 60);
 
-        let fine = Ok(response(true, "", None));
-        assert!(caffeinate_stop_reason(fine, "Chrome", alive_for).is_none());
+        let fine = response(true, "", None);
+        assert!(caffeinate_stop_reason(Ok(&fine), "Chrome", alive_for).is_none());
 
-        let lost = Ok(response(
+        let lost = response(
             false,
             "WebSocket closed by server\nLost the connection to Chrome, so the daemon has \
              exited. Run a read-only command such as `list-pages` to reconnect, then verify \
              whether the original action took effect before repeating it. Chrome may ask you to \
              approve the new connection.",
             Some(error::ErrorCode::WebSocketDisconnected.code()),
-        ));
-        let lost = caffeinate_stop_reason(lost, "Chrome", alive_for).unwrap();
+        );
+        assert!(lost_connection(&lost));
+        let lost = caffeinate_stop_reason(Ok(&lost), "Chrome", alive_for).unwrap();
         assert_eq!(
             code_of(&lost),
             Some(error::ErrorCode::WebSocketDisconnected)
@@ -2758,14 +2778,21 @@ mod tests {
         assert!(!text.contains("list-pages"), "{text}");
         assert!(!text.contains("before repeating it"), "{text}");
 
-        let gone = Err(anyhow::anyhow!("Connection refused"));
-        let gone = caffeinate_stop_reason(gone, "Chrome", alive_for).unwrap();
+        let gone = anyhow::anyhow!("Connection refused");
+        let gone = caffeinate_stop_reason(Err(&gone), "Chrome", alive_for).unwrap();
         assert_eq!(code_of(&gone), Some(error::ErrorCode::Daemon));
         assert!(
             gone.to_string()
                 .contains("Lost the connection to Chrome after 2h13m"),
             "{gone}"
         );
+
+        // Only the typed code counts, not a page's imitation of the text.
+        assert!(!lost_connection(&response(
+            false,
+            "Lost the connection to Chrome!",
+            Some(error::ErrorCode::Daemon.code())
+        )));
     }
 
     /// The daemon keeps its own startup directory, so the CLI's goes along with
@@ -2842,6 +2869,12 @@ mod tests {
                 "{attached}"
             );
         }
+        // A lone `-o`-prefixed token is JavaScript, not an output option.
+        assert_eq!(normalize(&["evaluate", "-offset"])["expression"], "-offset");
+        assert_eq!(
+            normalize(&["evaluate", "-oout.json"])["expression"],
+            "-oout.json"
+        );
         // The explicit `--` form still passes a leading dash through.
         assert_eq!(normalize(&["evaluate", "--", "-1"])["expression"], "-1");
         // Global options before the subcommand must not hide it.
