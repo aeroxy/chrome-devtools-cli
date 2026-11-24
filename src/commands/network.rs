@@ -237,6 +237,19 @@ fn process_network_events(
                     let error = params["errorText"].as_str().unwrap_or("failed").to_string();
                     req["status"] = json!("failed");
                     req["error"] = json!(error);
+                    if headers.response {
+                        // A failed fetch can still carry wire response headers in a
+                        // responseReceivedExtraInfo event with no responseReceived
+                        // (e.g. a CORS rejection). Keep any headers already recorded,
+                        // since a failure after a response may have set them from the
+                        // page's view.
+                        let hop = hops.get(&request_id).map_or(0, |n| n.saturating_sub(1));
+                        let page_view = req
+                            .get("responseHeaders")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        req["responseHeaders"] = pick(&wire_response, &request_id, hop, &page_view);
+                    }
                 }
             }
             _ => {}
@@ -535,6 +548,47 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["status"], "failed");
         assert_eq!(out[0]["error"], "net::ERR_BLOCKED_BY_CLIENT");
+    }
+
+    /// A CORS rejection can send responseReceivedExtraInfo without a
+    /// responseReceived. The wire headers must still be shown for the failed
+    /// request when response headers were asked for.
+    #[test]
+    fn cors_failure_keeps_wire_response_headers() {
+        let event =
+            |method: &str, params: serde_json::Value| json!({"method": method, "params": params});
+        let events = vec![
+            event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "1", "type": "Fetch",
+                "request": {"url": "https://api.test/data", "method": "GET"}}),
+            ),
+            event(
+                "Network.responseReceivedExtraInfo",
+                json!({"requestId": "1",
+                "headers": {"access-control-allow-origin": "https://app.test", "content-type": "application/json"}}),
+            ),
+            event(
+                "Network.loadingFailed",
+                json!({"requestId": "1", "errorText": "net::ERR_FAILED", "blockedReason": "cors"}),
+            ),
+        ];
+        let with_headers = Headers {
+            request: false,
+            response: true,
+        };
+        let out = process_network_events(&events, &[], with_headers);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["status"], "failed");
+        assert_eq!(out[0]["error"], "net::ERR_FAILED");
+        assert_eq!(
+            out[0]["responseHeaders"]["access-control-allow-origin"],
+            "https://app.test"
+        );
+
+        let without = process_network_events(&events, &[], Headers::default());
+        assert_eq!(without[0]["status"], "failed");
+        assert!(without[0].get("responseHeaders").is_none());
     }
 
     #[test]

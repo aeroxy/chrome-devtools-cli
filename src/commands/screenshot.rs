@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use serde_json::json;
 
-use crate::cdp::CdpClient;
+use crate::cdp::{CdpClient, DialogOpen};
 use crate::result::CommandResult;
 
 /// Chrome's GPU texture limit: past this many device pixels in either
@@ -80,7 +80,7 @@ pub async fn take_screenshot(
             .await
             .context("Failed to query page layout metrics")?;
 
-        dpr = match page_device_pixel_ratio(client, session_id).await {
+        dpr = match page_device_pixel_ratio(client, session_id).await? {
             Some(ratio) => ratio,
             None => device_pixel_ratio(&metrics),
         };
@@ -173,29 +173,43 @@ pub async fn take_screenshot(
 /// defences do, and a smaller value there would let a capture past
 /// --max-width through. Chrome reuses a world of the same name, so repeated
 /// screenshots don't add any. `None` where the page can't run JavaScript.
-async fn page_device_pixel_ratio(client: &mut CdpClient, session_id: &str) -> Option<f64> {
-    let frame_id = super::input::main_frame_id(client, session_id).await.ok()?;
-    let world = client
-        .send_to_target(
-            session_id,
-            "Page.createIsolatedWorld",
-            json!({"frameId": frame_id, "worldName": "chrome-devtools-cli"}),
-        )
-        .await
-        .ok()?;
-    let result = client
-        .send_to_target(
-            session_id,
-            "Runtime.evaluate",
-            json!({
-                "expression": "devicePixelRatio",
-                "contextId": world["executionContextId"],
-                "returnByValue": true,
-            }),
-        )
-        .await
-        .ok()?;
-    result["result"]["value"].as_f64().filter(|r| *r > 0.0)
+async fn page_device_pixel_ratio(client: &mut CdpClient, session_id: &str) -> Result<Option<f64>> {
+    let ratio = async {
+        let frame_id = super::input::main_frame_id(client, session_id).await?;
+        let world = client
+            .send_to_target(
+                session_id,
+                "Page.createIsolatedWorld",
+                json!({"frameId": frame_id, "worldName": "chrome-devtools-cli"}),
+            )
+            .await?;
+        let result = client
+            .send_to_target(
+                session_id,
+                "Runtime.evaluate",
+                json!({
+                    "expression": "devicePixelRatio",
+                    "contextId": world["executionContextId"],
+                    "returnByValue": true,
+                }),
+            )
+            .await?;
+        Ok::<Option<f64>, anyhow::Error>(result["result"]["value"].as_f64().filter(|r| *r > 0.0))
+    }
+    .await;
+    dpr_probe_result(ratio)
+}
+
+/// A dialog failure from the DPR probe is the screenshot's failure too: the
+/// capture would otherwise handle it again with a fresh deadline, and could
+/// succeed where the probe timed out. Other errors only mean the ratio is
+/// unavailable, so the metrics-based fallback can supply it.
+fn dpr_probe_result(ratio: Result<Option<f64>>) -> Result<Option<f64>> {
+    match ratio {
+        Err(e) if e.downcast_ref::<DialogOpen>().is_some() => Err(e),
+        Err(_) => Ok(None),
+        Ok(ratio) => Ok(ratio),
+    }
 }
 
 /// DIPs per CSS pixel, which is the browser zoom (`cssVisualViewport.zoom`;
@@ -264,7 +278,9 @@ fn clip_scale_factor(
 
 #[cfg(test)]
 mod tests {
+    use super::dpr_probe_result;
     use super::{browser_zoom, capture_clip, clip_scale_factor, device_pixel_ratio};
+    use crate::cdp::DialogOpen;
 
     /// Page.getLayoutMetrics at 200% browser zoom on a 1x screen (Chrome
     /// 158), scrolled to y=500: the clip must be in DIPs to frame the viewport.
@@ -344,6 +360,25 @@ mod tests {
             clip_scale_factor(2000.0, 1000.0, Some(1000.0), Some(250.0)),
             0.25
         );
+    }
+
+    /// A dialog that the probe could not settle must reach the caller: the
+    /// capture call would start a new deadline and could hide the failure.
+    #[test]
+    fn the_dpr_probe_keeps_a_dialog_failure() {
+        let dialog = anyhow::Error::new(DialogOpen {
+            dialog_type: "alert".into(),
+            message: "hi".into(),
+        });
+        assert!(dpr_probe_result(Err(dialog))
+            .unwrap_err()
+            .downcast_ref::<DialogOpen>()
+            .is_some());
+        assert_eq!(
+            dpr_probe_result(Err(anyhow::anyhow!("no JS"))).unwrap(),
+            None
+        );
+        assert_eq!(dpr_probe_result(Ok(Some(2.0))).unwrap(), Some(2.0));
     }
 
     #[test]

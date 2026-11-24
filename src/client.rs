@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::time::{Duration, SystemTime};
@@ -9,6 +9,20 @@ use tokio::net::UnixStream;
 
 use crate::protocol::*;
 
+/// Marker for a daemon socket that answers but belongs to another user. Kept
+/// as a type so `wait_for_daemon` can tell it from a socket simply not yet
+/// listening and carry the reason into its startup error.
+#[derive(Debug)]
+struct PeerRefused;
+
+impl std::fmt::Display for PeerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the daemon socket is served by another user's process")
+    }
+}
+
+impl std::error::Error for PeerRefused {}
+
 #[cfg(unix)]
 async fn connect_daemon(key: &str) -> Result<UnixStream> {
     let path = socket_path(key);
@@ -16,11 +30,11 @@ async fn connect_daemon(key: &str) -> Result<UnixStream> {
         .await
         .with_context(|| format!("Failed to connect to daemon {key} at {}", path.display()))?;
     if !peer_is_this_user(&stream) {
-        bail!(
+        return Err(anyhow::Error::new(PeerRefused)).context(format!(
             "The daemon socket {} is served by another user's process, so this command was not \
              sent to it. Remove the socket if it is stale, or ask whoever owns it.",
             path.display()
-        );
+        ));
     }
     Ok(stream)
 }
@@ -106,15 +120,17 @@ fn daemon_command(exe: &std::path::Path, ws_url: &str, browser: &str) -> std::pr
 pub async fn wait_for_daemon(key: &str) -> Result<()> {
     let deadline = tokio::time::Instant::now() + daemon_wait_timeout();
     let mut delay = Duration::from_millis(50);
+    // A socket answered but rejected us: that is not the "not listening yet"
+    // case this loop waits out, so keep its reason for the timeout error.
+    let mut refusal: Option<anyhow::Error> = None;
     loop {
         if tokio::time::Instant::now() > deadline {
-            bail!(
-                "Daemon failed to start within {} seconds",
-                daemon_wait_timeout().as_secs()
-            );
+            return Err(daemon_start_timeout(refusal.as_ref()));
         }
-        if connect_daemon(key).await.is_ok() {
-            return Ok(());
+        match connect_daemon(key).await {
+            Ok(_) => return Ok(()),
+            Err(e) if e.downcast_ref::<PeerRefused>().is_some() => refusal = Some(e),
+            Err(_) => {}
         }
         // Simple jitter based on current time subseconds
         let jitter = SystemTime::now()
@@ -128,9 +144,37 @@ pub async fn wait_for_daemon(key: &str) -> Result<()> {
     }
 }
 
+/// The startup error keeps a peer refusal's reason; a socket that was simply
+/// not listening yet still gets the plain timeout.
+fn daemon_start_timeout(refusal: Option<&anyhow::Error>) -> anyhow::Error {
+    let base = format!(
+        "Daemon failed to start within {} seconds",
+        daemon_wait_timeout().as_secs()
+    );
+    match refusal {
+        Some(e) => anyhow::anyhow!("{base}: {e:#}"),
+        None => anyhow::anyhow!("{base}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_refusal_survives_the_startup_timeout() {
+        let refusal = anyhow::Error::new(PeerRefused).context("socket owned by somebody else");
+        let error = daemon_start_timeout(Some(&refusal));
+        assert!(
+            error.to_string().contains("socket owned by somebody else"),
+            "{error:#}"
+        );
+        let plain = daemon_start_timeout(None);
+        assert!(
+            plain.to_string().starts_with("Daemon failed to start"),
+            "{plain:#}"
+        );
+    }
 
     #[test]
     fn daemon_endpoint_stays_out_of_its_arguments() {

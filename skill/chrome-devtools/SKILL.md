@@ -177,8 +177,8 @@ chrome-devtools new-page --background https://github.com
 **Note**: The `[navigated to: ...]` and `[target:...]` lines go to **stderr**, not stdout. The stdout contains only the main command output ("Navigated to …", "Opened new page: …"). Other stderr lines to act on:
 
 - `[navigated to: <url>]` also appears when a click or key press reloads the page or posts a form back to the same URL, and when `evaluate --track-navigation` sets `location.href`.
-- `[opened: <name> <url>]`: a click or key press opened a new tab (a `target=_blank` link, `window.open`). Use that name for the new tab; the command's own `[target:...]` is still the old one. `[new tab: <name> <url>]` is a tab that appeared while the command ran without this page as its opener, such as one the human opened.
-- `[page error] …`: the page threw an uncaught exception or called `console.error` while the command ran (first line of each, at most 10). The command itself did what it reports; `console --type error` has the full messages.
+- `[opened: <name> <url>]`: a click or key press opened a new tab (a `target=_blank` link, `window.open`). Use that name for the new tab; the command's own `[target:...]` is still the old one. `[new tab: <name> <url>]` is a tab that appeared while the command ran without evidence the action opened it — one the human opened, or a timer on this page opened it even though it names this page as opener.
+- `[page error] …`: the page threw an uncaught exception or called `console.error` while the command ran (first line of each, at most 10). The command itself did what it reports; `console --type error` shows the retained messages, but the buffer cuts each string argument at 10,000 characters and cannot recover the discarded text.
 - `[warning] …`: for example a full-page screenshot past Chrome's 16384px limit, or a daemon from an older version still serving this browser (leave restarting it to the human).
 
 ### Pattern 2: Emulation (Viewport, Geolocation & CSS Media)
@@ -411,7 +411,7 @@ The text output is the compact one: an indented outline in document order, `[rol
 `--json` and `--toon` return Chrome's raw accessibility tree instead, many times larger; use them only for properties the outline leaves out.
 
 ### Pattern 9: Screenshots
-`--max-width`/`--max-height` are in image pixels, so they hold on HiDPI screens and at any browser zoom too. A `--full-page` capture past 16384px in either direction warns on stderr, because Chrome repeats or corrupts content beyond that: add `--max-height`.
+`--max-width`/`--max-height` are in image pixels, so they hold on HiDPI screens and at any browser zoom too. A `--full-page` capture past 16384px in either direction warns on stderr, because Chrome repeats or corrupts content beyond that. Use `--max-width` for a wide capture and `--max-height` for a tall one, or both when both dimensions exceed the limit: each flag caps its own dimension and scales the image uniformly, so `--max-height` alone will not shrink an over-wide capture.
 
 ```bash
 # Default: viewport-only PNG
@@ -852,6 +852,7 @@ chrome-devtools --target warm-squid remove-network-mock             # remove all
 - Body text that starts with a dash goes attached, as in `--body=-1`: `--body -1` is an error, so `--body` can't take the next flag (`--abort`) as its text.
 - `--body-file` must be a regular file of at most 64 MiB. The daemon reads it, and would wait on a pipe or a device (`<(...)`, `/dev/stdin`), so those fail: save the body to a file first.
 - Mocks belong to the tab and to the daemon: they stop applying while the CLI works on another tab, come back when it returns, and end when the daemon exits. A daemon with mocks stays up while the page keeps making requests; run `caffeinate` in the background to keep it for longer quiet spells.
+- Mocks apply to requests on the tab's own session; cross-site iframe requests run in another process and are not paused.
 - Cross-origin `fetch` needs CORS headers in the mock, e.g. `--header 'Access-Control-Allow-Origin: *'`.
 - `--resource-type XHR` and `--resource-type Fetch` each match both `fetch()` and XMLHttpRequest: Chrome doesn't tell them apart when it intercepts.
 - The HTTP cache is off while any mock is set, so cached responses can't bypass it. Service workers can still answer requests before they reach a mock.

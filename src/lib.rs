@@ -1704,19 +1704,54 @@ fn print_result(result: &result::CommandResult, output_format: format::OutputFor
 
 /// `-oout.json` is clap's attached short-option form, but the expression's
 /// `allow_hyphen_values` makes clap take that token as the expression and the
-/// real expression as an extra argument. Split it before parsing. `evaluate
-/// -- -1` is left alone, so a literal leading dash still reaches the page.
+/// real expression as an extra argument. Split it before parsing, but only for
+/// the `evaluate` subcommand: after `--`, an `evaluate` token is raw script
+/// data, and `evaluate -- -1` must pass a literal leading dash through.
 fn normalize_cli_args(args: &mut Vec<String>) {
-    if let Some(i) = args.iter().position(|a| a == "evaluate") {
-        let path = args
-            .get(i + 1)
-            .and_then(|arg| arg.strip_prefix("-o"))
-            .filter(|p| !p.is_empty() && !p.starts_with('-'))
-            .map(str::to_string);
-        if let Some(path) = path {
-            args[i + 1] = "-o".to_string();
-            args.insert(i + 2, path);
+    let mut i = 1; // args[0] is the program name
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            return;
         }
+        // Global options can precede the subcommand. Skip the ones whose
+        // value is a separate token so it isn't taken for the subcommand.
+        if matches!(
+            arg,
+            "--ws-endpoint"
+                | "--port"
+                | "--user-data-dir"
+                | "--browser"
+                | "--channel"
+                | "--page"
+                | "-p"
+                | "--target"
+                | "-t"
+                | "--block-url"
+                | "--unblock-url"
+        ) {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if arg == "evaluate" {
+            let path = args
+                .get(i + 1)
+                .and_then(|a| a.strip_prefix("-o"))
+                // Clap accepts both `-oout.json` and `-o=out.json`; keep the
+                // filename, not the separator.
+                .map(|p| p.strip_prefix('=').unwrap_or(p))
+                .filter(|p| !p.is_empty() && !p.starts_with('-'))
+                .map(str::to_string);
+            if let Some(path) = path {
+                args[i + 1] = "-o".to_string();
+                args.insert(i + 2, path);
+            }
+        }
+        return; // the first positional is the subcommand, whatever it is
     }
 }
 
@@ -2476,7 +2511,19 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
             abort,
             resource_type,
         } => match pattern {
-            None => commands::network_mock::list_network_mocks(&client, cli.output_format()),
+            None => {
+                // A direct client's `network_mocks` is always empty; the
+                // daemon may still hold and apply mocks for this tab. Listing
+                // that emptiness would be a false "no mocks" answer.
+                if client.persistent_session.as_deref() != Some(session_id.as_str()) {
+                    anyhow::bail!(
+                        "Listing network mocks needs the daemon's long-lived session for this \
+                         tab, which this command is not running in (no daemon, or it could not \
+                         attach). Run it again once the daemon is up."
+                    );
+                }
+                commands::network_mock::list_network_mocks(&client, cli.output_format())
+            }
             Some(pattern) => {
                 let request = commands::network_mock::MockRequest {
                     pattern,
@@ -2691,8 +2738,9 @@ mod tests {
         let lost = Ok(response(
             false,
             "WebSocket closed by server\nLost the connection to Chrome, so the daemon has \
-             exited. Run the command again to reconnect; Chrome may ask you to approve the new \
-             connection.",
+             exited. Run a read-only command such as `list-pages` to reconnect, then verify \
+             whether the original action took effect before repeating it. Chrome may ask you to \
+             approve the new connection.",
             Some(error::ErrorCode::WebSocketDisconnected.code()),
         ));
         let lost = caffeinate_stop_reason(lost, "Chrome", alive_for).unwrap();
@@ -2705,8 +2753,10 @@ mod tests {
             text.contains("Lost the connection to Chrome after 2h13m (WebSocket closed by server)"),
             "{text}"
         );
-        // Rerunning is advice for ordinary commands; caffeinate must not loop.
-        assert!(!text.contains("Run the command again"), "{text}");
+        // Reconnecting for an ordinary command is advice the daemon appends;
+        // caffeinate replaces it so its caller never loops or repeats an action.
+        assert!(!text.contains("list-pages"), "{text}");
+        assert!(!text.contains("before repeating it"), "{text}");
 
         let gone = Err(anyhow::anyhow!("Connection refused"));
         let gone = caffeinate_stop_reason(gone, "Chrome", alive_for).unwrap();
@@ -2784,11 +2834,38 @@ mod tests {
                 .unwrap()
                 .args
         };
-        let args = normalize(&["evaluate", "-oout.json", "1 + 1"]);
-        assert_eq!(args["expression"], "1 + 1");
-        assert!(args["output"].as_str().unwrap().ends_with("out.json"));
+        for attached in ["-oout.json", "-o=out.json"] {
+            let args = normalize(&["evaluate", attached, "1 + 1"]);
+            assert_eq!(args["expression"], "1 + 1", "{attached}");
+            assert!(
+                args["output"].as_str().unwrap().ends_with("out.json"),
+                "{attached}"
+            );
+        }
         // The explicit `--` form still passes a leading dash through.
         assert_eq!(normalize(&["evaluate", "--", "-1"])["expression"], "-1");
+        // Global options before the subcommand must not hide it.
+        let args = normalize(&["--target", "warm-squid", "evaluate", "-oout.json", "1 + 1"]);
+        assert_eq!(args["expression"], "1 + 1");
+        assert!(args["output"].as_str().unwrap().ends_with("out.json"));
+    }
+
+    /// A token after `--` belongs to the script, not to the CLI: `evaluate`
+    /// there must not have its `-orange` rewritten into an output option.
+    #[test]
+    fn arguments_after_the_separator_are_never_rewritten() {
+        let normalize = |argv: &[&str]| {
+            let mut full = vec!["chrome-devtools".to_string()];
+            full.extend(argv.iter().map(|s| s.to_string()));
+            normalize_cli_args(&mut full);
+            Cli::try_parse_from(full).unwrap().command
+        };
+        match normalize(&["run-script", "probe.js", "--", "evaluate", "-orange"]) {
+            Commands::RunScript { raw_args, .. } => {
+                assert_eq!(raw_args, ["evaluate", "-orange"]);
+            }
+            _ => panic!("expected run-script, got a different command"),
+        }
     }
 
     #[test]

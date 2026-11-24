@@ -5,6 +5,11 @@
 //! answered, so a paused request must never wait on the CLI: `CdpClient`
 //! answers them from every read of the socket, and the daemon keeps reading
 //! between commands while any mock is set (`CdpClient::wants_idle_reads`).
+//!
+//! Fetch is enabled only on the tab's own session. A cross-site iframe that
+//! Chrome runs in a separate renderer process is a separate DevTools target,
+//! so requests from it are not intercepted: a mock covers the tab's main frame
+//! and its same-process frames, not those out-of-process iframes.
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -398,8 +403,21 @@ pub async fn mock_network(
     }
     Ok(CommandResult::output(format!(
         "Mocked {summary}. It applies to this tab while the daemon runs (see `caffeinate`), \
-         and only to requests made from now on: reload to mock the page's own requests."
+         and only to requests made from now on: reload to mock the page's own requests. \
+         Requests from cross-site iframes in a separate renderer process are not covered."
     )))
+}
+
+/// Context for a browser update that failed after the local mock list already
+/// changed. Without it, a retry reporting zero removals would hide that the
+/// earlier removal took effect in the daemon.
+fn partial_removal_context(removed: usize) -> String {
+    let noun = if removed == 1 { "mock" } else { "mocks" };
+    format!(
+        "Removed {removed} network {noun} from the daemon, but the browser could not be updated: \
+         Fetch interception or the HTTP cache may still be left on for this tab. \
+         Retry `remove-network-mock` to bring the browser back in sync."
+    )
 }
 
 /// Remove the mocks with exactly this pattern, or all of them.
@@ -415,7 +433,9 @@ pub async fn remove_network_mock(
         None => client.network_mocks.clear(),
     }
     let removed = before - client.network_mocks.len();
-    apply_mocks(client, session_id).await?;
+    apply_mocks(client, session_id)
+        .await
+        .with_context(|| partial_removal_context(removed))?;
     let noun = if removed == 1 { "mock" } else { "mocks" };
     Ok(CommandResult::output(format!(
         "Removed {removed} network {noun}; {} left on this tab.",
@@ -567,6 +587,20 @@ mod tests {
         assert_eq!(reply_to_paused(&mocks, &paused("Script")).2, None);
         assert_eq!(reason_phrase(404), "Not Found");
         assert_eq!(reason_phrase(599), "Mocked");
+    }
+
+    /// A failure to update the browser must not hide that the daemon's mock
+    /// list already changed, or the caller will not know to retry.
+    #[test]
+    fn a_failed_browser_update_reports_the_partial_removal() {
+        let one = partial_removal_context(1);
+        assert!(one.contains("Removed 1 network mock from the daemon"));
+        assert!(one.contains("browser could not be updated"));
+        assert!(one.contains("Fetch interception or the HTTP cache"));
+        assert!(one.contains("Retry `remove-network-mock`"));
+
+        let many = partial_removal_context(2);
+        assert!(many.contains("Removed 2 network mocks from the daemon"));
     }
 
     #[test]

@@ -1880,13 +1880,6 @@ pub async fn compare_heapsnapshots_offline(
     Ok(CommandResult::output(out))
 }
 
-/// DevTools' `tryParseWeakMapEdgeName`. V8 gives a WeakMap value two
-/// `internal` edges, one from the key and one from the WeakMap's table, both
-/// named `<n> / part of key (<key> @<id>) -> value (<value> @<id>) pair in
-/// WeakMap (table @<id>)` with only `<n>` differing. Returns the rest, which
-/// pairs them. The names in it are any text, line breaks included: V8 embeds
-/// the value's name, which can be a multiline string. DevTools' regex, whose
-/// `.` stops at a line break, takes such a pair for two unrelated edges.
 /// DevTools skips the descriptor links of a `(map descriptors)` array when
 /// ranking paths: maps share those arrays, so a link valid for one map is not
 /// necessarily the right retainer for another.
@@ -1899,6 +1892,13 @@ fn skip_descriptor_link(snap: &Snap, ord: usize, e: usize) -> bool {
         .is_ok_and(|i| i >= 2 && i % 3 == 1)
 }
 
+/// DevTools' `tryParseWeakMapEdgeName`. V8 gives a WeakMap value two
+/// `internal` edges, one from the key and one from the WeakMap's table, both
+/// named `<n> / part of key (<key> @<id>) -> value (<value> @<id>) pair in
+/// WeakMap (table @<id>)` with only `<n>` differing. Returns the rest, which
+/// pairs them. The names in it are any text, line breaks included: V8 embeds
+/// the value's name, which can be a multiline string. DevTools' regex, whose
+/// `.` stops at a line break, takes such a pair for two unrelated edges.
 fn weak_map_pair(name: &str) -> Option<&str> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let shared = name.trim_start_matches(|c: char| c.is_ascii_digit());
