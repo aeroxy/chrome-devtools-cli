@@ -959,13 +959,46 @@ fn scan_args(s: &str) -> Option<(usize, Option<usize>)> {
     None
 }
 
-/// A `var()` call whose arguments start at `args[0]`: the trimmed property
-/// name, the fallback, and the offset of the closing `)`.
+/// The first CSS identifier in `text`, skipping whitespace and comments.
+/// Blink keeps a comment in the authored `var()` value but ignores it when
+/// resolving the property name, so the lookup key must do the same.
+fn var_name(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    loop {
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if bytes.get(i..i + 2) == Some(b"/*") {
+            match text[i + 2..].find("*/") {
+                Some(end) => {
+                    i += 4 + end;
+                    continue;
+                }
+                None => return &text[i..],
+            }
+        }
+        break;
+    }
+    let start = i;
+    if bytes.get(i).is_some_and(|c| matches!(c, b'-' | b'+')) {
+        i += 1;
+    }
+    while bytes.get(i).is_some_and(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'\\') || !c.is_ascii()
+    }) {
+        i += 1;
+    }
+    &text[start..i]
+}
+
+/// A `var()` call whose arguments start at `args[0]`: the property name, the
+/// fallback, and the offset of the closing `)`.
 fn split_var(args: &str) -> Option<(&str, Option<&str>, usize)> {
     let (close, comma) = scan_args(args)?;
     Some(match comma {
-        Some(c) => (args[..c].trim(), Some(&args[c + 1..close]), close),
-        None => (args[..close].trim(), None, close),
+        Some(c) => (var_name(&args[..c]), Some(&args[c + 1..close]), close),
+        None => (var_name(&args[..close]), None, close),
     })
 }
 
@@ -1792,16 +1825,15 @@ pub async fn css_styles(
         Err(e) if e.downcast_ref::<ConnectionLost>().is_some() => return Err(e),
         report => report,
     };
-    // Otherwise turn the agents off whatever happened. The inspection's own
-    // error comes first; after a report, only a lost connection still
-    // counts: the daemon exits on it.
+    // Otherwise turn the agents off whatever happened. A lost connection on
+    // cleanup still takes precedence over a selector miss: the daemon has to
+    // retire the dead socket rather than report an ordinary error on it.
     let disabled = disable_agents(client, session_id, SETUP_CALL_TIMEOUT).await;
-    let report = report?;
-    if let Err(e) = disabled {
-        if e.downcast_ref::<ConnectionLost>().is_some() {
-            return Err(e);
-        }
-    }
+    let report = match (report, disabled) {
+        (_, Err(e)) if e.downcast_ref::<ConnectionLost>().is_some() => return Err(e),
+        (Err(e), _) => return Err(e),
+        (Ok(report), _) => report,
+    };
 
     if format.is_text() {
         Ok(CommandResult::output(format_text(&report)))
@@ -2991,6 +3023,20 @@ Inherited from body:
         assert_eq!(body_color(&report), Overridden);
     }
 
+    /// A comment in the authored value is not part of the property name:
+    /// `var(/* theme */ --tone, blue)` resolves to `--tone`, as in Blink.
+    #[test]
+    fn a_comment_does_not_become_part_of_the_var_name() {
+        assert_eq!(split_var("/* theme */ --tone, blue)").unwrap().0, "--tone");
+        assert_eq!(split_var("  --tone, blue)").unwrap().0, "--tone");
+        assert_eq!(split_var("--tone)").unwrap().0, "--tone");
+        let vars = HashMap::from([("--tone".to_string(), "red".to_string())]);
+        assert_eq!(
+            substituted("var(/* theme */ --tone, blue)", &vars).as_deref(),
+            Some("red")
+        );
+    }
+
     /// `var()` substitutes tokens, not text. In Chrome 158, `var(--size)px`
     /// with `--size: 20` is a number and an identifier, no font size, so the
     /// body's applies; `var(--a)var(--b)` is two lengths, which a margin
@@ -3238,28 +3284,39 @@ Inherited from body:
         assert!(seen.iter().any(|m| m == "DOM.disable"), "{seen:?}");
     }
 
-    /// The agents are turned off after a failed inspection too, and the
-    /// inspection's error is the one reported, whatever the cleanup met.
+    /// The agents are turned off after a failed inspection too. A selector
+    /// miss remains the reported error when cleanup only fails ordinarily;
+    /// a lost connection to the browser takes precedence, because the daemon
+    /// has to retire the dead socket.
     #[tokio::test]
-    async fn cleanup_keeps_the_inspection_error() {
-        let (url, browser) = fake_browser("DOM.disable", "", "").await;
-        let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
-        let result = css_styles(
-            &mut client,
-            "S",
-            ".nope",
-            CssOptions::default(),
-            OutputFormat::Text,
-        )
-        .await;
-        let error = result.err().expect("no element matches");
-        assert!(
-            error.to_string().contains("No element matches"),
-            "{error:#}"
-        );
-        drop(client);
-        let seen = browser.await.unwrap();
-        assert_eq!(seen.last().map(String::as_str), Some("DOM.disable"));
+    async fn cleanup_keeps_the_inspection_error_unless_the_connection_is_lost() {
+        for (close_on, lost) in [("", false), ("DOM.disable", true)] {
+            let (url, browser) = fake_browser(close_on, "", "").await;
+            let mut client = CdpClient::connect(&url, "Chrome").await.unwrap();
+            let result = css_styles(
+                &mut client,
+                "S",
+                ".nope",
+                CssOptions::default(),
+                OutputFormat::Text,
+            )
+            .await;
+            let error = result.err().expect("no element matches");
+            if lost {
+                assert!(
+                    error.downcast_ref::<ConnectionLost>().is_some(),
+                    "{error:#}"
+                );
+            } else {
+                assert!(
+                    error.to_string().contains("No element matches"),
+                    "{error:#}"
+                );
+            }
+            drop(client);
+            let seen = browser.await.unwrap();
+            assert_eq!(seen.last().map(String::as_str), Some("DOM.disable"));
+        }
     }
 
     /// Once the inspection has lost the connection, nothing more is sent to

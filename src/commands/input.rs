@@ -1,14 +1,11 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 
 use crate::cdp::CdpClient;
 use crate::result::CommandResult;
 
-async fn get_element_center(
-    client: &mut CdpClient,
-    session_id: &str,
-    selector: &str,
-) -> Result<(f64, f64)> {
+/// The script that finds where to click or hover `selector`.
+fn element_center_js(selector: &str) -> Result<String> {
     let escaped = serde_json::to_string(selector)?;
     // Mouse events go to whatever is at the point, so an element off screen
     // or without a box would send the click elsewhere (a hidden button's
@@ -20,16 +17,17 @@ async fn get_element_center(
     // click on it activates the control (styled checkboxes hide theirs
     // behind it), and each line of a wrapped link is tried, because the
     // centre of its box can fall between the lines.
-    let expr = format!(
+    //
+    // An element with visibility:hidden takes no clicks itself, but what it
+    // still shows does: a visible child, a ::before or ::after, its label.
+    // So it is refused only once nothing it shows is at the point.
+    Ok(format!(
         r#"(() => {{
             const el = document.querySelector({escaped});
             if (!el) return JSON.stringify({{error: "Element not found: " + {escaped}}});
             let rect = el.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) {{
                 return JSON.stringify({{error: "Element has no size, so it can't be clicked or hovered (hidden with display:none, collapsed, or empty): " + {escaped}}});
-            }}
-            if (getComputedStyle(el).visibility === 'hidden') {{
-                return JSON.stringify({{error: "Element is hidden with visibility:hidden: " + {escaped}}});
             }}
             const cx = rect.x + rect.width / 2, cy = rect.y + rect.height / 2;
             if (cx < 0 || cy < 0 || cx >= innerWidth || cy >= innerHeight) {{
@@ -40,6 +38,9 @@ async fn get_element_center(
             for (const r of [rect, ...el.getClientRects()]) {{
                 const x = r.x + r.width / 2, y = r.y + r.height / 2;
                 if (reaches(document.elementFromPoint(x, y))) return JSON.stringify({{x, y}});
+            }}
+            if (getComputedStyle(el).visibility === 'hidden') {{
+                return JSON.stringify({{error: "Element is hidden with visibility:hidden: " + {escaped}}});
             }}
             const x = Math.round(rect.x + rect.width / 2), y = Math.round(rect.y + rect.height / 2);
             const top = document.elementFromPoint(x, y);
@@ -52,8 +53,15 @@ async fn get_element_center(
                 "), which would get the click or hover instead (click-at " + x + " " + y +
                 " sends one there anyway): " + {escaped}}});
         }})()"#
-    );
+    ))
+}
 
+async fn get_element_center(
+    client: &mut CdpClient,
+    session_id: &str,
+    selector: &str,
+) -> Result<(f64, f64)> {
+    let expr = element_center_js(selector)?;
     let result = client
         .send_to_target(
             session_id,
@@ -293,6 +301,13 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
         return Ok(false);
     }
 
+    // `Page.loadEventFired` carries no frame or session ID. One buffered
+    // before this start belongs to the previous document, so drop those and
+    // wait only for a load that arrives after the navigation began.
+    client
+        .events
+        .retain(|e| e["method"] != "Page.loadEventFired");
+
     // A full navigation started on the main frame, so wait for it to finish loading
     let _ = client
         .wait_for_event_match(
@@ -331,9 +346,17 @@ async fn opened_pages(
     client: &mut CdpClient,
     session_id: &str,
     before: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    let Ok(targets) = client.send("Target.getTargets", json!({})).await else {
-        return Vec::new();
+) -> Result<Vec<String>> {
+    // The action already ran, so a lost connection is not an optional note:
+    // the daemon has to retire the dead socket. An ordinary query failure
+    // still just leaves the note out.
+    let lost = |e: anyhow::Error| {
+        Err(e).context("The input ran, but checking the tabs it opened lost the browser connection")
+    };
+    let targets = match client.send("Target.getTargets", json!({})).await {
+        Ok(targets) => targets,
+        Err(e) if e.downcast_ref::<crate::cdp::ConnectionLost>().is_some() => return lost(e),
+        Err(_) => return Ok(Vec::new()),
     };
     let infos = targets["targetInfos"]
         .as_array()
@@ -341,17 +364,21 @@ async fn opened_pages(
         .unwrap_or_default();
     let notes = new_tab_notes(infos, before, None);
     if notes.is_empty() {
-        return notes;
+        return Ok(notes);
     }
     // Which tab acted, asked only once there is a new one to place.
-    let own = client
+    let own = match client
         .send_to_target(session_id, "Target.getTargetInfo", json!({}))
         .await
-        .ok();
+    {
+        Ok(info) => Some(info),
+        Err(e) if e.downcast_ref::<crate::cdp::ConnectionLost>().is_some() => return lost(e),
+        Err(_) => None,
+    };
     let own_id = own
         .as_ref()
         .and_then(|info| info["targetInfo"]["targetId"].as_str());
-    new_tab_notes(infos, before, own_id)
+    Ok(new_tab_notes(infos, before, own_id))
 }
 
 /// Notes for the page targets in `infos` (`Target.getTargets`) missing from
@@ -424,7 +451,7 @@ pub async fn click_at(
         initial_url,
         new_document,
     );
-    result.notes = opened_pages(client, session_id, &pages_before).await;
+    result.notes = opened_pages(client, session_id, &pages_before).await?;
     Ok(result)
 }
 
@@ -867,7 +894,7 @@ pub async fn press_key(
         initial_url,
         new_document,
     );
-    result.notes = opened_pages(client, session_id, &pages_before).await;
+    result.notes = opened_pages(client, session_id, &pages_before).await?;
     Ok(result)
 }
 
@@ -1324,6 +1351,17 @@ mod tests {
             unplaced.iter().all(|n| n.starts_with("[new tab: ")),
             "{unplaced:?}"
         );
+    }
+
+    /// A visibility:hidden element takes no clicks itself, but a visible
+    /// child or its label still does, so the element is refused as hidden
+    /// only after the hit test found nothing of it at the point.
+    #[test]
+    fn a_hidden_element_is_hit_tested_before_it_is_refused() {
+        let js = element_center_js("#toggle").unwrap();
+        let hit_test = js.find("elementFromPoint").unwrap();
+        let refusal = js.find("visibility === 'hidden'").unwrap();
+        assert!(hit_test < refusal, "{js}");
     }
 
     #[test]

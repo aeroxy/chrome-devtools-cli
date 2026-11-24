@@ -251,22 +251,32 @@ fn check_supported(params: &WebAuthnParams, options: &AuthenticatorOptions) -> R
 /// Whether Chrome's error says the authenticator no longer exists, rather than
 /// that this one call failed. These are Chrome's own messages, not page text.
 fn authenticator_gone(e: &anyhow::Error) -> bool {
+    // A dialog's message is page text and can happen to mention either
+    // phrase; it is not proof that Chrome removed the authenticator.
+    if e.downcast_ref::<crate::cdp::DialogOpen>().is_some() {
+        return false;
+    }
     let text = format!("{e:#}");
     text.contains("Could not find a Virtual Authenticator")
         || text.contains("Virtual Authenticator Environment has not been enabled")
 }
 
-/// Whether the tab is hidden behind another one. Unknown counts as no, since
-/// the note is advice and the authenticator works either way.
-async fn is_background_tab(client: &mut CdpClient, session_id: &str) -> bool {
-    client
+/// Whether the tab is hidden behind another one. An ordinary query failure
+/// counts as no, since the note is advice and the authenticator works either
+/// way; a lost connection must reach the daemon, which retires it.
+async fn is_background_tab(client: &mut CdpClient, session_id: &str) -> Result<bool> {
+    let result = client
         .send_to_target(
             session_id,
             "Runtime.evaluate",
             json!({"expression": "document.visibilityState", "returnByValue": true}),
         )
-        .await
-        .is_ok_and(|v| v["result"]["value"].as_str() == Some("hidden"))
+        .await;
+    match result {
+        Ok(v) => Ok(v["result"]["value"].as_str() == Some("hidden")),
+        Err(e) if e.downcast_ref::<crate::cdp::ConnectionLost>().is_some() => Err(e),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Add, change, show, or remove the tab's virtual WebAuthn authenticator.
@@ -415,7 +425,7 @@ pub async fn configure_webauthn(
         Err(e) => return Err(e).context("Failed to read the virtual authenticator's credentials"),
     };
 
-    let background_tab = is_background_tab(client, session_id).await;
+    let background_tab = is_background_tab(client, session_id).await?;
     output(
         format,
         action,

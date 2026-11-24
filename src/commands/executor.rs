@@ -295,16 +295,10 @@ pub async fn execute_command(client: &mut CdpClient, req: &DaemonRequest) -> Res
     };
 
     // A dialog that opened while the daemon was idle is announced to whatever
-    // reads next, which is this lookup. The dialog doesn't block the lookup,
-    // and reading it recorded it on its own session, so look again: it is then
+    // reads next, often this lookup. It doesn't hold the lookup up, and it is
     // settled below, with this command's --dialog-action, only if it is on the
     // page this command resolves to.
-    let target = match client.resolve_page(target_id_arg, page_idx_arg).await {
-        Err(e) if e.downcast_ref::<crate::cdp::DialogOpen>().is_some() => {
-            client.resolve_page(target_id_arg, page_idx_arg).await?
-        }
-        resolved => resolved?,
-    };
+    let target = client.resolve_page(target_id_arg, page_idx_arg).await?;
     let target_id = target.target_id.clone();
 
     // Maintain a persistent CDP session for continuous event collection

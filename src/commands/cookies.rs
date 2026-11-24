@@ -1,4 +1,4 @@
-//! `cookies`: the cookies Chrome would send to a page, read over the daemon's
+//! `cookies`: the cookies Chrome stores for a page's URL, read over the daemon's
 //! connection.
 //!
 //! Page JavaScript can't see HttpOnly cookies, and a second DevTools client

@@ -277,7 +277,7 @@ The daemon keeps a persistent CDP session on the active page that continuously c
 | `console --type error --type warning` | Filter by level (`log`, `warn`, `info`, `error`, `debug`, `exception`) |
 | `console --duration 5000` | Live collection for 5 s (consumes events — they won't reappear on a later drain) |
 | `network` | Drain accumulated network requests |
-| `cookies [--url <url>]... [--name <name>]...` | The cookies Chrome would send to the page's URL (or each `--url`), HttpOnly and partitioned ones included, read over the daemon's approved connection: name, domain, path, expiry, flags and value length, values hidden |
+| `cookies [--url <url>]... [--name <name>]...` | The cookies Chrome stores for the page's URL (or each `--url`), HttpOnly and partitioned ones included, read over the daemon's approved connection: name, domain, path, expiry, flags and value length, values hidden. A lookup by URL: what one request sent, after `SameSite` rules, is in `network --request-headers` |
 | `cookies --header` | The same cookies as one `Cookie` request header (`name=value; ...`), values included, for one URL (the page's or a single `--url`); `--json` / `--toon` print every field |
 | `network --type Fetch --type XHR` | Filter by resource type (`Document`, `Script`, `Stylesheet`, `Image`, `Font`, `XHR`, `Fetch`, `Manifest`, `Media`, `Other`) |
 | `network --duration 5000` | Live collection for 5 s |
@@ -299,7 +299,7 @@ Other page commands list the errors the page raised while they ran (uncaught exc
 | `mock-network` | List the tab's mocks with hit counts |
 | `remove-network-mock [<url-glob>]` | Remove one mock, or all of them on the tab |
 
-Globs use `*` for any characters and `?` for one, as Chrome's Fetch domain does. The latest matching mock wins, and the HTTP cache is off while any is set so cached responses can't bypass it. Mocks live on the daemon's session for the tab: they pause while the CLI works on another tab, and end when the daemon exits. A daemon with mocks keeps reading from the browser between commands, since a request waits for its answer, so it stays up while the page keeps making requests.
+Globs use `*` for any characters and `?` for exactly one. The latest matching mock wins, and the HTTP cache is off while any is set so cached responses can't bypass it. Mocks live on the daemon's session for the tab: they pause while the CLI works on another tab, and end when the daemon exits. A daemon with mocks keeps reading from the browser between commands, since a request waits for its answer, so it stays up while the page keeps making requests.
 
 ### Daemon
 

@@ -191,6 +191,10 @@ pub struct CdpClient {
     /// Network mocks on the active tab (`mock-network`), saved per tab like
     /// the emulation state.
     pub network_mocks: Vec<crate::commands::network_mock::NetworkMock>,
+    /// Chrome may still be intercepting requests even when the mock list is
+    /// empty: a failed rollback can leave `Fetch.enable` in place. Keep
+    /// reading between commands in that case so paused requests get answered.
+    pub fetch_may_be_enabled: bool,
     /// `Fetch.requestPaused` events not yet answered. The page's request
     /// waits until they are, so every read answers them first.
     paused_requests: std::collections::VecDeque<Value>,
@@ -472,6 +476,7 @@ impl CdpClient {
             media: None,
             webauthn: None,
             network_mocks: Vec::new(),
+            fetch_may_be_enabled: false,
             paused_requests: std::collections::VecDeque::new(),
             emulation_saved: std::collections::HashMap::new(),
         })
@@ -861,6 +866,21 @@ impl CdpClient {
         method: &str,
         params: Value,
     ) -> Result<u64> {
+        self.send_raw_no_wait_within(session_id, method, params, cdp_call_timeout())
+            .await
+    }
+
+    /// [`Self::send_raw_no_wait`] with a caller-supplied write budget. A short
+    /// setup call must not spend the full write timeout on a browser that has
+    /// stopped reading: that would hold the daemon, and every caller queued
+    /// behind it, long past the call's own limit.
+    async fn send_raw_no_wait_within(
+        &mut self,
+        session_id: Option<&str>,
+        method: &str,
+        params: Value,
+        limit: std::time::Duration,
+    ) -> Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -879,7 +899,6 @@ impl CdpClient {
         // stopped reading), which would otherwise hold the daemon, and every
         // caller queued behind it, forever; a frame given up halfway leaves
         // the stream unusable anyway.
-        let limit = cdp_call_timeout();
         match tokio::time::timeout(limit, self.write.send(Message::Text(text))).await {
             Ok(sent) => sent.map_err(|e| ConnectionLost(format!("WebSocket error: {e}")))?,
             Err(_) => bail!(ConnectionLost(format!(
@@ -919,7 +938,25 @@ impl CdpClient {
                     .await?;
             }
         }
-        let id = self.send_raw_no_wait(session_id, method, params).await?;
+        // Settlement can run past the limit when its reply arrives during a
+        // liveness ping. Writing the operation then would let it run after the
+        // caller gave up, and for non-Runtime calls nothing stops it.
+        let remaining = limit.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            bail!(PageUnresponsive(format!(
+                "{method} was not sent: its {}s limit passed while a JavaScript dialog was \
+                 settled",
+                limit.as_secs()
+            )));
+        }
+        let id = self
+            .send_raw_no_wait_within(
+                session_id,
+                method,
+                params,
+                remaining.min(cdp_call_timeout()),
+            )
+            .await?;
 
         loop {
             let resp_text = self
@@ -945,7 +982,13 @@ impl CdpClient {
                     .await?;
                     continue;
                 }
-                bail!(dialog_from_event(&resp));
+                // A dialog holds up its page, not the browser: a browser-level
+                // call still gets its reply, and failing it would report a tab
+                // `new-page` opened as not opened. The dialog, recorded above,
+                // is for the next call on its page.
+                if session_id.is_some() {
+                    bail!(dialog_from_event(&resp));
+                }
             }
 
             if resp.get("id").and_then(|v| v.as_u64()) == Some(id) {
@@ -996,8 +1039,17 @@ impl CdpClient {
                 }
             }
 
+            let remaining = limit.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(dialog_past_limit(call, limit, dialog));
+            }
             let id = self
-                .send_raw_no_wait(session_id, "Page.handleJavaScriptDialog", handler_params)
+                .send_raw_no_wait_within(
+                    session_id,
+                    "Page.handleJavaScriptDialog",
+                    handler_params,
+                    remaining.min(cdp_call_timeout()),
+                )
                 .await?;
 
             loop {
@@ -1023,18 +1075,21 @@ impl CdpClient {
                 }
 
                 if resp.get("id").and_then(|v| v.as_u64()) == Some(id) {
-                    self.forget_dialog(session_id);
                     if let Some(error) = resp.get("error") {
                         // Closed meanwhile, by a person or the page navigating
                         // away: the goal is met either way.
                         if is_no_dialog_error(error) {
+                            self.forget_dialog(session_id);
                             return Ok(());
                         }
+                        // The dialog is still open: keep tracking it, or later
+                        // calls would wait behind it with no way to settle it.
                         bail!(
                             "CDP error in Page.handleJavaScriptDialog: {}",
                             serde_json::to_string_pretty(error)?
                         );
                     }
+                    self.forget_dialog(session_id);
                     return Ok(());
                 } else if resp.get("method").is_some() {
                     self.push_event(resp);
@@ -1171,10 +1226,24 @@ impl CdpClient {
                 let mut stopped = "";
                 if method.starts_with("Runtime.") {
                     if let Some(sid) = session_id {
-                        let _ = self
-                            .send_raw_no_wait(Some(sid), "Runtime.terminateExecution", json!({}))
-                            .await;
-                        stopped = " (its running JavaScript was stopped)";
+                        // At the deadline this is the last thing the daemon
+                        // writes. A failed write means the connection is gone:
+                        // the daemon has to see that error to retire it.
+                        match self
+                            .send_raw_no_wait_within(
+                                Some(sid),
+                                "Runtime.terminateExecution",
+                                json!({}),
+                                SETUP_CALL_TIMEOUT,
+                            )
+                            .await
+                        {
+                            Ok(_) => stopped = " (a stop was requested for its running JavaScript)",
+                            Err(e) if e.downcast_ref::<ConnectionLost>().is_some() => {
+                                return Err(e)
+                            }
+                            Err(_) => {}
+                        }
                     }
                 }
                 let longer = if limit >= cdp_call_timeout() {
@@ -1320,7 +1389,9 @@ impl CdpClient {
     /// Whether the daemon must keep reading between commands: with mocks
     /// set, the page's requests wait on answers only reads produce.
     pub fn wants_idle_reads(&self) -> bool {
-        !self.network_mocks.is_empty() || !self.paused_requests.is_empty()
+        !self.network_mocks.is_empty()
+            || !self.paused_requests.is_empty()
+            || self.fetch_may_be_enabled
     }
 
     /// One read between commands: buffer what arrives and answer paused
@@ -1499,13 +1570,11 @@ impl CdpClient {
                 }
                 // Timeout expired — normal completion path.
                 Err(_) => break,
-                // read_text() itself failed (socket closed, decode error,
-                // etc.) — real transport error. Log it so the user has a
-                // signal when the partial result is suspicious, then stop.
-                Ok(Err(e)) => {
-                    eprintln!("Warning: WebSocket read failed during event collection: {e}");
-                    break;
-                }
+                // A read fails only when the connection is gone. Returning
+                // what came before would pass a cut-short window off as the
+                // whole one, and a warning would reach nobody: the daemon has
+                // no stderr. The daemon also exits only on this error.
+                Ok(Err(e)) => return Err(e),
             }
         }
 
@@ -2070,9 +2139,9 @@ mod tests {
         client.ping().await.expect("second ping");
 
         let error = client
-            .send("Target.getTargets", json!({}))
+            .send_to_target("S", "DOM.getDocument", json!({}))
             .await
-            .expect_err("the dialog must reach the next command");
+            .expect_err("the dialog must reach the next command on its page");
         assert!(
             error
                 .to_string()
@@ -2228,6 +2297,65 @@ mod tests {
         drop(client);
         let calls = chrome.await.unwrap();
         assert_eq!(calls, ["Page.handleJavaScriptDialog", "Browser.getVersion"]);
+    }
+
+    /// A dialog that opened while the daemon was idle reaches whatever reads
+    /// next. It holds up its page, not the browser: `new-page` failed on it
+    /// although its tab was open, inviting a second one.
+    #[tokio::test]
+    async fn a_pages_dialog_does_not_fail_a_browser_level_call() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let reply = json!({"id": call["id"], "result": {"targetId": "T2"}});
+            match call["method"].as_str() {
+                Some("Target.createTarget") => {
+                    (std::time::Duration::ZERO, vec![opening("idle"), reply])
+                }
+                _ => (std::time::Duration::ZERO, Vec::new()),
+            }
+        })
+        .await;
+        let tab = client.create_target("about:blank", false).await;
+        assert_eq!(tab.expect("the tab is open"), "T2");
+        // Kept for the page, whose next call fails at once instead of waiting.
+        let error = client
+            .send_to_target("S", "DOM.getDocument", json!({}))
+            .await
+            .expect_err("the page's dialog is still open");
+        assert!(error.downcast_ref::<DialogOpen>().is_some(), "{error:#}");
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls, ["Target.createTarget"]);
+    }
+
+    /// The events read before the connection dropped are not the whole
+    /// window: they came back as if they were, and the daemon, which exits
+    /// only on a lost connection, kept the dead one.
+    #[tokio::test]
+    async fn a_connection_lost_while_collecting_fails_the_collection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let log = json!({"method": "Runtime.consoleAPICalled", "sessionId": "S",
+                "params": {"type": "log", "args": []}});
+            ws.send(Message::Text(log.to_string())).await.unwrap();
+            ws.close(None).await.unwrap();
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+
+        let collecting = client.read_events_for(10_000, true);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), collecting)
+            .await
+            .expect("the collection ends with the connection")
+            .expect_err("a cut-short window is not a result");
+        assert!(
+            error.downcast_ref::<ConnectionLost>().is_some(),
+            "{error:#}"
+        );
+        chrome.await.unwrap();
     }
 
     /// Chrome sends each CDP message as one frame, and a page can make one
