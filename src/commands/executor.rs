@@ -684,8 +684,14 @@ async fn inner_execute(
             params.validate()?;
 
             if params.has_emulation() {
-                commands::emulation::emulate_tab(client, session_id, Some(target_id), params)
-                    .await?;
+                commands::emulation::emulate_tab(
+                    client,
+                    session_id,
+                    req.format(),
+                    Some(target_id),
+                    params,
+                )
+                .await?;
             }
 
             commands::navigate::navigate(
@@ -858,7 +864,14 @@ async fn inner_execute(
                     .unwrap_or(false),
             };
             params.validate()?;
-            commands::emulation::emulate_tab(client, session_id, Some(target_id), params).await
+            commands::emulation::emulate_tab(
+                client,
+                session_id,
+                req.format(),
+                Some(target_id),
+                params,
+            )
+            .await
         }
         "mock-network" => match args.get("pattern").and_then(|v| v.as_str()) {
             None => {

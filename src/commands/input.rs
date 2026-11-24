@@ -35,7 +35,10 @@ fn element_center_js(selector: &str, allow_label: bool) -> Result<String> {
                 const label = hit.closest('label');
                 if (!label || label.control !== el) return false;
                 const interactive = hit.closest('a[href], button, input, select, textarea, [tabindex], [contenteditable], summary');
-                return !interactive || interactive === label || el.contains(interactive);
+                // Only interactive content inside the label takes the click
+                // away from its control. A focusable ancestor outside it, such
+                // as a tabindex container, does not intercept the activation.
+                return !interactive || interactive === label || !label.contains(interactive) || el.contains(interactive);
             };
             "#
     } else {
@@ -560,13 +563,13 @@ where
 fn drop_loads_before_start(
     events: &mut std::collections::VecDeque<serde_json::Value>,
     session_id: &str,
+    main_frame_id: &str,
     start_index: usize,
 ) {
     let mut index = 0;
     events.retain(|e| {
-        let before_start = e["method"] == "Page.loadEventFired"
-            && e["sessionId"].as_str() == Some(session_id)
-            && index < start_index;
+        let before_start =
+            index < start_index && load_completion_matches(e, session_id, main_frame_id);
         index += 1;
         !before_start
     });
@@ -624,18 +627,22 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
     // there yet; that reload is still loading, so its start keeps the wait
     // alive instead of ending it on the same-document match.
     let committed = main_frame_committed(&client.events, session_id, &main_frame_id);
-    let started_loading = method == "Page.frameStartedLoading"
-        || main_frame_started(&client.events, session_id, &main_frame_id);
+    // The matched event can be a fragment change while a reload's start is
+    // still buffered behind it. That start — not the fragment's index — is the
+    // load-completion boundary: a load before it belongs to the old document.
+    let buffered_start = main_frame_start_index(&client.events, session_id, &main_frame_id);
+    let started_loading = method == "Page.frameStartedLoading" || buffered_start.is_some();
     if !started_loading && !committed {
         return Ok(false);
     }
 
     if started_loading {
+        let boundary = buffered_start.map_or(start_index, |idx| idx.max(start_index));
         // `Page.loadEventFired` carries no frame ID. One buffered before this
         // start belongs to the previous document; one after it belongs to the
         // navigation being waited on, even if it arrived before the frame-tree
-        // reply.
-        drop_loads_before_start(&mut client.events, session_id, start_index);
+        // reply. The same applies to a main-frame `frameStoppedLoading`.
+        drop_loads_before_start(&mut client.events, session_id, &main_frame_id, boundary);
     }
 
     // A full navigation started on the main frame, so wait for it to finish
@@ -650,15 +657,16 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
     ))
 }
 
-/// Whether a main-frame load has started for this page. A reload can queue a
-/// same-document event before its start, so the start may still be in the
-/// buffer when the first event match points at the fragment change.
-fn main_frame_started(
+/// Position of this page's most recent main-frame loading start in the buffer.
+/// A reload can queue a same-document event before its start, so the start may
+/// still be buffered when the first event match points at the fragment change.
+/// Its position, not the fragment's, bounds the load wait.
+fn main_frame_start_index(
     events: &std::collections::VecDeque<serde_json::Value>,
     session_id: &str,
     main_frame_id: &str,
-) -> bool {
-    events.iter().any(|e| {
+) -> Option<usize> {
+    events.iter().rposition(|e| {
         e["method"] == "Page.frameStartedLoading"
             && e["sessionId"].as_str() == Some(session_id)
             && e["params"]["frameId"].as_str() == Some(main_frame_id)
@@ -1123,9 +1131,10 @@ enum ReadBack {
 }
 
 /// A failed `DOM.setFileInputFiles` may have set the file before the reply was
-/// lost. Keep `ConnectionLost` typed so the daemon retires the connection and
-/// the caller gets the reconnect and verification advice; a dialog means the
-/// file is set, and an ordinary refusal is just an error.
+/// lost. Keep `ConnectionLost` and `PageUnresponsive` typed so the daemon
+/// retires the connection or stops on the stalled page, and tell the caller
+/// the file may already be set; a dialog means the file is set, and an
+/// ordinary refusal is just an error.
 fn set_file_error(selector: &str, e: anyhow::Error) -> anyhow::Error {
     if e.downcast_ref::<crate::cdp::DialogOpen>().is_some() {
         return e;
@@ -1135,7 +1144,20 @@ fn set_file_error(selector: &str, e: anyhow::Error) -> anyhow::Error {
             "Can't set the file on '{selector}': the connection was lost, so the file may already be set"
         ));
     }
+    if e.downcast_ref::<crate::cdp::PageUnresponsive>().is_some() {
+        return e.context(format!(
+            "Can't set the file on '{selector}': the page stopped answering, so the file may already be set"
+        ));
+    }
     anyhow!("Can't set the file on '{selector}': {e}")
+}
+
+/// A stalled renderer must not be asked to release the handle: that would
+/// spend another full-budget page call on a page that already stopped
+/// answering. Cleanup is deferred until the renderer answers again or the
+/// session ends.
+fn should_release_file_handle(set: &Result<serde_json::Value>) -> bool {
+    !set.as_ref().err().is_some_and(is_page_stall)
 }
 
 /// Give the file `value` names to the file input `selector` matched.
@@ -1178,21 +1200,20 @@ async fn set_file(
             json!({"files": [&path], "objectId": object_id}),
         )
         .await;
-    let connection_lost = set
-        .as_ref()
-        .err()
-        .is_some_and(|e| e.downcast_ref::<crate::cdp::ConnectionLost>().is_some());
+    let release_handle = should_release_file_handle(&set);
     let read_back = match set {
         Ok(_) => Ok(read_back_file(client, session_id, &object_id).await),
         Err(e) => Err(set_file_error(selector, e)),
     };
     // The daemon's session outlives this command, so an unreleased handle would
-    // keep the element alive until the page navigates. A lost connection cannot
-    // release it; an ordinary CDP refusal still can.
-    if !connection_lost {
+    // keep the element alive until the page navigates. Send the release
+    // fire-and-forget: a change handler's dialog blocks a normal page call
+    // before it is written, leaving the handle behind long after the dialog
+    // closes. Chrome applies the write once the page answers again.
+    if release_handle {
         let _ = client
-            .send_to_target(
-                session_id,
+            .send_raw_no_wait(
+                Some(session_id),
                 "Runtime.releaseObject",
                 json!({"objectId": object_id}),
             )
@@ -1609,7 +1630,11 @@ async fn dispatch_key(client: &mut CdpClient, session_id: &str, spec: &KeySpec) 
     client
         .send_to_target(session_id, "Input.dispatchKeyEvent", down)
         .await?;
-    client
+    // keyDown reached the page. The keyUp is a separate call: a dialog the
+    // keyDown opened can be queued before it, and the pre-write guard then
+    // clears input_sent. The key was still delivered, so keep the flag.
+    client.input_sent = true;
+    let up = client
         .send_to_target(
             session_id,
             "Input.dispatchKeyEvent",
@@ -1621,7 +1646,11 @@ async fn dispatch_key(client: &mut CdpClient, session_id: &str, spec: &KeySpec) 
                 "modifiers": spec.modifiers,
             }),
         )
-        .await?;
+        .await;
+    if up.is_err() {
+        client.input_sent = true;
+    }
+    up?;
     Ok(())
 }
 
@@ -1739,7 +1768,7 @@ mod tests {
             load("s2"), // another session's load, ignored by the session-filtered wait
         ]);
         // The start was at index 1 before it was consumed.
-        drop_loads_before_start(&mut events, "s1", 1);
+        drop_loads_before_start(&mut events, "s1", "MAIN", 1);
         assert_eq!(events.len(), 3);
         assert_eq!(events[0]["method"], "Page.frameNavigated");
         assert_eq!(events[1]["method"], "Page.loadEventFired");
@@ -1772,11 +1801,114 @@ mod tests {
         );
         assert!(lost.downcast_ref::<crate::cdp::ConnectionLost>().is_some());
         assert!(lost.to_string().contains("may already be set"));
+        let stalled = set_file_error(
+            "#f",
+            anyhow::anyhow!(crate::cdp::PageUnresponsive("no answer".into())),
+        );
+        assert!(stalled
+            .downcast_ref::<crate::cdp::PageUnresponsive>()
+            .is_some());
+        assert!(stalled.to_string().contains("may already be set"));
         let refused = set_file_error("#f", anyhow::anyhow!("CDP error"));
         assert!(refused
             .downcast_ref::<crate::cdp::ConnectionLost>()
             .is_none());
         assert!(refused.to_string().contains("Can't set the file on '#f'"));
+    }
+
+    /// A stalled page is not spent another full-budget page call releasing the
+    /// handle; a dialog, an ordinary refusal and success still release it.
+    #[test]
+    fn a_stalled_file_set_defers_the_handle_release() {
+        let stalled: Result<serde_json::Value> = Err(anyhow::anyhow!(
+            crate::cdp::PageUnresponsive("no answer".into())
+        ));
+        assert!(!should_release_file_handle(&stalled));
+        let lost: Result<serde_json::Value> =
+            Err(anyhow::anyhow!(crate::cdp::ConnectionLost("closed".into())));
+        assert!(!should_release_file_handle(&lost));
+        let dialog: Result<serde_json::Value> = Err(anyhow::anyhow!(crate::cdp::DialogOpen {
+            dialog_type: "alert".into(),
+            message: "changed".into(),
+        }));
+        assert!(should_release_file_handle(&dialog));
+        let refused: Result<serde_json::Value> = Err(anyhow::anyhow!("CDP error"));
+        assert!(should_release_file_handle(&refused));
+        assert!(should_release_file_handle(&Ok(serde_json::json!({}))));
+    }
+
+    /// A dialog opened by the change handler is recorded before the file-set
+    /// returns, so a normal release would be refused before it is written and
+    /// the handle would outlive the dialog in the persistent session.
+    #[tokio::test]
+    async fn a_change_handler_dialog_still_writes_the_handle_release() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let file = file.to_str().unwrap().to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let browser = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut calls = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let method = call["method"].as_str().unwrap_or_default().to_string();
+                calls.push(method.clone());
+                match method.as_str() {
+                    "Runtime.evaluate" => {
+                        let reply = json!({"id": call["id"], "sessionId": call["sessionId"],
+                            "result": {"result": {"type": "object", "objectId": "O1"}}});
+                        if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                            break;
+                        }
+                    }
+                    "DOM.setFileInputFiles" => {
+                        let dialog = json!({"method": "Page.javascriptDialogOpening",
+                            "sessionId": call["sessionId"],
+                            "params": {"type": "alert", "message": "file changed"}});
+                        if ws.send(Message::Text(dialog.to_string())).await.is_err() {
+                            break;
+                        }
+                        // No reply: the page is paused until the dialog closes.
+                    }
+                    // The release is fire-and-forget; no reply is expected.
+                    _ => {}
+                }
+            }
+            calls
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        let error = match set_file(
+            &mut client,
+            "S1",
+            "#f",
+            &file,
+            None,
+            "https://a.test/".into(),
+        )
+        .await
+        {
+            Ok(_) => panic!("the dialog must fail the file set"),
+            Err(e) => e,
+        };
+        assert!(
+            error.downcast_ref::<crate::cdp::DialogOpen>().is_some(),
+            "{error:#}"
+        );
+        drop(client);
+        let calls = browser.await.unwrap();
+        assert!(
+            calls.iter().any(|m| m == "Runtime.releaseObject"),
+            "the release must be written even with the dialog open: {calls:?}"
+        );
     }
 
     /// A dialog after insertion belongs to the URL readback, not the insertion
@@ -2219,9 +2351,27 @@ mod tests {
             "{js}"
         );
         assert!(js.contains("el.contains(interactive)"), "{js}");
+        // Only interactive content inside the label intercepts the click; a
+        // focusable ancestor of the label does not.
+        assert!(js.contains("!label.contains(interactive)"), "{js}");
         let reaches = js.find("labelReachesControl").unwrap();
         let hit_test = js.find("elementFromPoint(x, y)").unwrap();
         assert!(reaches < hit_test, "{js}");
+    }
+
+    /// A focusable container around a hidden control and its plain-text label
+    /// must not make the label's hit point look like interactive content.
+    #[test]
+    fn a_focusable_ancestor_outside_the_label_does_not_reject_the_hit() {
+        let js = element_center_js("#toggle", true).unwrap();
+        assert!(
+            js.contains("hit.closest('a[href], button, input, select, textarea"),
+            "{js}"
+        );
+        assert!(
+            js.contains("!label.contains(interactive) || el.contains(interactive)"),
+            "{js}"
+        );
     }
 
     /// Every pointer move gets a recheck. A point confirmed before the last
@@ -2285,15 +2435,59 @@ mod tests {
             started("s2", "MAIN"),
         ]
         .into();
-        assert!(main_frame_started(&events, "s1", "MAIN"));
-        assert!(!main_frame_started(&events, "s1", "OTHER"));
-        assert!(!main_frame_started(&events, "s3", "MAIN"));
+        assert_eq!(main_frame_start_index(&events, "s1", "MAIN"), Some(1));
+        assert_eq!(main_frame_start_index(&events, "s1", "OTHER"), None);
+        assert_eq!(main_frame_start_index(&events, "s3", "MAIN"), None);
         let fragment_only: std::collections::VecDeque<_> = [
             json!({"sessionId": "s1", "method": "Page.navigatedWithinDocument",
                     "params": {"frameId": "MAIN"}}),
         ]
         .into();
-        assert!(!main_frame_started(&fragment_only, "s1", "MAIN"));
+        assert_eq!(main_frame_start_index(&fragment_only, "s1", "MAIN"), None);
+    }
+
+    /// A fragment matched first, the old document's load, then a reload start:
+    /// the reload's position — not the fragment's — bounds the load wait, so
+    /// the old completion cannot end it. The reload's own load stays eligible.
+    #[test]
+    fn a_reload_start_bounds_the_load_wait_after_a_fragment() {
+        let load = || json!({"sessionId": "s1", "method": "Page.loadEventFired"});
+        let mut events: std::collections::VecDeque<_> = [
+            load(), // old document, buffered after the fragment was consumed
+            json!({"sessionId": "s1", "method": "Page.frameStartedLoading",
+                   "params": {"frameId": "MAIN"}}),
+        ]
+        .into();
+        let boundary = main_frame_start_index(&events, "s1", "MAIN").unwrap();
+        assert_eq!(boundary, 1);
+        drop_loads_before_start(&mut events, "s1", "MAIN", boundary);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["method"], "Page.frameStartedLoading");
+        // A completion buffered after the start is still accepted.
+        events.push_back(load());
+        assert!(load_completion_matches(&events[1], "s1", "MAIN"));
+    }
+
+    /// Both load-completion methods before the start belong to the old
+    /// document; neither may end the new navigation's wait.
+    #[test]
+    fn both_completion_methods_before_the_start_are_dropped() {
+        let mut events: std::collections::VecDeque<_> = [
+            json!({"sessionId": "s1", "method": "Page.loadEventFired"}),
+            json!({"sessionId": "s1", "method": "Page.frameStoppedLoading",
+                   "params": {"frameId": "MAIN"}}),
+            json!({"sessionId": "s1", "method": "Page.frameStoppedLoading",
+                   "params": {"frameId": "CHILD"}}),
+            json!({"sessionId": "s1", "method": "Page.frameStartedLoading",
+                   "params": {"frameId": "MAIN"}}),
+            json!({"sessionId": "s1", "method": "Page.loadEventFired"}),
+        ]
+        .into();
+        drop_loads_before_start(&mut events, "s1", "MAIN", 3);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["params"]["frameId"], "CHILD");
+        assert_eq!(events[1]["method"], "Page.frameStartedLoading");
+        assert_eq!(events[2]["method"], "Page.loadEventFired");
     }
 
     #[test]

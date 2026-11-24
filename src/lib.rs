@@ -1659,10 +1659,10 @@ fn print_output(
 }
 
 /// A daemon outlives the binary that started it: after an upgrade the old one
-/// keeps serving until it has been idle for 5 minutes (or for as long as
-/// `caffeinate` runs), and a fix or command the new CLI expects is silently
-/// missing until then. Says so, and leaves restarting to a person, since that
-/// drops the approved connection.
+/// keeps serving until it has been idle for 5 minutes by default
+/// (`DAEMON_IDLE_TIMEOUT_SECS` changes it; `caffeinate` keeps it up), and a fix
+/// or command the new CLI expects is silently missing until then. Says so, and
+/// leaves restarting to a person, since that drops the approved connection.
 fn daemon_version_warning(daemon_version: Option<&str>) -> Option<String> {
     let ours = env!("CARGO_PKG_VERSION");
     if daemon_version == Some(ours) {
@@ -1671,8 +1671,9 @@ fn daemon_version_warning(daemon_version: Option<&str>) -> Option<String> {
     let theirs = daemon_version.map_or("an older version".to_string(), |v| format!("version {v}"));
     Some(format!(
         "[warning] The daemon serving this browser runs {theirs}, but this CLI is version {ours}, \
-         so behaviour of the newer version may be missing. The daemon exits after 5 idle minutes. \
-         Restarting it sooner (`kill-daemon`) drops the approved connection and the browser may \
+         so behaviour of the newer version may be missing. The daemon exits after 5 idle minutes \
+         by default (`DAEMON_IDLE_TIMEOUT_SECS` can change that). Restarting it sooner \
+         (`kill-daemon`) drops the approved connection and the browser may \
          ask for approval again, so leave that decision to a person."
     ))
 }
@@ -1737,44 +1738,62 @@ fn is_evaluate_flag(token: &str) -> bool {
     )
 }
 
-/// A token after an attached `-o...` supplies the expression only when it is
-/// not another `evaluate` flag. A leading-dash number is always an expression
-/// (`evaluate -oout.json -1`), and so is JavaScript like `-Math.abs(2)` once
-/// the output option has been seen.
-fn token_supplies_expression(token: &str, after_output: bool) -> bool {
+/// A token after an attached global value option supplies the expression only
+/// when it is not another `evaluate` flag. A leading-dash number is always an
+/// expression (`evaluate -oout.json -1`), and so is JavaScript like
+/// `-Math.abs(2)` once an attached option has been seen.
+fn token_supplies_expression(token: &str, after_option: bool) -> bool {
     if !token.starts_with('-') {
         return true;
     }
     if token[1..].parse::<f64>().is_ok() {
         return true;
     }
-    after_output && !is_evaluate_flag(token)
+    after_option && !is_evaluate_flag(token)
 }
 
-/// The filename in clap's attached `-oout.json` / `-o=out.json` form. A lone
-/// `-offset` is JavaScript, not an output option, and `-o` already takes a
-/// separate value token. The explicit `-o=` form may carry a dash-prefixed
-/// filename; without it a leading dash means the token is JavaScript.
-fn attached_output_path(token: &str) -> Option<String> {
-    let path = token
-        .strip_prefix("-o")
-        // Clap accepts both `-oout.json` and `-o=out.json`; keep the filename,
-        // not the separator.
-        .map(|p| p.strip_prefix('=').unwrap_or(p))?;
-    let explicit = token.starts_with("-o=");
-    (!path.is_empty() && (explicit || !path.starts_with('-'))).then(|| path.to_string())
+/// An attached short global value option before the expression: `-oout.json`,
+/// `-p0`, `-tname`. Clap 4.6 takes a leading-dash positional as the expression,
+/// so leaving `-p0` attached would make it the script and reject the real
+/// expression as an extra argument. The split is deferred until an expression
+/// is found, so a lone attached token stays JavaScript.
+struct AttachedOption {
+    idx: usize,
+    short: &'static str,
+    long: &'static str,
+    value: String,
 }
 
-/// Split an attached `-o` before clap sees it. An explicit `-o=-name.json`
-/// must become `--output=-name.json`: a dash-prefixed value after a bare `-o`
-/// would be read as the expression instead of the output path.
-fn apply_attached_output(args: &mut Vec<OsString>, idx: usize, path: &str) {
-    if path.starts_with('-') {
-        args[idx] = OsString::from(format!("--output={path}"));
-    } else {
-        args[idx] = OsString::from("-o");
-        args.insert(idx + 1, OsString::from(path));
+impl AttachedOption {
+    /// Replace the token with the option and its value as clap accepts them.
+    /// A dash-prefixed value needs the explicit `=` form: after a bare short
+    /// option a leading dash would be read as the expression instead.
+    fn apply(self, args: &mut Vec<OsString>) {
+        if self.value.starts_with('-') {
+            args[self.idx] = OsString::from(format!("{}={}", self.long, self.value));
+        } else {
+            args[self.idx] = OsString::from(self.short);
+            args.insert(self.idx + 1, OsString::from(self.value));
+        }
     }
+}
+
+/// The short flag, long flag and value of an attached global option, if
+/// `token` is one. A lone `-offset` is JavaScript, and `-o`/`-p`/`-t` with no
+/// value take a separate token. The explicit `-o=` form may carry a
+/// dash-prefixed value; without `=` a leading dash means script data.
+fn attached_option_value(token: &str) -> Option<(&'static str, &'static str, String)> {
+    for (short, long) in [("-o", "--output"), ("-p", "--page"), ("-t", "--target")] {
+        let Some(rest) = token.strip_prefix(short) else {
+            continue;
+        };
+        let explicit = rest.starts_with('=');
+        let value = rest.strip_prefix('=').unwrap_or(rest);
+        if !value.is_empty() && (explicit || !value.starts_with('-')) {
+            return Some((short, long, value.to_string()));
+        }
+    }
+    None
 }
 
 /// Flags whose value is a separate token, so a scan for the expression must
@@ -1827,12 +1846,13 @@ fn normalize_cli_args(args: &mut Vec<OsString>) {
             continue;
         }
         if arg == "evaluate" {
-            // The attached `-o` need not be the token right after `evaluate`:
-            // a flag such as `--track-navigation` can come first, and another
-            // flag can sit between it and the expression. Find that first
-            // attached form, then the expression that follows it. A lone
-            // `-offset` with no expression after it stays JavaScript.
-            let mut candidate: Option<(usize, String)> = None;
+            // Attached options need not be the tokens right after `evaluate`:
+            // a flag such as `--track-navigation` can come first, and several
+            // attached options can precede the expression (`-oout.json -p0`).
+            // Defer their splits until the expression is found, then apply
+            // them in reverse so inserted values don't shift later indices.
+            // A lone `-offset` with no expression after it stays JavaScript.
+            let mut pending: Vec<AttachedOption> = Vec::new();
             let mut j = i + 1;
             while j < args.len() {
                 let Some(token) = args[j].to_str() else {
@@ -1841,10 +1861,10 @@ fn normalize_cli_args(args: &mut Vec<OsString>) {
                 if token == "--" {
                     // The expression after the separator is passed through
                     // verbatim (`evaluate -oout.json -- -offset`), but an
-                    // attached `-o` before it still has to be split.
-                    if let Some((idx, path)) = candidate {
-                        if j + 1 < args.len() {
-                            apply_attached_output(args, idx, path.as_str());
+                    // attached option before it still has to be split.
+                    if j + 1 < args.len() {
+                        for option in pending.into_iter().rev() {
+                            option.apply(args);
                         }
                     }
                     break;
@@ -1853,16 +1873,19 @@ fn normalize_cli_args(args: &mut Vec<OsString>) {
                     j += 2;
                     continue;
                 }
-                if candidate.is_none() {
-                    if let Some(path) = attached_output_path(token) {
-                        candidate = Some((j, path));
-                        j += 1;
-                        continue;
-                    }
+                if let Some((short, long, value)) = attached_option_value(token) {
+                    pending.push(AttachedOption {
+                        idx: j,
+                        short,
+                        long,
+                        value,
+                    });
+                    j += 1;
+                    continue;
                 }
-                if token_supplies_expression(token, candidate.is_some()) {
-                    if let Some((idx, path)) = candidate {
-                        apply_attached_output(args, idx, path.as_str());
+                if token_supplies_expression(token, !pending.is_empty()) {
+                    for option in pending.into_iter().rev() {
+                        option.apply(args);
                     }
                     break;
                 }
@@ -2510,7 +2533,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
 
             // Apply emulation before navigation if requested
             if params.has_emulation() {
-                commands::emulation::emulate(&mut client, &session_id, params).await?;
+                commands::emulation::emulate(&mut client, &session_id, cli.output_format(), params)
+                    .await?;
             }
 
             commands::navigate::navigate(
@@ -2648,7 +2672,8 @@ async fn run_direct(cli: &Cli, ws_url: &str) -> Result<result::CommandResult> {
                 clear_media: *clear_media,
             };
             params.validate()?;
-            commands::emulation::emulate(&mut client, &session_id, params).await
+            commands::emulation::emulate(&mut client, &session_id, cli.output_format(), params)
+                .await
         }
         // Mocks need the daemon's long-lived session, so in direct mode these
         // explain why they can't apply (`require_persistent_session`).
@@ -3078,6 +3103,53 @@ mod tests {
         let args = normalize(&["--target", "warm-squid", "evaluate", "-oout.json", "1 + 1"]);
         assert_eq!(args["expression"], "1 + 1");
         assert!(args["output"].as_str().unwrap().ends_with("out.json"));
+    }
+
+    /// Attached global short options before the expression must be split too.
+    /// Clap 4.6 otherwise reads `-p0` as the hyphen-valued expression and
+    /// rejects the real script as an extra argument.
+    #[test]
+    fn attached_global_short_options_before_the_expression_are_split() {
+        let parse = |argv: &[&str]| {
+            let mut full = vec![OsString::from("chrome-devtools")];
+            full.extend(argv.iter().map(OsString::from));
+            normalize_cli_args(&mut full);
+            Cli::try_parse_from(full).unwrap()
+        };
+        let expression = |cli: &Cli| match &cli.command {
+            Commands::Evaluate { expression, .. } => expression.clone(),
+            _ => panic!("expected evaluate"),
+        };
+        let output = |cli: &Cli| match &cli.command {
+            Commands::Evaluate { output, .. } => output.clone().unwrap_or_default(),
+            _ => unreachable!(),
+        };
+
+        let cli = parse(&["evaluate", "-p0", "1+1"]);
+        assert_eq!(cli.page, Some(0));
+        assert_eq!(expression(&cli), "1+1");
+
+        let cli = parse(&["evaluate", "-twin", "1+1"]);
+        assert_eq!(cli.target.as_deref(), Some("win"));
+        assert_eq!(expression(&cli), "1+1");
+
+        // Several attached options, in either order, all get split.
+        let cli = parse(&["evaluate", "-oout.json", "-p0", "-twin", "1+1"]);
+        assert_eq!(cli.page, Some(0));
+        assert_eq!(cli.target.as_deref(), Some("win"));
+        assert_eq!(expression(&cli), "1+1");
+        assert!(output(&cli).ends_with("out.json"));
+
+        let cli = parse(&["evaluate", "-p0", "-oout.json", "-twin", "1+1"]);
+        assert_eq!(cli.page, Some(0));
+        assert_eq!(cli.target.as_deref(), Some("win"));
+        assert_eq!(expression(&cli), "1+1");
+        assert!(output(&cli).ends_with("out.json"));
+
+        // A literal `-p0` after `--` is script data, not an option.
+        let cli = parse(&["evaluate", "--", "-p0"]);
+        assert_eq!(expression(&cli), "-p0");
+        assert_eq!(cli.page, None);
     }
 
     /// The normalizer inspects only text tokens; non-UTF-8 names and values

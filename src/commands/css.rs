@@ -1427,6 +1427,37 @@ fn var_names(value: &str, out: &mut Vec<String>) {
     }
 }
 
+/// Custom properties whose declarations refer back to themselves through
+/// `var()`, directly or through another property. A cycle makes every property
+/// in it invalid at computed-value time, so no resolved value can be shown for
+/// their declarations, even though the lookup has no value for a reference in
+/// the cycle and would otherwise substitute its fallback.
+fn cyclic_custom_properties(blocks: &[Block]) -> HashSet<String> {
+    let mut refs: HashMap<String, Vec<String>> = HashMap::new();
+    for d in blocks.iter().flat_map(|b| b.decls.iter()) {
+        if d.name.starts_with("--") {
+            let mut names = Vec::new();
+            var_names(&d.value, &mut names);
+            refs.entry(d.key()).or_default().extend(names);
+        }
+    }
+    let mut cyclic = HashSet::new();
+    for start in refs.keys() {
+        let mut stack: Vec<&String> = refs.get(start).into_iter().flatten().collect();
+        let mut seen: HashSet<&String> = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if name == start {
+                cyclic.insert(start.clone());
+                break;
+            }
+            if seen.insert(name) {
+                stack.extend(refs.get(name).into_iter().flatten());
+            }
+        }
+    }
+    cyclic
+}
+
 /// The writing-mode and direction pairs `physical` recognises. The ancestor's
 /// own flow is not known when the page is asked for variables, so a logical
 /// longhand is matched against the physical key it would take under any flow;
@@ -1533,6 +1564,7 @@ fn shown_blocks(
     hidden_ua: &mut usize,
     declared: &mut Declared,
 ) -> Vec<Block> {
+    let cyclic = cyclic_custom_properties(&blocks);
     let mut out = Vec::new();
     for mut block in blocks {
         if block.decls.is_empty() {
@@ -1546,10 +1578,14 @@ fn shown_blocks(
             if d.usable() {
                 declared.add(d);
             }
-            d.resolved = vars.and_then(|vars| match queried {
-                Some(queried) => resolve_queried_vars(&d.value, vars, queried),
-                None => resolve_vars(&d.value, vars),
-            });
+            d.resolved = if d.name.starts_with("--") && cyclic.contains(&d.key()) {
+                None
+            } else {
+                vars.and_then(|vars| match queried {
+                    Some(queried) => resolve_queried_vars(&d.value, vars, queried),
+                    None => resolve_vars(&d.value, vars),
+                })
+            };
         }
         out.push(block);
     }
@@ -1717,6 +1753,30 @@ impl AnimatedProperties {
     fn keys(&self) -> impl Iterator<Item = &String> {
         self.animations.iter().chain(self.transitions.iter())
     }
+}
+
+/// The properties whose value this node takes from a running effect rather
+/// than from its static declarations. A transition outranks even `!important`;
+/// an animation does not, so where an important declaration won here it is that
+/// declaration which supplies the inherited value.
+fn supplying_effects(blocks: &[Block], animated: &AnimatedProperties) -> HashSet<String> {
+    let important_in_use: HashSet<&str> = blocks
+        .iter()
+        .flat_map(|b| b.decls.iter())
+        .filter(|d| d.important && matches!(d.status, Status::Active | Status::Indeterminate))
+        .flat_map(|d| d.longhands.iter().map(String::as_str))
+        .collect();
+    animated
+        .transitions
+        .iter()
+        .chain(
+            animated
+                .animations
+                .iter()
+                .filter(|key| !important_in_use.contains(key.as_str())),
+        )
+        .cloned()
+        .collect()
 }
 
 /// Animated properties CDP reports for the inspected node and, separately,
@@ -1919,6 +1979,10 @@ fn build_report_with_animated(
             ancestor_animated,
         );
         claimed.extend(set_here.iter().cloned());
+        // An effect on this ancestor supplies the value the element inherits,
+        // so a declaration further up is not in use. Keep the inheritance path
+        // when an animation was displaced by an important declaration here.
+        claimed.extend(supplying_effects(&blocks, ancestor_animated));
         // A longhand decided here no longer reaches from a further ancestor.
         // A non-inherited one stays eligible only while the parent takes it
         // from its own parent; otherwise the parent's initial value is what
@@ -2893,6 +2957,33 @@ Note: Matched rules, computed values and page details are read in separate reque
         assert_eq!(resolve_vars("somevar(--gap)", &vars), None);
     }
 
+    /// A cyclic custom property is invalid at computed-value time: its
+    /// declaration has no resolved value, while a noncyclic fallback and a
+    /// reference that uses the fallback keep theirs.
+    #[test]
+    fn cyclic_custom_property_has_no_resolved_value() {
+        let block = block(&authored(
+            &[
+                ("--tone", "var(--tone, red)"),
+                ("--absent-tone", "var(--absent, red)"),
+                ("color", "var(--tone, blue)"),
+                ("--a", "var(--b, red)"),
+                ("--b", "var(--a, blue)"),
+            ],
+            &[],
+        ));
+        // Chrome leaves a cyclic property out of the computed custom values.
+        let vars = HashMap::new();
+        let mut declared = Declared::default();
+        let shown = shown_blocks(vec![block], Some(&vars), None, false, &mut 0, &mut declared);
+        let resolved: Vec<Option<&str>> = shown[0]
+            .decls
+            .iter()
+            .map(|d| d.resolved.as_deref())
+            .collect();
+        assert_eq!(resolved, [None, Some("red"), Some("blue"), None, None]);
+    }
+
     #[test]
     fn var_names_include_fallbacks() {
         let mut names = Vec::new();
@@ -3755,6 +3846,79 @@ Note: Matched rules, computed values and page details are read in separate reque
         assert_eq!(
             status(AnimatedProperties::default(), vec![animations(&["color"])]),
             Status::Indeterminate
+        );
+    }
+
+    /// An effect on an ancestor supplies the value the element inherits, so a
+    /// static declaration further up is not in use. An animation displaced by
+    /// an important declaration on that ancestor does not supply the value; a
+    /// transition does.
+    #[test]
+    fn ancestor_effect_stops_more_distant_declarations() {
+        let mut m = matched();
+        m["inlineStyle"] = Value::Null;
+        m["matchedCSSRules"] = json!([]);
+        let far = rule(
+            "html",
+            1,
+            authored(&[("color", "green")], &[("color", "green")]),
+        );
+        let effect = |animations: &[&str], transitions: &[&str]| AnimatedProperties {
+            animations: animations.iter().map(|n| (*n).to_string()).collect(),
+            transitions: transitions.iter().map(|n| (*n).to_string()).collect(),
+        };
+        let far_status = |m: &Value, ancestors: Vec<AnimatedProperties>| {
+            let report = build_report_with_animated(
+                m,
+                &computed(),
+                &sheets(),
+                &page(),
+                &CssOptions::default(),
+                &AnimatedStyles {
+                    ancestors,
+                    ..Default::default()
+                },
+                None,
+            );
+            report
+                .inherited
+                .iter()
+                .flat_map(|g| &g.rules)
+                .flat_map(|r| &r.decls)
+                .find(|d| d.value == "green")
+                .unwrap()
+                .status
+        };
+        m["inherited"] = json!([{"matchedCSSRules": []}, {"matchedCSSRules": [far]}]);
+        let none = || effect(&[], &[]);
+        assert_eq!(far_status(&m, vec![none(), none()]), Status::Active);
+        assert_eq!(
+            far_status(&m, vec![effect(&["color"], &[]), none()]),
+            Status::Overridden
+        );
+        assert_eq!(
+            far_status(&m, vec![effect(&[], &["color"]), none()]),
+            Status::Overridden
+        );
+
+        // An important declaration on the nearer ancestor wins over an
+        // animation, so the more distant declaration keeps its status.
+        m["inherited"][0]["matchedCSSRules"] = json!([rule(
+            "body",
+            0,
+            authored(
+                &[("color", "inherit !important")],
+                &[("color", "inherit !important")]
+            )
+        )]);
+        assert_eq!(
+            far_status(&m, vec![effect(&["color"], &[]), none()]),
+            Status::Active
+        );
+        // A transition outranks the important declaration.
+        assert_eq!(
+            far_status(&m, vec![effect(&[], &["color"]), none()]),
+            Status::Overridden
         );
     }
 

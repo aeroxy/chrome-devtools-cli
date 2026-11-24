@@ -1436,6 +1436,9 @@ struct Aggregates {
     classes: HashMap<ClassKey, Members>,
     /// Exact self size, by node id, of each member stored as `WIDE`.
     wide: HashMap<u32, u64>,
+    /// Every node id, including zero-size ones whose size was moved onto an
+    /// owner: a surviving object can be absent from the counted classes.
+    all_ids: HashSet<u32>,
 }
 
 impl Aggregates {
@@ -1456,7 +1459,9 @@ impl Aggregates {
 fn build_class_aggregates(snap: &Snap, classes: &Classes) -> Aggregates {
     let mut groups: HashMap<(u32, Option<Location>), Members> = HashMap::new();
     let mut wide = HashMap::new();
+    let mut all_ids = HashSet::with_capacity(snap.node_count);
     for ord in 0..snap.node_count {
+        all_ids.insert(snap.id(ord));
         let size = snap.self_size(ord);
         // Zero-size nodes are in no class, as in DevTools: synthetic roots,
         // inline numbers, and the arrays and internals whose size
@@ -1490,7 +1495,11 @@ fn build_class_aggregates(snap: &Snap, classes: &Classes) -> Aggregates {
             (key, members)
         })
         .collect();
-    Aggregates { classes, wide }
+    Aggregates {
+        classes,
+        wide,
+        all_ids,
+    }
 }
 
 /// Read and index a .heapsnapshot file.
@@ -1513,6 +1522,9 @@ struct HeapSnapshotClassDiff {
     removed_count: usize,
     added_size: u64,
     removed_size: u64,
+    /// Size change of objects whose id and class are in both snapshots. An
+    /// object that only grew has no added/removed row, but still grew the heap.
+    retained_size_delta: i64,
 }
 
 impl HeapSnapshotClassDiff {
@@ -1522,18 +1534,20 @@ impl HeapSnapshotClassDiff {
 
     /// Exact: `diff_snapshots` keeps both totals below 2^63.
     fn size_delta(&self) -> i64 {
-        self.added_size as i64 - self.removed_size as i64
+        (self.added_size as i64 - self.removed_size as i64).saturating_add(self.retained_size_delta)
     }
 }
 
 /// Walk one class's id-sorted members in both snapshots like DevTools'
 /// `calculateDiffForClass`, reporting `(added, id, size)` for each id found
-/// on one side only.
+/// on one side only. Ids found on both sides but with different sizes go to
+/// `report_size_change` instead: those objects were retained, not allocated.
 fn merge_diff(
     base: &Aggregates,
     current: &Aggregates,
     key: &ClassKey,
     mut report: impl FnMut(bool, u32, u64),
+    mut report_size_change: impl FnMut(u32, u64, u64),
 ) {
     let (b, c) = (base.members(key), current.members(key));
     let (mut i, mut j) = (0, 0);
@@ -1548,6 +1562,10 @@ fn merge_diff(
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
+                let (base_size, current_size) = (base.size(b[i]), current.size(c[j]));
+                if base_size != current_size {
+                    report_size_change(b[i].0, base_size, current_size);
+                }
                 i += 1;
                 j += 1;
             }
@@ -1576,16 +1594,30 @@ fn diff_snapshots(base: &Aggregates, current: &Aggregates) -> Result<Vec<HeapSna
         // overflow, and checked below.
         let (mut added_count, mut removed_count, mut added_size, mut removed_size) =
             (0, 0, 0u128, 0u128);
-        merge_diff(base, current, key, |added, _, size| {
-            if added {
-                added_count += 1;
-                added_size += u128::from(size);
-            } else {
-                removed_count += 1;
-                removed_size += u128::from(size);
-            }
-        });
-        if added_count > 0 || removed_count > 0 {
+        let mut retained_size_delta = 0i128;
+        merge_diff(
+            base,
+            current,
+            key,
+            |added, _, size| {
+                if added {
+                    added_count += 1;
+                    added_size += u128::from(size);
+                } else {
+                    removed_count += 1;
+                    removed_size += u128::from(size);
+                }
+            },
+            |_, from, to| retained_size_delta += i128::from(to) - i128::from(from),
+        );
+        let retained_size_delta = i64::try_from(retained_size_delta).with_context(|| {
+            format!(
+                "Corrupt snapshot: retained objects of class '{}' changed size by 2^63 bytes or \
+                 more",
+                key.name
+            )
+        })?;
+        if added_count > 0 || removed_count > 0 || retained_size_delta != 0 {
             // `size_delta` subtracts the totals as i64s. Only a corrupt file
             // reaches 2^63 bytes.
             let total = |size: u128, objects: &str| {
@@ -1606,6 +1638,7 @@ fn diff_snapshots(base: &Aggregates, current: &Aggregates) -> Result<Vec<HeapSna
                 removed_count,
                 added_size: total(added_size, "the current snapshot's added")?,
                 removed_size: total(removed_size, "the base snapshot's removed")?,
+                retained_size_delta,
             });
         }
     }
@@ -1635,23 +1668,24 @@ fn compute_class_node_detail(
     current: &Aggregates,
     key: &ClassKey,
 ) -> Vec<DiffObject> {
-    let base_ids: HashSet<u32> = base.classes.values().flatten().map(|&(id, _)| id).collect();
-    let current_ids: HashSet<u32> = current
-        .classes
-        .values()
-        .flatten()
-        .map(|&(id, _)| id)
-        .collect();
+    let base_ids = &base.all_ids;
+    let current_ids = &current.all_ids;
     let mut objects = Vec::new();
-    merge_diff(base, current, key, |added, id, self_size| {
-        let other = if added { &base_ids } else { &current_ids };
-        objects.push(DiffObject {
-            added,
-            id,
-            self_size,
-            also_in_other: other.contains(&id),
-        })
-    });
+    merge_diff(
+        base,
+        current,
+        key,
+        |added, id, self_size| {
+            let other = if added { base_ids } else { current_ids };
+            objects.push(DiffObject {
+                added,
+                id,
+                self_size,
+                also_in_other: other.contains(&id),
+            })
+        },
+        |_, _, _| (),
+    );
     objects.sort_by(|a, b| {
         b.self_size
             .cmp(&a.self_size)
@@ -2061,16 +2095,19 @@ fn weak_map_pair_ids(name: &str) -> Option<(Vec<u32>, u32)> {
     Some((keys, table.parse().ok()?))
 }
 
-/// A lone candidate key id only identifies a node when exactly one of the
-/// candidates is a node in the snapshot. Otherwise the name is ambiguous and
-/// no node is claimed.
+/// A lone candidate key id identifies a node only when the name supplies one
+/// distinct candidate. With several, presence alone cannot choose: a trimmed
+/// snapshot can omit the real key's node, leaving a different candidate as the
+/// only one still present. Another edge must settle an ambiguous name.
 fn weak_map_key_from_metadata(snap: &Snap, keys: &[u32]) -> Option<u32> {
-    let mut found = keys
-        .iter()
-        .copied()
-        .filter(|id| (0..snap.node_count).any(|ord| snap.id(ord) == *id));
-    let only = found.next()?;
-    found.next().is_none().then_some(only)
+    let mut candidates = keys.iter().copied().collect::<HashSet<_>>().into_iter();
+    let only = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    (0..snap.node_count)
+        .any(|ord| snap.id(ord) == only)
+        .then_some(only)
 }
 
 /// The other edge a WeakMap-pair retainer needs in order to keep the value
@@ -3519,6 +3556,63 @@ mod tests {
         );
     }
 
+    /// A retained object keeps its id and class, so it is neither added nor
+    /// removed, but a transferred backing store can change its attributed
+    /// size. That growth must still appear in the diff.
+    #[test]
+    fn retained_object_size_change_is_reported_without_counting_it() {
+        let base = objects(&[(11, "Map", 100)]);
+        let current = objects(&[(11, "Map", 150)]);
+        let diffs = diff_snapshots(&base, &current).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].key.name, "Map");
+        assert_eq!((diffs[0].added_count, diffs[0].removed_count), (0, 0));
+        assert_eq!(diffs[0].size_delta(), 50);
+        let summary = format_class_diff_summary(&diffs, &defaults(), OutputFormat::Text).unwrap();
+        assert!(summary.contains("\n0,Map,,0,0,0,0,0,50\n"), "{summary}");
+
+        let shrank = diff_snapshots(&current, &base).unwrap();
+        assert_eq!(shrank.len(), 1);
+        assert_eq!(shrank[0].size_delta(), -50);
+        assert_eq!(
+            compute_class_node_detail(&base, &current, &diffs[0].key),
+            []
+        );
+    }
+
+    /// A store whose size was moved onto its sole owner has no counted class
+    /// in the base, though its node survived. When a second owner makes the
+    /// store count on its own, the per-class + row must still say `alsoIn`.
+    #[test]
+    fn also_in_uses_all_nodes_not_just_counted_class_members() {
+        let mut base = TestSnap::page().0;
+        let owner = base.node("object", "Map", 11, 40);
+        let store = base.node("array", "", 13, 64);
+        base.edge(owner, "element", "0", store);
+        let mut current = TestSnap::page().0;
+        let first = current.node("object", "Map", 11, 40);
+        let second = current.node("object", "Map", 15, 40);
+        let store = current.node("array", "", 13, 64);
+        current.edge(first, "element", "0", store);
+        current.edge(second, "element", "0", store);
+
+        let base = base.aggregates();
+        let current = current.aggregates();
+        let diffs = diff_snapshots(&base, &current).unwrap();
+        let array = diffs.iter().find(|d| d.key.name.contains("array")).unwrap();
+        assert_eq!(array.added_count, 1);
+        let objects = compute_class_node_detail(&base, &current, &array.key);
+        assert_eq!(
+            objects,
+            [DiffObject {
+                added: true,
+                id: 13,
+                self_size: 64,
+                also_in_other: true,
+            }]
+        );
+    }
+
     #[test]
     fn test_diff_filters_unchanged_classes_and_groups_strings() {
         let same = objects(&[(11, "Map", 100)]);
@@ -3900,10 +3994,22 @@ mod tests {
         let text = format_node_report(&report, &defaults(), OutputFormat::Text).unwrap();
         assert!(text.contains("while its key, a node the snapshot does not identify, is alive"));
 
-        // When only the real id names a node, metadata resolves the lone
-        // table's key without another edge.
+        // A missing candidate could be the real key in a trimmed snapshot, so
+        // presence alone cannot resolve an ambiguous name even when the other
+        // candidate is a node here.
         let entry =
             "part of key (a @99) -> value (b @7) -> value (Val @17) pair in WeakMap (table @5)";
+        let snap = fixture(entry, false);
+        let report = inspect_node(&snap, 17, &defaults()).unwrap();
+        assert_eq!(
+            report.retainers[0]
+                .conditional_on
+                .as_ref()
+                .map(|c| (c.role, c.node_id)),
+            Some(("key", None))
+        );
+        // An unambiguous candidate still resolves from the node's presence.
+        let entry = "part of key (Key @7) -> value (Val @17) pair in WeakMap (table @5)";
         let snap = fixture(entry, false);
         let report = inspect_node(&snap, 17, &defaults()).unwrap();
         assert_eq!(

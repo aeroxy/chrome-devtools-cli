@@ -121,7 +121,14 @@ pub async fn new_page(
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("No persistent session for the new page"))?;
             if let Some(params) = emulation {
-                crate::commands::emulation::emulate(client, &session_id, params).await?;
+                // The new-page result supersedes this status output.
+                crate::commands::emulation::emulate(
+                    client,
+                    &session_id,
+                    crate::format::OutputFormat::Text,
+                    params,
+                )
+                .await?;
             }
             crate::commands::navigate::navigate(
                 client,

@@ -229,6 +229,12 @@ pub struct CdpClient {
     /// interception state of one that is still live. Idle reads stay on while
     /// any such session remains.
     sessions_may_intercept: std::collections::HashSet<String>,
+    /// Sessions whose `Fetch.enable` was actually written. A setup that fails
+    /// after that write but before the detach is confirmed leaves Chrome able
+    /// to pause requests, so the session must keep idle reads on. The shared
+    /// `fetch_may_be_enabled` cannot decide this: a different session may have
+    /// set it. A session that failed before the write needs no such record.
+    fetch_enable_sent_sessions: std::collections::HashSet<String>,
     /// Mock policy of sessions left intercepting by a failed detach, keyed by
     /// that session. Returning to its tab moves the tab's mocks into the active
     /// list; a late pause from the old session still needs its own policy or
@@ -526,6 +532,7 @@ impl CdpClient {
             network_mocks: Vec::new(),
             fetch_may_be_enabled: false,
             sessions_may_intercept: std::collections::HashSet::new(),
+            fetch_enable_sent_sessions: std::collections::HashSet::new(),
             interceptor_mocks: std::collections::HashMap::new(),
             paused_requests: std::collections::VecDeque::new(),
             emulation_saved: std::collections::HashMap::new(),
@@ -580,16 +587,15 @@ impl CdpClient {
         let old_session = self.persistent_session.take();
         if let Some(ref old_session) = old_session {
             // A detach does not close an open dialog, and only the session
-            // that saw it can settle it. Keep the record for the tab so a
-            // later session on it reports the dialog at once, or handles it
-            // once it can answer `Page.handleJavaScriptDialog`.
-            if let (Some(old_target), Some(open)) =
-                (old_target.as_deref(), self.open_dialog_for(old_session))
-            {
-                self.orphan_dialogs
-                    .insert(old_target.to_string(), open.dialog.clone());
-            }
-            self.forget_dialog(Some(old_session.as_str()));
+            // that saw it can settle it. Keep the dialog on that session while
+            // the detach is in flight: a close arriving meanwhile is applied
+            // to the session, so the tab must not inherit a stale record. The
+            // dialog is saved for the tab only if it is still open afterwards,
+            // where a later session can report or handle it.
+            let dialog_target = old_target
+                .as_deref()
+                .filter(|_| self.open_dialog_for(old_session).is_some())
+                .map(str::to_string);
             match self
                 .send("Target.detachFromTarget", json!({"sessionId": old_session}))
                 .await
@@ -618,6 +624,10 @@ impl CdpClient {
                     self.answer_paused_requests().await?;
                 }
             }
+            if let (Some(target), Some(open)) = (dialog_target, self.open_dialog_for(old_session)) {
+                self.orphan_dialogs.insert(target, open.dialog);
+            }
+            self.forget_dialog(Some(old_session.as_str()));
             self.persistent_target_id = None;
             self.events
                 .retain(|event| event["sessionId"].as_str() != Some(old_session.as_str()));
@@ -761,6 +771,21 @@ impl CdpClient {
             .is_some_and(|e| e.downcast_ref::<ConnectionLost>().is_some());
         if detached.is_ok() {
             self.session_ended(session_id);
+        } else {
+            // This session wrote Fetch.enable and its detach is unconfirmed:
+            // Chrome may still pause its requests, so keep idle reads on and
+            // keep its mock policy until this session really ends. The shared
+            // `fetch_may_be_enabled` cannot decide this (another session may
+            // have set it). A dead socket needs no record: the daemon retires
+            // the connection and its sessions.
+            let fetch_was_enabled = self.fetch_enable_sent_sessions.remove(session_id);
+            if fetch_was_enabled && !connection_lost {
+                self.sessions_may_intercept.insert(session_id.to_string());
+                if let Some(state) = self.emulation_saved.get(failed_target_id) {
+                    self.interceptor_mocks
+                        .insert(session_id.to_string(), state.network_mocks.clone());
+                }
+            }
         }
 
         self.persistent_session = None;
@@ -1171,6 +1196,13 @@ impl CdpClient {
             )));
         }
         *wrote = true;
+        // Remember which session actually got Fetch.enable: a failed setup
+        // needs this to tell whether its detach left requests paused.
+        if method == "Fetch.enable" {
+            if let Some(sid) = session_id {
+                self.fetch_enable_sent_sessions.insert(sid.to_string());
+            }
+        }
         let id = self
             .send_raw_no_wait_within(
                 session_id,
@@ -1868,6 +1900,7 @@ impl CdpClient {
     fn session_ended(&mut self, session_id: &str) {
         self.sessions_may_intercept.remove(session_id);
         self.interceptor_mocks.remove(session_id);
+        self.fetch_enable_sent_sessions.remove(session_id);
         // Only stop reading when no other session may still be intercepting:
         // a failed detach on an earlier tab leaves its Fetch domain live even
         // though this tab's detach succeeded.
@@ -4023,6 +4056,136 @@ mod tests {
             .await
             .expect_err("the dialog is reported at once");
         assert!(error.downcast_ref::<DialogOpen>().is_some(), "{error:#}");
+        drop(client);
+        chrome.await.unwrap();
+    }
+
+    /// A close arriving while the detach is in flight must invalidate the tab's
+    /// saved record too: a later session there would otherwise report a dialog
+    /// that no longer blocks the page.
+    #[tokio::test]
+    async fn a_dialog_closed_during_detach_does_not_follow_the_tab() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let messages = match call["method"].as_str() {
+                Some("Target.detachFromTarget") if call["params"]["sessionId"] == "S1" => vec![
+                    json!({
+                        "method": "Page.javascriptDialogClosed",
+                        "sessionId": "S1",
+                        "params": {}
+                    }),
+                    json!({"id": call["id"], "result": {}}),
+                ],
+                Some("Target.attachToTarget") if call["params"]["targetId"] == "T2" => {
+                    vec![json!({"id": call["id"], "result": {"sessionId": "S2"}})]
+                }
+                Some("Target.attachToTarget") => {
+                    vec![json!({"id": call["id"], "result": {"sessionId": "S3"}})]
+                }
+                _ => vec![json!({"id": call["id"], "result": {}})],
+            };
+            (std::time::Duration::ZERO, messages)
+        })
+        .await;
+        client.persistent_session = Some("S1".into());
+        client.persistent_target_id = Some("T1".into());
+        client.note_dialog_event(&json!({
+            "method": "Page.javascriptDialogOpening", "sessionId": "S1",
+            "params": {"type": "alert", "message": "closed meanwhile"}
+        }));
+
+        client
+            .ensure_persistent_session("T2")
+            .await
+            .expect("switch to the other tab");
+        assert!(
+            !client.orphan_dialogs.contains_key("T1"),
+            "the close during detach invalidated the saved dialog"
+        );
+        client
+            .ensure_persistent_session("T1")
+            .await
+            .expect("return to the first tab");
+        assert!(client.open_dialog_for("S3").is_none());
+        client
+            .settle_open_dialog("S3")
+            .await
+            .expect("no stale dialog blocks the page");
+        drop(client);
+        chrome.await.unwrap();
+    }
+
+    /// A failed setup whose Fetch.enable reached Chrome but whose detach did
+    /// not complete must keep idle reads on and its mock policy. A setup that
+    /// failed before that write must leave no record: nothing can clear it.
+    #[tokio::test]
+    async fn a_failed_setup_after_fetch_enable_keeps_its_interception() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let msg = match call["method"].as_str() {
+                Some("Target.attachToTarget") => {
+                    json!({"id": call["id"], "result": {"sessionId": "S-new"}})
+                }
+                Some("Fetch.enable") => {
+                    json!({"id": call["id"], "error": {"code": -32000, "message": "refused"}})
+                }
+                Some("Target.detachFromTarget") => {
+                    json!({"id": call["id"], "error": {"code": -32000, "message": "busy"}})
+                }
+                _ => json!({"id": call["id"], "result": {}}),
+            };
+            (std::time::Duration::ZERO, vec![msg])
+        })
+        .await;
+        client.emulation_saved.insert(
+            "T-new".to_string(),
+            TabEmulation {
+                network_mocks: vec![crate::commands::network_mock::NetworkMock {
+                    pattern: "*".into(),
+                    resource_type: None,
+                    action: crate::commands::network_mock::MockAction::Abort,
+                    hits: 0,
+                }],
+                ..Default::default()
+            },
+        );
+
+        let err = client
+            .ensure_persistent_session("T-new")
+            .await
+            .expect_err("setup fails after Fetch.enable");
+        assert!(err.to_string().contains("refused"), "{err:#}");
+        assert!(client.sessions_may_intercept.contains("S-new"));
+        assert_eq!(client.interceptor_mocks["S-new"].len(), 1);
+        assert!(client.wants_idle_reads());
+        drop(client);
+        chrome.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_setup_before_fetch_enable_leaves_no_interception() {
+        let (mut client, chrome) = fake_chrome(|call| {
+            let msg = match call["method"].as_str() {
+                Some("Target.attachToTarget") => {
+                    json!({"id": call["id"], "result": {"sessionId": "S-new"}})
+                }
+                Some("Network.enable") => {
+                    json!({"id": call["id"], "error": {"code": -32000, "message": "refused"}})
+                }
+                Some("Target.detachFromTarget") => {
+                    json!({"id": call["id"], "error": {"code": -32000, "message": "busy"}})
+                }
+                _ => json!({"id": call["id"], "result": {}}),
+            };
+            (std::time::Duration::ZERO, vec![msg])
+        })
+        .await;
+
+        let err = client
+            .ensure_persistent_session("T-new")
+            .await
+            .expect_err("setup fails before Fetch.enable");
+        assert!(err.to_string().contains("refused"), "{err:#}");
+        assert!(!client.sessions_may_intercept.contains("S-new"));
+        assert!(!client.wants_idle_reads());
         drop(client);
         chrome.await.unwrap();
     }
