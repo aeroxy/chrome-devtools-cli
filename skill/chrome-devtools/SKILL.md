@@ -384,7 +384,7 @@ chrome-devtools --target warm-squid evaluate "JSON.stringify(performance.timing)
 
 **Dialogs opened by an action.** When a `click`, `press-key`, `fill`, `hover` or `type-text` makes the page open a dialog, the command succeeds and says so: `Clicked, and the page opened a confirm dialog: "Delete?"`. **Don't repeat the action.** Handle the dialog next with `evaluate --dialog-action accept|dismiss|<text> true`. Steps after the dialog opened did not run. For `type-text`, if Enter may have opened the dialog, the `--submit-key` outcome is unconfirmed — don't press it again; say it did not run only when the dialog interrupted text insertion before the key was sent. If the CLI warned that it ran without the daemon, or the report says the daemon could not attach to the tab, no later command can handle the dialog: ask the human to close it, or `close-page` the tab.
 
-A dialog that opens while the command is only getting ready fails it instead, because the action never happened: `Moving the pointer there opened a dialog, so the click was not sent` (a mouseover handler) or `Focusing or clearing the field opened a dialog, so the value was not entered` (`fill`). Handle the dialog, then run the command again.
+A dialog that opens while the command is only getting ready fails it instead, because the action never happened: `Moving the pointer there opened a dialog, so the click was not sent` (a mouseover handler) or `Focusing or clearing the field opened a dialog, so the value was not entered` (`fill`). Handle the dialog, then run the command again. A `fill` clears the field and fires an `input` event before it types, so check the field, and anything its handlers do (a search, an autosave), before retrying.
 
 If a command instead fails with `got no answer from the page` and mentions a dialog this daemon did not see, treat an unseen dialog as one possible cause, not a conclusion from the message alone: an endless loop or a hung renderer gets the same text. Such a dialog would have opened before the daemon attached to the tab (or under an earlier session), so the CLI cannot handle it — ask the human to close it, or `close-page` the tab, if one really is open.
 
@@ -589,23 +589,25 @@ header gives the total and the `--offset` for the next page, `--limit` sets
 the page size (default 50), and names longer than `--max-name-length`
 characters (default 100) end in `…`.
 
-**3. List the retained objects of a class** by its `idx`, largest first. `+`
-objects entered the class and are in the `--current` file; `-` objects left it
-and are in `--base`. `alsoIn` names the other file when the same id is there
-too, under another class: the object changed class (a node that got detached,
-say) rather than being allocated or freed. Inspect each object in the file
-that has it under this class.
+**3. List the retained objects of a class** by its `idx`, largest change
+first. `+` objects entered the class and are in the `--current` file; `-`
+objects left it and are in `--base`. `alsoIn` names the other file when the
+same id is there too, under another class: the object changed class (a node
+that got detached, say) rather than being allocated or freed. `~` objects
+stayed in the class and changed size, from `previousSize` to `selfSize`: they
+account for the part of `sizeDelta` that no `+` or `-` row explains. Inspect
+each object in the file that has it under this class (`--current` for `~`).
 
 ```bash
 chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /tmp/final.heapsnapshot --class-index 0 --limit 3
 # idx:0,className:Detached <div>,location:,addedCount:10,removedCount:0,countDelta:10,addedSize:880,removedSize:0,sizeDelta:880
 #
-# Objects, largest selfSize first: showing 1-3 of 10; next page: --offset 3
-# + = entered this class, - = left it; an id present in the other capture is a class change, not an allocation or deletion.
-# op,nodeId,selfSize,alsoIn
-# +,101,88,-
-# +,103,88,-
-# +,105,88,-
+# Objects, largest size change first: showing 1-3 of 10; next page: --offset 3
+# + = entered this class, - = left it, ~ = stayed in it and changed size from previousSize; a + or - id present in the other capture is a class change, not an allocation or deletion.
+# op,nodeId,selfSize,previousSize,alsoIn
+# +,101,88,,-
+# +,103,88,,-
+# +,105,88,,-
 ```
 
 **4. Ask one of them what keeps it alive.** `inspect-heapsnapshot-node` prints
@@ -816,7 +818,7 @@ chrome-devtools --target warm-squid css-styles 'button' --ua-rules              
 
 - **Computed** lists `display`, `width`, `height`, and what the shown rules set; a shorthand shows as one value when Chrome can write one.
 - **Rules** are in normal precedence order, highest first. An `!important` declaration can beat one in a rule above it (`color: white !important` beats `element.style` here), so the tags, not the order, say what applies. Each has `file:line` (an inline `<style>` gives the document's line) and its enclosing `@media`/`@layer`/`@supports`/`@container`/nesting as wrapping blocks. `[overridden]` marks a declaration that applies nowhere; `[invalid]` and `[disabled]` mark ones that never could. `/* ... */` after a `var()` value is what it resolves to on that element (or, under "Inherited from", on that ancestor). An empty comment in it, written `/**\/` there, keeps apart tokens that would otherwise read as one, as Chrome does: `var(--size)px` with `--size: 20` resolves to `20/**\/px`, the number 20 and then `px`, which is no length.
-- **Inherited from** lists only properties that inherit. A user-agent rule on the element itself (common on `button`, `input`) can block inheritance even while hidden; the computed value is the final word.
+- **Inherited from** lists properties that inherit, and any other property the element sets to `inherit` (`width: inherit` shows the parent's `width`). A user-agent rule on the element itself (common on `button`, `input`) can block inheritance even while hidden; the computed value is the final word.
 - Not covered: pseudo-elements (`::before`), `@keyframes`, elements inside iframes or shadow roots. Use `--json`/`--toon` for structured output.
 
 ### Pattern 18: Passkeys and Security Keys (configure-webauthn)
@@ -872,7 +874,7 @@ chrome-devtools --target warm-squid remove-network-mock             # remove all
 - Body text that starts with a dash goes attached, as in `--body=-1`: `--body -1` is an error, so `--body` can't take the next flag (`--abort`) as its text.
 - `--body-file` must be a regular file of at most 64 MiB. The daemon reads it, and would wait on a pipe or a device (`<(...)`, `/dev/stdin`), so those fail: save the body to a file first.
 - Mocks belong to the tab and to the daemon: they stop applying while the CLI works on another tab, come back when it returns, and end when the daemon exits. A daemon with mocks stays up while the page keeps making requests; run `caffeinate` in the background to keep it for longer quiet spells.
-- Mocks apply to requests on the tab's own session; cross-site iframe requests run in another process and are not paused.
+- Mocks catch the tab's own requests, but not those a cross-site iframe makes from its own process (its fetches, scripts, images): those reach the network, and the mock's hit count doesn't grow.
 - Cross-origin `fetch` needs CORS headers in the mock, e.g. `--header 'Access-Control-Allow-Origin: *'`.
 - `--resource-type XHR` and `--resource-type Fetch` each match both `fetch()` and XMLHttpRequest: Chrome doesn't tell them apart when it intercepts.
 - The HTTP cache is off while any mock is set, so cached responses can't bypass it. Service workers can still answer requests before they reach a mock.

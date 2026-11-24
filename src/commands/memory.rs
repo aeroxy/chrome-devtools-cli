@@ -1691,19 +1691,47 @@ fn diff_snapshots(base: &Aggregates, current: &Aggregates) -> Result<Vec<HeapSna
     Ok(diffs)
 }
 
-/// One object that entered or left a class. `also_in_other` marks a class
-/// change rather than an allocation or deletion: V8 keeps the node id when,
-/// for example, a live `<div>` becomes detached between captures.
+/// How an object of a class differs between the captures. The variant order
+/// breaks ties between rows whose sizes changed as much.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Change {
+    Added,
+    Removed,
+    /// In the class in both captures, with this self size in the base one.
+    /// Without these rows, a class whose objects changed size in place (an
+    /// object turned into a dictionary, or an owner whose backing stores
+    /// `transfer_owned_sizes` counts) would show a sizeDelta and no object.
+    Resized {
+        previous_size: u64,
+    },
+}
+
+/// One object that entered or left a class, or stayed and changed size.
+/// `also_in_other` marks a class change rather than an allocation or
+/// deletion: V8 keeps the node id when, for example, a live `<div>` becomes
+/// detached between captures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DiffObject {
-    added: bool,
+    change: Change,
     id: u32,
+    /// The size in the capture holding the object under this class, the
+    /// current one when both do.
     self_size: u64,
     also_in_other: bool,
 }
 
-/// The added and deleted objects of one class, largest first so the first
-/// page shows what matters most.
+impl DiffObject {
+    /// How far the object moved the class's sizeDelta, either way.
+    fn size_change(&self) -> u64 {
+        match self.change {
+            Change::Resized { previous_size } => self.self_size.abs_diff(previous_size),
+            Change::Added | Change::Removed => self.self_size,
+        }
+    }
+}
+
+/// The added, deleted and resized objects of one class, largest change first
+/// so the first page shows what accounts for the class's sizeDelta.
 fn compute_class_node_detail(
     base: &Aggregates,
     current: &Aggregates,
@@ -1712,6 +1740,7 @@ fn compute_class_node_detail(
     let base_ids = &base.all_ids;
     let current_ids = &current.all_ids;
     let mut objects = Vec::new();
+    let mut resized = Vec::new();
     merge_diff(
         base,
         current,
@@ -1719,20 +1748,27 @@ fn compute_class_node_detail(
         |added, id, self_size| {
             let other = if added { base_ids } else { current_ids };
             objects.push(DiffObject {
-                added,
+                change: if added {
+                    Change::Added
+                } else {
+                    Change::Removed
+                },
                 id,
                 self_size,
                 also_in_other: other.contains(&id),
             })
         },
-        |_, _, _| (),
+        |id, previous_size, self_size| {
+            resized.push(DiffObject {
+                change: Change::Resized { previous_size },
+                id,
+                self_size,
+                also_in_other: false,
+            })
+        },
     );
-    objects.sort_by(|a, b| {
-        b.self_size
-            .cmp(&a.self_size)
-            .then_with(|| b.added.cmp(&a.added))
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    objects.append(&mut resized);
+    objects.sort_by_key(|o| (std::cmp::Reverse(o.size_change()), o.change, o.id));
     objects
 }
 
@@ -1813,8 +1849,9 @@ fn location_value(location: Option<Location>) -> serde_json::Value {
 
 /// The `+`/`-` rows are per-class, so a node that changes class appears in
 /// both classes. Say so, or a still-live object reads as deleted.
-const DETAIL_NOTE: &str = "+ = entered this class, - = left it; an id present in the other \
-                           capture is a class change, not an allocation or deletion.";
+const DETAIL_NOTE: &str = "+ = entered this class, - = left it, ~ = stayed in it and changed \
+                           size from previousSize; a + or - id present in the other capture is \
+                           a class change, not an allocation or deletion.";
 
 /// Columns of a diff row, in output order.
 const DIFF_COLUMNS: [&str; 9] = [
@@ -1910,8 +1947,9 @@ fn format_class_diff_summary(
     Ok(out)
 }
 
-/// Format one class's added/deleted objects. `idx` is the summary row it was
-/// selected from, so the header can be matched back to the summary.
+/// Format one class's added, deleted and resized objects. `idx` is the
+/// summary row it was selected from, so the header can be matched back to
+/// the summary.
 fn format_class_diff_detail(
     idx: usize,
     diff: &HeapSnapshotClassDiff,
@@ -1921,17 +1959,21 @@ fn format_class_diff_detail(
 ) -> Result<String> {
     use std::fmt::Write;
     let page = &objects[page_bounds(objects.len(), opts)];
-    let op = |o: &DiffObject| if o.added { "+" } else { "-" };
+    let op = |o: &DiffObject| match o.change {
+        Change::Added => "+",
+        Change::Removed => "-",
+        Change::Resized { .. } => "~",
+    };
+    let previous_size = |o: &DiffObject| match o.change {
+        Change::Resized { previous_size } => Some(previous_size),
+        Change::Added | Change::Removed => None,
+    };
     // `alsoIn` names the capture holding the same id under another class: the
     // object changed class, it was not allocated or freed.
-    let also_in = |o: &DiffObject| {
-        if !o.also_in_other {
-            None
-        } else if o.added {
-            Some("base")
-        } else {
-            Some("current")
-        }
+    let also_in = |o: &DiffObject| match (o.also_in_other, o.change) {
+        (true, Change::Added) => Some("base"),
+        (true, Change::Removed) => Some("current"),
+        _ => None,
     };
     if !format.is_text() {
         let nodes: Vec<serde_json::Value> = page
@@ -1941,6 +1983,7 @@ fn format_class_diff_detail(
                     "op": op(o),
                     "nodeId": o.id,
                     "selfSize": o.self_size,
+                    "previousSize": previous_size(o),
                     "alsoIn": also_in(o),
                 })
             })
@@ -1963,20 +2006,21 @@ fn format_class_diff_detail(
     let _ = writeln!(out, "{}", header.join(","));
     let _ = writeln!(
         out,
-        "\nObjects, largest selfSize first: {}",
+        "\nObjects, largest size change first: {}",
         page_summary(objects.len(), opts.offset, page.len())
     );
     let _ = writeln!(out, "{DETAIL_NOTE}");
     if !page.is_empty() {
-        out.push_str("op,nodeId,selfSize,alsoIn\n");
+        out.push_str("op,nodeId,selfSize,previousSize,alsoIn\n");
     }
     for o in page {
         let _ = writeln!(
             out,
-            "{},{},{},{}",
+            "{},{},{},{},{}",
             op(o),
             o.id,
             o.self_size,
+            previous_size(o).map(|s| s.to_string()).unwrap_or_default(),
             also_in(o).unwrap_or("-")
         );
     }
@@ -3572,13 +3616,13 @@ mod tests {
             detail,
             [
                 DiffObject {
-                    added: true,
+                    change: Change::Added,
                     id: 17,
                     self_size: 150,
                     also_in_other: false,
                 },
                 DiffObject {
-                    added: false,
+                    change: Change::Removed,
                     id: 13,
                     self_size: 100,
                     also_in_other: false,
@@ -3589,7 +3633,7 @@ mod tests {
         assert_eq!(
             gone,
             [DiffObject {
-                added: false,
+                change: Change::Removed,
                 id: 15,
                 self_size: 50,
                 also_in_other: false,
@@ -3615,9 +3659,25 @@ mod tests {
         let shrank = diff_snapshots(&current, &base).unwrap();
         assert_eq!(shrank.len(), 1);
         assert_eq!(shrank[0].size_delta(), -50);
+        // The detail names the object, or the drill-down would end at a class
+        // that changed size with no object to inspect.
         assert_eq!(
             compute_class_node_detail(&base, &current, &diffs[0].key),
-            []
+            [DiffObject {
+                change: Change::Resized { previous_size: 100 },
+                id: 11,
+                self_size: 150,
+                also_in_other: false,
+            }]
+        );
+        assert_eq!(
+            compute_class_node_detail(&current, &base, &shrank[0].key),
+            [DiffObject {
+                change: Change::Resized { previous_size: 150 },
+                id: 11,
+                self_size: 100,
+                also_in_other: false,
+            }]
         );
 
         // Exact i64::MAX succeeds; exceeding it via retained + added rejects
@@ -3660,7 +3720,7 @@ mod tests {
         assert_eq!(
             objects,
             [DiffObject {
-                added: true,
+                change: Change::Added,
                 id: 13,
                 self_size: 64,
                 also_in_other: true,
@@ -3736,7 +3796,7 @@ mod tests {
             format_class_diff_detail(0, &diffs[0], &objects, &defaults(), OutputFormat::Text)
                 .unwrap();
         assert!(text.contains(DETAIL_NOTE), "{text}");
-        assert!(text.contains("+,11,40,base\n"), "{text}");
+        assert!(text.contains("+,11,40,,base\n"), "{text}");
         let json: serde_json::Value = serde_json::from_str(
             &format_class_diff_detail(0, &diffs[0], &objects, &defaults(), OutputFormat::Json)
                 .unwrap(),
@@ -3780,9 +3840,98 @@ mod tests {
         assert_eq!(
             detail,
             "idx:1,className:Map,location:,addedCount:2,removedCount:1,countDelta:1,addedSize:240,removedSize:100,sizeDelta:140\n\
-             \nObjects, largest selfSize first: showing 1-2 of 3; next page: --offset 2\n\
-             + = entered this class, - = left it; an id present in the other capture is a class change, not an allocation or deletion.\n\
-             op,nodeId,selfSize,alsoIn\n+,17,150,-\n-,11,100,-\n"
+             \nObjects, largest size change first: showing 1-2 of 3; next page: --offset 2\n\
+             + = entered this class, - = left it, ~ = stayed in it and changed size from previousSize; a + or - id present in the other capture is a class change, not an allocation or deletion.\n\
+             op,nodeId,selfSize,previousSize,alsoIn\n+,17,150,,-\n-,11,100,,-\n"
+        );
+    }
+
+    /// An object that changes size in place keeps its id and class, so only a
+    /// `~` row can show it. It ranks among the + and - rows by how much it
+    /// changed, and those keep their order.
+    #[test]
+    fn resized_objects_are_listed_by_how_much_they_changed() {
+        let base = objects(&[
+            (11, "Map", 100),
+            (13, "Map", 40),
+            (15, "Map", 64),
+            (21, "Map", 50),
+        ]);
+        let current = objects(&[
+            (11, "Map", 400),
+            (13, "Map", 40),
+            (17, "Map", 80),
+            (19, "Map", 30),
+            (21, "Map", 45),
+        ]);
+        let diffs = diff_snapshots(&base, &current).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].size_delta(), 80 + 30 - 64 + 300 - 5);
+        let objects = compute_class_node_detail(&base, &current, &diffs[0].key);
+        let detail =
+            |format| format_class_diff_detail(0, &diffs[0], &objects, &defaults(), format).unwrap();
+        // 13 kept its size, so it is left out.
+        assert!(
+            detail(OutputFormat::Text).ends_with(
+                "\nObjects, largest size change first: showing 1-5 of 5\n\
+                 + = entered this class, - = left it, ~ = stayed in it and changed size from previousSize; a + or - id present in the other capture is a class change, not an allocation or deletion.\n\
+                 op,nodeId,selfSize,previousSize,alsoIn\n\
+                 ~,11,400,100,-\n\
+                 +,17,80,,-\n\
+                 -,15,64,,-\n\
+                 +,19,30,,-\n\
+                 ~,21,45,50,-\n"
+            ),
+            "{}",
+            detail(OutputFormat::Text)
+        );
+        let json: serde_json::Value = serde_json::from_str(&detail(OutputFormat::Json)).unwrap();
+        assert_eq!(
+            json["nodes"][0],
+            json!({"op": "~", "nodeId": 11, "selfSize": 400, "previousSize": 100, "alsoIn": null})
+        );
+        assert_eq!(json["nodes"][1]["previousSize"], serde_json::Value::Null);
+        // Every node has the same fields, so TOON keeps them one table.
+        let toon = detail(OutputFormat::Toon);
+        assert!(
+            toon.contains(
+                "nodes[5]{op,nodeId,selfSize,previousSize,alsoIn}:\n  ~,11,400,100,null\n"
+            ),
+            "{toon}"
+        );
+    }
+
+    /// An array counts the backing store only it holds, so one that grew is a
+    /// single `~` row even though V8 gave it a new, larger store.
+    #[test]
+    fn an_array_whose_store_grew_is_listed_as_resized() {
+        let snapshot = |store_id, store_size| {
+            let (mut t, window) = TestSnap::page();
+            let array = t.node("object", "Array", 11, 16);
+            let store = t.node("array", "(object elements)", store_id, store_size);
+            t.edge(window, "property", "items", array);
+            t.edge(array, "internal", "elements", store);
+            t.aggregates()
+        };
+        let (base, current) = (snapshot(13, 64), snapshot(15, 1024));
+        let diffs = diff_snapshots(&base, &current).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(
+            (
+                diffs[0].key.name.as_str(),
+                diffs[0].count_delta(),
+                diffs[0].size_delta()
+            ),
+            ("Array", 0, 960)
+        );
+        assert_eq!(
+            compute_class_node_detail(&base, &current, &diffs[0].key),
+            [DiffObject {
+                change: Change::Resized { previous_size: 80 },
+                id: 11,
+                self_size: 1040,
+                also_in_other: false,
+            }]
         );
     }
 
@@ -3813,7 +3962,7 @@ mod tests {
 
         let detail = run(Some(0)).unwrap().output;
         assert!(detail.contains("className:Window"));
-        assert!(detail.contains("\n+,15,500,-\n"));
+        assert!(detail.contains("\n+,15,500,,-\n"));
 
         let err = run(Some(99)).err().unwrap();
         let msg = err.to_string();
@@ -4159,7 +4308,7 @@ mod tests {
             "{summary}"
         );
         assert!(summary.contains("\n1,Edge,,1,0,1,4294967295,0,4294967295\n"));
-        assert!(run(Some(0)).ends_with("\n+,13,5368709120,-\n"));
+        assert!(run(Some(0)).ends_with("\n+,13,5368709120,,-\n"));
 
         // Only `self_size` may be that wide.
         let mut v = t.json();
@@ -4320,7 +4469,7 @@ mod tests {
             detail.starts_with("idx:2,className:Foo,location:7:10:1,addedCount:1,"),
             "{detail}"
         );
-        assert!(detail.ends_with("\n+,15,20,-\n"));
+        assert!(detail.ends_with("\n+,15,20,,-\n"));
         let json: serde_json::Value = serde_json::from_str(
             &format_class_diff_detail(2, &diffs[2], &objects, &defaults(), OutputFormat::Json)
                 .unwrap(),

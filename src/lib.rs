@@ -283,10 +283,11 @@ pub enum Commands {
     /// grouped as in the DevTools Memory panel (all functions under
     /// `Function`, `<div id=…>` under `<div>`, detached DOM under
     /// `Detached <div>`). Without --class-index, prints a summary table
-    /// sorted by size delta. With --class-index N, prints the added/deleted
-    /// objects of row N (use the idx column from the summary), largest first.
-    /// Both are paged with --limit/--offset. Node IDs in the detail output
-    /// are directly usable with `inspect-heapsnapshot-node --node-id`.
+    /// sorted by size delta. With --class-index N, prints the objects of row
+    /// N (use the idx column from the summary) that were added or deleted, or
+    /// stayed and changed size, largest change first. Both are paged with
+    /// --limit/--offset. Node IDs in the detail output are directly usable
+    /// with `inspect-heapsnapshot-node --node-id`.
     ///
     /// IMPORTANT: take both snapshots of one tab with `take-heapsnapshot`,
     /// with no command for another tab in between and the same daemon running
@@ -361,6 +362,10 @@ pub enum Commands {
     /// instead of the network (or fail them with --abort). The latest
     /// matching mock wins; the HTTP cache is off while any is set. Mocks last
     /// while the daemon runs. Without a pattern, lists the tab's mocks.
+    ///
+    /// Mocks catch the tab's own requests, but not those a cross-site iframe
+    /// makes from its own process (its fetches, scripts, images), which reach
+    /// the network.
     #[command(name = "mock-network")]
     MockNetwork {
         /// URL glob: * matches any characters, ? one, \ escapes (e.g. "*/api/user*")
