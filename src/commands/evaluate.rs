@@ -78,7 +78,10 @@ pub async fn evaluate(
         let new_document = navigation_after_expression(
             crate::commands::input::wait_for_navigation(client, session_id).await,
         )?;
-        let new_url = client.current_url(session_id).await?;
+        let new_url = client
+            .current_url(session_id)
+            .await
+            .map_err(url_read_error)?;
         Ok(CommandResult::output(output_hint)
             .save_output(output)
             .await?
@@ -88,6 +91,13 @@ pub async fn evaluate(
             .save_output(output)
             .await?)
     }
+}
+
+/// A URL readback after the expression ran can stall or lose the connection.
+/// Context says the script must not be repeated; `context` keeps the typed
+/// error downcastable for the caller.
+fn url_read_error(e: anyhow::Error) -> anyhow::Error {
+    e.context("The expression already ran, but the page URL could not be read")
 }
 
 /// Interpret the navigation probe after the expression has already run.
@@ -655,6 +665,22 @@ mod tests {
             "Timeout waiting for any event"
         )))
         .unwrap());
+    }
+
+    /// The trailing URL read must say the script already ran without hiding
+    /// the typed error the daemon acts on.
+    #[test]
+    fn a_failed_url_read_keeps_the_typed_error_and_its_context() {
+        let stalled = url_read_error(anyhow::anyhow!(crate::cdp::PageUnresponsive(
+            "no answer".into()
+        )));
+        assert!(stalled
+            .downcast_ref::<crate::cdp::PageUnresponsive>()
+            .is_some());
+        assert!(stalled.to_string().contains("expression already ran"));
+
+        let lost = url_read_error(anyhow::anyhow!(crate::cdp::ConnectionLost("closed".into())));
+        assert!(lost.downcast_ref::<crate::cdp::ConnectionLost>().is_some());
     }
 
     #[test]

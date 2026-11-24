@@ -245,6 +245,31 @@ fn readback_dialog_result(
     ))
 }
 
+/// Marks a dialog opened by `mousePressed` before `mouseReleased` was sent:
+/// the press handler ran, but the page's click handler did not. The executor
+/// uses this to report the press without claiming a completed click.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PressOnlyDialog {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+}
+
+impl std::fmt::Display for PressOnlyDialog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the mouse press opened the dialog before the click finished")
+    }
+}
+
+impl std::error::Error for PressOnlyDialog {}
+
+fn mark_press_only_dialog(error: anyhow::Error, x: f64, y: f64) -> anyhow::Error {
+    if error.downcast_ref::<crate::cdp::DialogOpen>().is_some() {
+        error.context(PressOnlyDialog { x, y })
+    } else {
+        error
+    }
+}
+
 /// Click an element identified by CSS selector.
 pub async fn click(
     client: &mut CdpClient,
@@ -463,6 +488,90 @@ async fn wait_for_load_in_session(
     }
 }
 
+/// Match a navigation-start event on the acting session. `wait_for_event_match`
+/// sees only the method and params, so a stale session left attached by a
+/// failed detach could end the wait with its own main-frame event.
+fn start_event_matches<F>(
+    event: &serde_json::Value,
+    session_id: &str,
+    methods: &[&str],
+    mut matches: F,
+) -> bool
+where
+    F: FnMut(&str, &serde_json::Value) -> bool,
+{
+    if event["sessionId"].as_str() != Some(session_id) {
+        return false;
+    }
+    let Some(method) = event["method"].as_str() else {
+        return false;
+    };
+    methods.contains(&method) && matches(method, &event["params"])
+}
+
+/// Wait for this session's navigation start. The returned index is where the
+/// event sat in the buffer before it was consumed, or the buffer's length when
+/// it arrived live: buffered load events before that index belong to the
+/// previous document.
+async fn wait_for_start_in_session<F>(
+    client: &mut CdpClient,
+    session_id: &str,
+    methods: &[&str],
+    timeout: std::time::Duration,
+    matches: F,
+) -> Result<(String, usize)>
+where
+    F: FnMut(&str, &serde_json::Value) -> bool,
+{
+    let mut matches = matches;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(idx) = client
+            .events
+            .iter()
+            .position(|e| start_event_matches(e, session_id, methods, &mut matches))
+        {
+            if let Some(event) = client.events.remove(idx) {
+                let method = event["method"].as_str().unwrap().to_string();
+                return Ok((method, idx));
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("Timeout waiting for any event {methods:?}");
+        }
+        let text = tokio::time::timeout(remaining, client.read_text())
+            .await
+            .map_err(|_| anyhow!("Timeout waiting for any event {methods:?}"))??;
+        let event: serde_json::Value = serde_json::from_str(&text)?;
+        if event.get("method").is_some() {
+            if start_event_matches(&event, session_id, methods, &mut matches) {
+                let method = event["method"].as_str().unwrap().to_string();
+                return Ok((method, client.events.len()));
+            }
+            client.push_event(event);
+        }
+    }
+}
+
+/// Drop this session's load events that predate the matched start. The
+/// `getFrameTree` reply can follow a load of the navigation just started, and
+/// that load must still complete the wait.
+fn drop_loads_before_start(
+    events: &mut std::collections::VecDeque<serde_json::Value>,
+    session_id: &str,
+    start_index: usize,
+) {
+    let mut index = 0;
+    events.retain(|e| {
+        let before_start = e["method"] == "Page.loadEventFired"
+            && e["sessionId"].as_str() == Some(session_id)
+            && index < start_index;
+        index += 1;
+        !before_start
+    });
+}
+
 pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str) -> Result<bool> {
     let main_frame_id = main_frame_id(client, session_id).await?;
     let in_main_frame = |m: &str, p: &serde_json::Value| {
@@ -473,32 +582,37 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
         main && same_tab
     };
 
-    let started = client
-        .wait_for_event_match(
-            &[
-                "Page.frameStartedLoading",
-                "Page.navigatedWithinDocument",
-                "Page.frameRequestedNavigation",
-            ],
-            std::time::Duration::from_millis(500),
-            in_main_frame,
-        )
-        .await;
-    let mut method = match started {
-        Ok((method, _)) => method,
+    let started = wait_for_start_in_session(
+        client,
+        session_id,
+        &[
+            "Page.frameStartedLoading",
+            "Page.navigatedWithinDocument",
+            "Page.frameRequestedNavigation",
+        ],
+        std::time::Duration::from_millis(500),
+        &in_main_frame,
+    )
+    .await;
+    let (mut method, mut start_index) = match started {
+        Ok((method, index)) => (method, index),
         Err(e) if is_page_stall(&e) => return Err(e),
         Err(_) => return Ok(false),
     };
     if method == "Page.frameRequestedNavigation" {
-        match client
-            .wait_for_event_match(
-                &["Page.frameStartedLoading", "Page.navigatedWithinDocument"],
-                std::time::Duration::from_secs(5),
-                in_main_frame,
-            )
-            .await
+        match wait_for_start_in_session(
+            client,
+            session_id,
+            &["Page.frameStartedLoading", "Page.navigatedWithinDocument"],
+            std::time::Duration::from_secs(5),
+            &in_main_frame,
+        )
+        .await
         {
-            Ok((m, _)) => method = m,
+            Ok((m, index)) => {
+                method = m;
+                start_index = index;
+            }
             Err(e) if is_page_stall(&e) => return Err(e),
             Err(_) => return Ok(false),
         }
@@ -517,12 +631,11 @@ pub(crate) async fn wait_for_navigation(client: &mut CdpClient, session_id: &str
     }
 
     if started_loading {
-        // `Page.loadEventFired` carries no frame or session ID. One buffered
-        // before this start belongs to the previous document, so drop those
-        // and wait only for a load that arrives after the navigation began.
-        client
-            .events
-            .retain(|e| e["method"] != "Page.loadEventFired");
+        // `Page.loadEventFired` carries no frame ID. One buffered before this
+        // start belongs to the previous document; one after it belongs to the
+        // navigation being waited on, even if it arrived before the frame-tree
+        // reply.
+        drop_loads_before_start(&mut client.events, session_id, start_index);
     }
 
     // A full navigation started on the main frame, so wait for it to finish
@@ -793,7 +906,11 @@ async fn click_point(
     }
     // The press starts the click: the page may act on it, as on a person's.
     client.input_sent = true;
-    dispatch_mouse(client, session_id, "mousePressed", x, y, "left", 1).await?;
+    dispatch_mouse(client, session_id, "mousePressed", x, y, "left", 1)
+        .await
+        // A dialog from the press handler means `mouseReleased` was never
+        // sent: the click did not finish, though the press may have acted.
+        .map_err(|e| mark_press_only_dialog(e, x, y))?;
     dispatch_mouse(client, session_id, "mouseReleased", x, y, "left", 1).await?;
 
     let new_document =
@@ -1005,6 +1122,22 @@ enum ReadBack {
     Unread(String),
 }
 
+/// A failed `DOM.setFileInputFiles` may have set the file before the reply was
+/// lost. Keep `ConnectionLost` typed so the daemon retires the connection and
+/// the caller gets the reconnect and verification advice; a dialog means the
+/// file is set, and an ordinary refusal is just an error.
+fn set_file_error(selector: &str, e: anyhow::Error) -> anyhow::Error {
+    if e.downcast_ref::<crate::cdp::DialogOpen>().is_some() {
+        return e;
+    }
+    if e.downcast_ref::<crate::cdp::ConnectionLost>().is_some() {
+        return e.context(format!(
+            "Can't set the file on '{selector}': the connection was lost, so the file may already be set"
+        ));
+    }
+    anyhow!("Can't set the file on '{selector}': {e}")
+}
+
 /// Give the file `value` names to the file input `selector` matched.
 ///
 /// Chrome opens the file itself, so there is no size cap and the bytes never
@@ -1045,21 +1178,26 @@ async fn set_file(
             json!({"files": [&path], "objectId": object_id}),
         )
         .await;
+    let connection_lost = set
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.downcast_ref::<crate::cdp::ConnectionLost>().is_some());
     let read_back = match set {
         Ok(_) => Ok(read_back_file(client, session_id, &object_id).await),
-        // Kept as it is, so the executor reports the file as set.
-        Err(e) if e.downcast_ref::<crate::cdp::DialogOpen>().is_some() => Err(e),
-        Err(e) => Err(anyhow!("Can't set the file on '{selector}': {e}")),
+        Err(e) => Err(set_file_error(selector, e)),
     };
     // The daemon's session outlives this command, so an unreleased handle would
-    // keep the element alive until the page navigates.
-    let _ = client
-        .send_to_target(
-            session_id,
-            "Runtime.releaseObject",
-            json!({"objectId": object_id}),
-        )
-        .await;
+    // keep the element alive until the page navigates. A lost connection cannot
+    // release it; an ordinary CDP refusal still can.
+    if !connection_lost {
+        let _ = client
+            .send_to_target(
+                session_id,
+                "Runtime.releaseObject",
+                json!({"objectId": object_id}),
+            )
+            .await;
+    }
     let read_back = read_back?;
 
     // From here nothing may fail the command: the file is set and Chrome has
@@ -1553,6 +1691,92 @@ mod tests {
             "s2",
             "MAIN"
         ));
+    }
+
+    /// A stale session's start event must not end the navigation wait.
+    #[test]
+    fn navigation_start_is_scoped_to_the_acting_session() {
+        let start = |session| {
+            serde_json::json!({"sessionId": session, "method": "Page.frameStartedLoading",
+                "params": {"frameId": "MAIN"}})
+        };
+        let in_main_frame = |m: &str, p: &serde_json::Value| {
+            m == "Page.frameStartedLoading" && p["frameId"].as_str() == Some("MAIN")
+        };
+        let methods = ["Page.frameStartedLoading"];
+        assert!(start_event_matches(
+            &start("s2"),
+            "s2",
+            &methods,
+            &in_main_frame
+        ));
+        assert!(!start_event_matches(
+            &start("s1"),
+            "s2",
+            &methods,
+            &in_main_frame
+        ));
+        let other_frame = serde_json::json!({"sessionId": "s2",
+            "method": "Page.frameStartedLoading", "params": {"frameId": "CHILD"}});
+        assert!(!start_event_matches(
+            &other_frame,
+            "s2",
+            &methods,
+            &in_main_frame
+        ));
+    }
+
+    /// A load buffered after the start belongs to this navigation even though
+    /// it arrived before the frame-tree reply.
+    #[test]
+    fn a_buffered_load_after_the_start_is_kept() {
+        let load =
+            |session| serde_json::json!({"sessionId": session, "method": "Page.loadEventFired"});
+        let mut events = std::collections::VecDeque::from([
+            load("s1"), // previous document
+            serde_json::json!({"sessionId": "s1", "method": "Page.frameNavigated"}),
+            load("s1"), // this navigation, buffered before getFrameTree replied
+            load("s2"), // another session's load, ignored by the session-filtered wait
+        ]);
+        // The start was at index 1 before it was consumed.
+        drop_loads_before_start(&mut events, "s1", 1);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["method"], "Page.frameNavigated");
+        assert_eq!(events[1]["method"], "Page.loadEventFired");
+        assert_eq!(events[2]["sessionId"], "s2");
+    }
+
+    /// A dialog from mousePressed is marked so the report cannot claim a
+    /// completed click; an ordinary failure is left alone.
+    #[test]
+    fn a_press_dialog_is_marked_for_the_report() {
+        let dialog = anyhow::anyhow!(crate::cdp::DialogOpen {
+            dialog_type: "confirm".into(),
+            message: "Delete?".into(),
+        });
+        let marked = mark_press_only_dialog(dialog, 5.0, 10.0);
+        let press = marked.downcast_ref::<PressOnlyDialog>().unwrap();
+        assert_eq!((press.x, press.y), (5.0, 10.0));
+        assert!(marked.downcast_ref::<crate::cdp::DialogOpen>().is_some());
+
+        let plain = mark_press_only_dialog(anyhow::anyhow!("other failure"), 5.0, 10.0);
+        assert!(plain.downcast_ref::<PressOnlyDialog>().is_none());
+    }
+
+    /// A lost connection keeps its type so the daemon retires the connection.
+    #[test]
+    fn a_lost_connection_while_setting_a_file_keeps_its_type() {
+        let lost = set_file_error(
+            "#f",
+            anyhow::anyhow!(crate::cdp::ConnectionLost("closed".into())),
+        );
+        assert!(lost.downcast_ref::<crate::cdp::ConnectionLost>().is_some());
+        assert!(lost.to_string().contains("may already be set"));
+        let refused = set_file_error("#f", anyhow::anyhow!("CDP error"));
+        assert!(refused
+            .downcast_ref::<crate::cdp::ConnectionLost>()
+            .is_none());
+        assert!(refused.to_string().contains("Can't set the file on '#f'"));
     }
 
     /// A dialog after insertion belongs to the URL readback, not the insertion
