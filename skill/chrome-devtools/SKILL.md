@@ -591,9 +591,9 @@ characters (default 100) end in `…`.
 
 **3. List the retained objects of a class** by its `idx`, largest change
 first. `+` objects entered the class and are in the `--current` file; `-`
-objects left it and are in `--base`. `alsoIn` names the other file when the
-same id is there too, under another class: the object changed class (a node
-that got detached, say) rather than being allocated or freed. `~` objects
+objects left it and are in `--base`. `alsoIn` names the other file when it
+has the same id too: the object entered or left this class (a node that got
+detached, say) rather than being allocated or freed. `~` objects
 stayed in the class and changed size, from `previousSize` to `selfSize`: they
 account for the part of `sizeDelta` that no `+` or `-` row explains. Inspect
 each object in the file that has it under this class (`--current` for `~`).
@@ -603,7 +603,7 @@ chrome-devtools compare-heapsnapshots --base /tmp/base.heapsnapshot --current /t
 # idx:0,className:Detached <div>,location:,addedCount:10,removedCount:0,countDelta:10,addedSize:880,removedSize:0,sizeDelta:880
 #
 # Objects, largest size change first: showing 1-3 of 10; next page: --offset 3
-# + = entered this class, - = left it, ~ = stayed in it and changed size from previousSize; a + or - id present in the other capture is a class change, not an allocation or deletion.
+# + = entered this class, - = left it, ~ = stayed in it and changed size from previousSize; alsoIn = the other capture has this id too, so the object entered or left this class rather than being allocated or freed.
 # op,nodeId,selfSize,previousSize,alsoIn
 # +,101,88,,-
 # +,103,88,,-
@@ -638,8 +638,9 @@ chrome-devtools inspect-heapsnapshot-node --file-path /tmp/final.heapsnapshot --
 
 Read the path from the bottom up to the first edge the application owns: here
 `window.openDialogs` keeps every closed dialog. That edge is where the fix
-goes. A node with no retaining path (`Retaining path: none found.`) is not kept
-alive and will be collected.
+goes. `Retaining path: none found.` means the analysis found nothing holding
+the node from the roots: usually it is garbage, but that is no guarantee, since
+an incomplete snapshot or a link the analysis skips can hide a holder.
 A step through a WeakMap entry holds its value only while both the key and the
 WeakMap are alive, so the path goes through whichever is farther from the root
 and is followed by a line naming the other (`Step 5 is conditional: …`); the
