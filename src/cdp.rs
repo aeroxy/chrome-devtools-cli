@@ -315,6 +315,10 @@ pub struct TabEmulation {
     pub media: Option<MediaOverride>,
     pub webauthn: Option<VirtualAuthenticator>,
     pub network_mocks: Vec<crate::commands::network_mock::NetworkMock>,
+    /// Session whose Fetch interception these mocks belong to. A failed detach
+    /// leaves it interrupting even after the tab is switched away, so a paused
+    /// request from it must be answered from this list, not the active tab's.
+    pub session_id: Option<String>,
 }
 
 impl TabEmulation {
@@ -541,9 +545,11 @@ impl CdpClient {
 
         let old_target = self.persistent_target_id.clone();
 
-        // Detach old session if target changed
-        if let Some(old_session) = self.persistent_session.take() {
-            self.forget_dialog(Some(&old_session));
+        // Detach old session if target changed. Keep the id outside the block
+        // so the outgoing tab's state can be saved with it below.
+        let old_session = self.persistent_session.take();
+        if let Some(ref old_session) = old_session {
+            self.forget_dialog(Some(old_session.as_str()));
             match self
                 .send("Target.detachFromTarget", json!({"sessionId": old_session}))
                 .await
@@ -551,11 +557,14 @@ impl CdpClient {
                 Ok(_) => {
                     // The old tab's Fetch interception died with its session;
                     // otherwise a later tab inherits idle reads it doesn't need.
-                    self.session_ended(&old_session);
+                    self.session_ended(old_session);
                 }
                 Err(e) if e.downcast_ref::<ConnectionLost>().is_some() => {
-                    // The socket is gone; the daemon retires it and no request
-                    // on this session can be answered.
+                    // The socket is gone: writing the detach left it unusable,
+                    // and the daemon retires it on this typed error. Attaching
+                    // on the same socket would spend another full write budget
+                    // before the failure reaches anyone.
+                    return Err(e);
                 }
                 Err(_) => {
                     // A failed detach can leave the old tab's Fetch interception
@@ -585,6 +594,7 @@ impl CdpClient {
                 media: self.media.take(),
                 webauthn: self.webauthn.take(),
                 network_mocks: std::mem::take(&mut self.network_mocks),
+                session_id: old_session.clone(),
             };
             stash_tab_emulation(&mut self.emulation_saved, old_target, saved);
         }
@@ -671,6 +681,7 @@ impl CdpClient {
                 media: self.media.take(),
                 webauthn: self.webauthn.take(),
                 network_mocks: std::mem::take(&mut self.network_mocks),
+                session_id: Some(session_id.to_string()),
             };
             stash_tab_emulation(
                 &mut self.emulation_saved,
@@ -1608,6 +1619,57 @@ impl CdpClient {
         self.read_socket_text().await
     }
 
+    /// Mocks governing a paused request's session. During a tab switch the
+    /// active list still belongs to the outgoing session, so it is used as-is;
+    /// once a new session is attached, an older session's mocks live in its
+    /// stashed tab state and must be found there. A session with no mocks falls
+    /// back to an empty list, which sends the request on to the network.
+    fn mocks_for_session(
+        &self,
+        session: Option<&str>,
+    ) -> &[crate::commands::network_mock::NetworkMock] {
+        if session.is_none()
+            || self.persistent_session.is_none()
+            || self.persistent_session.as_deref() == session
+        {
+            return &self.network_mocks;
+        }
+        self.emulation_saved
+            .values()
+            .find(|state| {
+                state
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|s| Some(s) == session)
+            })
+            .map(|state| state.network_mocks.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The matching mock in the same list [`Self::mocks_for_session`] chose, so
+    /// the hit is credited to the tab whose interception answered the request.
+    fn mock_for_session_mut(
+        &mut self,
+        session: Option<&str>,
+        index: usize,
+    ) -> Option<&mut crate::commands::network_mock::NetworkMock> {
+        if session.is_none()
+            || self.persistent_session.is_none()
+            || self.persistent_session.as_deref() == session
+        {
+            return self.network_mocks.get_mut(index);
+        }
+        self.emulation_saved
+            .values_mut()
+            .find(|state| {
+                state
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|s| Some(s) == session)
+            })
+            .and_then(|state| state.network_mocks.get_mut(index))
+    }
+
     /// Answer the requests the page is holding for a mock. Each stays queued
     /// until its answer is sent, so a read cancelled mid-send retries it
     /// rather than leave the request hanging.
@@ -1615,7 +1677,7 @@ impl CdpClient {
         while let Some(event) = self.paused_requests.front().cloned() {
             let session = event["sessionId"].as_str().map(str::to_string);
             let (method, params, matched) = crate::commands::network_mock::reply_to_paused(
-                &self.network_mocks,
+                self.mocks_for_session(session.as_deref()),
                 &event["params"],
             );
             self.send_raw_no_wait(session.as_deref(), method, params)
@@ -1623,8 +1685,10 @@ impl CdpClient {
             self.paused_requests.pop_front();
             // Counted only now: a send cancelled above is retried, and a
             // retry is the same request.
-            if let Some(mock) = matched.and_then(|i| self.network_mocks.get_mut(i)) {
-                mock.hits += 1;
+            if let Some(i) = matched {
+                if let Some(mock) = self.mock_for_session_mut(session.as_deref(), i) {
+                    mock.hits += 1;
+                }
             }
         }
         Ok(())
@@ -2862,6 +2926,50 @@ mod tests {
         chrome.await.unwrap();
     }
 
+    /// A detach whose write leaves the socket unusable must stop the switch:
+    /// attaching a new session on that socket would spend another full write
+    /// budget before the daemon learns the connection is gone.
+    #[tokio::test]
+    async fn a_lost_detach_does_not_attach_on_a_dead_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut calls = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: Value = serde_json::from_str(&text).unwrap();
+                let method = call["method"].as_str().unwrap_or_default().to_string();
+                calls.push(method.clone());
+                if method == "Target.detachFromTarget" {
+                    ws.close(None).await.unwrap();
+                }
+            }
+            calls
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        client.persistent_session = Some("S-old".into());
+        client.persistent_target_id = Some("T-old".into());
+        let error = client
+            .ensure_persistent_session("T-new")
+            .await
+            .expect_err("a lost detach fails the switch");
+        assert!(
+            error.downcast_ref::<ConnectionLost>().is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains("WebSocket closed by server"),
+            "the detach's own error must reach the caller, not a later write \
+             failure on the dead socket: {error:#}"
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        assert_eq!(calls, ["Target.detachFromTarget"]);
+    }
+
     /// A dialog on the persistent session is another page's when this command
     /// ran on a one-off session. It is recorded for that page, and B's call
     /// still gets its reply; B's --dialog-action is not spent on it.
@@ -3245,6 +3353,99 @@ mod tests {
             client.paused_requests.is_empty(),
             "the old tab's request was answered"
         );
+        assert_eq!(
+            client.network_mocks[0].hits, 0,
+            "the new tab's mock was not used"
+        );
+        assert_eq!(
+            client.emulation_saved["T-old"].network_mocks[0].hits, 1,
+            "the old tab's mock answered its own request"
+        );
+        drop(client);
+        let calls = chrome.await.unwrap();
+        let answered = calls
+            .iter()
+            .find(|call| call["method"] == "Fetch.fulfillRequest")
+            .expect("the paused request was answered");
+        assert_eq!(answered["sessionId"], "S-old");
+        assert_eq!(answered["params"]["responseCode"], 200);
+        assert_eq!(
+            answered["params"]["body"],
+            base64::engine::general_purpose::STANDARD.encode("old")
+        );
+    }
+
+    /// A request from an old session can pause only after the daemon has
+    /// switched to a new tab (the old detach was refused, so its Fetch
+    /// interception is still live). Its answer must come from the old tab's
+    /// stashed mocks, not the new tab's, and charge the hit to the old tab.
+    #[tokio::test]
+    async fn a_late_paused_request_uses_the_mocks_of_its_own_session() {
+        use base64::Engine;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chrome = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut calls = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: Value = serde_json::from_str(&text).unwrap();
+                let method = call["method"].as_str().unwrap_or_default().to_string();
+                let reply = match method.as_str() {
+                    "Target.detachFromTarget" => {
+                        json!({"id": call["id"], "error": {"code": -32000, "message": "busy"}})
+                    }
+                    "Target.attachToTarget" => {
+                        json!({"id": call["id"], "result": {"sessionId": "S-new"}})
+                    }
+                    _ => json!({"id": call["id"], "result": {}}),
+                };
+                calls.push(call);
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+            calls
+        });
+        let mut client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        let mock = |body: &str, status: u16| crate::commands::network_mock::NetworkMock {
+            pattern: "*".into(),
+            resource_type: None,
+            action: crate::commands::network_mock::MockAction::Fulfill {
+                status,
+                headers: vec![],
+                body: body.as_bytes().to_vec(),
+            },
+            hits: 0,
+        };
+        client.persistent_session = Some("S-old".into());
+        client.persistent_target_id = Some("T-old".into());
+        client.network_mocks = vec![mock("old", 200)];
+        client.emulation_saved.insert(
+            "T-new".into(),
+            TabEmulation {
+                network_mocks: vec![mock("new", 500)],
+                ..Default::default()
+            },
+        );
+        client
+            .ensure_persistent_session("T-new")
+            .await
+            .expect("the switch succeeds despite the failed detach");
+        // The old session pauses a request only after the new tab's mocks have
+        // been loaded into the active list.
+        client.push_event(json!({
+            "method": "Fetch.requestPaused",
+            "sessionId": "S-old",
+            "params": {"requestId": "R", "request": {"url": "https://a.test/"},
+                       "resourceType": "Fetch"}
+        }));
+        client
+            .answer_paused_requests()
+            .await
+            .expect("the late request is answered");
+
+        assert!(client.paused_requests.is_empty());
         assert_eq!(
             client.network_mocks[0].hits, 0,
             "the new tab's mock was not used"

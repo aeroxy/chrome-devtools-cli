@@ -672,8 +672,9 @@ fn lost_connection_advice(browser: &str) -> String {
     let name = crate::browser::display_name(browser);
     format!(
         "\nLost the connection to {name}, so the daemon has exited. Run a read-only command such \
-         as `list-pages` to reconnect, then verify whether the original action took effect \
-         before repeating it. {name} may ask you to approve the new connection."
+         as `list-pages` to reconnect, using the same browser/profile or `--ws-endpoint` \
+         selection flags as the failed command, then verify whether the original action took \
+         effect before repeating it. {name} may ask you to approve the new connection."
     )
 }
 
@@ -1069,6 +1070,10 @@ mod tests {
         assert!(
             advice.contains("verify whether the original action took effect"),
             "{advice}"
+        );
+        assert!(
+            advice.contains("--ws-endpoint") && advice.contains("same browser/profile"),
+            "the reconnect must reach the same browser: {advice}"
         );
         assert!(!advice.contains("Run the command again"), "{advice}");
     }

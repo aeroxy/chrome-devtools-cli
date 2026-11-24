@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use std::fmt::Write;
 use std::io::Read;
 
-use crate::cdp::CdpClient;
+use crate::cdp::{CdpClient, ConnectionLost};
 use crate::format::{format_structured, OutputFormat};
 use crate::result::CommandResult;
 
@@ -373,6 +373,18 @@ fn require_persistent_session(client: &CdpClient, session_id: &str) -> Result<()
     Ok(())
 }
 
+/// A failed apply is rolled back locally and on the browser. If the rollback
+/// loses the connection, that typed error has to reach the daemon, which
+/// retires the socket; an ordinary rollback failure keeps the original
+/// apply error as its type.
+fn rollback_error(original: anyhow::Error, rollback: anyhow::Error) -> anyhow::Error {
+    if rollback.downcast_ref::<ConnectionLost>().is_some() {
+        rollback.context(format!("Applying the mock failed: {original}"))
+    } else {
+        original.context(format!("Could not roll back the mock: {rollback}"))
+    }
+}
+
 /// Add a mock, replacing any with the same pattern and resource type.
 pub async fn mock_network(
     client: &mut CdpClient,
@@ -394,8 +406,9 @@ pub async fn mock_network(
         if let Err(rollback) = apply_mocks(client, session_id).await {
             // The disable can be blocked by a dialog, leaving Chrome
             // intercepting. `fetch_may_be_enabled` keeps idle reads on; say
-            // so rather than hide the failure.
-            return Err(e.context(format!("Could not roll back the mock: {rollback}")));
+            // so rather than hide the failure. A lost connection is the
+            // rollback's error, not the apply's, so the daemon can tell.
+            return Err(rollback_error(e, rollback));
         }
         return Err(e);
     }
@@ -608,6 +621,27 @@ mod tests {
 
         let many = partial_removal_context(2);
         assert!(many.contains("Removed 2 network mocks from the daemon"));
+    }
+
+    /// A rollback that loses the connection keeps its typed error so the
+    /// daemon retires the socket; an ordinary rollback failure keeps the
+    /// apply error's type.
+    #[test]
+    fn a_lost_rollback_keeps_its_error_type() {
+        let lost = rollback_error(
+            anyhow::anyhow!("the browser refused the mock"),
+            anyhow::Error::new(ConnectionLost("closed".into())),
+        );
+        assert!(lost.downcast_ref::<ConnectionLost>().is_some());
+        assert!(lost.to_string().contains("the browser refused the mock"));
+        let ordinary = rollback_error(
+            anyhow::anyhow!("the browser refused the mock"),
+            anyhow::anyhow!("rollback refused"),
+        );
+        assert!(ordinary.downcast_ref::<ConnectionLost>().is_none());
+        assert!(ordinary
+            .to_string()
+            .contains("Could not roll back the mock"));
     }
 
     #[test]

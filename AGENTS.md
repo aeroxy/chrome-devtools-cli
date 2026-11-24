@@ -99,8 +99,10 @@ Every CDP call waits on `read_text_for_call` (`cdp.rs`), so nothing waits
 forever on a connected browser. The call's limit, 180s by default
 (`CHROME_CDP_TIMEOUT_SECS`) or `SETUP_CALL_TIMEOUT` (10s) for domain enables,
 counts from before a dialog left open is handled and the request written;
-the write itself is bounded by the default limit and a write that doesn't
-finish retires the connection.
+the write itself is bounded by both the call's remaining budget and the
+configured default write limit, whichever is smaller (a setup call with 7s
+left gets at most 7s to write, not the full 180s). A write that doesn't finish
+retires the connection.
 Whenever the socket is quiet for 30s, and once more when the limit runs out,
 the call pings the browser (`check_alive`, which `caffeinate` uses too): no
 answer within 15s is `ConnectionLost` and the daemon exits. A ping can

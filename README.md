@@ -224,6 +224,8 @@ You can also use `--page <index>` for quick one-offs, or pass the raw hex target
 
 The offline heap commands page their rows with `--limit` (default 50) and `--offset`, say how many rows there are in total, and cut names longer than `--max-name-length` (default 100) characters.
 
+For `compare-heapsnapshots`, both captures must come from the same uninterrupted daemon session on the same tab: moving to another tab, letting the daemon exit, or another debugger detaching resets V8's heap IDs, so the diff can silently pair unrelated objects. See the [heap-debugging guide](skill/chrome-devtools/SKILL.md#pattern-15-memory-leak-debugging-heap-snapshots) for the events that invalidate a snapshot series.
+
 ### Interaction
 
 | Command | Description |

@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::cdp::{CdpClient, ConnectionLost, SETUP_CALL_TIMEOUT};
+use crate::cdp::{is_connection_or_page_failure, CdpClient, ConnectionLost, SETUP_CALL_TIMEOUT};
 use crate::format::{format_structured, OutputFormat};
 use crate::result::CommandResult;
 
@@ -769,12 +769,15 @@ fn all_properties(computed: &[(String, String)], blocks: &[Block]) -> HashSet<St
 /// value, which stops a more distant ancestor from supplying it (on one that
 /// does inherit, `unset` is `inherit` and keeps looking further up). Returns
 /// the longhands decided here and the ones whose winning value comes from a
-/// parent. `animated` longhands are marked indeterminate rather than active:
+/// parent. `non_inheriting` names custom properties registered not to inherit,
+/// used to decide which longhands take a parent's value on `unset`.
+/// `animated` longhands are marked indeterminate rather than active:
 /// an animation or transition can override the winning declaration. A winning
-/// `inherit` or `unset`
+/// `inherit` always, and `unset` only on a property that inherits by default,
 /// decides none on the element: the value comes from an ancestor's declaration,
 /// so that one still applies. Nor does a declaration that is invalid at
-/// computed-value time, which acts as `unset`. These keywords count after
+/// computed-value time, which acts as `unset`, on such a property. These
+/// keywords count after
 /// `var()` substitution too (see `NodeFacts::value`).
 ///
 /// A winning `revert-layer` rolls the longhand back to the next lower
@@ -788,6 +791,7 @@ fn cascade(
     blocks: &mut [Block],
     claimed: &HashSet<String>,
     node: &NodeFacts,
+    non_inheriting: &HashSet<String>,
     all: &HashSet<String>,
     stop_on_unset: &HashSet<String>,
     animated: &HashSet<String>,
@@ -837,7 +841,6 @@ fn cascade(
                 } else {
                     None
                 };
-                let needs_parent = value.is_none() || is("inherit") || is("unset");
                 // The one `all` row CDP gives us resets every property at
                 // once; a later declaration in this block was seen first and
                 // has already claimed its own longhands.
@@ -854,6 +857,17 @@ fn cascade(
                     {
                         continue;
                     }
+                    // `inherit` always takes the parent's value. `unset` and
+                    // a value invalid at computed-value time do so only for
+                    // properties that inherit by default: on the others the
+                    // initial value is used here.
+                    let needs_parent = if is("inherit") {
+                        true
+                    } else if value.is_none() || is("unset") {
+                        is_inherited(&key, non_inheriting)
+                    } else {
+                        false
+                    };
                     // A running animation or transition sets the property at a
                     // higher level than the static cascade. The declaration is
                     // still the winner among rules, but whether its value is in
@@ -1645,18 +1659,11 @@ fn build_report_with_animated(
         inheriting: Some(&inheriting),
     };
     let all = all_properties(computed, &blocks);
-    // Only inheritable properties can reach the element from an ancestor, so
-    // an ancestor's `all` is expanded over just those. A reset of, say,
-    // `display` on the parent is not an inherited declaration to report.
-    let inherited_all: HashSet<String> = all
-        .iter()
-        .filter(|name| is_inherited(name, &non_inheriting))
-        .cloned()
-        .collect();
     let (mut claimed, mut inherited_keys) = cascade(
         &mut blocks,
         &HashSet::new(),
         &element,
+        &non_inheriting,
         &all,
         &HashSet::new(),
         animated,
@@ -1693,12 +1700,35 @@ fn build_report_with_animated(
             // `all` is not itself an inherited property, but its reset of
             // inherited ones stops a more distant ancestor's declarations.
             // Keep it for the cascade, which expands it over the properties
-            // that can reach the element.
+            // that can reach the element. A shorthand can also reach it
+            // through one longhand the element explicitly inherits; the
+            // others must not be marked active.
             block.decls.retain(|d| {
                 let key = d.key();
-                key == "all" || is_inherited(&key, &non_inheriting) || inherited_keys.contains(&key)
+                key == "all"
+                    || is_inherited(&key, &non_inheriting)
+                    || inherited_keys.contains(&key)
+                    || d.longhands.iter().any(|l| inherited_keys.contains(l))
             });
+            for d in &mut block.decls {
+                let key = d.key();
+                if key != "all"
+                    && !is_inherited(&key, &non_inheriting)
+                    && !inherited_keys.contains(&key)
+                {
+                    d.longhands
+                        .retain(|l| is_inherited(l, &non_inheriting) || inherited_keys.contains(l));
+                }
+            }
         }
+        // Only properties that can reach the element are an inherited `all`'s
+        // reset: those that inherit by default, and those the element (or a
+        // nearer ancestor) explicitly takes from its parent.
+        let inherited_all: HashSet<String> = all
+            .iter()
+            .filter(|name| is_inherited(name, &non_inheriting) || inherited_keys.contains(*name))
+            .cloned()
+            .collect();
         // Flow-relative properties don't inherit, so only the element's own
         // cascade maps them.
         let ancestor = NodeFacts {
@@ -1716,14 +1746,19 @@ fn build_report_with_animated(
             &mut blocks,
             &claimed,
             &ancestor,
+            &non_inheriting,
             &inherited_all,
             &stop_on_unset,
             animated,
         );
         claimed.extend(set_here.iter().cloned());
-        // A longhand decided here no longer reaches from a further ancestor;
-        // one still taken from a parent keeps the search going.
-        inherited_keys.retain(|k| !set_here.contains(k));
+        // A longhand decided here no longer reaches from a further ancestor.
+        // A non-inherited one stays eligible only while the parent takes it
+        // from its own parent; otherwise the parent's initial value is what
+        // the element inherits.
+        inherited_keys.retain(|k| {
+            !set_here.contains(k) && (is_inherited(k, &non_inheriting) || more_parent.contains(k))
+        });
         inherited_keys.extend(more_parent);
         let rules = shown_blocks(
             blocks,
@@ -1898,6 +1933,16 @@ const PAGE_INFO_JS: &str = r#"function (varNames, props, expand, checks) {
   return out;
 }"#;
 
+/// A connection lost while writing `Runtime.releaseObjectGroup` leaves the
+/// WebSocket unusable, so the command must stop rather than send another
+/// request on it. Any other release failure does not change the result.
+fn release_outcome(result: Result<u64>) -> Result<()> {
+    match result {
+        Err(e) if e.downcast_ref::<ConnectionLost>().is_some() => Err(e),
+        _ => Ok(()),
+    }
+}
+
 async fn page_info(
     client: &mut CdpClient,
     session_id: &str,
@@ -1935,14 +1980,24 @@ async fn page_info(
             }),
         )
         .await;
-    // Nothing to wait for: the reply only says it was done.
-    let _ = client
-        .send_raw_no_wait(
-            Some(session_id),
-            "Runtime.releaseObjectGroup",
-            json!({"objectGroup": "css-styles"}),
-        )
-        .await;
+    // A lost connection stops here: a release on a dead socket could wait out
+    // the whole write budget before the caller hears about the loss.
+    let result = match result {
+        Err(e) if e.downcast_ref::<ConnectionLost>().is_some() => return Err(e),
+        result => result,
+    };
+    // Nothing to wait for: the reply only says it was done. A failed write
+    // leaves the stream unusable, so a loss here stops too; other release
+    // errors do not change the result.
+    release_outcome(
+        client
+            .send_raw_no_wait(
+                Some(session_id),
+                "Runtime.releaseObjectGroup",
+                json!({"objectGroup": "css-styles"}),
+            )
+            .await,
+    )?;
     let result = result?;
     if let Some(e) = result.get("exceptionDetails") {
         bail!(
@@ -1978,10 +2033,14 @@ fn take_sheet_headers(client: &mut CdpClient, session_id: &str) -> HashMap<Strin
 /// the keys the cascade uses. Both animations and transitions set properties
 /// outside the matched rules.
 fn animated_names(result: &Value) -> HashSet<String> {
-    ["animations", "transitions"]
-        .into_iter()
-        .flat_map(|kind| items(&result[kind]))
-        .flat_map(|entry| items(&entry["properties"]))
+    // CDP puts each animation's style under `animationStyles[].style` and the
+    // transition's under `transitionsStyle`; both are `CSSStyle`s whose
+    // properties live in `cssProperties`.
+    items(&result["animationStyles"])
+        .iter()
+        .map(|entry| &entry["style"])
+        .chain(std::iter::once(&result["transitionsStyle"]))
+        .flat_map(|style| items(&style["cssProperties"]))
         .filter_map(|p| p["name"].as_str())
         .map(normalize_property_name)
         .collect()
@@ -2004,6 +2063,29 @@ async fn animated_properties(
         )
         .await?;
     Ok(animated_names(&result))
+}
+
+/// The page's labels and the animation list are enrichments: an ordinary
+/// refusal or an unsupported method leaves them out of the report. A page
+/// that stopped answering or a lost connection is not optional — it must
+/// reach the caller before another full-budget page call is started.
+fn page_info_fallback(result: Result<PageInfo>, selector: &str) -> Result<PageInfo> {
+    match result {
+        Ok(page) => Ok(page),
+        Err(e) if is_connection_or_page_failure(&e) => Err(e),
+        Err(_) => Ok(PageInfo {
+            element: selector.to_string(),
+            ..Default::default()
+        }),
+    }
+}
+
+fn animated_fallback(result: Result<HashSet<String>>) -> Result<HashSet<String>> {
+    match result {
+        Ok(animated) => Ok(animated),
+        Err(e) if is_connection_or_page_failure(&e) => Err(e),
+        Err(_) => Ok(HashSet::new()),
+    }
 }
 
 async fn collect(
@@ -2081,32 +2163,24 @@ async fn collect(
     // "ancestor N", leaves ancestor var() references unresolved, lists
     // shorthands' computed longhands one by one, guesses what a var()
     // shorthand sets from its longhands' names, and counts every value a
-    // var() reference resolves to as one its property accepts. A lost
-    // connection is no nicety: it must reach the daemon, which exits on it.
+    // var() reference resolves to as one its property accepts. A page that
+    // stops answering or a lost connection is no nicety: it must reach the
+    // caller instead of starting another page call on the same renderer.
     let names = ancestor_var_names(&matched);
     let props = element_props_to_read(&matched, &computed, &opts.computed);
     let expand = shorthands_to_expand(&matched, &computed, &opts.computed);
     let checks = substituted_values(&matched, &custom_properties(&computed));
-    let page = page_info(
-        client, session_id, node_id, &names, &props, &expand, &checks,
-    )
-    .await;
-    let page = match page {
-        Ok(page) => page,
-        Err(e) if e.downcast_ref::<ConnectionLost>().is_some() => return Err(e),
-        Err(_) => PageInfo {
-            element: selector.to_string(),
-            ..Default::default()
-        },
-    };
+    let page = page_info_fallback(
+        page_info(
+            client, session_id, node_id, &names, &props, &expand, &checks,
+        )
+        .await,
+        selector,
+    )?;
     // An animation or transition setting a property is not observable from the
     // matched rules or the computed value alone. A browser that does not know
     // the CDP call is treated as having none.
-    let animated = match animated_properties(client, session_id, node_id).await {
-        Ok(animated) => animated,
-        Err(e) if e.downcast_ref::<ConnectionLost>().is_some() => return Err(e),
-        Err(_) => HashSet::new(),
-    };
+    let animated = animated_fallback(animated_properties(client, session_id, node_id).await)?;
 
     Ok(build_report_with_animated(
         &matched, &computed, &sheets, &page, opts, &animated,
@@ -2208,7 +2282,7 @@ pub async fn css_styles(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdp::{DialogOpen, OpenDialog};
+    use crate::cdp::{DialogOpen, OpenDialog, PageUnresponsive};
 
     fn range(line: u64) -> Value {
         json!({"startLine": line, "startColumn": 0, "endLine": line, "endColumn": 1})
@@ -2438,6 +2512,7 @@ Note: Matched rules, computed values and page details are read in separate reque
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
         );
         let status: Vec<Status> = blocks[0].decls.iter().map(|d| d.status).collect();
         assert_eq!(status, [Status::Overridden, Status::Active]);
@@ -2529,6 +2604,7 @@ Note: Matched rules, computed values and page details are read in separate reque
             &mut blocks,
             &HashSet::new(),
             &NodeFacts::default(),
+            &HashSet::new(),
             &all,
             &HashSet::new(),
             &HashSet::new(),
@@ -2554,6 +2630,7 @@ Note: Matched rules, computed values and page details are read in separate reque
             &mut blocks,
             &HashSet::new(),
             &NodeFacts::default(),
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
@@ -3082,11 +3159,121 @@ Note: Matched rules, computed values and page details are read in separate reque
         let report = report_for(&m, CssOptions::default());
         assert_eq!(report.inherited[0].rules[0].decls[0].status, Status::Active);
         // The parent's `unset` is the initial value for this non-inherited
-        // property, so the grandparent's red does not supply it.
-        assert_eq!(
-            report.inherited[1].rules[0].decls[0].status,
-            Status::Overridden
+        // property, so the grandparent's red cannot reach the element and is
+        // no longer an inherited declaration to show.
+        assert_eq!(report.inherited.len(), 1);
+    }
+
+    /// A parent shorthand supplies a longhand the element explicitly
+    /// inherits, even though the shorthand itself is not an inherited
+    /// property. Only the inherited member is propagated.
+    #[test]
+    fn an_explicitly_inherited_longhand_matches_an_ancestor_shorthand() {
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = authored(
+            &[("background-color", "inherit")],
+            &[("background-color", "inherit")],
         );
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(
+            &[("background", "red")],
+            &[("background-color", "red"), ("background-image", "none")],
+        );
+        // The non-inherited member is not propagated, so it does not become
+        // a computed value worth showing either.
+        let mut computed = computed();
+        computed.push(("background-image".into(), "none".into()));
+        let report = build_report(&m, &computed, &sheets(), &page(), &CssOptions::default());
+        let parent = &report.inherited[0].rules[0].decls[0];
+        assert_eq!(parent.name, "background");
+        assert_eq!(parent.status, Status::Active);
+        assert!(!report.computed.iter().any(|(n, _)| n == "background-image"));
+    }
+
+    /// The element inherits `background-color`, so the parent's `all` reset
+    /// includes it and beats that parent's own red declaration. Without the
+    /// reset red still supplies the value.
+    #[test]
+    fn an_ancestors_all_includes_explicitly_inherited_keys() {
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = authored(
+            &[("background-color", "inherit")],
+            &[("background-color", "inherit")],
+        );
+        let red = [("background-color", "red")];
+        let parent = |decls: &[(&str, &str)], longhands: &[(&str, &str)]| {
+            let mut m = m.clone();
+            m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(decls, longhands);
+            report_for(&m, CssOptions::default())
+        };
+        let report = parent(&red, &red);
+        assert_eq!(report.inherited[0].rules[0].decls[0].status, Status::Active);
+
+        let report = parent(&[("background-color", "red"), ("all", "initial")], &red);
+        let decls = &report.inherited[0].rules[0].decls;
+        assert_eq!(decls[0].name, "background-color");
+        assert_eq!(decls[0].status, Status::Overridden);
+        assert_eq!(decls[1].name, "all");
+        assert_eq!(decls[1].status, Status::Active);
+    }
+
+    /// A non-inherited key only reaches further ancestors while the nearer
+    /// one explicitly inherits it; otherwise its initial value is what the
+    /// element gets.
+    #[test]
+    fn a_non_inherited_key_needs_the_parent_to_inherit_it() {
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = authored(
+            &[("background-color", "inherit")],
+            &[("background-color", "inherit")],
+        );
+        let html = rule(
+            "html",
+            1,
+            authored(
+                &[("background-color", "red")],
+                &[("background-color", "red")],
+            ),
+        );
+        m["inherited"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "matchedCSSRules": [html] }));
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(report.inherited.len(), 1);
+
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(
+            &[("background-color", "inherit")],
+            &[("background-color", "inherit")],
+        );
+        let report = report_for(&m, CssOptions::default());
+        assert_eq!(report.inherited[1].rules[0].decls[0].status, Status::Active);
+    }
+
+    /// `unset` on a non-inherited property uses the initial value, but on one
+    /// that inherits by default it still takes the parent's.
+    #[test]
+    fn unset_only_inherits_properties_that_inherit_by_default() {
+        let mut m = matched();
+        m["matchedCSSRules"] = json!([]);
+        m["inlineStyle"] = authored(
+            &[("background-color", "unset"), ("color", "unset")],
+            &[("background-color", "unset"), ("color", "unset")],
+        );
+        m["inherited"][0]["matchedCSSRules"][0]["rule"]["style"] = authored(
+            &[("background-color", "red"), ("color", "blue")],
+            &[("background-color", "red"), ("color", "blue")],
+        );
+        let report = report_for(&m, CssOptions::default());
+        let decls = &report.inherited[0].rules[0].decls;
+        // `background-color: unset` uses the initial value, so the parent's
+        // red is not an inherited declaration. `color: unset` still takes
+        // the parent's blue.
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name, "color");
+        assert_eq!(decls[0].status, Status::Active);
     }
 
     /// An animation or transition sets a property above the static cascade, so
@@ -3095,11 +3282,15 @@ Note: Matched rules, computed values and page details are read in separate reque
     #[test]
     fn animated_properties_are_not_marked_active() {
         let reply = json!({
-            "animations": [{"properties": [{"name": "Opacity"}]}],
-            "transitions": [{"properties": [{"name": "width"}]}],
+            "animationStyles": [
+                {"name": "fade", "style": {"cssProperties": [{"name": "Opacity", "value": "0"}]}}
+            ],
+            "transitionsStyle": {"cssProperties": [{"name": "width", "value": "10px"}]},
         });
         let animated = animated_names(&reply);
         assert_eq!(animated, HashSet::from(["opacity".into(), "width".into()]));
+        // A node with no animated styles has nothing to mark indeterminate.
+        assert!(animated_names(&json!({})).is_empty());
 
         let mut m = matched();
         m["matchedCSSRules"] = json!([]);
@@ -3124,6 +3315,31 @@ Note: Matched rules, computed values and page details are read in separate reque
         let json = report_json(&report).unwrap();
         assert_eq!(json["rules"][0]["properties"][0]["status"], "indeterminate");
         assert_eq!(json["rules"][0]["properties"][1]["status"], "active");
+    }
+
+    /// A stalled page or a lost connection during either optional enrichment
+    /// is the command's error; only an ordinary refusal gets the reduced
+    /// report.
+    #[test]
+    fn a_page_failure_stops_both_enrichments() {
+        for kind in ["page", "connection"] {
+            let error = || match kind {
+                "page" => anyhow::Error::new(PageUnresponsive("no answer".into())),
+                _ => anyhow::Error::new(ConnectionLost("closed".into())),
+            };
+            let info = page_info_fallback(Err(error()), "p");
+            assert!(is_connection_or_page_failure(&info.unwrap_err()), "{kind}");
+            let animated = animated_fallback(Err(error()));
+            assert!(
+                is_connection_or_page_failure(&animated.unwrap_err()),
+                "{kind}"
+            );
+        }
+        let info = page_info_fallback(Err(anyhow::anyhow!("Method not found")), "p").unwrap();
+        assert_eq!(info.element, "p");
+        assert!(animated_fallback(Err(anyhow::anyhow!("Method not found")))
+            .unwrap()
+            .is_empty());
     }
 
     /// `<table cellspacing>` beats the user-agent stylesheet's spacing, and
@@ -3165,6 +3381,7 @@ Note: Matched rules, computed values and page details are read in separate reque
             &mut blocks,
             &HashSet::new(),
             &NodeFacts::default(),
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
@@ -3968,8 +4185,26 @@ Note: Matched rules, computed values and page details are read in separate reque
                 "{close_on}: {error:#}"
             );
             drop(client);
-            browser.await.unwrap();
+            let seen = browser.await.unwrap();
+            if close_on == "Runtime.callFunctionOn" {
+                assert!(
+                    !seen.iter().any(|m| m == "Runtime.releaseObjectGroup"),
+                    "{seen:?}"
+                );
+            } else {
+                assert!(seen.iter().any(|m| m == "Runtime.releaseObjectGroup"));
+            }
         }
+    }
+
+    /// A release write that loses the connection must stop the command; other
+    /// release failures do not change the result.
+    #[test]
+    fn a_lost_release_write_stops_the_command() {
+        let lost = release_outcome(Err(anyhow::Error::new(ConnectionLost("closed".into()))));
+        assert!(lost.unwrap_err().downcast_ref::<ConnectionLost>().is_some());
+        release_outcome(Err(anyhow::anyhow!("ordinary release failure"))).unwrap();
+        release_outcome(Ok(1)).unwrap();
     }
 
     /// A page that doesn't answer gets the cleanup's own short wait, not a
