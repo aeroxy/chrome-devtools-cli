@@ -150,7 +150,7 @@ async fn traverse_history(client: &mut CdpClient, session_id: &str, entry_id: i6
     // commits in its own process, out of this session's sight.
     if !frames.is_empty() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        wait_for_event_from_session(client, remaining, |e| {
+        wait_for_event_from_session(client, session_id, remaining, |e| {
             commit_from_session(e, session_id, &frames)
         })
         .await
@@ -179,8 +179,15 @@ fn commit_from_session(event: &serde_json::Value, session_id: &str, frames: &[St
 /// Read until an event from the acting session matches, checking both buffered
 /// and freshly read events. The session lives on the event envelope, so the
 /// predicate needs the whole event, not just its method and params.
+///
+/// A dialog that opens on `session_id` meanwhile, such as the "Leave site?" a
+/// `beforeunload` handler raises as a traversal starts, holds the page until it
+/// is answered, and no call is waiting to answer it. So it is settled here:
+/// handled with the command's `--dialog-action`, or the wait fails at once with
+/// `DialogOpen` instead of running out its time with the dialog still open.
 async fn wait_for_event_from_session<F>(
     client: &mut CdpClient,
+    session_id: &str,
     timeout: std::time::Duration,
     mut matches: F,
 ) -> Result<serde_json::Value>
@@ -206,15 +213,25 @@ where
             if matches(&event) {
                 return Ok(event);
             }
+            // Another session's dialog belongs to its own page: `push_event`
+            // records it for that page, and this command must not answer it.
+            let dialog_here = event["method"] == "Page.javascriptDialogOpening"
+                && event["sessionId"].as_str() == Some(session_id);
             client.push_event(event);
+            if dialog_here {
+                client.settle_open_dialog(session_id).await?;
+            }
         }
     }
 }
 
-/// A lost connection keeps its type, which the daemon exits on; any other
-/// failure of the wait is the wait running out.
+/// A lost connection keeps its type, which the daemon exits on, and so does a
+/// dialog the wait could not settle, whose message says how to handle it. Any
+/// other failure is reported as the wait running out.
 fn history_wait_error(e: anyhow::Error) -> anyhow::Error {
-    if crate::cdp::is_connection_or_page_failure(&e) {
+    if crate::cdp::is_connection_or_page_failure(&e)
+        || e.downcast_ref::<crate::cdp::DialogOpen>().is_some()
+    {
         e
     } else {
         anyhow::anyhow!(
@@ -586,6 +603,139 @@ mod tests {
         // Another session's events are no part of it.
         let other = [started("s2", "Page.frameStartedLoading", "MAIN")].into();
         assert!(traversal_frames(&other, "s1", "MAIN").is_empty());
+    }
+
+    /// A browser that answers each call with the messages `answer` makes from
+    /// it, in order. The task yields the calls it got.
+    async fn fake_browser(
+        answer: impl Fn(&serde_json::Value) -> Vec<serde_json::Value> + Send + 'static,
+    ) -> (CdpClient, tokio::task::JoinHandle<Vec<serde_json::Value>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let browser = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut calls = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let call: serde_json::Value = serde_json::from_str(&text).unwrap();
+                for message in answer(&call) {
+                    if ws.send(Message::Text(message.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+                calls.push(call);
+            }
+            calls
+        });
+        let client = CdpClient::connect(&format!("ws://{addr}"), "Chrome")
+            .await
+            .unwrap();
+        (client, browser)
+    }
+
+    /// Going back from a page whose `beforeunload` handler asks "Leave site?",
+    /// as Chrome 158 answers it on session S1: the dialog opens after
+    /// `Page.navigateToHistoryEntry` replies, and the traversal commits only
+    /// once it is accepted. Here the opening is tagged `dialog_session`; a
+    /// dialog of another session does not hold S1's commit back.
+    fn leave_site_prompt(
+        dialog_session: &'static str,
+    ) -> impl Fn(&serde_json::Value) -> Vec<serde_json::Value> + Send + 'static {
+        move |call| {
+            let reply = |result| json!({"id": call["id"], "sessionId": "S1", "result": result});
+            let event =
+                |method, params| json!({"method": method, "sessionId": "S1", "params": params});
+            let commit = event("Page.frameNavigated", json!({"frame": {"id": "MAIN"}}));
+            match call["method"].as_str().unwrap_or_default() {
+                "Page.getFrameTree" => vec![reply(json!({"frameTree": {"frame": {"id": "MAIN"}}}))],
+                "Page.navigateToHistoryEntry" => {
+                    let mut messages = vec![
+                        event("Page.frameStartedNavigating", json!({"frameId": "MAIN"})),
+                        reply(json!({})),
+                        json!({"method": "Page.javascriptDialogOpening", "sessionId": dialog_session,
+                               "params": {"type": "beforeunload", "message": ""}}),
+                    ];
+                    if dialog_session != "S1" {
+                        messages.push(commit);
+                    }
+                    messages
+                }
+                "Page.handleJavaScriptDialog" => vec![
+                    event("Page.javascriptDialogClosed", json!({"result": true})),
+                    reply(json!({})),
+                    commit,
+                ],
+                "Runtime.evaluate" => vec![reply(json!({"result": {"value": "complete"}}))],
+                _ => vec![reply(json!({}))],
+            }
+        }
+    }
+
+    fn handled_dialogs(calls: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        calls
+            .iter()
+            .filter(|c| c["method"] == "Page.handleJavaScriptDialog")
+            .collect()
+    }
+
+    /// Nothing else answers a dialog that opens during the commit wait, so the
+    /// wait answers it with the command's action and goes on to the commit.
+    #[tokio::test]
+    async fn a_dialog_during_a_history_traversal_is_handled_with_the_action() {
+        let (mut client, browser) = fake_browser(leave_site_prompt("S1")).await;
+        client.dialog_action = Some("accept".into());
+        let traversal = traverse_history(&mut client, "S1", 7);
+        tokio::time::timeout(std::time::Duration::from_secs(5), traversal)
+            .await
+            .expect("the dialog does not hold the wait to its deadline")
+            .expect("the traversal commits once the dialog is accepted");
+        assert!(client.open_dialog.is_none());
+        drop(client);
+        let calls = browser.await.unwrap();
+        let handled = handled_dialogs(&calls);
+        assert_eq!(handled.len(), 1, "{calls:?}");
+        assert_eq!(handled[0]["sessionId"], "S1");
+        assert_eq!(handled[0]["params"]["accept"], true);
+    }
+
+    /// Without an action the wait fails at once with the typed error, not at
+    /// the navigation deadline, and the dialog stays recorded for the next
+    /// command on the page.
+    #[tokio::test]
+    async fn a_dialog_during_a_history_traversal_fails_at_once_without_an_action() {
+        let (mut client, browser) = fake_browser(leave_site_prompt("S1")).await;
+        let traversal = traverse_history(&mut client, "S1", 7);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), traversal)
+            .await
+            .expect("the wait fails at once")
+            .expect_err("nothing may answer the dialog");
+        let dialog = error.downcast_ref::<crate::cdp::DialogOpen>();
+        assert_eq!(dialog.map(|d| d.dialog_type.as_str()), Some("beforeunload"));
+        let open = client.open_dialog.as_ref();
+        assert_eq!(open.and_then(|d| d.session_id.as_deref()), Some("S1"));
+        drop(client);
+        let calls = browser.await.unwrap();
+        assert!(handled_dialogs(&calls).is_empty(), "{calls:?}");
+    }
+
+    /// A dialog on another session is that page's: the wait records it but
+    /// does not answer it, even with an action, and goes on to this commit.
+    #[tokio::test]
+    async fn a_history_traversal_leaves_another_sessions_dialog_alone() {
+        let (mut client, browser) = fake_browser(leave_site_prompt("S2")).await;
+        client.dialog_action = Some("accept".into());
+        let traversal = traverse_history(&mut client, "S1", 7);
+        tokio::time::timeout(std::time::Duration::from_secs(5), traversal)
+            .await
+            .expect("the other dialog does not hold the wait")
+            .expect("this session's commit ends the wait");
+        let open = client.open_dialog.as_ref();
+        assert_eq!(open.and_then(|d| d.session_id.as_deref()), Some("S2"));
+        drop(client);
+        let calls = browser.await.unwrap();
+        assert!(handled_dialogs(&calls).is_empty(), "{calls:?}");
     }
 
     #[test]
